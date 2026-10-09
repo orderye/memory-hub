@@ -561,6 +561,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "ref-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "common",
+ "hub-authz",
+ "hub-core",
+ "hub-embed",
+ "hub-mcp",
+ "hub-packs",
+ "hub-retrieval",
+ "hub-rules",
+ "hub-store",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "regex-automata"
 version = "0.4.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
