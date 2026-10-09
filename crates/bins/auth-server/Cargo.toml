@@ -1,0 +1,18 @@
+[package]
+name = "auth-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "auth-server"
+path = "src/main.rs"
+
+[dependencies]
+common = { workspace = true }
+as-core = { workspace = true }
+hub-authz = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde_json = { workspace = true }

@@ -67,6 +67,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "auth-server"
+version = "0.1.0"
+dependencies = [
+ "as-core",
+ "common",
+ "hub-authz",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -184,6 +196,34 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer",
  "crypto-common",
+]
+
+[[package]]
+name = "editor-server"
+version = "0.1.0"
+dependencies = [
+ "common",
+ "editor-web",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "editor-web"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "common",
+ "hub-core",
+ "hub-packs",
+ "hub-rules",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -473,6 +513,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "mcp-server"
+version = "0.1.0"
+dependencies = [
+ "common",
+ "hub-authz",
+ "hub-core",
+ "hub-embed",
+ "hub-mcp",
+ "hub-packs",
+ "hub-retrieval",
+ "hub-rules",
+ "hub-store",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -519,6 +577,20 @@ dependencies = [
  "hub-store",
  "serde",
  "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "offline-worker"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "common",
+ "hub-core",
+ "hub-store",
+ "offline",
  "tokio",
  "tracing",
  "uuid",

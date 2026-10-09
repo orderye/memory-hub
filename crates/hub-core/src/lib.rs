@@ -8,11 +8,13 @@ pub mod algorithm;
 pub mod assembler;
 pub mod check_service;
 pub mod domain;
+pub mod fusion;
 pub mod infra;
 pub mod observe_service;
 pub mod service;
 
 pub use check_service::{DefaultCheckService, DefaultFeedbackService};
+pub use fusion::{MemoryEvidenceItem, MemoryFusionEngine};
 pub use observe_service::DefaultObserveService;
 
 pub use algorithm::{

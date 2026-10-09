@@ -10,3 +10,4 @@ pub mod log;
 pub use auth::{Acl, AuthCtx, ClientId, Scope, UserId};
 pub use config::AppConfig;
 pub use error::{ErrorDetail, HubError, Result};
+pub use log::init_tracing;
