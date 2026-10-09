@@ -8,6 +8,9 @@ members = [
     "crates/hub-packs",
     "crates/hub-rules",
     "crates/hub-retrieval",
+    "crates/hub-authz",
+    "crates/as-core",
+    "crates/hub-mcp",
 ]
 
 [workspace.package]
@@ -25,6 +28,9 @@ hub-store = { path = "crates/hub-store" }
 hub-packs = { path = "crates/hub-packs" }
 hub-rules = { path = "crates/hub-rules" }
 hub-retrieval = { path = "crates/hub-retrieval" }
+hub-authz = { path = "crates/hub-authz" }
+as-core = { path = "crates/as-core" }
+hub-mcp = { path = "crates/hub-mcp" }
 
 # 错误处理与工具
 thiserror = "2.0"
@@ -53,4 +59,5 @@ secrecy = { version = "0.10", features = ["serde"] }
 zeroize = { version = "1.8", features = ["derive"] }
 sha2 = "0.10"
 hex = "0.4"
+base64 = "0.22"
 arc-swap = "1.7"
