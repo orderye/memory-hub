@@ -12,6 +12,8 @@ members = [
     "crates/as-core",
     "crates/hub-mcp",
     "crates/ref-client",
+    "crates/offline",
+    "crates/eval",
 ]
 
 [workspace.package]
@@ -33,6 +35,8 @@ hub-authz = { path = "crates/hub-authz" }
 as-core = { path = "crates/as-core" }
 hub-mcp = { path = "crates/hub-mcp" }
 ref-client = { path = "crates/ref-client" }
+offline = { path = "crates/offline" }
+eval = { path = "crates/eval" }
 
 # 错误处理与工具
 thiserror = "2.0"

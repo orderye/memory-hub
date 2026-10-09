@@ -6,9 +6,14 @@
 
 pub mod algorithm;
 pub mod assembler;
+pub mod check_service;
 pub mod domain;
 pub mod infra;
+pub mod observe_service;
 pub mod service;
+
+pub use check_service::{DefaultCheckService, DefaultFeedbackService};
+pub use observe_service::DefaultObserveService;
 
 pub use algorithm::{
     apply_decay, calculate_item_score, can_promote_to_belief, check_margin, mmr_rerank,
