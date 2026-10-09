@@ -5,6 +5,7 @@
 //! 本 crate 遵循纯领域设计原则，无外部 IO、无 Web/DB 强依赖。
 
 pub mod algorithm;
+pub mod assembler;
 pub mod domain;
 pub mod infra;
 pub mod service;
@@ -13,6 +14,7 @@ pub use algorithm::{
     apply_decay, calculate_item_score, can_promote_to_belief, check_margin, mmr_rerank,
     update_confidence_on_event, ConfidenceEvent, ItemScoreParams, MarginResult, PromotionCandidate,
 };
+pub use assembler::Assembler;
 pub use domain::{ItemStatus, Layer, MemoryItem, Provenance, Sensitivity, UsePolicy};
 pub use infra::{
     AuditEvent, AuditSink, CheckInput, CheckResult, Clock, ConflictFlag, ConflictTable,

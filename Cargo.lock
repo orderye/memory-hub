@@ -238,6 +238,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
  "tracing",
  "uuid",
 ]
@@ -269,6 +270,23 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "hub-retrieval"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "common",
+ "hub-core",
+ "hub-embed",
+ "hub-store",
+ "serde_json",
+ "tokio",
  "tracing",
  "uuid",
 ]

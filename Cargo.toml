@@ -7,6 +7,7 @@ members = [
     "crates/hub-store",
     "crates/hub-packs",
     "crates/hub-rules",
+    "crates/hub-retrieval",
 ]
 
 [workspace.package]
@@ -23,6 +24,7 @@ hub-embed = { path = "crates/hub-embed" }
 hub-store = { path = "crates/hub-store" }
 hub-packs = { path = "crates/hub-packs" }
 hub-rules = { path = "crates/hub-rules" }
+hub-retrieval = { path = "crates/hub-retrieval" }
 
 # 错误处理与工具
 thiserror = "2.0"
