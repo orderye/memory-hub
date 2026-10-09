@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/common",
+    "crates/hub-core",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+authors = ["Memory Hub Team"]
+
+[workspace.dependencies]
+common = { path = "crates/common" }
+hub-core = { path = "crates/hub-core" }
+
+# 错误处理与工具
+thiserror = "2.0"
+anyhow = "1.0"
+async-trait = "0.1"
+
+# 序列化
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+
+# 时间与唯一 ID
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.10", features = ["v4", "serde"] }
+
+# 异步与运行时
+tokio = { version = "1.40", features = ["full"] }
+
+# 日志与可观测性
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+
+# 安全与加密辅助
+secrecy = { version = "0.10", features = ["serde"] }
+zeroize = { version = "1.8", features = ["derive"] }
