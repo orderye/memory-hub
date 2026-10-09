@@ -10,6 +10,7 @@ members = [
     "crates/hub-retrieval",
     "crates/hub-authz",
     "crates/as-core",
+    "crates/as-web",
     "crates/hub-mcp",
     "crates/ref-client",
     "crates/offline",
@@ -38,6 +39,7 @@ hub-rules = { path = "crates/hub-rules" }
 hub-retrieval = { path = "crates/hub-retrieval" }
 hub-authz = { path = "crates/hub-authz" }
 as-core = { path = "crates/as-core" }
+as-web = { path = "crates/as-web" }
 hub-mcp = { path = "crates/hub-mcp" }
 ref-client = { path = "crates/ref-client" }
 offline = { path = "crates/offline" }

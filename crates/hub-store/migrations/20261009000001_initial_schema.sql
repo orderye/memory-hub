@@ -210,3 +210,16 @@ create table if not exists audit_log (
   detail jsonb not null default '{}',
   created_at timestamptz not null default now()
 );
+
+-- 5. 权限硬防御：只追加角色权限配置（设计规范 17.3 节）
+do $$
+begin
+  if not exists (select from pg_roles where rolname = 'audit_writer') then
+    create role audit_writer;
+  end if;
+end $$;
+
+grant insert on events to audit_writer;
+grant insert on audit_log to audit_writer;
+revoke update, delete, truncate on events from audit_writer;
+revoke update, delete, truncate on audit_log from audit_writer;

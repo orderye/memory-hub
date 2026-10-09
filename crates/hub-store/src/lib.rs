@@ -7,5 +7,6 @@
 //! - 数据库迁移脚本（PostgreSQL 15+ 模式）
 
 pub mod in_memory;
+pub mod sql_validation;
 
 pub use in_memory::InMemoryMemoryStore;

@@ -333,6 +333,116 @@ impl RuleEditorService {
         };
         self.audit_logs.lock().unwrap().push(entry);
     }
+
+    /// 渲染编审工作台可视化管理控制台 HTML
+    pub fn render_dashboard_html(&self) -> String {
+        let requests = self.requests.lock().unwrap();
+        let rows_html: String = if requests.is_empty() {
+            "<tr><td colspan='7' style='text-align:center; color:#94a3b8; padding: 24px;'>当前无变更提案</td></tr>".to_string()
+        } else {
+            requests
+                .iter()
+                .map(|r| {
+                    let status_badge = match r.status {
+                        ChangeRequestStatus::Draft => "<span style='background:#f1f5f9; color:#475569; padding:2px 8px; border-radius:4px;'>草案</span>",
+                        ChangeRequestStatus::Submitted | ChangeRequestStatus::InReview => "<span style='background:#fef3c7; color:#92400e; padding:2px 8px; border-radius:4px;'>审核中</span>",
+                        ChangeRequestStatus::Approved => "<span style='background:#dcfce7; color:#166534; padding:2px 8px; border-radius:4px;'>已批准</span>",
+                        ChangeRequestStatus::Rejected => "<span style='background:#fee2e2; color:#991b1b; padding:2px 8px; border-radius:4px;'>已拒绝</span>",
+                        ChangeRequestStatus::Deployed => "<span style='background:#dbeafe; color:#1e40af; padding:2px 8px; border-radius:4px;'>灰度发布中</span>",
+                        ChangeRequestStatus::RolledBack => "<span style='background:#f3e8ff; color:#6b21a8; padding:2px 8px; border-radius:4px;'>已回滚</span>",
+                    };
+
+                    let type_label = match r.change_type {
+                        ChangeType::Tightening => "收紧防护",
+                        ChangeType::Relaxation => "<strong style='color:#dc2626'>放宽底线 (需双签)</strong>",
+                        ChangeType::Routine => "日常微调",
+                    };
+
+                    format!(
+                        r##"<tr>
+                            <td><code>{}</code></td>
+                            <td><strong>{}</strong></td>
+                            <td><code>{}</code></td>
+                            <td>{}</td>
+                            <td>{}</td>
+                            <td>{}%</td>
+                            <td>
+                                <form method='POST' action='/editor/approve' style='display:inline;'>
+                                    <input type='hidden' name='id' value='{}' />
+                                    <button type='submit' style='padding:4px 8px; font-size:12px; cursor:pointer;'>审批</button>
+                                </form>
+                                <form method='POST' action='/editor/rollback' style='display:inline; margin-left:4px;'>
+                                    <input type='hidden' name='id' value='{}' />
+                                    <button type='submit' style='padding:4px 8px; font-size:12px; background:#ef4444; color:white; border:none; border-radius:3px; cursor:pointer;'>回滚</button>
+                                </form>
+                            </td>
+                        </tr>"##,
+                        &r.id.to_string()[0..8],
+                        r.title,
+                        r.pack_id,
+                        type_label,
+                        status_badge,
+                        r.rollout_percentage,
+                        r.id,
+                        r.id
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        format!(
+            r##"<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>记忆中枢 - 规范与规则编审工作台</title>
+    <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; padding: 32px; }}
+        .header {{ display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #334155; padding-bottom: 20px; margin-bottom: 24px; }}
+        h1 {{ margin: 0; font-size: 22px; color: #38bdf8; }}
+        .card {{ background: #1e293b; border: 1px solid #334155; border-radius: 8px; padding: 20px; margin-bottom: 24px; }}
+        table {{ width: 100%; border-collapse: collapse; text-align: left; }}
+        th, td {{ padding: 12px; border-bottom: 1px solid #334155; font-size: 13px; }}
+        th {{ background: #0f172a; color: #94a3b8; font-weight: 600; }}
+        .btn-create {{ background: #0284c7; color: white; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; text-decoration: none; }}
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div>
+            <h1>记忆中枢规则编审控制台 (Rule Editor Workbench)</h1>
+            <p style="margin:4px 0 0; color:#94a3b8; font-size:13px;">双人审批制衡体系 · 放宽类法务与负责人双签机制 · 核心锁防篡改防线</p>
+        </div>
+        <div>
+            <button class="btn-create" onclick="alert('起草新规则变更')">+ 起草新规则提案</button>
+        </div>
+    </div>
+
+    <div class="card">
+        <h3 style="margin-top:0;">变更提案与审批流</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>编号</th>
+                    <th>提案标题</th>
+                    <th>目标规范包</th>
+                    <th>类型</th>
+                    <th>状态</th>
+                    <th>灰度比例</th>
+                    <th>管理操作</th>
+                </tr>
+            </thead>
+            <tbody>
+                {}
+            </tbody>
+        </table>
+    </div>
+</body>
+</html>"##,
+            rows_html
+        )
+    }
 }
 
 #[cfg(test)]

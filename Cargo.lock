@@ -56,6 +56,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "as-web"
+version = "0.1.0"
+dependencies = [
+ "as-core",
+ "chrono",
+ "common",
+ "hub-authz",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "async-trait"
 version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"

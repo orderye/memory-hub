@@ -1,0 +1,100 @@
+version: '3.8'
+
+services:
+  # 1. 核心持久化存储：PostgreSQL 15 + pgvector 插件
+  postgres:
+    image: pgvector/pgvector:pg15
+    container_name: memoryhub-postgres
+    restart: always
+    environment:
+      POSTGRES_DB: memory_hub
+      POSTGRES_USER: hub_app
+      POSTGRES_PASSWORD: hub_app_secure_password_2026
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./crates/hub-store/migrations/20261009000001_initial_schema.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hub_app -d memory_hub"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # 2. 授权服务器 (RFC 6749 / RFC 8707 / RFC 9728) + 用户中心
+  auth-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: memoryhub-auth-server
+    restart: always
+    entrypoint: ["/app/auth-server"]
+    ports:
+      - "8080:8080"
+    environment:
+      - RUST_LOG=info
+      - HUB_DB_URL=postgresql://hub_app:hub_app_secure_password_2026@postgres:5432/memory_hub
+      - AS_ACCESS_TOKEN_TTL_S=900
+      - AS_REFRESH_TOKEN_TTL_D=30
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # 3. 记忆中枢主 MCP Server (Streamable HTTP / stdio)
+  mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: memoryhub-mcp-server
+    restart: always
+    entrypoint: ["/app/mcp-server"]
+    ports:
+      - "3000:3000"
+    environment:
+      - RUST_LOG=info
+      - HUB_DB_URL=postgresql://hub_app:hub_app_secure_password_2026@postgres:5432/memory_hub
+      - HUB_TOKEN_BUDGET_DEFAULT=600
+      - HUB_SOFT_TIMEOUT_MS=300
+      - FEATURE_NATIONAL_MEMORY=false
+      - FEATURE_LEDGER_AVAILABLE=false
+    depends_on:
+      postgres:
+        condition: service_healthy
+      auth-server:
+        condition: service_started
+
+  # 4. 离线批处理守护进程（每日衰减清理 & 聚类分析）
+  offline-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: memoryhub-offline-worker
+    restart: always
+    entrypoint: ["/app/offline-worker"]
+    environment:
+      - RUST_LOG=info
+      - HUB_DB_URL=postgresql://hub_app:hub_app_secure_password_2026@postgres:5432/memory_hub
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # 5. 规则编审工作台服务端 (双人审批、灰度与一键回滚控制台)
+  editor-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: memoryhub-editor-server
+    restart: always
+    entrypoint: ["/app/editor-server"]
+    ports:
+      - "8081:8081"
+    environment:
+      - RUST_LOG=info
+      - HUB_DB_URL=postgresql://hub_app:hub_app_secure_password_2026@postgres:5432/memory_hub
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+    driver: local
