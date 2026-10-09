@@ -3,6 +3,10 @@ resolver = "2"
 members = [
     "crates/common",
     "crates/hub-core",
+    "crates/hub-embed",
+    "crates/hub-store",
+    "crates/hub-packs",
+    "crates/hub-rules",
 ]
 
 [workspace.package]
@@ -15,6 +19,10 @@ authors = ["Memory Hub Team"]
 [workspace.dependencies]
 common = { path = "crates/common" }
 hub-core = { path = "crates/hub-core" }
+hub-embed = { path = "crates/hub-embed" }
+hub-store = { path = "crates/hub-store" }
+hub-packs = { path = "crates/hub-packs" }
+hub-rules = { path = "crates/hub-rules" }
 
 # 错误处理与工具
 thiserror = "2.0"
@@ -38,6 +46,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
 
-# 安全与加密辅助
+# 安全、加密与哈希
 secrecy = { version = "0.10", features = ["serde"] }
 zeroize = { version = "1.8", features = ["derive"] }
+sha2 = "0.10"
+hex = "0.4"
+arc-swap = "1.7"
