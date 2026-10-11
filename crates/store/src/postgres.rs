@@ -137,6 +137,81 @@ pub struct PostgresHubStore {
     pool: PgPool,
 }
 
+// ===== 迁移语句切分 =====
+
+/// 按语句切分迁移脚本。感知单引号字符串、dollar-quoted 块（`$$…$$` / `$tag$…$tag$`）
+/// 与 `--` / `/* */` 注释，这些结构内部的分号不作为语句边界；
+/// 返回的片段保留结尾分号，便于整段回读排查。
+fn split_sql_statements(sql: &str) -> Vec<&str> {
+    let b = sql.as_bytes();
+    let mut stmts = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    let mut in_single_quote = false;
+    let mut dollar_tag: Option<&[u8]> = None;
+
+    while i < b.len() {
+        if let Some(tag) = dollar_tag {
+            if b[i..].starts_with(tag) {
+                i += tag.len();
+                dollar_tag = None;
+            } else {
+                i += 1;
+            }
+        } else if in_single_quote {
+            if b[i] == b'\'' {
+                in_single_quote = false;
+            }
+            i += 1;
+        } else if b[i] == b'\'' {
+            in_single_quote = true;
+            i += 1;
+        } else if b[i] == b'$' {
+            match parse_dollar_tag(b, i) {
+                Some(tag) => {
+                    dollar_tag = Some(tag);
+                    i += tag.len();
+                }
+                None => i += 1,
+            }
+        } else if b[i] == b';' {
+            stmts.push(&sql[start..=i]);
+            i += 1;
+            start = i;
+        } else if b[i] == b'-' && i + 1 < b.len() && b[i + 1] == b'-' {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+        } else if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(b.len());
+        } else {
+            i += 1;
+        }
+    }
+    if start < b.len() {
+        stmts.push(&sql[start..]);
+    }
+    stmts
+}
+
+/// 识别位置 `i` 处的 dollar-quote 前导标记（`$$` 或 `$tag$`），返回含首尾 `$` 的完整标记；
+/// `$1` 这类非标记情形返回 None
+fn parse_dollar_tag(b: &[u8], i: usize) -> Option<&[u8]> {
+    let mut j = i + 1;
+    while j < b.len() && (b[j] == b'_' || b[j].is_ascii_alphanumeric()) {
+        j += 1;
+    }
+    if j < b.len() && b[j] == b'$' {
+        Some(&b[i..=j])
+    } else {
+        None
+    }
+}
+
 impl PostgresHubStore {
     /// 连接并执行迁移
     pub async fn connect(database_url: &str, max_connections: u32) -> Result<Self> {
@@ -186,7 +261,7 @@ impl PostgresHubStore {
 
             let mut tx = self.pool.begin().await.pg()?;
             // 迁移脚本按语句顺序整体执行；DDL 幂等（if not exists）
-            for stmt in sql.split(';') {
+            for stmt in split_sql_statements(sql) {
                 let trimmed = stmt.trim();
                 if trimmed.is_empty() {
                     continue;
@@ -1155,6 +1230,43 @@ mod tests {
     fn test_migrations_registered() {
         assert_eq!(MIGRATIONS.len(), 1);
         assert!(MIGRATIONS[0].0.starts_with("20261011"));
+    }
+
+    #[test]
+    fn test_split_sql_statements_dollar_quote() {
+        let sql = "create table a(id int);\n\
+                   do $$\nbegin\n  create role audit_writer;\nend $$;\n\
+                   grant insert on events to audit_writer;";
+        let stmts = split_sql_statements(sql);
+        assert_eq!(stmts.len(), 3);
+        assert!(stmts[1].contains("create role audit_writer;"));
+        assert!(stmts[1].ends_with("$$;"));
+
+        let tagged = "do $body$\n  update t set note = 'a;b';\n$body$;\nselect 1;";
+        let stmts = split_sql_statements(tagged);
+        assert_eq!(stmts.len(), 2);
+        assert!(stmts[0].contains("'a;b'"));
+    }
+
+    #[test]
+    fn test_split_sql_statements_comments_and_strings() {
+        let sql = "-- 注释里的分号; 与引号 '\ninsert into t values ('a;b');\n/* 块注释 ; */ select 1;";
+        let stmts = split_sql_statements(sql);
+        assert_eq!(stmts.len(), 2);
+    }
+
+    #[test]
+    fn test_split_full_migration_keeps_do_block_intact() {
+        let (_, sql) = MIGRATIONS[0];
+        let stmts: Vec<&str> = split_sql_statements(sql)
+            .into_iter()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert!(stmts.len() > 10);
+        assert!(stmts
+            .iter()
+            .any(|s| s.contains("create role audit_writer") && s.contains("begin") && s.ends_with("$$;")));
     }
 
     #[test]
