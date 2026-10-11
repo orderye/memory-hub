@@ -1,0 +1,13 @@
+# 构建上下文只包含 Cargo 工程本身；.env 密钥与运行产物绝不进入镜像层
+.git
+.github
+target
+docs
+.env
+.env.*
+*.log
+build.log
+.DS_Store
+docker-compose*.yml
+Dockerfile
+.dockerignore

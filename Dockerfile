@@ -7,7 +7,30 @@
 # 使用浮动的最新稳定版 Rust：本项目用到 1.82+ 的语言特性
 FROM rust:1-slim-bookworm AS builder
 
+# 可选构建加速（默认直连官方源，行为不变）：
+#   --build-arg APT_MIRROR=mirrors.tencentyun.com               Debian 源镜像域名（需同时提供 /debian 与 /debian-security）
+#   --build-arg CRATES_MIRROR=sparse+https://rsproxy.cn/index/  crates.io 稀疏索引镜像（完整 registry URL）
+ARG APT_MIRROR=deb.debian.org
+ARG CRATES_MIRROR=""
+
 WORKDIR /build
+
+# 按需切换 Debian 源 / crates.io 镜像；均为默认值时不做任何改动
+RUN if [ "$APT_MIRROR" != "deb.debian.org" ]; then \
+      sed -i "s|deb.debian.org|${APT_MIRROR}|g; s|security.debian.org|${APT_MIRROR}|g" \
+        /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list 2>/dev/null || true; \
+    fi \
+ && if [ -n "$CRATES_MIRROR" ]; then \
+      mkdir -p /usr/local/cargo \
+      && printf '%s\n' \
+           '[source.crates-io]' \
+           'replace-with = "mirror"' \
+           '[source.mirror]' \
+           "registry = \"${CRATES_MIRROR}\"" \
+           '[net]' \
+           'git-fetch-with-cli = true' \
+           > /usr/local/cargo/config.toml; \
+    fi
 
 # 安装基础编译依赖（包含 build-essential，用于支持 jemalloc 生产内存分配器构建）
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -26,6 +49,13 @@ RUN cargo build --release --bins --features jemalloc
 
 # ----------------- 阶段 2: 极简运行镜像 -----------------
 FROM debian:bookworm-slim AS runtime
+
+# 可选：与构建阶段相同的 Debian 源镜像切换
+ARG APT_MIRROR=deb.debian.org
+RUN if [ "$APT_MIRROR" != "deb.debian.org" ]; then \
+      sed -i "s|deb.debian.org|${APT_MIRROR}|g; s|security.debian.org|${APT_MIRROR}|g" \
+        /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list 2>/dev/null || true; \
+    fi
 
 # 安全加固：创建非 root 运行用户
 RUN groupadd -r memoryhub && useradd -r -g memoryhub -s /bin/false memoryhub
