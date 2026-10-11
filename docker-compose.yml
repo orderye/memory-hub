@@ -1,6 +1,6 @@
 version: '3.8'
 
-# 多智能体长期记忆服务一键部署
+# 多智能体长期记忆服务一键部署（生产级资源配额与并发调优）
 #
 # 前置条件：`cp .env.example .env` 并至少修改 `HUB_TOKEN_SECRET`
 # （授权服务器与 MCP 服务必须使用同一密钥）。
@@ -11,6 +11,18 @@ services:
     image: pgvector/pgvector:pg15
     container_name: memoryhub-postgres
     restart: always
+    command:
+      - "postgres"
+      - "-c"
+      - "max_connections=200"
+      - "-c"
+      - "shared_buffers=512MB"
+      - "-c"
+      - "work_mem=32MB"
+      - "-c"
+      - "maintenance_work_mem=256MB"
+      - "-c"
+      - "effective_cache_size=1536MB"
     environment:
       POSTGRES_DB: memory_hub
       POSTGRES_USER: hub_app
@@ -26,6 +38,14 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
 
   # 2. OAuth 2.1 授权服务器（DCR / client_credentials / 授权码+PKCE / Agent 控制台）
   auth-server:
@@ -39,6 +59,8 @@ services:
     environment:
       HUB_DB_URL: postgresql://hub_app:${POSTGRES_PASSWORD:-hub_app_secure_password_2026}@postgres:5432/memory_hub
       AUTH_EXTERNAL_BASE_URL: http://localhost:8080
+      TOKIO_WORKER_THREADS: 2
+      HUB_DB_MAX_CONNECTIONS: 5
     ports:
       - "8080:8080"
     healthcheck:
@@ -50,6 +72,14 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          cpus: '0.2'
+          memory: 128M
 
   # 3. 记忆服务主 MCP Server（Streamable HTTP / stdio）
   mcp-server:
@@ -63,6 +93,8 @@ services:
     environment:
       HUB_MCP_BIND: 0.0.0.0:3000
       HUB_DB_URL: postgresql://hub_app:${POSTGRES_PASSWORD:-hub_app_secure_password_2026}@postgres:5432/memory_hub
+      TOKIO_WORKER_THREADS: 2
+      HUB_DB_MAX_CONNECTIONS: 10
     ports:
       - "3000:3000"
     healthcheck:
@@ -76,6 +108,14 @@ services:
         condition: service_healthy
       auth-server:
         condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 256M
 
   # 4. 备份与整合作业守护进程（定时快照 / 过期清理 / 冲突扫描）
   backup-worker:
@@ -89,9 +129,19 @@ services:
     environment:
       HUB_DB_URL: postgresql://hub_app:${POSTGRES_PASSWORD:-hub_app_secure_password_2026}@postgres:5432/memory_hub
       BACKUP_CRON: "0 3 * * *"
+      TOKIO_WORKER_THREADS: 2
+      HUB_DB_MAX_CONNECTIONS: 5
     depends_on:
       postgres:
         condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1536M
+        reservations:
+          cpus: '0.2'
+          memory: 256M
 
 volumes:
   pgdata:

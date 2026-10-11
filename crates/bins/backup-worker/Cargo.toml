@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+jemalloc = ["dep:tikv-jemallocator"]
+
 [dependencies]
 chrono.workspace = true
 common = { workspace = true }
@@ -15,3 +19,4 @@ worker = { workspace = true }
 anyhow.workspace = true
 tokio = { workspace = true, features = ["rt", "macros", "time"] }
 tracing.workspace = true
+tikv-jemallocator = { workspace = true, optional = true }

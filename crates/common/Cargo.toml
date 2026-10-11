@@ -21,6 +21,4 @@ tracing-subscriber.workspace = true
 secrecy.workspace = true
 reqwest.workspace = true
 zeroize.workspace = true
-
-[dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

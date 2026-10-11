@@ -21,8 +21,19 @@ use std::sync::Arc;
 use store::{InMemoryHubStore, PostgresHubStore};
 use tracing::info;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let rt = common::build_runtime()?;
+    rt.block_on(async_main())
+}
+
+async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     // 强制脱敏日志（LOG_REDACTION=always，不可关闭）
     init_tracing();
 

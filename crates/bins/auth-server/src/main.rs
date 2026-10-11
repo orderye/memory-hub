@@ -15,8 +15,19 @@ use mem_core::MemoryHubStore;
 use std::sync::Arc;
 use tracing::info;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let rt = common::build_runtime()?;
+    rt.block_on(async_main())
+}
+
+async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
 
     let cfg = common::AppConfig::from_env()?;

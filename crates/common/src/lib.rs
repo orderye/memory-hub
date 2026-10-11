@@ -9,6 +9,7 @@ pub mod error;
 pub mod idempotency;
 pub mod log;
 pub mod rate_limit;
+pub mod runtime;
 
 pub use auth::{Acl, AgentId, AuthCtx, NamespaceGrant, Scope, UserId};
 pub use config::AppConfig;
@@ -19,3 +20,4 @@ pub use idempotency::{
 };
 pub use log::init_tracing;
 pub use rate_limit::{is_capacity_enabled, rate_limit_error, RateDimension, RateLimitStore};
+pub use runtime::build_runtime;

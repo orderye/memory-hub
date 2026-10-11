@@ -9,19 +9,20 @@ FROM rust:1-slim-bookworm AS builder
 
 WORKDIR /build
 
-# 安装基础编译依赖
+# 安装基础编译依赖（包含 build-essential，用于支持 jemalloc 生产内存分配器构建）
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     ca-certificates \
     curl \
+    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 # 复制 Cargo Workspace 配置文件与源码
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-# 编译所有二进制产物（Release 优化模式）
-RUN cargo build --release --bins
+# 编译所有二进制产物（Release 优化模式，启用 jemalloc 特性以在 Linux 生产环境中抑制内存碎片）
+RUN cargo build --release --bins --features jemalloc
 
 # ----------------- 阶段 2: 极简运行镜像 -----------------
 FROM debian:bookworm-slim AS runtime

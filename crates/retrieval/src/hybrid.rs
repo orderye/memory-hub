@@ -22,6 +22,7 @@ use std::time::Duration;
 pub const DEFAULT_RECENCY_TAU_DAYS: f32 = 30.0;
 
 /// 混合检索器
+#[derive(Clone)]
 pub struct HybridRetriever {
     store: Arc<dyn MemoryStore>,
     embedder: Arc<dyn Embedder>,
@@ -252,8 +253,20 @@ impl Retriever for HybridRetriever {
             }
         };
 
-        let scored = self.score_items(merged, q);
-        Ok(self.mmr_rerank(scored, top_k))
+        if merged.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let this = self.clone();
+        let q_clone = q.clone();
+        let reranked = tokio::task::spawn_blocking(move || {
+            let scored = this.score_items(merged, &q_clone);
+            this.mmr_rerank(scored, top_k)
+        })
+        .await
+        .map_err(|e| common::HubError::Internal(anyhow::anyhow!("检索重排任务调度失败: {}", e)))?;
+
+        Ok(reranked)
     }
 }
 
