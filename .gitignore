@@ -7,3 +7,4 @@ Cargo.lock.bk
 !.env.example
 .DS_Store
 Thumbs.db
+.zcode/

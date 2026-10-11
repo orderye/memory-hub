@@ -1,0 +1,37 @@
+# ==============================================================================
+# CNB 云原生构建流水线
+#
+# push 到 main 触发：云端构建生产镜像 → 推送 CNB 制品库 → ssh 部署到 tx-cloud
+# 制品镜像：docker.cnb.cool/toroyxxx/memory-hub:latest
+#
+# 部署依赖的 SSH 私钥来自密钥仓 toroyxxx/ci-secrets 的 deploy-key.yml
+# （文件内 allow_slugs/allow_events/allow_branches 限定仅本仓 main push 可引用）。
+# ==============================================================================
+main:
+  push:
+    - runner:
+        cpus: 8
+      services:
+        - docker
+      imports: https://cnb.cool/toroyxxx/ci-secrets/-/blob/main/deploy-key.yml
+      stages:
+        - name: 构建镜像
+          # 节点在腾讯云内网，apt 走 tencentyun 镜像；crates 走 rsproxy 稀疏索引
+          script: |
+            docker build \
+              --build-arg APT_MIRROR=mirrors.tencentyun.com \
+              --build-arg CRATES_MIRROR=sparse+https://rsproxy.cn/index/ \
+              -t ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}:latest .
+        - name: 推送制品库
+          # services: [docker] 已内置触发者凭据，免手动 docker login
+          script: docker push ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}:latest
+        - name: 部署到 tx-cloud
+          script: |
+            command -v ssh >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq openssh-client; }
+            echo "$SSH_KEY_B64" | base64 -d > /tmp/deploy_key && chmod 600 /tmp/deploy_key
+            ssh -i /tmp/deploy_key -o StrictHostKeyChecking=accept-new ubuntu@43.143.104.93 '
+              cd ~/memory-hub &&
+              docker compose pull mcp-server auth-server backup-worker &&
+              docker compose up -d &&
+              docker compose ps
+            '
