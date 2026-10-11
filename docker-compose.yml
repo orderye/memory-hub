@@ -59,6 +59,11 @@ services:
     environment:
       HUB_DB_URL: postgresql://hub_app:${POSTGRES_PASSWORD:-hub_app_secure_password_2026}@postgres:5432/memory_hub
       AUTH_EXTERNAL_BASE_URL: http://localhost:8080
+      # 引导账户与注册邀请码（无默认口令：仅归属存量数据；登录口令在 .env 设定）
+      HUB_BOOTSTRAP_USERNAME: ${HUB_BOOTSTRAP_USERNAME:-bootstrap}
+      HUB_BOOTSTRAP_PASSWORD: ${HUB_BOOTSTRAP_PASSWORD:-}
+      AUTH_INVITE_CODE: ${AUTH_INVITE_CODE:-}
+      AUTH_SESSION_TTL_H: ${AUTH_SESSION_TTL_H:-720}
       TOKIO_WORKER_THREADS: 2
       HUB_DB_MAX_CONNECTIONS: 5
     ports:

@@ -642,7 +642,7 @@ mod tests {
             if token == "good" {
                 Ok(AuthCtx {
                     agent_id: "agent-a".to_string(),
-                    user_id: None,
+                    account_id: common::BOOTSTRAP_ACCOUNT_ID,
                     scopes: vec![Scope::Read, Scope::Write, Scope::Admin],
                     acl: Acl::default(),
                 })
@@ -686,7 +686,7 @@ mod tests {
     fn ctx() -> AuthCtx {
         AuthCtx {
             agent_id: "agent-a".to_string(),
-            user_id: None,
+            account_id: common::BOOTSTRAP_ACCOUNT_ID,
             scopes: vec![Scope::Read, Scope::Write, Scope::Admin],
             acl: Acl::default(),
         }

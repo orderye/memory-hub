@@ -8,7 +8,7 @@
 //! 错误一律以 `isError = true` + 标准错误码对象返回（MCP 规定工具错误仍在 200 内表达）。
 
 use common::{AgentId, AuthCtx, HubError, Scope};
-use mem_core::{BackupService, IntegrationService, MemoryService, NamespaceGrantRecord};
+use mem_core::{BackupService, GrantStore, IntegrationService, MemoryService, NamespaceGrantRecord};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -68,7 +68,8 @@ pub struct ToolDispatcher {
     pub memory: Arc<dyn MemoryService>,
     pub backup: Arc<dyn BackupService>,
     pub integration: Arc<dyn IntegrationService>,
-    pub grants: Arc<dyn mem_core::GrantStore>,
+    /// 底层存储（授权工具用；所有访问经账户作用域包装器）
+    pub store: Arc<dyn mem_core::MemoryHubStore>,
 }
 
 impl ToolDispatcher {
@@ -76,13 +77,13 @@ impl ToolDispatcher {
         memory: Arc<dyn MemoryService>,
         backup: Arc<dyn BackupService>,
         integration: Arc<dyn IntegrationService>,
-        grants: Arc<dyn mem_core::GrantStore>,
+        store: Arc<dyn mem_core::MemoryHubStore>,
     ) -> Self {
         Self {
             memory,
             backup,
             integration,
-            grants,
+            store,
         }
     }
 
@@ -452,20 +453,37 @@ impl ToolDispatcher {
             }
         };
 
-        // 仅 owner（或通配管理员）可转授
         if !auth.has_scope(&Scope::Admin) {
             return ToolCallResult::error(&HubError::InsufficientScope);
         }
-        let is_owner = self
-            .grants
+        // 沙箱语义：通配授权已废除，授权必须落在具体命名空间
+        if req.namespace == "*" {
+            return ToolCallResult::error(&HubError::InvalidArgument(
+                "通配命名空间授权已废除（账户沙箱）：请对具体命名空间授权".to_string(),
+            ));
+        }
+        if let Err(e) = mem_core::validate_namespace(&req.namespace) {
+            return ToolCallResult::error(&e);
+        }
+        // 目标 Agent 必须与调用方同属一个账户
+        match self.store.get_agent(&req.agent_id).await {
+            Ok(Some(target)) if target.owner_account_id == auth.account_id => {}
+            _ => {
+                return ToolCallResult::error(&HubError::InvalidArgument(
+                    "目标 Agent 不存在或不属于本账户".to_string(),
+                ))
+            }
+        }
+        // 仅命名空间 owner 可转授
+        let scoped = mem_core::AccountScopedStore::new(self.store.clone(), auth.account_id);
+        let is_owner = scoped
             .get_namespace(&req.namespace)
             .await
             .ok()
             .flatten()
             .map(|info| info.owner_agent == auth.agent_id)
             .unwrap_or(false);
-        let wildcard = auth.acl.can_write("*");
-        if !is_owner && !wildcard {
+        if !is_owner {
             return ToolCallResult::error(&HubError::InsufficientScope);
         }
 
@@ -477,7 +495,7 @@ impl ToolDispatcher {
             granted_by: auth.agent_id.clone(),
             created_at: chrono::Utc::now(),
         };
-        match self.grants.grant(&record).await {
+        match scoped.grant(&record).await {
             Ok(()) => ToolCallResult::success(json!({
                 "granted": true,
                 "namespace": req.namespace,
@@ -508,20 +526,35 @@ impl ToolDispatcher {
         if !auth.has_scope(&Scope::Admin) {
             return ToolCallResult::error(&HubError::InsufficientScope);
         }
-        let is_owner = self
-            .grants
+        if req.namespace == "*" {
+            return ToolCallResult::error(&HubError::InvalidArgument(
+                "通配命名空间授权已废除（账户沙箱）".to_string(),
+            ));
+        }
+        if let Err(e) = mem_core::validate_namespace(&req.namespace) {
+            return ToolCallResult::error(&e);
+        }
+        match self.store.get_agent(&req.agent_id).await {
+            Ok(Some(target)) if target.owner_account_id == auth.account_id => {}
+            _ => {
+                return ToolCallResult::error(&HubError::InvalidArgument(
+                    "目标 Agent 不存在或不属于本账户".to_string(),
+                ))
+            }
+        }
+        let scoped = mem_core::AccountScopedStore::new(self.store.clone(), auth.account_id);
+        let is_owner = scoped
             .get_namespace(&req.namespace)
             .await
             .ok()
             .flatten()
             .map(|info| info.owner_agent == auth.agent_id)
             .unwrap_or(false);
-        let wildcard = auth.acl.can_write("*");
-        if !is_owner && !wildcard {
+        if !is_owner {
             return ToolCallResult::error(&HubError::InsufficientScope);
         }
 
-        match self.grants.revoke(&req.namespace, &req.agent_id).await {
+        match scoped.revoke(&req.namespace, &req.agent_id).await {
             Ok(()) => ToolCallResult::success(json!({
                 "revoked": true,
                 "namespace": req.namespace,
@@ -537,6 +570,7 @@ mod tests {
     use super::*;
     use mem_core::{DefaultBackupService, DefaultIntegrationService, GrantChecker};
     use store::InMemoryHubStore;
+    use uuid::Uuid;
 
     fn harness() -> (ToolDispatcher, AuthCtx) {
         let store = Arc::new(InMemoryHubStore::new());
@@ -559,7 +593,7 @@ mod tests {
         );
         let auth = AuthCtx {
             agent_id: "agent-a".to_string(),
-            user_id: None,
+            account_id: common::BOOTSTRAP_ACCOUNT_ID,
             scopes: vec![Scope::Read, Scope::Write, Scope::Admin],
             acl: Default::default(),
         };
@@ -895,6 +929,21 @@ mod tests {
     #[tokio::test]
     async fn test_grant_and_revoke_via_tools() {
         let (d, auth) = harness();
+        // 沙箱语义：授权双方都必须已注册且同属一个账户
+        for id in ["agent-a", "agent-b"] {
+            d.store
+                .register_agent(&mem_core::AgentRegistration {
+                    agent_id: id.to_string(),
+                    name: id.to_string(),
+                    kind: "assistant".to_string(),
+                    owner_account_id: common::BOOTSTRAP_ACCOUNT_ID,
+                    client_secret: None,
+                    redirect_uris: vec![],
+                    max_scopes: vec![Scope::Read, Scope::Write, Scope::Admin],
+                })
+                .await
+                .unwrap();
+        }
         // 先建命名空间
         d.dispatch(
             &auth,
@@ -920,7 +969,7 @@ mod tests {
         // agent-b 现在可以读写 shared
         let b = AuthCtx {
             agent_id: "agent-b".to_string(),
-            user_id: None,
+            account_id: common::BOOTSTRAP_ACCOUNT_ID,
             scopes: vec![Scope::Read, Scope::Write],
             acl: Default::default(),
         };
@@ -953,6 +1002,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_grant_rejects_cross_account_and_wildcard() {
+        let (d, auth) = harness();
+        d.store
+            .register_agent(&mem_core::AgentRegistration {
+                agent_id: "agent-a".to_string(),
+                name: "A".to_string(),
+                kind: "assistant".to_string(),
+                owner_account_id: common::BOOTSTRAP_ACCOUNT_ID,
+                client_secret: None,
+                redirect_uris: vec![],
+                max_scopes: vec![Scope::Read, Scope::Write, Scope::Admin],
+            })
+            .await
+            .unwrap();
+        d.dispatch(
+            &auth,
+            "memory_put",
+            arg(json!({ "namespace": "shared", "kind": "note", "content": "笔记" })),
+        )
+        .await;
+
+        // 跨账户目标：agent-other 属于另一个账户 → 拒绝
+        d.store
+            .register_agent(&mem_core::AgentRegistration {
+                agent_id: "agent-other".to_string(),
+                name: "Other".to_string(),
+                kind: "assistant".to_string(),
+                owner_account_id: Uuid::from_u128(999),
+                client_secret: None,
+                redirect_uris: vec![],
+                max_scopes: vec![Scope::Read],
+            })
+            .await
+            .unwrap();
+        let cross = d
+            .dispatch(
+                &auth,
+                "memory_grant",
+                arg(json!({
+                    "namespace": "shared",
+                    "agent_id": "agent-other",
+                    "can_read": true,
+                })),
+            )
+            .await;
+        assert!(cross.is_error, "跨账户授权必须被拒绝: {:?}", cross);
+
+        // 通配命名空间授权 → 拒绝（沙箱废除 `*`）
+        let wildcard = d
+            .dispatch(
+                &auth,
+                "memory_grant",
+                arg(json!({
+                    "namespace": "*",
+                    "agent_id": "agent-a",
+                    "can_read": true,
+                })),
+            )
+            .await;
+        assert!(wildcard.is_error, "通配授权必须被拒绝");
+    }
+
+    #[tokio::test]
     async fn test_grant_rejected_for_non_owner() {
         let (d, auth) = harness();
         d.dispatch(
@@ -965,7 +1077,7 @@ mod tests {
         // agent-c 虽然持有 admin scope，但不是 owner 也不能通配授权 → 拒绝
         let c = AuthCtx {
             agent_id: "agent-c".to_string(),
-            user_id: None,
+            account_id: common::BOOTSTRAP_ACCOUNT_ID,
             scopes: vec![Scope::Read, Scope::Write, Scope::Admin],
             acl: Default::default(),
         };

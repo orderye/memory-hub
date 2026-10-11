@@ -1,22 +1,22 @@
 //! 内存级存储实现（开发、测试与无数据库环境）
 //!
-//! 单进程内实现全部四类存储契约（记忆 / 备份 / 整合提案 / 命名空间授权），
+//! 单进程内实现全部存储契约（记忆 / 备份 / 整合提案 / 命名空间授权 / Agent / 账户），
 //! 语义与 PostgreSQL 实现对齐：命名空间隔离、owner 首次写入、游标分页、
 //! 软删除归档、合并溯源。
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use common::{AgentId, HubError, Result};
+use common::{AccountId, AgentId, HubError, Result};
 use mem_core::{
-    BackupRecord, IntegrationProposal, MemoryEntry, MemoryFilter, MemoryKind, MemoryStats,
-    MemoryStatus, MemoryVersion, Namespace, NamespaceGrantRecord, NamespaceInfo, ProposalStatus,
-    Scored, VersionChange,
+    AccountRecord, BackupRecord, IntegrationProposal, MemoryEntry, MemoryFilter, MemoryKind,
+    MemoryStats, MemoryStatus, MemoryVersion, Namespace, NamespaceGrantRecord, NamespaceInfo,
+    ProposalStatus, Scored, SessionRecord, VersionChange,
 };
 use std::collections::BTreeMap;
 use std::sync::RwLock;
 use uuid::Uuid;
 
-/// 内存存储（五合一）
+/// 内存存储（多合一）
 #[derive(Default)]
 pub struct InMemoryHubStore {
     /// (namespace, id) → 条目
@@ -27,14 +27,28 @@ pub struct InMemoryHubStore {
     namespaces: RwLock<BTreeMap<Namespace, NamespaceInfo>>,
     grants: RwLock<Vec<NamespaceGrantRecord>>,
     agents: RwLock<BTreeMap<AgentId, StoredAgent>>,
+    accounts: RwLock<BTreeMap<AccountId, StoredAccount>>,
+    /// sha256(会话令牌) → 会话
+    sessions: RwLock<BTreeMap<Vec<u8>, SessionRecord>>,
 }
 
-/// 内部 Agent 记录（含密钥散列）
+/// 内部账户记录（含口令散列）
+#[derive(Default, Clone)]
+struct StoredAccount {
+    username: String,
+    display_name: String,
+    status: String,
+    password_hash: Option<String>,
+    created_at: Option<chrono::DateTime<Utc>>,
+}
+
+/// 内部 Agent 记录（含密钥散列与账户归属）
 #[derive(Default, Clone)]
 struct StoredAgent {
     name: String,
     kind: String,
     status: String,
+    owner_account_id: Option<AccountId>,
     secret_hash: Option<String>,
     redirect_uris: Vec<String>,
     max_scopes: Vec<common::Scope>,
@@ -458,19 +472,22 @@ impl mem_core::GrantStore for InMemoryHubStore {
     }
 
     async fn can_read(&self, namespace: &str, agent_id: &AgentId) -> Result<bool> {
-        Ok(self.grants.read().unwrap().iter().any(|x| {
-            (x.namespace == namespace || x.namespace == "*")
-                && x.agent_id == *agent_id
-                && x.can_read
-        }))
+        // 沙箱语义：授权行必须精确匹配命名空间；`*` 通配授权已废除
+        Ok(self
+            .grants
+            .read()
+            .unwrap()
+            .iter()
+            .any(|x| x.namespace == namespace && x.agent_id == *agent_id && x.can_read))
     }
 
     async fn can_write(&self, namespace: &str, agent_id: &AgentId) -> Result<bool> {
-        Ok(self.grants.read().unwrap().iter().any(|x| {
-            (x.namespace == namespace || x.namespace == "*")
-                && x.agent_id == *agent_id
-                && x.can_write
-        }))
+        Ok(self
+            .grants
+            .read()
+            .unwrap()
+            .iter()
+            .any(|x| x.namespace == namespace && x.agent_id == *agent_id && x.can_write))
     }
 
     async fn owned_namespaces(&self, agent_id: &AgentId) -> Result<Vec<Namespace>> {
@@ -498,14 +515,16 @@ impl mem_core::AgentStore for InMemoryHubStore {
                 name: reg.name.clone(),
                 kind: reg.kind.clone(),
                 status: "active".to_string(),
+                owner_account_id: Some(reg.owner_account_id),
                 secret_hash: None,
                 redirect_uris: Vec::new(),
                 max_scopes: Vec::new(),
                 created_at: Some(Utc::now()),
             });
-        // upsert 语义：名称/类型/授权域以本次为准；密钥仅在提供时更新
+        // upsert 语义：名称/类型/账户归属/授权域以本次为准；密钥仅在提供时更新
         entry.name = reg.name.clone();
         entry.kind = reg.kind.clone();
+        entry.owner_account_id = Some(reg.owner_account_id);
         entry.redirect_uris = reg.redirect_uris.clone();
         entry.max_scopes = reg.max_scopes.clone();
         if let Some(secret) = &reg.client_secret {
@@ -563,10 +582,175 @@ fn agent_record(agent_id: &str, a: &StoredAgent) -> mem_core::AgentRecord {
         name: a.name.clone(),
         kind: a.kind.clone(),
         status: a.status.clone(),
+        owner_account_id: a.owner_account_id.unwrap_or(common::BOOTSTRAP_ACCOUNT_ID),
         redirect_uris: a.redirect_uris.clone(),
         max_scopes: a.max_scopes.clone(),
         confidential: a.secret_hash.is_some(),
         created_at: a.created_at.unwrap_or_else(Utc::now),
+    }
+}
+
+/// StoredAccount → AccountRecord（不暴露口令散列本体）
+fn account_record(id: &AccountId, a: &StoredAccount) -> AccountRecord {
+    AccountRecord {
+        id: *id,
+        username: a.username.clone(),
+        display_name: a.display_name.clone(),
+        status: a.status.clone(),
+        has_password: a.password_hash.is_some(),
+        created_at: a.created_at.unwrap_or_else(Utc::now),
+    }
+}
+
+#[async_trait]
+impl mem_core::AccountStore for InMemoryHubStore {
+    async fn create_account(
+        &self,
+        username: &str,
+        password_hash: Option<&str>,
+        display_name: &str,
+    ) -> Result<AccountRecord> {
+        let normalized = username.trim().to_ascii_lowercase();
+        let mut w = self.accounts.write().unwrap();
+        if w.values().any(|a| a.username == normalized) {
+            return Err(HubError::InvalidArgument(format!(
+                "用户名 {} 已被占用",
+                normalized
+            )));
+        }
+        let id = Uuid::new_v4();
+        let record = StoredAccount {
+            username: normalized,
+            display_name: display_name.to_string(),
+            status: "active".to_string(),
+            password_hash: password_hash.map(str::to_string),
+            created_at: Some(Utc::now()),
+        };
+        w.insert(id, record.clone());
+        Ok(account_record(&id, &record))
+    }
+
+    async fn ensure_account(
+        &self,
+        id: &AccountId,
+        username: &str,
+        display_name: &str,
+    ) -> Result<AccountRecord> {
+        let normalized = username.trim().to_ascii_lowercase();
+        let mut w = self.accounts.write().unwrap();
+        // 用户名已被别的账户占用时，退回按 ID 查找（保持幂等）
+        let existing = w
+            .get(id)
+            .map(|a| (id.to_owned(), a.clone()))
+            .or_else(|| {
+                w.iter()
+                    .find(|(_, a)| a.username == normalized)
+                    .map(|(k, a)| (*k, a.clone()))
+            });
+        if let Some((found_id, record)) = existing {
+            return Ok(account_record(&found_id, &record));
+        }
+        let record = StoredAccount {
+            username: normalized,
+            display_name: display_name.to_string(),
+            status: "active".to_string(),
+            password_hash: None,
+            created_at: Some(Utc::now()),
+        };
+        w.insert(*id, record.clone());
+        Ok(account_record(id, &record))
+    }
+
+    async fn get_account(&self, id: &AccountId) -> Result<Option<AccountRecord>> {
+        Ok(self.accounts.read().unwrap().get(id).map(|a| account_record(id, a)))
+    }
+
+    async fn get_account_by_username(&self, username: &str) -> Result<Option<AccountRecord>> {
+        let normalized = username.trim().to_ascii_lowercase();
+        Ok(self
+            .accounts
+            .read()
+            .unwrap()
+            .iter()
+            .find(|(_, a)| a.username == normalized)
+            .map(|(id, a)| account_record(id, a)))
+    }
+
+    async fn password_hash_of(&self, username: &str) -> Result<Option<String>> {
+        let normalized = username.trim().to_ascii_lowercase();
+        Ok(self
+            .accounts
+            .read()
+            .unwrap()
+            .values()
+            .find(|a| a.username == normalized)
+            .and_then(|a| a.password_hash.clone()))
+    }
+
+    async fn set_account_password(&self, id: &AccountId, password_hash: &str) -> Result<()> {
+        let mut w = self.accounts.write().unwrap();
+        match w.get_mut(id) {
+            Some(a) => {
+                a.password_hash = Some(password_hash.to_string());
+                Ok(())
+            }
+            None => Err(HubError::NotFound),
+        }
+    }
+
+    async fn set_account_status(&self, id: &AccountId, status: &str) -> Result<()> {
+        let mut w = self.accounts.write().unwrap();
+        match w.get_mut(id) {
+            Some(a) => {
+                a.status = status.to_string();
+                Ok(())
+            }
+            None => Err(HubError::NotFound),
+        }
+    }
+
+    async fn list_accounts(&self) -> Result<Vec<AccountRecord>> {
+        let mut out: Vec<AccountRecord> = self
+            .accounts
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(id, a)| account_record(id, a))
+            .collect();
+        out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        Ok(out)
+    }
+
+    async fn create_session(
+        &self,
+        token_hash: &[u8],
+        account_id: &AccountId,
+        expires_at: DateTime<Utc>,
+    ) -> Result<()> {
+        self.sessions.write().unwrap().insert(
+            token_hash.to_vec(),
+            SessionRecord {
+                account_id: *account_id,
+                expires_at,
+            },
+        );
+        Ok(())
+    }
+
+    async fn get_session(&self, token_hash: &[u8]) -> Result<Option<SessionRecord>> {
+        Ok(self.sessions.read().unwrap().get(token_hash).cloned())
+    }
+
+    async fn delete_session(&self, token_hash: &[u8]) -> Result<()> {
+        self.sessions.write().unwrap().remove(token_hash);
+        Ok(())
+    }
+
+    async fn prune_sessions(&self, now: DateTime<Utc>) -> Result<usize> {
+        let mut w = self.sessions.write().unwrap();
+        let before = w.len();
+        w.retain(|_, s| s.expires_at > now);
+        Ok(before - w.len())
     }
 }
 
@@ -595,7 +779,9 @@ pub fn stats_of(store: &InMemoryHubStore) -> MemoryStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mem_core::{BackupStore, GrantStore, IntegrationStore, MemoryHubStore, MemoryStore};
+    use mem_core::{
+        AccountStore, BackupStore, GrantStore, IntegrationStore, MemoryHubStore, MemoryStore,
+    };
 
     fn entry(ns: &str, content: &str, key: Option<&str>) -> MemoryEntry {
         MemoryEntry {
@@ -756,7 +942,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_namespace_grants_and_wildcard() {
+    async fn test_namespace_grants_and_wildcard_disabled() {
         let store = InMemoryHubStore::new();
         store
             .ensure_namespace("ns", &"agent-a".to_string())
@@ -780,24 +966,24 @@ mod tests {
         assert!(store.can_read("ns", &"agent-a".to_string()).await.unwrap());
         assert!(store.can_write("ns", &"agent-a".to_string()).await.unwrap());
 
-        // 通配授权对所有命名空间生效
+        // 沙箱语义：`*` 通配授权行不再对任何命名空间生效
         store
             .grant(&NamespaceGrantRecord {
                 namespace: "*".to_string(),
                 agent_id: "agent-b".to_string(),
                 can_read: true,
-                can_write: false,
+                can_write: true,
                 granted_by: "agent-a".to_string(),
                 created_at: Utc::now(),
             })
             .await
             .unwrap();
-        assert!(store
+        assert!(!store
             .can_read("any-ns", &"agent-b".to_string())
             .await
             .unwrap());
         assert!(!store
-            .can_write("any-ns", &"agent-b".to_string())
+            .can_write("ns", &"agent-b".to_string())
             .await
             .unwrap());
 
@@ -810,6 +996,63 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(owned, vec!["ns".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_accounts_and_sessions_roundtrip() {
+        let store = InMemoryHubStore::new();
+
+        let acct = store
+            .create_account("Alice", Some("hash-a"), "爱丽丝")
+            .await
+            .unwrap();
+        assert_eq!(acct.username, "alice", "用户名归一化为小写");
+        assert!(acct.has_password);
+
+        // 用户名冲突（大小写不敏感）
+        assert!(store
+            .create_account("ALICE", Some("x"), "")
+            .await
+            .is_err());
+
+        // 按用户名查哈希（认证路径）
+        assert_eq!(
+            store.password_hash_of("aLiCe").await.unwrap().as_deref(),
+            Some("hash-a")
+        );
+
+        // 引导账户幂等（按固定 ID）
+        let boot1 = store
+            .ensure_account(&common::BOOTSTRAP_ACCOUNT_ID, "bootstrap", "引导账户")
+            .await
+            .unwrap();
+        let boot2 = store
+            .ensure_account(&common::BOOTSTRAP_ACCOUNT_ID, "bootstrap", "引导账户")
+            .await
+            .unwrap();
+        assert_eq!(boot1.id, boot2.id);
+        assert!(!boot1.has_password, "引导账户初始无口令");
+
+        // 会话：创建 → 读取 → 过期清理 → 删除
+        let hash = vec![7u8; 32];
+        let future = Utc::now() + chrono::Duration::hours(1);
+        store
+            .create_session(&hash, &acct.id, future)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_session(&hash).await.unwrap().unwrap().account_id,
+            acct.id
+        );
+        assert_eq!(store.prune_sessions(Utc::now()).await.unwrap(), 0);
+        assert_eq!(
+            store
+                .prune_sessions(future + chrono::Duration::seconds(1))
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(store.get_session(&hash).await.unwrap().is_none());
     }
 
     #[tokio::test]

@@ -9,11 +9,14 @@
 //! （merge 合并 / dismiss 保留分立），所有被合并条目保留 `merged_into`
 //! 溯源，绝不静默删数据。
 
+use crate::account_scope::AccountScopedStore;
 use crate::algorithm::cosine_similarity;
 use crate::domain::{
     IntegrationKind, IntegrationProposal, MemoryEntry, MemoryStatus, ProposalStatus, VersionChange,
 };
-use crate::infra::{AccessChecker, Clock, MemoryHubStore, SystemClock};
+use crate::infra::{
+    AccessChecker, Clock, IntegrationStore, MemoryHubStore, MemoryStore, SystemClock,
+};
 use async_trait::async_trait;
 use common::{AuthCtx, HubError, Result, Scope};
 use serde::{Deserialize, Serialize};
@@ -108,11 +111,16 @@ impl DefaultIntegrationService {
         self
     }
 
+    /// 本请求的账户作用域存储
+    fn scoped(&self, auth: &AuthCtx) -> AccountScopedStore<dyn MemoryHubStore> {
+        AccountScopedStore::new(self.store.clone(), auth.account_id)
+    }
+
     async fn require_read(&self, auth: &AuthCtx, namespace: &str) -> Result<()> {
         if !auth.has_scope(&Scope::Read) {
             return Err(HubError::InsufficientScope);
         }
-        if !self.access.can_read(&auth.agent_id, namespace).await? {
+        if !self.access.can_read(auth, namespace).await? {
             return Err(HubError::InsufficientScope);
         }
         Ok(())
@@ -122,7 +130,7 @@ impl DefaultIntegrationService {
         if !auth.has_scope(&Scope::Write) {
             return Err(HubError::InsufficientScope);
         }
-        if !self.access.can_write(&auth.agent_id, namespace).await? {
+        if !self.access.can_write(auth, namespace).await? {
             return Err(HubError::InsufficientScope);
         }
         Ok(())
@@ -197,9 +205,9 @@ impl IntegrationService for DefaultIntegrationService {
                 "sim_threshold 必须落在 [0,1]".to_string(),
             ));
         }
+        let store = self.scoped(auth);
 
-        let entries: Vec<MemoryEntry> = self
-            .store
+        let entries: Vec<MemoryEntry> = store
             .all_in_namespace(&req.namespace, false)
             .await?
             .into_iter()
@@ -336,8 +344,7 @@ impl IntegrationService for DefaultIntegrationService {
 
         // 落库前查重：跳过已有 open 提案的组
         for proposal in new_proposals {
-            let exists = self
-                .store
+            let exists = store
                 .open_exists(
                     &req.namespace,
                     std::slice::from_ref(&(
@@ -350,7 +357,7 @@ impl IntegrationService for DefaultIntegrationService {
                 report.skipped_existing += 1;
                 continue;
             }
-            self.store.save_proposal(&proposal).await?;
+            store.save_proposal(&proposal).await?;
             report.proposals.push(proposal);
         }
 
@@ -359,11 +366,12 @@ impl IntegrationService for DefaultIntegrationService {
 
     async fn list(&self, auth: &AuthCtx, namespace: &str) -> Result<Vec<IntegrationProposal>> {
         self.require_read(auth, namespace).await?;
-        self.store.list_proposals(namespace, None).await
+        self.scoped(auth).list_proposals(namespace, None).await
     }
 
     async fn resolve(&self, auth: &AuthCtx, req: ResolveRequest) -> Result<MemoryEntry> {
-        let mut proposal = self.store.get_proposal(req.proposal_id).await?;
+        let store = self.scoped(auth);
+        let mut proposal = store.get_proposal(req.proposal_id).await?;
         if proposal.status != ProposalStatus::Open {
             return Err(HubError::Conflict);
         }
@@ -372,7 +380,7 @@ impl IntegrationService for DefaultIntegrationService {
         // 载入全部成员（缺失成员跳过，不影响其余合并）
         let mut members = Vec::new();
         for id in &proposal.member_ids {
-            if let Ok(e) = self.store.get(&proposal.namespace, *id).await {
+            if let Ok(e) = store.get(&proposal.namespace, *id).await {
                 members.push(e);
             }
         }
@@ -404,7 +412,7 @@ impl IntegrationService for DefaultIntegrationService {
                 proposal.status = ProposalStatus::Dismissed;
                 proposal.resolution_note = req.note.clone();
                 proposal.resolved_at = Some(now);
-                self.store.save_proposal(&proposal).await?;
+                store.save_proposal(&proposal).await?;
                 return Ok(members.into_iter().next().unwrap());
             }
         };
@@ -432,7 +440,7 @@ impl IntegrationService for DefaultIntegrationService {
         survivor.version += 1;
         survivor.updated_at = now;
         survivor.source_agent = auth.agent_id.clone();
-        let saved = self.store.save(&survivor).await?;
+        let saved = store.save(&survivor).await?;
         self.record_version(&saved, VersionChange::Updated, &auth.agent_id)
             .await?;
 
@@ -443,7 +451,7 @@ impl IntegrationService for DefaultIntegrationService {
             archived.version += 1;
             archived.updated_at = now;
             archived.source_agent = auth.agent_id.clone();
-            let saved_archived = self.store.save(&archived).await?;
+            let saved_archived = store.save(&archived).await?;
             self.record_version(&saved_archived, VersionChange::Merged, &auth.agent_id)
                 .await?;
         }
@@ -451,12 +459,13 @@ impl IntegrationService for DefaultIntegrationService {
         proposal.status = ProposalStatus::Merged;
         proposal.resolution_note = req.note.clone();
         proposal.resolved_at = Some(now);
-        self.store.save_proposal(&proposal).await?;
+        store.save_proposal(&proposal).await?;
 
         Ok(saved)
     }
 
     async fn expire_stale(&self, now: chrono::DateTime<chrono::Utc>) -> Result<usize> {
+        // 系统级批处理（worker 调用，无请求账户）：对全库统一归档过期条目
         self.store.archive_expired(now).await
     }
 }
@@ -471,6 +480,10 @@ fn sorted_by_recency(members: &[usize], entries: &[MemoryEntry]) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// 测试账户作用域名：与 `auth()`/`writer()` 辅助中的账户一致
+    fn scoped_ns(ns: &str) -> String {
+        crate::account_scope::scope_name(&common::BOOTSTRAP_ACCOUNT_ID, ns)
+    }
     use crate::access::GrantChecker;
     use crate::algorithm::l2_normalize;
     use crate::domain::{
@@ -786,7 +799,7 @@ mod tests {
     fn writer() -> AuthCtx {
         AuthCtx {
             agent_id: "agent-a".to_string(),
-            user_id: None,
+            account_id: common::BOOTSTRAP_ACCOUNT_ID,
             scopes: vec![Scope::Read, Scope::Write],
             acl: Default::default(),
         }
@@ -795,12 +808,12 @@ mod tests {
     async fn setup() -> (DefaultIntegrationService, Arc<TestHubStore>) {
         let store = Arc::new(TestHubStore::default());
         store
-            .ensure_namespace("ns", &"agent-a".to_string())
+            .ensure_namespace(&scoped_ns("ns"), &"agent-a".to_string())
             .await
             .unwrap();
         store
             .grant(&NamespaceGrantRecord {
-                namespace: "ns".to_string(),
+                namespace: scoped_ns("ns"),
                 agent_id: "agent-a".to_string(),
                 can_read: true,
                 can_write: true,
@@ -832,13 +845,13 @@ mod tests {
     async fn test_scan_detects_duplicates_and_dry_run_does_not_persist() {
         let (svc, store) = setup().await;
         store.add(TestHubStore::make_entry_with_embedding(
-            "ns",
+            &scoped_ns("ns"),
             "服务器部署在东京",
             None,
             Some(near_identical_vec("x", 0.0)),
         ));
         store.add(TestHubStore::make_entry_with_embedding(
-            "ns",
+            &scoped_ns("ns"),
             "服务器部署在东京区域",
             None,
             Some(near_identical_vec("x", 0.001)),
@@ -868,12 +881,12 @@ mod tests {
     async fn test_scan_detects_key_conflicts() {
         let (svc, store) = setup().await;
         store.add(TestHubStore::make_entry(
-            "ns",
+            &scoped_ns("ns"),
             "数据库用 MySQL",
             Some("db:engine"),
         ));
         store.add(TestHubStore::make_entry(
-            "ns",
+            &scoped_ns("ns"),
             "数据库用 PostgreSQL",
             Some("db:engine"),
         ));
@@ -913,12 +926,12 @@ mod tests {
     async fn test_resolve_merge_archives_members_and_keeps_lineage() {
         let (svc, store) = setup().await;
         let e1 = store.add(TestHubStore::make_entry(
-            "ns",
+            &scoped_ns("ns"),
             "数据库用 MySQL",
             Some("db:engine"),
         ));
         let e2 = store.add(TestHubStore::make_entry(
-            "ns",
+            &scoped_ns("ns"),
             "数据库用 PostgreSQL",
             Some("db:engine"),
         ));
@@ -950,7 +963,7 @@ mod tests {
             .unwrap();
         assert_eq!(survivor.id, e2.id);
 
-        let archived = store.get("ns", e1.id).await.unwrap();
+        let archived = store.get(&scoped_ns("ns"), e1.id).await.unwrap();
         assert_eq!(archived.status, MemoryStatus::Merged);
         assert_eq!(archived.merged_into, Some(e2.id));
 
@@ -982,12 +995,12 @@ mod tests {
     async fn test_resolve_dismiss_keeps_members() {
         let (svc, store) = setup().await;
         let e1 = store.add(TestHubStore::make_entry(
-            "ns",
+            &scoped_ns("ns"),
             "数据库用 MySQL",
             Some("db:engine"),
         ));
         store.add(TestHubStore::make_entry(
-            "ns",
+            &scoped_ns("ns"),
             "数据库用 PostgreSQL",
             Some("db:engine"),
         ));
@@ -1016,7 +1029,7 @@ mod tests {
         .await
         .unwrap();
 
-        let e1_after = store.get("ns", e1.id).await.unwrap();
+        let e1_after = store.get(&scoped_ns("ns"), e1.id).await.unwrap();
         assert_eq!(e1_after.status, MemoryStatus::Active);
         let proposals = svc.list(&writer(), "ns").await.unwrap();
         assert_eq!(proposals[0].status, ProposalStatus::Dismissed);
@@ -1025,9 +1038,9 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_rejects_non_member_survivor() {
         let (svc, store) = setup().await;
-        store.add(TestHubStore::make_entry("ns", "A", Some("k:1")));
-        store.add(TestHubStore::make_entry("ns", "B", Some("k:1")));
-        let outsider = store.add(TestHubStore::make_entry("ns", "C", Some("k:2")));
+        store.add(TestHubStore::make_entry(&scoped_ns("ns"), "A", Some("k:1")));
+        store.add(TestHubStore::make_entry(&scoped_ns("ns"), "B", Some("k:1")));
+        let outsider = store.add(TestHubStore::make_entry(&scoped_ns("ns"), "C", Some("k:2")));
 
         let scan = svc
             .scan(
@@ -1059,10 +1072,10 @@ mod tests {
     #[tokio::test]
     async fn test_merge_unions_tags() {
         let (svc, store) = setup().await;
-        let mut e1 = TestHubStore::make_entry("ns", "旧内容", Some("k:1"));
+        let mut e1 = TestHubStore::make_entry(&scoped_ns("ns"), "旧内容", Some("k:1"));
         e1.tags = vec!["db".to_string()];
         let e1 = store.add(e1);
-        let mut e2 = TestHubStore::make_entry("ns", "新内容", Some("k:1"));
+        let mut e2 = TestHubStore::make_entry(&scoped_ns("ns"), "新内容", Some("k:1"));
         e2.tags = vec!["pg".to_string()];
         let e2 = store.add(e2);
 
@@ -1097,14 +1110,14 @@ mod tests {
     #[tokio::test]
     async fn test_expire_stale_archives_expired() {
         let (svc, store) = setup().await;
-        let mut e = TestHubStore::make_entry("ns", "临时状态", None);
+        let mut e = TestHubStore::make_entry(&scoped_ns("ns"), "临时状态", None);
         e.expires_at = Some(chrono::Utc::now() - chrono::Duration::hours(1));
         let id = store.add(e).id;
 
         let count = svc.expire_stale(chrono::Utc::now()).await.unwrap();
         assert_eq!(count, 1);
         assert_eq!(
-            store.get("ns", id).await.unwrap().status,
+            store.get(&scoped_ns("ns"), id).await.unwrap().status,
             MemoryStatus::Archived
         );
     }
@@ -1114,7 +1127,7 @@ mod tests {
         let (svc, _store) = setup().await;
         let reader = AuthCtx {
             agent_id: "agent-a".to_string(),
-            user_id: None,
+            account_id: common::BOOTSTRAP_ACCOUNT_ID,
             scopes: vec![Scope::Read],
             acl: Default::default(),
         };

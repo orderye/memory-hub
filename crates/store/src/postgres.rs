@@ -1,8 +1,9 @@
 #![forbid(unsafe_code)]
 
-//! PostgreSQL 15 + pgvector 持久化实现（四合一：记忆 / 备份 / 整合提案 / 命名空间授权）
+//! PostgreSQL 15 + pgvector 持久化实现（记忆 / 备份 / 整合提案 / 命名空间授权 / Agent / 账户）
 //!
-//! - 行级隔离：所有语句以 `namespace` 为一等谓词；
+//! - 行级隔离：所有语句以 `namespace` 为一等谓词；命名空间的账户归属
+//!   由 `AccountScopedStore` 以 `{account_id}/{namespace}` 前缀表达；
 //! - pgvector ANN：`similar` 走 HNSW 索引的 `<=>` 余弦距离，分数 = 1 - 距离；
 //! - 全文检索：`to_tsvector('simple', content)` GIN 索引；
 //! - 迁移：版本化清单 + `_hub_migrations` 账本，已应用的迁移不重复执行；
@@ -12,11 +13,11 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use common::{AgentId, HubError, Result};
+use common::{AccountId, AgentId, HubError, Result};
 use mem_core::{
-    BackupRecord, IntegrationKind, IntegrationProposal, MemoryEntry, MemoryFilter, MemoryKind,
-    MemoryStatus, MemoryVersion, Namespace, NamespaceGrantRecord, NamespaceInfo, ProposalStatus,
-    Scored, VersionChange,
+    AccountRecord, BackupRecord, IntegrationKind, IntegrationProposal, MemoryEntry, MemoryFilter,
+    MemoryKind, MemoryStatus, MemoryVersion, Namespace, NamespaceGrantRecord, NamespaceInfo,
+    ProposalStatus, Scored, SessionRecord, VersionChange,
 };
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::Row;
@@ -126,10 +127,16 @@ impl<T> PgResultExt<T> for std::result::Result<T, sqlx::Error> {
 }
 
 /// 内嵌迁移清单：按文件名（即版本号）顺序应用
-pub const MIGRATIONS: &[(&str, &str)] = &[(
-    "20261011000001_initial_schema",
-    include_str!("../migrations/20261011000001_initial_schema.sql"),
-)];
+pub const MIGRATIONS: &[(&str, &str)] = &[
+    (
+        "20261011000001_initial_schema",
+        include_str!("../migrations/20261011000001_initial_schema.sql"),
+    ),
+    (
+        "20261012000002_accounts_sandbox",
+        include_str!("../migrations/20261012000002_accounts_sandbox.sql"),
+    ),
+];
 
 /// PostgreSQL 四合一存储
 #[derive(Clone)]
@@ -906,14 +913,15 @@ impl mem_core::GrantStore for PostgresHubStore {
         namespace: &str,
         owner: &AgentId,
     ) -> Result<(NamespaceInfo, bool)> {
-        // owner 必须先注册为 agent（外键约束）
+        // owner 必须先注册为 agent（外键约束）；未知 Agent 归入引导账户兜底
         sqlx::query(
             r#"
-            insert into agents (agent_id, name) values ($1, $1)
+            insert into agents (agent_id, name, owner_account_id) values ($1, $1, $2)
             on conflict (agent_id) do nothing
             "#,
         )
         .bind(owner)
+        .bind(common::BOOTSTRAP_ACCOUNT_ID)
         .execute(&self.pool)
         .await
         .pg()?;
@@ -1032,10 +1040,11 @@ impl mem_core::GrantStore for PostgresHubStore {
     }
 
     async fn can_read(&self, namespace: &str, agent_id: &AgentId) -> Result<bool> {
+        // 沙箱语义：授权行必须精确匹配命名空间；`*` 通配授权已废除
         let count: i64 = sqlx::query_scalar(
             r#"
             select count(*) from namespace_grants
-            where agent_id = $1 and (namespace = $2 or namespace = '*') and can_read
+            where agent_id = $1 and namespace = $2 and can_read
             "#,
         )
         .bind(agent_id)
@@ -1050,7 +1059,7 @@ impl mem_core::GrantStore for PostgresHubStore {
         let count: i64 = sqlx::query_scalar(
             r#"
             select count(*) from namespace_grants
-            where agent_id = $1 and (namespace = $2 or namespace = '*') and can_write
+            where agent_id = $1 and namespace = $2 and can_write
             "#,
         )
         .bind(agent_id)
@@ -1091,11 +1100,12 @@ impl mem_core::AgentStore for PostgresHubStore {
 
         sqlx::query(
             r#"
-            insert into agents (agent_id, name, kind, status, client_secret_hash, redirect_uris, max_scopes, created_at)
-            values ($1, $2, $3, 'active', $4, $5, $6, now())
+            insert into agents (agent_id, name, kind, status, owner_account_id, client_secret_hash, redirect_uris, max_scopes, created_at)
+            values ($1, $2, $3, 'active', $4, $5, $6, $7, now())
             on conflict (agent_id) do update set
               name = excluded.name,
               kind = excluded.kind,
+              owner_account_id = excluded.owner_account_id,
               redirect_uris = excluded.redirect_uris,
               max_scopes = excluded.max_scopes,
               client_secret_hash = coalesce(excluded.client_secret_hash, agents.client_secret_hash)
@@ -1104,6 +1114,7 @@ impl mem_core::AgentStore for PostgresHubStore {
         .bind(&reg.agent_id)
         .bind(&reg.name)
         .bind(&reg.kind)
+        .bind(reg.owner_account_id)
         .bind(&secret_hash)
         .bind(&reg.redirect_uris)
         .bind(&max_scopes)
@@ -1119,7 +1130,7 @@ impl mem_core::AgentStore for PostgresHubStore {
     async fn get_agent(&self, agent_id: &AgentId) -> Result<Option<mem_core::AgentRecord>> {
         let row = sqlx::query(
             r#"
-            select agent_id, name, kind, status, redirect_uris, max_scopes,
+            select agent_id, name, kind, status, owner_account_id, redirect_uris, max_scopes,
                    (client_secret_hash is not null) as confidential, created_at
             from agents where agent_id = $1
             "#,
@@ -1136,6 +1147,9 @@ impl mem_core::AgentStore for PostgresHubStore {
                 name: r.get("name"),
                 kind: r.get("kind"),
                 status: r.get("status"),
+                owner_account_id: r
+                    .try_get("owner_account_id")
+                    .unwrap_or(common::BOOTSTRAP_ACCOUNT_ID),
                 redirect_uris: r.try_get("redirect_uris").unwrap_or_default(),
                 max_scopes: max_scopes
                     .iter()
@@ -1150,7 +1164,7 @@ impl mem_core::AgentStore for PostgresHubStore {
     async fn list_agents(&self) -> Result<Vec<mem_core::AgentRecord>> {
         let rows = sqlx::query(
             r#"
-            select agent_id, name, kind, status, redirect_uris, max_scopes,
+            select agent_id, name, kind, status, owner_account_id, redirect_uris, max_scopes,
                    (client_secret_hash is not null) as confidential, created_at
             from agents order by created_at desc
             "#,
@@ -1168,6 +1182,9 @@ impl mem_core::AgentStore for PostgresHubStore {
                     name: r.get("name"),
                     kind: r.get("kind"),
                     status: r.get("status"),
+                    owner_account_id: r
+                        .try_get("owner_account_id")
+                        .unwrap_or(common::BOOTSTRAP_ACCOUNT_ID),
                     redirect_uris: r.try_get("redirect_uris").unwrap_or_default(),
                     max_scopes: max_scopes
                         .iter()
@@ -1212,6 +1229,224 @@ impl mem_core::AgentStore for PostgresHubStore {
     }
 }
 
+#[async_trait]
+impl mem_core::AccountStore for PostgresHubStore {
+    async fn create_account(
+        &self,
+        username: &str,
+        password_hash: Option<&str>,
+        display_name: &str,
+    ) -> Result<AccountRecord> {
+        let normalized = username.trim().to_ascii_lowercase();
+        let exists: Option<Uuid> =
+            sqlx::query_scalar("select id from accounts where lower(username) = $1")
+                .bind(&normalized)
+                .fetch_optional(&self.pool)
+                .await
+                .pg()?;
+        if exists.is_some() {
+            return Err(HubError::InvalidArgument(format!(
+                "用户名 {} 已被占用",
+                normalized
+            )));
+        }
+        let id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            insert into accounts (id, username, display_name, status, password_hash, created_at)
+            values ($1, $2, $3, 'active', $4, now())
+            "#,
+        )
+        .bind(id)
+        .bind(&normalized)
+        .bind(display_name)
+        .bind(password_hash)
+        .execute(&self.pool)
+        .await
+        .pg()?;
+        self.get_account(&id)
+            .await?
+            .ok_or_else(|| HubError::Internal(anyhow::anyhow!("账户创建后读取失败")))
+    }
+
+    async fn ensure_account(
+        &self,
+        id: &AccountId,
+        username: &str,
+        display_name: &str,
+    ) -> Result<AccountRecord> {
+        let normalized = username.trim().to_ascii_lowercase();
+        sqlx::query(
+            r#"
+            insert into accounts (id, username, display_name, status, created_at)
+            values ($1, $2, $3, 'active', now())
+            on conflict (id) do nothing
+            "#,
+        )
+        .bind(id)
+        .bind(&normalized)
+        .bind(display_name)
+        .execute(&self.pool)
+        .await
+        .pg()?;
+        // 用户名冲突兜底：若该用户名已归属其他账户，按用户名回读
+        if let Some(record) = self.get_account(id).await? {
+            return Ok(record);
+        }
+        self.get_account_by_username(&normalized)
+            .await?
+            .ok_or_else(|| HubError::Internal(anyhow::anyhow!("引导账户确保失败")))
+    }
+
+    async fn get_account(&self, id: &AccountId) -> Result<Option<AccountRecord>> {
+        let row = sqlx::query(
+            r#"
+            select id, username, display_name, status,
+                   (password_hash is not null) as has_password, created_at
+            from accounts where id = $1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .pg()?;
+        Ok(row.map(|r| account_record_of(&r)))
+    }
+
+    async fn get_account_by_username(&self, username: &str) -> Result<Option<AccountRecord>> {
+        let normalized = username.trim().to_ascii_lowercase();
+        let row = sqlx::query(
+            r#"
+            select id, username, display_name, status,
+                   (password_hash is not null) as has_password, created_at
+            from accounts where lower(username) = $1
+            "#,
+        )
+        .bind(&normalized)
+        .fetch_optional(&self.pool)
+        .await
+        .pg()?;
+        Ok(row.map(|r| account_record_of(&r)))
+    }
+
+    async fn password_hash_of(&self, username: &str) -> Result<Option<String>> {
+        let normalized = username.trim().to_ascii_lowercase();
+        let hash: Option<String> =
+            sqlx::query_scalar("select password_hash from accounts where lower(username) = $1")
+                .bind(&normalized)
+                .fetch_optional(&self.pool)
+                .await
+                .pg()?
+                .flatten();
+        Ok(hash)
+    }
+
+    async fn set_account_password(&self, id: &AccountId, password_hash: &str) -> Result<()> {
+        let res = sqlx::query("update accounts set password_hash = $2 where id = $1")
+            .bind(id)
+            .bind(password_hash)
+            .execute(&self.pool)
+            .await
+            .pg()?;
+        if res.rows_affected() == 0 {
+            return Err(HubError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn set_account_status(&self, id: &AccountId, status: &str) -> Result<()> {
+        let res = sqlx::query("update accounts set status = $2 where id = $1")
+            .bind(id)
+            .bind(status)
+            .execute(&self.pool)
+            .await
+            .pg()?;
+        if res.rows_affected() == 0 {
+            return Err(HubError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn list_accounts(&self) -> Result<Vec<AccountRecord>> {
+        let rows = sqlx::query(
+            r#"
+            select id, username, display_name, status,
+                   (password_hash is not null) as has_password, created_at
+            from accounts order by created_at
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .pg()?;
+        Ok(rows.iter().map(account_record_of).collect())
+    }
+
+    async fn create_session(
+        &self,
+        token_hash: &[u8],
+        account_id: &AccountId,
+        expires_at: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            insert into account_sessions (token_hash, account_id, expires_at, created_at)
+            values ($1, $2, $3, now())
+            on conflict (token_hash) do update set
+              account_id = excluded.account_id, expires_at = excluded.expires_at
+            "#,
+        )
+        .bind(token_hash)
+        .bind(account_id)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await
+        .pg()?;
+        Ok(())
+    }
+
+    async fn get_session(&self, token_hash: &[u8]) -> Result<Option<SessionRecord>> {
+        let row = sqlx::query("select account_id, expires_at from account_sessions where token_hash = $1")
+            .bind(token_hash)
+            .fetch_optional(&self.pool)
+            .await
+            .pg()?;
+        Ok(row.map(|r| SessionRecord {
+            account_id: r.get("account_id"),
+            expires_at: r.get("expires_at"),
+        }))
+    }
+
+    async fn delete_session(&self, token_hash: &[u8]) -> Result<()> {
+        sqlx::query("delete from account_sessions where token_hash = $1")
+            .bind(token_hash)
+            .execute(&self.pool)
+            .await
+            .pg()?;
+        Ok(())
+    }
+
+    async fn prune_sessions(&self, now: DateTime<Utc>) -> Result<usize> {
+        let res = sqlx::query("delete from account_sessions where expires_at <= $1")
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .pg()?;
+        Ok(res.rows_affected() as usize)
+    }
+}
+
+/// accounts 行 → AccountRecord
+fn account_record_of(r: &PgRow) -> AccountRecord {
+    AccountRecord {
+        id: r.get("id"),
+        username: r.get("username"),
+        display_name: r.get("display_name"),
+        status: r.get("status"),
+        has_password: r.get("has_password"),
+        created_at: r.get("created_at"),
+    }
+}
+
 /// 密钥散列：sha256(agent_id:secret)
 fn hash_secret(agent_id: &str, secret: &str) -> String {
     use sha2::{Digest, Sha256};
@@ -1228,8 +1463,16 @@ mod tests {
 
     #[test]
     fn test_migrations_registered() {
-        assert_eq!(MIGRATIONS.len(), 1);
+        assert_eq!(MIGRATIONS.len(), 2);
         assert!(MIGRATIONS[0].0.starts_with("20261011"));
+        assert!(MIGRATIONS[1].0.starts_with("20261012"));
+        // 迁移清单必须按版本号字典序排列（执行顺序依赖于此）
+        assert!(MIGRATIONS[0].0 < MIGRATIONS[1].0);
+        // 沙箱迁移必须可被语句切分器完整切开（每段以分号结尾）
+        let (_, sql) = MIGRATIONS[1];
+        let stmts = split_sql_statements(sql);
+        assert!(stmts.len() > 10);
+        assert!(stmts.iter().all(|s| s.trim_end().ends_with(';')));
     }
 
     #[test]
@@ -1474,6 +1717,7 @@ mod pg_integration {
             agent_id: id.to_string(),
             name: format!("Agent {}", id),
             kind: "service".to_string(),
+            owner_account_id: common::BOOTSTRAP_ACCOUNT_ID,
             client_secret: secret.map(str::to_string),
             redirect_uris: vec![],
             max_scopes: vec![common::Scope::Read, common::Scope::Write],

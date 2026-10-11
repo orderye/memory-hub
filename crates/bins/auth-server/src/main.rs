@@ -4,16 +4,24 @@
 //!
 //! 职责：
 //! - 加载配置并执行迁移（与 MCP Server 共享同一份 PostgreSQL）；
+//! - 装配 `AccountService`（注册/登录/会话）并确保引导账户存在；
 //! - 装配 `AgentOAuthServer`（DCR / client_credentials / 授权码+PKCE / 刷新轮换）；
-//! - 启动 axum 路由：元数据、注册、授权、令牌、内省、撤销、Agent 控制台。
+//! - 启动 axum 路由：元数据、账户页面、注册、授权、令牌、内省、撤销、账户控制台。
 
 use anyhow::{anyhow, Result};
 use auth_web::oauth_router;
-use auth_web::AgentOAuthServer;
+use auth_web::{AccountService, AgentOAuthServer, ensure_bootstrap_account};
 use common::init_tracing;
-use mem_core::MemoryHubStore;
+use mem_core::{AccountStore, MemoryHubStore};
 use std::sync::Arc;
 use tracing::info;
+
+/// 同一底层实现的两个视角：`MemoryHubStore`（命名空间/Agent/授权）与
+/// `AccountStore`（账户/会话）指向同一个存储对象
+struct StoreHandle {
+    memory: Arc<dyn MemoryHubStore>,
+    accounts: Arc<dyn AccountStore>,
+}
 
 #[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
 use tikv_jemallocator::Jemalloc;
@@ -34,10 +42,39 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     info!(config = %cfg.redacted_summary(), "记忆中枢 Auth Server 启动中");
 
     // 授权服务器与 MCP Server 共享存储（同一 HUB_DB_URL）
-    let store: Arc<dyn MemoryHubStore> = build_store(&cfg).await?;
+    let handle: StoreHandle = build_store(&cfg).await?;
+
+    // 引导账户：存量数据归属；设置口令后控制台可登录管理
+    let bootstrap = ensure_bootstrap_account(
+        handle.accounts.as_ref(),
+        &cfg.bootstrap_username,
+        cfg.bootstrap_password.as_deref(),
+    )
+    .await
+    .map_err(|e| anyhow!("引导账户初始化失败: {}", e))?;
+    info!(
+        username = %bootstrap.username,
+        has_password = bootstrap.has_password,
+        "引导账户已就绪"
+    );
+    // 账户服务：注册/登录/会话 + 注册令牌（注册令牌 aud = 本服务器 register 端点）
+    let external_base = std::env::var("AUTH_EXTERNAL_BASE_URL")
+        .unwrap_or_else(|_| format!("http://{}", cfg.auth_bind));
+    let register_audience = format!("{}/oauth/register", external_base.trim_end_matches('/'));
+    let accounts = Arc::new(AccountService::new(
+        handle.accounts.clone(),
+        cfg.invite_code.clone(),
+        cfg.auth_session_ttl_h,
+        cfg.token_secret.clone(),
+        cfg.auth_issuer.clone(),
+        register_audience,
+    ));
+    // 清理过期会话（启动维护；运行期会话读取时也会惰性清理）
+    let pruned = accounts.prune_sessions().await?;
+    info!(pruned = pruned, "过期会话清理完成");
 
     let oauth = Arc::new(AgentOAuthServer::new(
-        store.clone(),
+        handle.memory.clone(),
         cfg.token_secret.clone(),
         cfg.auth_issuer.clone(),
         cfg.resource_uri.clone(),
@@ -51,6 +88,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         .token_manager()
         .issue(
             &"__selfcheck__".to_string(),
+            common::BOOTSTRAP_ACCOUNT_ID,
             vec![common::Scope::Read],
             vec![],
         )
@@ -61,12 +99,11 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| anyhow!("令牌管理器自检（校验阶段）失败: {}", e))?;
     info!("令牌管理器自检通过");
 
-    let external_base = std::env::var("AUTH_EXTERNAL_BASE_URL")
-        .unwrap_or_else(|_| format!("http://{}", cfg.auth_bind));
-
     let state = auth_web::AsWebState {
         oauth,
+        accounts,
         external_base_url: external_base,
+        allowed_origins: cfg.allowed_origins.clone(),
     };
 
     let app = oauth_router(state);
@@ -82,13 +119,17 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// 构建存储：PostgreSQL 优先；开发模式可退回内存
-async fn build_store(cfg: &common::AppConfig) -> Result<Arc<dyn MemoryHubStore>> {
+async fn build_store(cfg: &common::AppConfig) -> Result<StoreHandle> {
     let is_pg = cfg.db_url.starts_with("postgres://") || cfg.db_url.starts_with("postgresql://");
     if is_pg {
         match store::PostgresHubStore::connect(&cfg.db_url, cfg.db_max_connections).await {
             Ok(pg) => {
                 info!("PostgreSQL 存储连接成功（含迁移执行）");
-                return Ok(Arc::new(pg));
+                let pg = Arc::new(pg);
+                return Ok(StoreHandle {
+                    memory: pg.clone(),
+                    accounts: pg,
+                });
             }
             Err(e) => {
                 let allow_fallback = std::env::var("HUB_STORE_FALLBACK_MEMORY")
@@ -109,7 +150,11 @@ async fn build_store(cfg: &common::AppConfig) -> Result<Arc<dyn MemoryHubStore>>
         }
     }
     info!("使用内存存储（开发/测试模式）");
-    Ok(Arc::new(store::InMemoryHubStore::new()))
+    let mem = Arc::new(store::InMemoryHubStore::new());
+    Ok(StoreHandle {
+        memory: mem.clone(),
+        accounts: mem,
+    })
 }
 
 #[cfg(test)]
@@ -124,7 +169,12 @@ mod tests {
             900,
         );
         let token = manager
-            .issue(&"agent-a".to_string(), vec![common::Scope::Read], vec![])
+            .issue(
+                &"agent-a".to_string(),
+                common::BOOTSTRAP_ACCOUNT_ID,
+                vec![common::Scope::Read],
+                vec![],
+            )
             .unwrap();
         assert_eq!(token.split('.').count(), 3);
         assert!(manager.verify(&token).is_ok());

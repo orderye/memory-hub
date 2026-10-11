@@ -2,15 +2,17 @@
 //!
 //! 规则：
 //! - token scope 决定"能不能做这类操作"（read/write/admin）；
-//! - GrantStore 决定"能对哪个命名空间做"（owner / 显式授权 / 通配授权）；
+//! - GrantStore 决定"能对哪个命名空间做"（owner / 显式授权）；
+//! - 命名空间先按 `auth.account_id` 作用域化再查库：跨账户永远无匹配行；
 //! - 首次写入新命名空间时，写入方自动成为 owner 并获得读写授权。
 
+use crate::account_scope::scope_name;
 use crate::infra::{AccessChecker, GrantStore};
 use async_trait::async_trait;
-use common::{AgentId, Result};
+use common::{AuthCtx, Result};
 use std::sync::Arc;
 
-/// 基于 GrantStore 的访问判定
+/// 基于 GrantStore 的访问判定（账户沙箱内）
 pub struct GrantChecker {
     store: Arc<dyn GrantStore>,
 }
@@ -23,25 +25,41 @@ impl GrantChecker {
 
 #[async_trait]
 impl AccessChecker for GrantChecker {
-    async fn can_read(&self, agent: &AgentId, namespace: &str) -> Result<bool> {
-        self.store.can_read(namespace, agent).await
+    async fn can_read(&self, auth: &AuthCtx, namespace: &str) -> Result<bool> {
+        if namespace.contains(crate::account_scope::SCOPE_SEPARATOR) {
+            // 用户可见命名空间不含 `/`；带分隔符的输入只会来自引擎内部键，
+            // 一律拒绝，防止绕过作用域直接指定内部键。
+            return Ok(false);
+        }
+        self.store
+            .can_read(&scope_name(&auth.account_id, namespace), &auth.agent_id)
+            .await
     }
 
-    async fn can_write(&self, agent: &AgentId, namespace: &str) -> Result<bool> {
-        self.store.can_write(namespace, agent).await
+    async fn can_write(&self, auth: &AuthCtx, namespace: &str) -> Result<bool> {
+        if namespace.contains(crate::account_scope::SCOPE_SEPARATOR) {
+            return Ok(false);
+        }
+        self.store
+            .can_write(&scope_name(&auth.account_id, namespace), &auth.agent_id)
+            .await
     }
 
-    async fn is_owner(&self, agent: &AgentId, namespace: &str) -> Result<bool> {
+    async fn is_owner(&self, auth: &AuthCtx, namespace: &str) -> Result<bool> {
+        if namespace.contains(crate::account_scope::SCOPE_SEPARATOR) {
+            return Ok(false);
+        }
         Ok(self
             .store
-            .get_namespace(namespace)
+            .get_namespace(&scope_name(&auth.account_id, namespace))
             .await?
-            .map(|info| info.owner_agent == *agent)
+            .map(|info| info.owner_agent == auth.agent_id)
             .unwrap_or(false))
     }
 
-    async fn ensure_namespace(&self, namespace: &str, owner: &AgentId) -> Result<()> {
-        let (_info, created) = self.store.ensure_namespace(namespace, owner).await?;
+    async fn ensure_namespace(&self, auth: &AuthCtx, namespace: &str) -> Result<()> {
+        let scoped = scope_name(&auth.account_id, namespace);
+        let (_info, created) = self.store.ensure_namespace(&scoped, &auth.agent_id).await?;
         if !created {
             // 命名空间已存在：不得借 ensure 之名给后来者放权
             return Ok(());
@@ -50,11 +68,11 @@ impl AccessChecker for GrantChecker {
         let now = chrono::Utc::now();
         self.store
             .grant(&crate::domain::NamespaceGrantRecord {
-                namespace: namespace.to_string(),
-                agent_id: owner.clone(),
+                namespace: scoped,
+                agent_id: auth.agent_id.clone(),
                 can_read: true,
                 can_write: true,
-                granted_by: owner.clone(),
+                granted_by: auth.agent_id.clone(),
                 created_at: now,
             })
             .await

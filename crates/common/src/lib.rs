@@ -11,7 +11,7 @@ pub mod log;
 pub mod rate_limit;
 pub mod runtime;
 
-pub use auth::{Acl, AgentId, AuthCtx, NamespaceGrant, Scope, UserId};
+pub use auth::{AccountId, Acl, AgentId, AuthCtx, NamespaceGrant, Scope, BOOTSTRAP_ACCOUNT_ID};
 pub use config::AppConfig;
 pub use error::{ErrorDetail, HubError, Result};
 pub use idempotency::{

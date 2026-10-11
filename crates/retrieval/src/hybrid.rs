@@ -446,7 +446,7 @@ mod tests {
     fn auth() -> AuthCtx {
         AuthCtx {
             agent_id: "agent-a".to_string(),
-            user_id: None,
+            account_id: common::BOOTSTRAP_ACCOUNT_ID,
             scopes: vec![],
             acl: Default::default(),
         }

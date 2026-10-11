@@ -256,6 +256,7 @@ mod tests {
             .tokens
             .issue(
                 &"agent-a".to_string(),
+                common::BOOTSTRAP_ACCOUNT_ID,
                 vec![common::Scope::Read],
                 vec![common::NamespaceGrant::read_only("ns")],
             )
@@ -285,7 +286,12 @@ mod tests {
             3600,
         );
         let token = foreign
-            .issue(&"agent-a".to_string(), vec![common::Scope::Read], vec![])
+            .issue(
+                &"agent-a".to_string(),
+                common::BOOTSTRAP_ACCOUNT_ID,
+                vec![common::Scope::Read],
+                vec![],
+            )
             .unwrap();
         assert!(introspector.introspect(&token).await.is_err());
     }

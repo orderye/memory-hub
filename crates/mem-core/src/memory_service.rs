@@ -7,6 +7,7 @@
 //! 4. 内容变更必然产生一条版本历史（备份与审计的事实来源）。
 
 use crate::access::{validate_key, validate_namespace};
+use crate::account_scope::{scope_name, unscope_name, AccountScopedStore};
 use crate::algorithm::{
     calculate_item_score, cosine_similarity, keyword_score, recency_score, ItemScoreParams,
     SearchQuery,
@@ -156,12 +157,17 @@ impl DefaultMemoryService {
         self
     }
 
+    /// 本请求的账户作用域存储：一切数据访问都经它代理
+    fn scoped(&self, auth: &AuthCtx) -> AccountScopedStore<dyn MemoryStore> {
+        AccountScopedStore::new(self.store.clone(), auth.account_id)
+    }
+
     /// 读前置校验
     async fn require_read(&self, auth: &AuthCtx, namespace: &str) -> Result<()> {
         if !auth.has_scope(&common::Scope::Read) {
             return Err(HubError::InsufficientScope);
         }
-        if !self.access.can_read(&auth.agent_id, namespace).await? {
+        if !self.access.can_read(auth, namespace).await? {
             return Err(HubError::InsufficientScope);
         }
         Ok(())
@@ -172,7 +178,7 @@ impl DefaultMemoryService {
         if !auth.has_scope(&common::Scope::Write) {
             return Err(HubError::InsufficientScope);
         }
-        if !self.access.can_write(&auth.agent_id, namespace).await? {
+        if !self.access.can_write(auth, namespace).await? {
             return Err(HubError::InsufficientScope);
         }
         Ok(())
@@ -257,16 +263,15 @@ impl MemoryService for DefaultMemoryService {
     async fn put(&self, auth: &AuthCtx, req: PutRequest) -> Result<MemoryEntry> {
         Self::validate_new(&req)?;
         // 先注册命名空间（首次写入方成为 owner 并获得授权），再做写权限校验
-        self.access
-            .ensure_namespace(&req.namespace, &auth.agent_id)
-            .await?;
+        self.access.ensure_namespace(auth, &req.namespace).await?;
         self.require_write(auth, &req.namespace).await?;
+        let store = self.scoped(auth);
 
         let now = self.clock.now();
 
         // upsert 语义：同 namespace + key 已存在则走修订
         if let Some(key) = &req.key {
-            if let Some(existing) = self.store.get_by_key(&req.namespace, key).await? {
+            if let Some(existing) = store.get_by_key(&req.namespace, key).await? {
                 if existing.status == MemoryStatus::Merged {
                     // 已被合并的 key 允许重新启用为全新条目
                 } else {
@@ -292,7 +297,7 @@ impl MemoryService for DefaultMemoryService {
                     if updated.status == MemoryStatus::Archived {
                         updated.status = MemoryStatus::Active;
                     }
-                    let saved = self.store.save(&updated).await?;
+                    let saved = store.save(&updated).await?;
                     self.record_version(&saved, VersionChange::Updated).await?;
                     return Ok(saved);
                 }
@@ -322,19 +327,19 @@ impl MemoryService for DefaultMemoryService {
             created_at: now,
             updated_at: now,
         };
-        let saved = self.store.insert(&entry).await?;
+        let saved = store.insert(&entry).await?;
         self.record_version(&saved, VersionChange::Created).await?;
         Ok(saved)
     }
 
     async fn get(&self, auth: &AuthCtx, req: GetRequest) -> Result<MemoryEntry> {
         self.require_read(auth, &req.namespace).await?;
+        let store = self.scoped(auth);
         if let Some(id) = req.id {
-            return self.store.get(&req.namespace, id).await;
+            return store.get(&req.namespace, id).await;
         }
         if let Some(key) = &req.key {
-            return self
-                .store
+            return store
                 .get_by_key(&req.namespace, key)
                 .await?
                 .ok_or(HubError::NotFound);
@@ -352,7 +357,8 @@ impl MemoryService for DefaultMemoryService {
         patch: crate::domain::MemoryPatch,
     ) -> Result<MemoryEntry> {
         self.require_write(auth, namespace).await?;
-        let mut entry = self.store.get(namespace, id).await?;
+        let store = self.scoped(auth);
+        let mut entry = store.get(namespace, id).await?;
 
         let mut content_changed = false;
         if let Some(content) = patch.content {
@@ -415,14 +421,15 @@ impl MemoryService for DefaultMemoryService {
             entry.embedding = emb;
             entry.embedding_model = model;
         }
-        let saved = self.store.save(&entry).await?;
+        let saved = store.save(&entry).await?;
         self.record_version(&saved, VersionChange::Updated).await?;
         Ok(saved)
     }
 
     async fn delete(&self, auth: &AuthCtx, namespace: &str, id: Uuid) -> Result<()> {
         self.require_write(auth, namespace).await?;
-        let mut entry = self.store.get(namespace, id).await?;
+        let store = self.scoped(auth);
+        let mut entry = store.get(namespace, id).await?;
         if entry.status != MemoryStatus::Active {
             return Err(HubError::InvalidArgument(format!(
                 "条目已处于 {} 状态",
@@ -433,15 +440,21 @@ impl MemoryService for DefaultMemoryService {
         entry.version += 1;
         entry.updated_at = self.clock.now();
         entry.source_agent = auth.agent_id.clone();
-        let saved = self.store.save(&entry).await?;
+        let saved = store.save(&entry).await?;
         self.record_version(&saved, VersionChange::Archived).await?;
         Ok(())
     }
 
-    async fn search(&self, auth: &AuthCtx, q: SearchQuery) -> Result<Vec<Scored<MemoryEntry>>> {
+    async fn search(&self, auth: &AuthCtx, mut q: SearchQuery) -> Result<Vec<Scored<MemoryEntry>>> {
         self.require_read(auth, &q.namespace).await?;
         if let Some(retriever) = &self.retriever {
-            return retriever.search(auth, &q).await;
+            // 检索器直接在存储上按命名空间键工作：查询前作用域化、返回后剥离
+            q.namespace = scope_name(&auth.account_id, &q.namespace);
+            let mut rows = retriever.search(auth, &q).await?;
+            for s in &mut rows {
+                s.item.namespace = unscope_name(&auth.account_id, &s.item.namespace);
+            }
+            return Ok(rows);
         }
         // 退化路径：纯向量近邻 + 本地加权重排
         let mut out = Vec::new();
@@ -460,8 +473,8 @@ impl MemoryService for DefaultMemoryService {
         let mut qv = query_vec;
         crate::algorithm::l2_normalize(&mut qv);
         let now = self.clock.now();
-        let mut scored: Vec<Scored<MemoryEntry>> = self
-            .store
+        let store = self.scoped(auth);
+        let mut scored: Vec<Scored<MemoryEntry>> = store
             .similar(&q.namespace, &qv, q.top_k.max(1), q.kinds.as_deref())
             .await?
             .into_iter()
@@ -512,7 +525,7 @@ impl MemoryService for DefaultMemoryService {
             before,
             limit: Some(limit + 1),
         };
-        let mut items = self.store.list(&filter).await?;
+        let mut items = self.scoped(auth).list(&filter).await?;
         let has_more = items.len() > limit;
         if has_more {
             items.truncate(limit);
@@ -527,7 +540,7 @@ impl MemoryService for DefaultMemoryService {
 
     async fn stats(&self, auth: &AuthCtx, namespace: &str) -> Result<MemoryStats> {
         self.require_read(auth, namespace).await?;
-        let all = self.store.all_in_namespace(namespace, true).await?;
+        let all = self.scoped(auth).all_in_namespace(namespace, true).await?;
         let mut stats = MemoryStats {
             namespace: namespace.to_string(),
             total: all.len(),
@@ -564,9 +577,10 @@ impl MemoryService for DefaultMemoryService {
         id: Uuid,
     ) -> Result<Vec<MemoryVersion>> {
         self.require_read(auth, namespace).await?;
-        // 先确认条目存在且归属该命名空间
-        self.store.get(namespace, id).await?;
-        self.store.versions(id).await
+        // 先确认条目存在且归属该命名空间（账户作用域内）
+        let store = self.scoped(auth);
+        store.get(namespace, id).await?;
+        store.versions(id).await
     }
 }
 
@@ -693,6 +707,10 @@ pub fn decode_cursor(cursor: &str) -> Result<(chrono::DateTime<chrono::Utc>, Uui
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// 测试账户作用域名：与 `auth()`/`writer()` 辅助中的账户一致
+    fn scoped_ns(ns: &str) -> String {
+        crate::account_scope::scope_name(&common::BOOTSTRAP_ACCOUNT_ID, ns)
+    }
     use crate::infra::{GrantStore, MemoryHubStore};
     use common::Scope;
     use std::collections::HashMap as StdHashMap;
@@ -942,7 +960,7 @@ mod tests {
     fn auth(agent: &str, scopes: Vec<Scope>) -> AuthCtx {
         AuthCtx {
             agent_id: agent.to_string(),
-            user_id: None,
+            account_id: common::BOOTSTRAP_ACCOUNT_ID,
             scopes,
             acl: Default::default(),
         }
@@ -1203,14 +1221,14 @@ mod tests {
         let a = auth("agent-a", vec![Scope::Write]);
         svc.put(&a, put_req("fresh-ns", "第一条")).await.unwrap();
 
-        let info = grants.get_namespace("fresh-ns").await.unwrap().unwrap();
+        let info = grants.get_namespace(&scoped_ns("fresh-ns")).await.unwrap().unwrap();
         assert_eq!(info.owner_agent, "agent-a");
         assert!(grants
-            .can_read("fresh-ns", &"agent-a".to_string())
+            .can_read(&scoped_ns("fresh-ns"), &"agent-a".to_string())
             .await
             .unwrap());
         assert!(grants
-            .can_write("fresh-ns", &"agent-a".to_string())
+            .can_write(&scoped_ns("fresh-ns"), &"agent-a".to_string())
             .await
             .unwrap());
     }

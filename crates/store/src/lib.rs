@@ -49,6 +49,9 @@ pub async fn ping_store(store: &impl std::fmt::Debug) -> Result<()> {
 }
 
 #[cfg(test)]
+mod account_scope_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use mem_core::MemoryHubStore;

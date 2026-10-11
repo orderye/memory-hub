@@ -17,8 +17,8 @@ use auth_core::{
     compute_code_challenge_s256, AccessTokenManager, ConfirmTokenManager, TokenFamilyManager,
 };
 use chrono::{DateTime, Duration, Utc};
-use common::{AgentId, HubError, NamespaceGrant, Result, Scope, UserId};
-use mem_core::{AgentRecord, MemoryHubStore, NamespaceGrantRecord};
+use common::{AccountId, AgentId, HubError, NamespaceGrant, Result, Scope};
+use mem_core::{unscope_name, AgentRecord, MemoryHubStore, NamespaceGrantRecord};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -88,6 +88,8 @@ pub struct TokenRequest {
 #[derive(Debug, Clone)]
 struct AuthorizationCode {
     agent_id: AgentId,
+    /// 账户（沙箱边界）：签发时冻结，换令牌时直接使用
+    account_id: AccountId,
     redirect_uri: String,
     code_challenge: String,
     scopes: Vec<Scope>,
@@ -171,6 +173,11 @@ impl AgentOAuthServer {
         &self.tokens
     }
 
+    /// 底层存储引用（控制台查询命名空间/授权/Agent 用）
+    pub fn store(&self) -> Arc<dyn MemoryHubStore> {
+        self.store.clone()
+    }
+
     /// 确认令牌管理器引用
     pub fn confirm_manager(&self) -> &ConfirmTokenManager {
         &self.confirm
@@ -188,7 +195,13 @@ impl AgentOAuthServer {
 
     // ===== 动态注册（RFC 7591）=====
 
-    pub async fn register(&self, req: RegisterAgentRequest) -> Result<AgentRecord> {
+    /// 注册 Agent 到指定账户（owner_account_id 由调用方从会话/注册令牌注入，
+    /// 绝不取自请求体——这是沙箱归属不可伪造的关键）。
+    pub async fn register(
+        &self,
+        req: RegisterAgentRequest,
+        owner_account_id: AccountId,
+    ) -> Result<AgentRecord> {
         if req.agent_id.trim().is_empty() || req.agent_id.len() > 128 {
             return Err(HubError::InvalidArgument(
                 "agent_id 长度必须在 1..=128".to_string(),
@@ -239,6 +252,7 @@ impl AgentOAuthServer {
                 agent_id: req.agent_id.clone(),
                 name: req.name.clone(),
                 kind: req.kind.clone(),
+                owner_account_id,
                 client_secret: req.client_secret.clone(),
                 redirect_uris: req.redirect_uris.clone(),
                 max_scopes,
@@ -294,11 +308,14 @@ impl AgentOAuthServer {
         }
 
         let scopes = self.resolve_scopes(req.scope.as_deref(), &agent)?;
-        let grants = self.resolve_grants(&client_id).await?;
+        let grants = self.resolve_grants(&agent).await?;
 
-        let access = self
-            .tokens
-            .issue(&client_id.clone(), scopes.clone(), grants)?;
+        let access = self.tokens.issue(
+            &client_id.clone(),
+            agent.owner_account_id,
+            scopes.clone(),
+            grants,
+        )?;
         Ok(TokenResponse {
             access_token: access,
             token_type: "Bearer",
@@ -347,6 +364,7 @@ impl AgentOAuthServer {
 
         let access = self.tokens.issue(
             &record.agent_id,
+            record.account_id,
             record.scopes.clone(),
             record.grants.clone(),
         )?;
@@ -373,8 +391,16 @@ impl AgentOAuthServer {
             .ok_or_else(|| HubError::InvalidArgument("缺少 refresh_token".to_string()))?;
 
         let rotated = self.families.rotate(&token)?;
+        // 账户归属以库内 Agent 记录为准（刷新令牌族不携带账户）
+        let agent = self
+            .store
+            .get_agent(&rotated.agent_id)
+            .await?
+            .filter(|a| a.status == "active")
+            .ok_or(HubError::AuthRequired)?;
         let access = self.tokens.issue(
             &rotated.agent_id,
+            agent.owner_account_id,
             rotated.scopes.clone(),
             rotated.grants.clone(),
         )?;
@@ -415,29 +441,26 @@ impl AgentOAuthServer {
         Ok(agent)
     }
 
-    /// 记录同意并换发授权码
-    ///
-    /// `user_id` 由调用方从会话显式传入（Agent 代终端用户行动时携带）。
+    /// 记录同意并换发授权码（账户归属从 agent 记录冻结进授权码）
     pub async fn issue_authorization_code(
         &self,
         params: &AuthorizeParams,
         agent: &AgentRecord,
         scopes: Vec<Scope>,
-        user_id: Option<UserId>,
     ) -> Result<String> {
-        let _ = user_id; // 主体为 Agent；用户信息记住在 consent 侧
-                         // scope 不得超出客户端注册上限
+        // scope 不得超出客户端注册上限
         for s in &scopes {
             if !agent.max_scopes.contains(s) {
                 return Err(HubError::InsufficientScope);
             }
         }
         let code = format!("ac_{}", Uuid::new_v4().simple());
-        let grants = self.resolve_grants(&agent.agent_id).await?;
+        let grants = self.resolve_grants(agent).await?;
         self.auth_codes.write().unwrap().insert(
             code.clone(),
             AuthorizationCode {
                 agent_id: agent.agent_id.clone(),
+                account_id: agent.owner_account_id,
                 redirect_uri: params.redirect_uri.clone(),
                 code_challenge: params.code_challenge.clone(),
                 scopes,
@@ -506,12 +529,14 @@ impl AgentOAuthServer {
     }
 
     /// 从 GrantStore 解析 Agent 当前生效的命名空间授权
-    async fn resolve_grants(&self, agent_id: &AgentId) -> Result<Vec<NamespaceGrant>> {
-        let records: Vec<NamespaceGrantRecord> = self.store.grants_for(agent_id).await?;
+    ///
+    /// 库内授权键带账户前缀（内部存储键），令牌 Claims 只携带用户可见名。
+    async fn resolve_grants(&self, agent: &AgentRecord) -> Result<Vec<NamespaceGrant>> {
+        let records: Vec<NamespaceGrantRecord> = self.store.grants_for(&agent.agent_id).await?;
         Ok(records
             .into_iter()
             .map(|r| NamespaceGrant {
-                namespace: r.namespace,
+                namespace: unscope_name(&agent.owner_account_id, &r.namespace),
                 read: r.can_read,
                 write: r.can_write,
             })
@@ -575,10 +600,15 @@ mod tests {
         }
     }
 
+    /// 测试用账户（沙箱边界）
+    fn test_account() -> AccountId {
+        Uuid::from_u128(42)
+    }
+
     #[tokio::test]
     async fn test_register_and_client_credentials() {
         let (srv, _store) = server().await;
-        srv.register(register_req("agent-a", true)).await.unwrap();
+        srv.register(register_req("agent-a", true), test_account()).await.unwrap();
 
         let resp = srv
             .token(TokenRequest {
@@ -609,7 +639,7 @@ mod tests {
     #[tokio::test]
     async fn test_client_credentials_rejects_bad_secret() {
         let (srv, _store) = server().await;
-        srv.register(register_req("agent-a", true)).await.unwrap();
+        srv.register(register_req("agent-a", true), test_account()).await.unwrap();
 
         let err = srv
             .token(TokenRequest {
@@ -631,7 +661,7 @@ mod tests {
     #[tokio::test]
     async fn test_public_client_cannot_use_client_credentials() {
         let (srv, _store) = server().await;
-        srv.register(register_req("pub", false)).await.unwrap();
+        srv.register(register_req("pub", false), test_account()).await.unwrap();
 
         let err = srv
             .token(TokenRequest {
@@ -653,7 +683,7 @@ mod tests {
     #[tokio::test]
     async fn test_scope_cannot_exceed_registered_max() {
         let (srv, _store) = server().await;
-        srv.register(register_req("agent-a", true)).await.unwrap();
+        srv.register(register_req("agent-a", true), test_account()).await.unwrap();
 
         let err = srv
             .token(TokenRequest {
@@ -675,7 +705,7 @@ mod tests {
     #[tokio::test]
     async fn test_authorization_code_with_pkce() {
         let (srv, store) = server().await;
-        let agent = srv.register(register_req("agent-a", false)).await.unwrap();
+        let agent = srv.register(register_req("agent-a", false), test_account()).await.unwrap();
 
         // 先给命名空间授权（模拟 owner 分享）
         store
@@ -704,7 +734,7 @@ mod tests {
 
         srv.validate_authorize(&params).await.unwrap();
         let code = srv
-            .issue_authorization_code(&params, &agent, vec![Scope::Read, Scope::Write], None)
+            .issue_authorization_code(&params, &agent, vec![Scope::Read, Scope::Write])
             .await
             .unwrap();
 
@@ -748,7 +778,7 @@ mod tests {
     #[tokio::test]
     async fn test_authorization_code_rejects_wrong_verifier() {
         let (srv, _store) = server().await;
-        let agent = srv.register(register_req("agent-a", false)).await.unwrap();
+        let agent = srv.register(register_req("agent-a", false), test_account()).await.unwrap();
 
         let challenge = compute_code_challenge_s256("correct-verifier");
         let params = AuthorizeParams {
@@ -761,7 +791,7 @@ mod tests {
             scope: None,
         };
         let code = srv
-            .issue_authorization_code(&params, &agent, vec![Scope::Read], None)
+            .issue_authorization_code(&params, &agent, vec![Scope::Read])
             .await
             .unwrap();
 
@@ -785,7 +815,7 @@ mod tests {
     #[tokio::test]
     async fn test_authorize_rejects_bad_redirect_and_method() {
         let (srv, _store) = server().await;
-        srv.register(register_req("agent-a", false)).await.unwrap();
+        srv.register(register_req("agent-a", false), test_account()).await.unwrap();
 
         let mut params = AuthorizeParams {
             response_type: "token".to_string(), // 隐式流不允许
@@ -810,7 +840,7 @@ mod tests {
     #[tokio::test]
     async fn test_refresh_rotation() {
         let (srv, _store) = server().await;
-        let agent = srv.register(register_req("agent-a", false)).await.unwrap();
+        let agent = srv.register(register_req("agent-a", false), test_account()).await.unwrap();
 
         let challenge = compute_code_challenge_s256("v1");
         let params = AuthorizeParams {
@@ -823,7 +853,7 @@ mod tests {
             scope: None,
         };
         let code = srv
-            .issue_authorization_code(&params, &agent, vec![Scope::Read], None)
+            .issue_authorization_code(&params, &agent, vec![Scope::Read])
             .await
             .unwrap();
         let first = srv
@@ -894,7 +924,7 @@ mod tests {
                 client_secret: None,
                 redirect_uris: vec![],
                 max_scopes: None,
-            })
+            }, test_account())
             .await
             .is_err());
 
@@ -906,7 +936,7 @@ mod tests {
                 client_secret: None,
                 redirect_uris: vec![],
                 max_scopes: None,
-            })
+            }, test_account())
             .await
             .is_err());
 
@@ -918,7 +948,7 @@ mod tests {
                 client_secret: None,
                 redirect_uris: vec!["http://insecure.example.com".to_string()],
                 max_scopes: None,
-            })
+            }, test_account())
             .await
             .is_err());
     }
@@ -926,7 +956,7 @@ mod tests {
     #[tokio::test]
     async fn test_suspended_agent_cannot_get_tokens() {
         let (srv, store) = server().await;
-        srv.register(register_req("agent-a", true)).await.unwrap();
+        srv.register(register_req("agent-a", true), test_account()).await.unwrap();
         store
             .set_agent_status(&"agent-a".to_string(), "suspended")
             .await

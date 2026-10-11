@@ -9,7 +9,7 @@ use crate::domain::{
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use common::{AgentId, AuthCtx, Result};
+use common::{AccountId, AgentId, AuthCtx, Result};
 use serde::{Deserialize, Serialize};
 
 /// 记忆存储：条目 CRUD、查询与向量近邻
@@ -135,6 +135,8 @@ pub struct AgentRegistration {
     pub name: String,
     /// service | assistant | worker
     pub kind: String,
+    /// 归属账户（沙箱边界；注册时由授权服务器注入，不取自请求体）
+    pub owner_account_id: AccountId,
     /// 机密客户端密钥（公共客户端为 None，只能走 PKCE 授权码）
     pub client_secret: Option<String>,
     pub redirect_uris: Vec<String>,
@@ -149,6 +151,8 @@ pub struct AgentRecord {
     pub kind: String,
     /// active | suspended
     pub status: String,
+    /// 归属账户
+    pub owner_account_id: AccountId,
     pub redirect_uris: Vec<String>,
     pub max_scopes: Vec<common::Scope>,
     /// 是否为机密客户端（持有密钥）
@@ -166,6 +170,67 @@ pub trait AgentStore: Send + Sync {
     async fn set_agent_status(&self, agent_id: &AgentId, status: &str) -> Result<()>;
     /// 校验机密客户端密钥（公共客户端恒 false）
     async fn verify_agent_secret(&self, agent_id: &AgentId, secret: &str) -> Result<bool>;
+}
+
+/// 账户注册记录（不含口令哈希本体）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountRecord {
+    pub id: AccountId,
+    pub username: String,
+    pub display_name: String,
+    /// active | suspended
+    pub status: String,
+    /// 是否已设置登录口令
+    pub has_password: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+/// 账户登录会话记录
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionRecord {
+    pub account_id: AccountId,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// 账户存储：注册、登录凭据与登录会话（auth-server 使用）
+///
+/// 账户是沙箱边界：命名空间数据不直接携带 account 列，
+/// 而是通过 `AccountScopedStore` 按账户前缀隔离（见 account_scope 模块）。
+#[async_trait]
+pub trait AccountStore: Send + Sync {
+    /// 创建账户（用户名冲突返回 InvalidArgument）
+    async fn create_account(
+        &self,
+        username: &str,
+        password_hash: Option<&str>,
+        display_name: &str,
+    ) -> Result<AccountRecord>;
+    /// 按固定 ID 确保账户存在（引导账户；已存在时原样返回，不改口令）
+    async fn ensure_account(
+        &self,
+        id: &AccountId,
+        username: &str,
+        display_name: &str,
+    ) -> Result<AccountRecord>;
+    async fn get_account(&self, id: &AccountId) -> Result<Option<AccountRecord>>;
+    async fn get_account_by_username(&self, username: &str) -> Result<Option<AccountRecord>>;
+    /// 读取口令哈希（仅认证路径使用，禁止用于展示）
+    async fn password_hash_of(&self, username: &str) -> Result<Option<String>>;
+    async fn set_account_password(&self, id: &AccountId, password_hash: &str) -> Result<()>;
+    async fn set_account_status(&self, id: &AccountId, status: &str) -> Result<()>;
+    async fn list_accounts(&self) -> Result<Vec<AccountRecord>>;
+
+    // ===== 登录会话（token_hash 为会话令牌的 SHA-256）=====
+    async fn create_session(
+        &self,
+        token_hash: &[u8],
+        account_id: &AccountId,
+        expires_at: DateTime<Utc>,
+    ) -> Result<()>;
+    async fn get_session(&self, token_hash: &[u8]) -> Result<Option<SessionRecord>>;
+    async fn delete_session(&self, token_hash: &[u8]) -> Result<()>;
+    /// 清理过期会话，返回删除条数
+    async fn prune_sessions(&self, now: DateTime<Utc>) -> Result<usize>;
 }
 
 /// 嵌入器：文本 → 归一化向量
@@ -206,13 +271,16 @@ pub trait TokenIntrospector: Send + Sync {
     async fn introspect(&self, token: &str) -> Result<AuthCtx>;
 }
 
-/// 访问判定：命名空间级读/写/管理权（基于 GrantStore）
+/// 访问判定：命名空间级读/写/管理权（基于 GrantStore，账户沙箱内判定）
+///
+/// 所有判定以 `auth.account_id` 为边界：命名空间名先按账户作用域化，
+/// 跨账户的命名空间在授权表中永远找不到匹配行。
 #[async_trait]
 pub trait AccessChecker: Send + Sync {
-    async fn can_read(&self, agent: &AgentId, namespace: &str) -> Result<bool>;
-    async fn can_write(&self, agent: &AgentId, namespace: &str) -> Result<bool>;
-    /// 是否为命名空间 owner（或持有通配授权）
-    async fn is_owner(&self, agent: &AgentId, namespace: &str) -> Result<bool>;
+    async fn can_read(&self, auth: &AuthCtx, namespace: &str) -> Result<bool>;
+    async fn can_write(&self, auth: &AuthCtx, namespace: &str) -> Result<bool>;
+    /// 是否为命名空间 owner
+    async fn is_owner(&self, auth: &AuthCtx, namespace: &str) -> Result<bool>;
     /// 首次写入时自动注册命名空间并建立 owner 授权
-    async fn ensure_namespace(&self, namespace: &str, owner: &AgentId) -> Result<()>;
+    async fn ensure_namespace(&self, auth: &AuthCtx, namespace: &str) -> Result<()>;
 }

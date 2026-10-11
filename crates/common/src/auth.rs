@@ -1,8 +1,10 @@
 //! 多智能体记忆服务的身份认证上下文与授权范围
 //!
-//! 与旧版"单用户个人记忆"模型不同，本服务的主体是 **Agent**：
-//! 每个调用方（AI 助手、自动化 Worker、批处理任务）以自己的 `agent_id`
-//! 身份访问记忆命名空间（namespace），通过 OAuth 2.1 获取访问令牌。
+//! 本服务的两级主体模型：
+//! - **Account（账户）**：终端用户，沙箱边界。每个账户拥有独立的命名空间
+//!   空间与自己的 Agent 集合，跨账户不可见、不可访问；账户通过控制台注册/登录。
+//! - **Agent**：调用方（AI 助手、自动化 Worker、批处理任务），归属于某个账户，
+//!   以自己的 `agent_id` 身份访问本账户内的记忆命名空间，通过 OAuth 2.1 获取令牌。
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -11,8 +13,11 @@ use uuid::Uuid;
 /// Agent 唯一标识（与 OAuth client_id 对应）
 pub type AgentId = String;
 
-/// 可选的人类用户标识：当 Agent 代表某个终端用户行动时携带
-pub type UserId = Uuid;
+/// 账户唯一标识（沙箱边界）
+pub type AccountId = Uuid;
+
+/// 引导账户 ID：固定值，SQL 迁移据此把存量数据归属到该账户
+pub const BOOTSTRAP_ACCOUNT_ID: Uuid = Uuid::from_u128(1);
 
 /// 授权范围（Scope）
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -124,8 +129,8 @@ impl Acl {
 pub struct AuthCtx {
     /// 调用方 Agent 标识
     pub agent_id: AgentId,
-    /// 可选的终端用户（Agent 代为行动时携带）
-    pub user_id: Option<UserId>,
+    /// 所属账户（沙箱边界；所有命名空间访问都在该账户内解析）
+    pub account_id: AccountId,
     /// 令牌携带的作用域
     pub scopes: Vec<Scope>,
     /// 命名空间级访问控制
@@ -133,6 +138,20 @@ pub struct AuthCtx {
 }
 
 impl AuthCtx {
+    /// 构造鉴权上下文（测试与内部装配用；令牌路径请走 authz 校验）
+    pub fn new(
+        agent_id: impl Into<AgentId>,
+        account_id: AccountId,
+        scopes: Vec<Scope>,
+        acl: Acl,
+    ) -> Self {
+        Self {
+            agent_id: agent_id.into(),
+            account_id,
+            scopes,
+            acl,
+        }
+    }
     /// 检查是否拥有特定 Scope
     pub fn has_scope(&self, required: &Scope) -> bool {
         self.scopes.contains(required)
@@ -161,7 +180,7 @@ mod tests {
     fn ctx_with(acl: Acl, scopes: Vec<Scope>) -> AuthCtx {
         AuthCtx {
             agent_id: "agent-a".to_string(),
-            user_id: None,
+            account_id: Uuid::from_u128(7),
             scopes,
             acl,
         }

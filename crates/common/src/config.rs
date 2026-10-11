@@ -38,6 +38,16 @@ pub struct AppConfig {
     pub access_token_ttl_s: i64,
     pub confirm_token_ttl_s: u64,
 
+    // ===== 账户（沙箱）=====
+    /// 引导账户用户名（存量数据归属；仅 auth-server 使用）
+    pub bootstrap_username: String,
+    /// 引导账户口令（未设置则不写入；仅 auth-server 使用）
+    pub bootstrap_password: Option<String>,
+    /// 账户注册邀请码（未设置 = 开放注册）
+    pub invite_code: Option<String>,
+    /// 账户登录会话有效期（小时）
+    pub auth_session_ttl_h: i64,
+
     // ===== 检索 =====
     pub retrieval_fts_k: usize,
     pub retrieval_vec_k: usize,
@@ -149,6 +159,10 @@ impl Default for AppConfig {
             resource_uri: "https://hub.memory-hub.local".to_string(),
             access_token_ttl_s: 3600,
             confirm_token_ttl_s: 120,
+            bootstrap_username: "bootstrap".to_string(),
+            bootstrap_password: None,
+            invite_code: None,
+            auth_session_ttl_h: 720,
             retrieval_fts_k: 20,
             retrieval_vec_k: 20,
             score_weights: [0.50, 0.20, 0.10, 0.10, 0.10],
@@ -191,6 +205,12 @@ impl AppConfig {
         cfg.access_token_ttl_s =
             parse_u64("AS_ACCESS_TOKEN_TTL_S", cfg.access_token_ttl_s as u64)? as i64;
         cfg.confirm_token_ttl_s = parse_u64("HUB_CONFIRM_TOKEN_TTL_S", cfg.confirm_token_ttl_s)?;
+
+        cfg.bootstrap_username = var_or("HUB_BOOTSTRAP_USERNAME", &cfg.bootstrap_username);
+        cfg.bootstrap_password = var("HUB_BOOTSTRAP_PASSWORD");
+        cfg.invite_code = var("AUTH_INVITE_CODE");
+        let session_ttl_h = parse_u64("AUTH_SESSION_TTL_H", cfg.auth_session_ttl_h as u64)?;
+        cfg.auth_session_ttl_h = session_ttl_h.max(1) as i64;
 
         cfg.retrieval_fts_k = parse_usize("HUB_RETRIEVAL_FTS_K", cfg.retrieval_fts_k)?;
         cfg.retrieval_vec_k = parse_usize("HUB_RETRIEVAL_VEC_K", cfg.retrieval_vec_k)?;
@@ -313,7 +333,8 @@ impl AppConfig {
             .to_string();
         format!(
             "db_host={} embed_dim={} embed_provider={} mcp_bind={} auth_bind={} \
-             backup_cron={} integrate_threshold={} sweep_h={} origins={}",
+             backup_cron={} integrate_threshold={} sweep_h={} origins={} \
+             invite={} bootstrap_pwd={}",
             db_host,
             self.embed_dim,
             self.embed_provider,
@@ -323,6 +344,8 @@ impl AppConfig {
             self.integrate_sim_threshold,
             self.expiry_sweep_interval_h,
             self.allowed_origins.len(),
+            if self.invite_code.is_some() { "set" } else { "open" },
+            if self.bootstrap_password.is_some() { "set" } else { "unset" },
         )
     }
 }

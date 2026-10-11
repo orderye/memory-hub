@@ -8,6 +8,7 @@
 //! 模块划分：
 //! - [`domain`]：记忆条目、备份快照、整合提案等核心类型
 //! - [`infra`]：存储 / 嵌入 / 时钟 / 检索 / 令牌内省抽象
+//! - [`account_scope`]：账户沙箱作用域（命名空间按账户前缀隔离）
 //! - [`memory_service`]：记忆 CRUD 与检索门面
 //! - [`backup_service`]：快照创建、恢复与保留策略
 //! - [`integration_service`]：去重与冲突归并
@@ -15,6 +16,7 @@
 //! - [`algorithm`]：打分、余弦与 MMR 等纯函数
 
 pub mod access;
+pub mod account_scope;
 pub mod algorithm;
 pub mod backup_service;
 pub mod domain;
@@ -24,6 +26,7 @@ pub mod memory_service;
 pub mod testing;
 
 pub use access::{validate_key, validate_namespace, GrantChecker};
+pub use account_scope::{scope_name, unscope_name, AccountScopedStore};
 pub use algorithm::{
     calculate_item_score, cosine_similarity, keyword_score, l2_normalize, mmr_rerank,
     recency_score, SearchQuery,
@@ -39,9 +42,9 @@ pub use domain::{
     RestoreReport, Scored, VersionChange,
 };
 pub use infra::{
-    AccessChecker, AgentRecord, AgentRegistration, AgentStore, BackupStore, Clock, Embedder,
-    GrantStore, IntegrationStore, MemoryHubStore, MemoryStore, Retriever, SystemClock,
-    TokenIntrospector,
+    AccessChecker, AccountRecord, AccountStore, AgentRecord, AgentRegistration, AgentStore,
+    BackupStore, Clock, Embedder, GrantStore, IntegrationStore, MemoryHubStore, MemoryStore,
+    Retriever, SessionRecord, SystemClock, TokenIntrospector,
 };
 pub use integration_service::{
     DefaultIntegrationService, IntegrationService, ResolveAction, ResolveRequest, ScanReport,

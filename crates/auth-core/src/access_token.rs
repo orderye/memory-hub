@@ -9,7 +9,7 @@ use authz::TokenClaims;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use chrono::{Duration, Utc};
-use common::{AgentId, AuthCtx, HubError, NamespaceGrant, Result, Scope};
+use common::{AccountId, AgentId, AuthCtx, HubError, NamespaceGrant, Result, Scope};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -82,11 +82,13 @@ impl AccessTokenManager {
 
     /// 签发访问令牌
     ///
-    /// `agent_id` 为调用方 Agent 主体；`grants` 为该 Agent 当前生效的
-    /// 命名空间授权条目（由授权服务器从 GrantStore 解析后随令牌下发）。
+    /// `agent_id` 为调用方 Agent 主体；`account_id` 为其所属账户（沙箱边界，
+    /// 由授权服务器从 agents.owner_account_id 注入）；`grants` 为该 Agent
+    /// 当前生效的命名空间授权条目（用户可见名，不含账户前缀）。
     pub fn issue(
         &self,
         agent_id: &AgentId,
+        account_id: AccountId,
         scopes: Vec<Scope>,
         grants: Vec<NamespaceGrant>,
     ) -> Result<String> {
@@ -96,6 +98,7 @@ impl AccessTokenManager {
             iss: self.issuer.clone(),
             aud: self.audience.clone(),
             client_id: agent_id.clone(),
+            account: Some(account_id),
             scopes,
             grants,
             iat: now.timestamp(),
@@ -213,12 +216,17 @@ mod tests {
         )
     }
 
+    fn account() -> AccountId {
+        Uuid::from_u128(7)
+    }
+
     #[test]
     fn test_issue_and_verify_roundtrip() {
         let m = mgr();
         let token = m
             .issue(
                 &"agent-alpha".to_string(),
+                account(),
                 vec![Scope::Read, Scope::Write],
                 vec![NamespaceGrant::read_write("team-x")],
             )
@@ -228,6 +236,7 @@ mod tests {
         let claims = m.verify(&token).unwrap();
         assert_eq!(claims.sub, "agent-alpha");
         assert_eq!(claims.client_id, "agent-alpha");
+        assert_eq!(claims.account, Some(account()));
         assert_eq!(claims.iss, "https://auth.example.com");
         assert_eq!(claims.aud, "https://hub.example.com");
         assert!(claims.exp > claims.iat);
@@ -240,7 +249,12 @@ mod tests {
     fn test_tampered_payload_rejected() {
         let m = mgr();
         let token = m
-            .issue(&"agent-alpha".to_string(), vec![Scope::Read], vec![])
+            .issue(
+                &"agent-alpha".to_string(),
+                account(),
+                vec![Scope::Read],
+                vec![],
+            )
             .unwrap();
 
         let mut parts: Vec<&str> = token.split('.').collect();
@@ -257,7 +271,12 @@ mod tests {
     fn test_wrong_secret_rejected() {
         let m = mgr();
         let token = m
-            .issue(&"agent-alpha".to_string(), vec![Scope::Read], vec![])
+            .issue(
+                &"agent-alpha".to_string(),
+                account(),
+                vec![Scope::Read],
+                vec![],
+            )
             .unwrap();
 
         let other = AccessTokenManager::new(
@@ -282,6 +301,7 @@ mod tests {
             iss: m.issuer.clone(),
             aud: m.audience.clone(),
             client_id: "agent-alpha".to_string(),
+            account: Some(account()),
             scopes: vec![Scope::Read],
             grants: vec![],
             iat: now,

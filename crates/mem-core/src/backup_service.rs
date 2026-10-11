@@ -7,10 +7,11 @@
 //! - **保留**：按"每命名空间保留 N 份 + TTL 天数"淘汰最旧快照。
 
 use crate::access::GrantChecker;
+use crate::account_scope::AccountScopedStore;
 use crate::domain::{
     BackupRecord, BackupSummary, MemoryEntry, RestoreMode, RestoreReport, VersionChange,
 };
-use crate::infra::{AccessChecker, Clock, MemoryHubStore, SystemClock};
+use crate::infra::{AccessChecker, BackupStore, Clock, MemoryHubStore, MemoryStore, SystemClock};
 use async_trait::async_trait;
 use common::{AgentId, AuthCtx, HubError, Result, Scope};
 use serde::{Deserialize, Serialize};
@@ -80,12 +81,17 @@ impl DefaultBackupService {
         self
     }
 
+    /// 本请求的账户作用域存储：`*` 全量与恢复都只在账户内展开
+    fn scoped(&self, auth: &AuthCtx) -> AccountScopedStore<dyn MemoryHubStore> {
+        AccountScopedStore::new(self.store.clone(), auth.account_id)
+    }
+
     /// 读前置校验（含通配命名空间）
     async fn require_read(&self, auth: &AuthCtx, namespace: &str) -> Result<()> {
         if !auth.has_scope(&Scope::Read) {
             return Err(HubError::InsufficientScope);
         }
-        if !self.access.can_read(&auth.agent_id, namespace).await? {
+        if !self.access.can_read(auth, namespace).await? {
             return Err(HubError::InsufficientScope);
         }
         Ok(())
@@ -96,7 +102,7 @@ impl DefaultBackupService {
         if !auth.has_scope(&Scope::Write) {
             return Err(HubError::InsufficientScope);
         }
-        if !self.access.can_write(&auth.agent_id, namespace).await? {
+        if !self.access.can_write(auth, namespace).await? {
             return Err(HubError::InsufficientScope);
         }
         Ok(())
@@ -138,15 +144,16 @@ impl DefaultBackupService {
     /// 内部：为当前状态创建安全备份（replace 恢复前调用）
     async fn create_safety_backup(
         &self,
+        auth: &AuthCtx,
         namespace: &str,
-        agent: &AgentId,
     ) -> Result<Option<BackupRecord>> {
         if namespace == "*" {
             // 全量恢复前先对每个命名空间逐一备份代价过高，改为跳过并告警
             tracing::warn!("全量恢复前不自动创建安全备份，请先手动创建全量备份");
             return Ok(None);
         }
-        let entries = self.store.all_in_namespace(namespace, true).await?;
+        let store = self.scoped(auth);
+        let entries = store.all_in_namespace(namespace, true).await?;
         if entries.is_empty() {
             return Ok(None);
         }
@@ -154,7 +161,7 @@ impl DefaultBackupService {
         let record = BackupRecord {
             id: Uuid::new_v4(),
             namespace: namespace.to_string(),
-            created_by: agent.clone(),
+            created_by: auth.agent_id.clone(),
             note: Some(format!("restore-safety:{}", namespace)),
             entry_count: entries.len(),
             checksum: Self::checksum_of(&entries),
@@ -162,7 +169,7 @@ impl DefaultBackupService {
             retain_until: None,
             created_at: now,
         };
-        self.store.save_backup(&record).await?;
+        store.save_backup(&record).await?;
         Ok(Some(record))
     }
 }
@@ -174,16 +181,17 @@ impl BackupService for DefaultBackupService {
         if req.namespace.trim().is_empty() {
             return Err(HubError::InvalidArgument("namespace 不能为空".to_string()));
         }
+        let store = self.scoped(auth);
 
         let entries: Vec<MemoryEntry> = if req.namespace == "*" {
             let mut all = Vec::new();
-            for ns in crate::infra::MemoryStore::list_namespaces(self.store.as_ref()).await? {
-                all.extend(self.store.all_in_namespace(&ns, true).await?);
+            for ns in crate::infra::MemoryStore::list_namespaces(&store).await? {
+                all.extend(store.all_in_namespace(&ns, true).await?);
             }
             all
         } else {
             self.require_write(auth, &req.namespace).await?;
-            self.store.all_in_namespace(&req.namespace, true).await?
+            store.all_in_namespace(&req.namespace, true).await?
         };
 
         let now = self.clock.now();
@@ -198,12 +206,12 @@ impl BackupService for DefaultBackupService {
             retain_until: None,
             created_at: now,
         };
-        self.store.save_backup(&record).await?;
+        store.save_backup(&record).await?;
         Ok(record)
     }
 
     async fn list(&self, auth: &AuthCtx, namespace: Option<&str>) -> Result<Vec<BackupSummary>> {
-        let all = self.store.list_backups(namespace).await?;
+        let all = self.scoped(auth).list_backups(namespace).await?;
         let mut out = Vec::with_capacity(all.len());
         for b in &all {
             // 逐份校验访问权：全量备份只对通配读授权可见
@@ -215,7 +223,8 @@ impl BackupService for DefaultBackupService {
 
     async fn restore(&self, auth: &AuthCtx, req: RestoreRequest) -> Result<RestoreReport> {
         self.require_admin(auth).await?;
-        let backup = self.store.get_backup(req.backup_id).await?;
+        let store = self.scoped(auth);
+        let backup = store.get_backup(req.backup_id).await?;
 
         // 完整性校验：重建校验和与写入时比对
         let entries = Self::entries_of(&backup)?;
@@ -239,7 +248,7 @@ impl BackupService for DefaultBackupService {
 
         if req.mode == RestoreMode::DryRun {
             for e in &entries {
-                match self.store.get(&e.namespace, e.id).await {
+                match store.get(&e.namespace, e.id).await {
                     Ok(cur) if cur == *e => report.unchanged += 1,
                     Ok(_) => report.updated += 1,
                     Err(_) => report.created += 1,
@@ -257,14 +266,14 @@ impl BackupService for DefaultBackupService {
             // 先为每个受影响的命名空间创建安全备份
             for ns in &namespaces {
                 self.require_write(auth, ns).await?;
-                if let Some(safety) = self.create_safety_backup(ns, &auth.agent_id).await? {
+                if let Some(safety) = self.create_safety_backup(auth, ns).await? {
                     report.safety_backup_id = Some(safety.id);
                 }
             }
             // 再清空当前状态（merged 一并清除，保证与快照一致）
             for ns in &namespaces {
-                for cur in self.store.all_in_namespace(ns, true).await? {
-                    self.store.delete(&cur.namespace, cur.id).await?;
+                for cur in store.all_in_namespace(ns, true).await? {
+                    store.delete(&cur.namespace, cur.id).await?;
                 }
             }
         } else {
@@ -274,7 +283,7 @@ impl BackupService for DefaultBackupService {
         }
 
         for mut e in entries {
-            match self.store.get(&e.namespace, e.id).await {
+            match store.get(&e.namespace, e.id).await {
                 Ok(cur) => {
                     if cur == e {
                         report.unchanged += 1;
@@ -284,7 +293,7 @@ impl BackupService for DefaultBackupService {
                     e.version = cur.version + 1;
                     e.updated_at = now;
                     e.source_agent = auth.agent_id.clone();
-                    self.store.save(&e).await?;
+                    store.save(&e).await?;
                     self.record_restore_version(&e, &auth.agent_id, VersionChange::Updated)
                         .await?;
                     report.updated += 1;
@@ -293,7 +302,7 @@ impl BackupService for DefaultBackupService {
                     // 新建：保留快照的 created_at，updated_at 置为恢复时刻
                     e.updated_at = now;
                     e.source_agent = auth.agent_id.clone();
-                    self.store.insert(&e).await?;
+                    store.insert(&e).await?;
                     self.record_restore_version(&e, &auth.agent_id, VersionChange::Created)
                         .await?;
                     report.created += 1;
@@ -307,6 +316,7 @@ impl BackupService for DefaultBackupService {
     async fn prune(&self, keep: usize, retention_days: u32) -> Result<PruneReport> {
         let keep = keep.max(1);
         let now = self.clock.now();
+        // 系统级保留策略（worker 调用，无请求账户）：按原始存储对全库统一执行
         let all = self.store.list_backups(None).await?;
 
         // 按命名空间分组，组内按 created_at 从新到旧排序
@@ -368,6 +378,10 @@ pub fn grant_checker(store: Arc<dyn MemoryHubStore>) -> Arc<GrantChecker> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// 测试账户作用域名：与 `auth()`/`writer()` 辅助中的账户一致
+    fn scoped_ns(ns: &str) -> String {
+        crate::account_scope::scope_name(&common::BOOTSTRAP_ACCOUNT_ID, ns)
+    }
     use crate::domain::{
         IntegrationProposal, MemoryFilter, MemoryKind, MemoryStatus, MemoryVersion,
         NamespaceGrantRecord, NamespaceInfo, ProposalStatus,
@@ -683,7 +697,7 @@ mod tests {
     fn admin(agent: &str) -> AuthCtx {
         AuthCtx {
             agent_id: agent.to_string(),
-            user_id: None,
+            account_id: common::BOOTSTRAP_ACCOUNT_ID,
             scopes: vec![Scope::Read, Scope::Write, Scope::Admin],
             acl: Default::default(),
         }
@@ -703,12 +717,12 @@ mod tests {
 
         // 建立命名空间归属
         store
-            .ensure_namespace("ns", &"agent-a".to_string())
+            .ensure_namespace(&scoped_ns("ns"), &"agent-a".to_string())
             .await
             .unwrap();
         store
             .grant(&NamespaceGrantRecord {
-                namespace: "ns".to_string(),
+                namespace: scoped_ns("ns"),
                 agent_id: "agent-a".to_string(),
                 can_read: true,
                 can_write: true,
@@ -717,8 +731,8 @@ mod tests {
             })
             .await
             .unwrap();
-        let e1 = store.seed("ns", "agent-a", "记忆一");
-        store.seed("ns", "agent-a", "记忆二");
+        let e1 = store.seed(&scoped_ns("ns"), "agent-a", "记忆一");
+        store.seed(&scoped_ns("ns"), "agent-a", "记忆二");
 
         let backup = svc
             .create(
@@ -748,7 +762,7 @@ mod tests {
         assert_eq!(report.unchanged, 2);
 
         // 修改一条后 merge：应识别 1 updated 1 unchanged
-        let mut changed = store.get("ns", e1.id).await.unwrap();
+        let mut changed = store.get(&scoped_ns("ns"), e1.id).await.unwrap();
         changed.content = "被外部改动了".to_string();
         store.save(&changed).await.unwrap();
 
@@ -765,7 +779,7 @@ mod tests {
         assert_eq!(report2.updated, 1);
         assert_eq!(report2.unchanged, 1);
         assert_eq!(
-            store.get("ns", e1.id).await.unwrap().content,
+            store.get(&scoped_ns("ns"), e1.id).await.unwrap().content,
             "记忆一",
             "merge 后内容应恢复为快照值"
         );
@@ -776,12 +790,12 @@ mod tests {
         let (svc, store) = setup();
         let a = admin("agent-a");
         store
-            .ensure_namespace("ns", &"agent-a".to_string())
+            .ensure_namespace(&scoped_ns("ns"), &"agent-a".to_string())
             .await
             .unwrap();
         store
             .grant(&NamespaceGrantRecord {
-                namespace: "ns".to_string(),
+                namespace: scoped_ns("ns"),
                 agent_id: "agent-a".to_string(),
                 can_read: true,
                 can_write: true,
@@ -790,8 +804,8 @@ mod tests {
             })
             .await
             .unwrap();
-        store.seed("ns", "agent-a", "旧内容一");
-        store.seed("ns", "agent-a", "旧内容二");
+        store.seed(&scoped_ns("ns"), "agent-a", "旧内容一");
+        store.seed(&scoped_ns("ns"), "agent-a", "旧内容二");
 
         let backup = svc
             .create(
@@ -805,9 +819,9 @@ mod tests {
             .unwrap();
 
         // 删掉一条、改写一条，再 replace 恢复
-        let items = store.all_in_namespace("ns", true).await.unwrap();
-        store.delete("ns", items[0].id).await.unwrap();
-        let mut kept = store.get("ns", items[1].id).await.unwrap();
+        let items = store.all_in_namespace(&scoped_ns("ns"), true).await.unwrap();
+        store.delete(&scoped_ns("ns"), items[0].id).await.unwrap();
+        let mut kept = store.get(&scoped_ns("ns"), items[1].id).await.unwrap();
         kept.content = "被改坏了".to_string();
         store.save(&kept).await.unwrap();
 
@@ -828,7 +842,7 @@ mod tests {
         // replace 先清空当前状态再按快照重建，两条都应计为 created
         assert_eq!(report.created, 2, "replace 后两条都应按快照重建");
 
-        let after = store.all_in_namespace("ns", true).await.unwrap();
+        let after = store.all_in_namespace(&scoped_ns("ns"), true).await.unwrap();
         assert_eq!(after.len(), 2);
         assert!(after.iter().any(|e| e.content == "旧内容一"));
         assert!(after.iter().any(|e| e.content == "旧内容二"));
@@ -839,12 +853,12 @@ mod tests {
         let (svc, store) = setup();
         let a = admin("agent-a");
         store
-            .ensure_namespace("ns", &"agent-a".to_string())
+            .ensure_namespace(&scoped_ns("ns"), &"agent-a".to_string())
             .await
             .unwrap();
         store
             .grant(&NamespaceGrantRecord {
-                namespace: "ns".to_string(),
+                namespace: scoped_ns("ns"),
                 agent_id: "agent-a".to_string(),
                 can_read: true,
                 can_write: true,
@@ -853,7 +867,7 @@ mod tests {
             })
             .await
             .unwrap();
-        store.seed("ns", "agent-a", "记忆");
+        store.seed(&scoped_ns("ns"), "agent-a", "记忆");
 
         let backup = svc
             .create(
@@ -893,12 +907,12 @@ mod tests {
         let (svc, store) = setup();
         let a = admin("agent-a");
         store
-            .ensure_namespace("ns", &"agent-a".to_string())
+            .ensure_namespace(&scoped_ns("ns"), &"agent-a".to_string())
             .await
             .unwrap();
         store
             .grant(&NamespaceGrantRecord {
-                namespace: "ns".to_string(),
+                namespace: scoped_ns("ns"),
                 agent_id: "agent-a".to_string(),
                 can_read: true,
                 can_write: true,
@@ -907,7 +921,7 @@ mod tests {
             })
             .await
             .unwrap();
-        store.seed("ns", "agent-a", "记忆");
+        store.seed(&scoped_ns("ns"), "agent-a", "记忆");
 
         let mut ids = Vec::new();
         for i in 0..3 {
@@ -939,18 +953,18 @@ mod tests {
         let a = admin("agent-a");
         let stranger = AuthCtx {
             agent_id: "agent-b".to_string(),
-            user_id: None,
+            account_id: common::BOOTSTRAP_ACCOUNT_ID,
             scopes: vec![Scope::Read, Scope::Write, Scope::Admin],
             acl: Default::default(),
         };
 
         store
-            .ensure_namespace("ns", &"agent-a".to_string())
+            .ensure_namespace(&scoped_ns("ns"), &"agent-a".to_string())
             .await
             .unwrap();
         store
             .grant(&NamespaceGrantRecord {
-                namespace: "ns".to_string(),
+                namespace: scoped_ns("ns"),
                 agent_id: "agent-a".to_string(),
                 can_read: true,
                 can_write: true,
@@ -959,7 +973,7 @@ mod tests {
             })
             .await
             .unwrap();
-        store.seed("ns", "agent-a", "记忆");
+        store.seed(&scoped_ns("ns"), "agent-a", "记忆");
         svc.create(
             &a,
             BackupCreateRequest {
@@ -980,7 +994,7 @@ mod tests {
         let (svc, _store) = setup();
         let no_admin = AuthCtx {
             agent_id: "agent-a".to_string(),
-            user_id: None,
+            account_id: common::BOOTSTRAP_ACCOUNT_ID,
             scopes: vec![Scope::Read, Scope::Write],
             acl: Default::default(),
         };

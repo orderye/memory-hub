@@ -31,24 +31,30 @@ cargo run --bin backup-worker  # 备份/整合作业（需要 PostgreSQL）
 
 开发环境无数据库时也可直接用内存存储启动：`HUB_DB_URL=memory://local`（重启即失忆，仅限开发）。
 
+**多账户沙箱**：终端用户通过控制台注册/登录（`Account`，沙箱边界）。每个账户拥有独立的命名空间空间与自己的 Agent 集合——不同账户可各有 `personal`，互不可见、互不授权、互不共享。
+
 ## 三个进程
 
 | 进程 | 职责 |
 | :--- | :--- |
 | `mcp-server` | MCP 服务：16 个记忆工具 + Streamable HTTP / stdio 传输 |
-| `auth-server` | OAuth 2.1 授权服务器：Agent 注册（DCR）、`client_credentials`、授权码+PKCE、令牌内省/撤销、Agent 控制台 |
+| `auth-server` | 账户注册/登录/控制台（沙箱边界）+ OAuth 2.1：Agent 注册（DCR，需账户身份）、`client_credentials`、授权码+PKCE、令牌内省/撤销 |
 | `backup-worker` | 周期作业：定时快照（cron）、过期记忆归档、整合冲突扫描 |
 
 存储：PostgreSQL 15 + pgvector（生产）或内存实现（开发/测试）。嵌入器：OpenAI 兼容 `/embeddings` 服务或确定性 mock。
 
+## 账户（沙箱）与 Agent
+
+1. 打开 `http://localhost:8080/account/register` 注册账户（设了 `AUTH_INVITE_CODE` 则需邀请码）；
+2. 登录后在控制台（`/console`）注册 Agent，或点「生成注册令牌」走程序化 DCR：
+   `curl -X POST http://localhost:8080/oauth/register -H "Authorization: Bearer <注册令牌>" ...`
+3. 引导账户（`HUB_BOOTSTRAP_USERNAME`/`HUB_BOOTSTRAP_PASSWORD`）承载升级前的存量数据。
+
 ## 一次完整调用
 
 ```bash
-# 1. Agent 注册（DCR）并直接换取访问令牌（机器 Agent 主路径）
-curl -X POST http://localhost:8080/oauth/register -H 'content-type: application/json' -d '{
-  "agent_id": "agent-alpha", "name": "Alpha 助手", "kind": "assistant",
-  "client_secret": "s3cret"
-}'
+# 0a. 若首次使用：控制台注册账户并登录；再按上面的说明注册 Agent 或取注册令牌
+# 0b. 机器 Agent 直接换取访问令牌（client_credentials，需先注册 Agent）
 TOKEN=$(curl -s -X POST http://localhost:8080/oauth/token \
   -d 'grant_type=client_credentials&client_id=agent-alpha&client_secret=s3cret' \
   | jq -r .access_token)

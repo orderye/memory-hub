@@ -7,6 +7,7 @@
 use chrono::Utc;
 use common::{Acl, AgentId, AuthCtx, HubError, NamespaceGrant, Result, Scope};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 /// 访问令牌载荷 Claims
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,6 +20,8 @@ pub struct TokenClaims {
     pub aud: String,
     /// OAuth 客户端标识（与 sub 一致；保留以兼容 RFC 7662 内省响应）
     pub client_id: AgentId,
+    /// 所属账户（沙箱边界）；缺失视为非法令牌
+    pub account: Option<Uuid>,
     /// 授权 Scopes
     pub scopes: Vec<Scope>,
     /// 命名空间授权条目（读/写分开）
@@ -79,9 +82,15 @@ impl TokenValidator {
             return Err(HubError::AuthRequired);
         }
 
+        // 5. 账户声明必须存在（沙箱边界；升级前的旧令牌一律拒收）
+        let Some(account_id) = claims.account else {
+            tracing::warn!(agent = %claims.sub, "Token missing account claim: rejected");
+            return Err(HubError::AuthRequired);
+        };
+
         Ok(AuthCtx {
             agent_id: claims.sub.clone(),
-            user_id: None,
+            account_id,
             scopes: claims.scopes.clone(),
             acl: Acl::from_grants(&claims.grants),
         })
@@ -100,27 +109,32 @@ impl TokenValidator {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_valid_token_claims() {
-        let validator = TokenValidator::new("https://hub.example.com", "https://auth.example.com");
+    fn claims_with(account: Option<Uuid>) -> TokenClaims {
         let now = Utc::now().timestamp();
-
-        let claims = TokenClaims {
+        TokenClaims {
             sub: "agent-alpha".to_string(),
             iss: "https://auth.example.com".to_string(),
             aud: "https://hub.example.com".to_string(),
             client_id: "agent-alpha".to_string(),
+            account,
             scopes: vec![Scope::Read, Scope::Write],
             grants: vec![NamespaceGrant::read_write("team-x")],
             exp: now + 900,
             iat: now,
             jti: "test-jti".to_string(),
-        };
+        }
+    }
+
+    #[test]
+    fn test_valid_token_claims() {
+        let validator = TokenValidator::new("https://hub.example.com", "https://auth.example.com");
+        let account = Uuid::from_u128(9);
 
         let auth_ctx = validator
-            .validate_claims(&claims)
+            .validate_claims(&claims_with(Some(account)))
             .expect("Claims should be valid");
         assert_eq!(auth_ctx.agent_id, "agent-alpha");
+        assert_eq!(auth_ctx.account_id, account, "沙箱边界随令牌下发");
         assert!(auth_ctx.has_scope(&Scope::Read));
         assert!(auth_ctx.has_scope(&Scope::Write));
         assert!(!auth_ctx.has_scope(&Scope::Admin));
@@ -136,22 +150,20 @@ mod tests {
     }
 
     #[test]
+    fn test_missing_account_rejected() {
+        let validator = TokenValidator::new("https://hub.example.com", "https://auth.example.com");
+        // 升级前签发的旧令牌没有 account 声明：一律拒收
+        let err = validator
+            .validate_claims(&claims_with(None))
+            .unwrap_err();
+        assert!(matches!(err, HubError::AuthRequired));
+    }
+
+    #[test]
     fn test_audience_mismatch_rejected() {
         let validator = TokenValidator::new("https://hub.example.com", "https://auth.example.com");
-        let now = Utc::now().timestamp();
-
-        let claims = TokenClaims {
-            sub: "agent-alpha".to_string(),
-            iss: "https://auth.example.com".to_string(),
-            aud: "https://other-service.example.com".to_string(), // 错配受众
-            client_id: "agent-alpha".to_string(),
-            scopes: vec![Scope::Read],
-            grants: vec![],
-            exp: now + 900,
-            iat: now,
-            jti: "test-jti".to_string(),
-        };
-
+        let mut claims = claims_with(Some(Uuid::from_u128(9)));
+        claims.aud = "https://other-service.example.com".to_string(); // 错配受众
         assert!(validator.validate_claims(&claims).is_err());
     }
 
@@ -159,39 +171,18 @@ mod tests {
     fn test_expired_token_rejected() {
         let validator = TokenValidator::new("https://hub.example.com", "https://auth.example.com");
         let now = Utc::now().timestamp();
-
-        let claims = TokenClaims {
-            sub: "agent-alpha".to_string(),
-            iss: "https://auth.example.com".to_string(),
-            aud: "https://hub.example.com".to_string(),
-            client_id: "agent-alpha".to_string(),
-            scopes: vec![Scope::Read],
-            grants: vec![],
-            exp: now - 10, // 已过期
-            iat: now - 1000,
-            jti: "test-jti".to_string(),
-        };
-
+        let mut claims = claims_with(Some(Uuid::from_u128(9)));
+        claims.exp = now - 10; // 已过期
+        claims.iat = now - 1000;
         assert!(validator.validate_claims(&claims).is_err());
     }
 
     #[test]
     fn test_empty_subject_rejected() {
         let validator = TokenValidator::new("https://hub.example.com", "https://auth.example.com");
-        let now = Utc::now().timestamp();
-
-        let claims = TokenClaims {
-            sub: "  ".to_string(),
-            iss: "https://auth.example.com".to_string(),
-            aud: "https://hub.example.com".to_string(),
-            client_id: "  ".to_string(),
-            scopes: vec![Scope::Read],
-            grants: vec![],
-            exp: now + 900,
-            iat: now,
-            jti: "test-jti".to_string(),
-        };
-
+        let mut claims = claims_with(Some(Uuid::from_u128(9)));
+        claims.sub = "  ".to_string();
+        claims.client_id = "  ".to_string();
         assert!(validator.validate_claims(&claims).is_err());
     }
 }
