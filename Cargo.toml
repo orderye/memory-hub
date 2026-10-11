@@ -2,24 +2,18 @@
 resolver = "2"
 members = [
     "crates/common",
-    "crates/hub-core",
-    "crates/hub-embed",
-    "crates/hub-store",
-    "crates/hub-packs",
-    "crates/hub-rules",
-    "crates/hub-retrieval",
-    "crates/hub-authz",
-    "crates/as-core",
-    "crates/as-web",
-    "crates/hub-mcp",
-    "crates/ref-client",
-    "crates/offline",
-    "crates/eval",
-    "crates/editor-web",
+    "crates/mem-core",
+    "crates/embed",
+    "crates/store",
+    "crates/retrieval",
+    "crates/authz",
+    "crates/auth-core",
+    "crates/auth-web",
+    "crates/mcp",
+    "crates/worker",
     "crates/bins/mcp-server",
     "crates/bins/auth-server",
-    "crates/bins/offline-worker",
-    "crates/bins/editor-server",
+    "crates/bins/backup-worker",
 ]
 
 [workspace.package]
@@ -31,20 +25,15 @@ authors = ["Memory Hub Team"]
 
 [workspace.dependencies]
 common = { path = "crates/common" }
-hub-core = { path = "crates/hub-core" }
-hub-embed = { path = "crates/hub-embed" }
-hub-store = { path = "crates/hub-store" }
-hub-packs = { path = "crates/hub-packs" }
-hub-rules = { path = "crates/hub-rules" }
-hub-retrieval = { path = "crates/hub-retrieval" }
-hub-authz = { path = "crates/hub-authz" }
-as-core = { path = "crates/as-core" }
-as-web = { path = "crates/as-web" }
-hub-mcp = { path = "crates/hub-mcp" }
-ref-client = { path = "crates/ref-client" }
-offline = { path = "crates/offline" }
-eval = { path = "crates/eval" }
-editor-web = { path = "crates/editor-web" }
+mem-core = { path = "crates/mem-core" }
+embed = { path = "crates/embed" }
+store = { path = "crates/store" }
+retrieval = { path = "crates/retrieval" }
+authz = { path = "crates/authz" }
+auth-core = { path = "crates/auth-core" }
+auth-web = { path = "crates/auth-web" }
+mcp = { path = "crates/mcp" }
+worker = { path = "crates/worker" }
 
 # 错误处理与工具
 thiserror = "2.0"
@@ -63,6 +52,25 @@ uuid = { version = "1.10", features = ["v4", "serde"] }
 # 异步与运行时
 tokio = { version = "1.40", features = ["full"] }
 
+# HTTP 服务与传输层
+axum = { version = "0.8", features = ["http1", "tokio", "json", "form", "query"] }
+tower-http = { version = "0.6", features = ["limit", "trace", "cors", "timeout"] }
+tower = { version = "0.5", features = ["limit"] }
+
+# 持久化
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "uuid",
+    "chrono",
+    "json",
+    "migrate",
+] }
+
+# 外部嵌入服务客户端（OpenAI 兼容 /embeddings 协议）
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2"] }
+
 # 日志与可观测性
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
@@ -75,3 +83,4 @@ sha2 = "0.10"
 hex = "0.4"
 base64 = "0.22"
 arc-swap = "1.7"
+subtle = "2.6"

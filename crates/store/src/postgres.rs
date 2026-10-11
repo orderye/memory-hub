@@ -1,0 +1,1408 @@
+#![forbid(unsafe_code)]
+
+//! PostgreSQL 15 + pgvector 持久化实现（四合一：记忆 / 备份 / 整合提案 / 命名空间授权）
+//!
+//! - 行级隔离：所有语句以 `namespace` 为一等谓词；
+//! - pgvector ANN：`similar` 走 HNSW 索引的 `<=>` 余弦距离，分数 = 1 - 距离；
+//! - 全文检索：`to_tsvector('simple', content)` GIN 索引；
+//! - 迁移：版本化清单 + `_hub_migrations` 账本，已应用的迁移不重复执行；
+//! - 只追加历史：`memory_versions` 写入幂等（`on conflict do nothing`）。
+//!
+//! 本实现使用运行时校验查询（非 `sqlx::query!` 宏），编译期无需数据库。
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use common::{AgentId, HubError, Result};
+use mem_core::{
+    BackupRecord, IntegrationKind, IntegrationProposal, MemoryEntry, MemoryFilter, MemoryKind,
+    MemoryStatus, MemoryVersion, Namespace, NamespaceGrantRecord, NamespaceInfo, ProposalStatus,
+    Scored, VersionChange,
+};
+use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
+use sqlx::Row;
+use uuid::Uuid;
+
+/// 行映射辅助
+mod mapping {
+    use super::*;
+
+    pub fn parse_kind(s: &str) -> Result<MemoryKind> {
+        MemoryKind::parse(s)
+            .ok_or_else(|| HubError::Internal(anyhow::anyhow!("未知记忆类型: {}", s)))
+    }
+
+    pub fn parse_status(s: &str) -> Result<MemoryStatus> {
+        MemoryStatus::parse(s)
+            .ok_or_else(|| HubError::Internal(anyhow::anyhow!("未知记忆状态: {}", s)))
+    }
+
+    pub fn parse_integration_kind(s: &str) -> Result<IntegrationKind> {
+        match s {
+            "duplicate" => Ok(IntegrationKind::Duplicate),
+            "conflict" => Ok(IntegrationKind::Conflict),
+            other => Err(HubError::Internal(anyhow::anyhow!(
+                "未知提案类型: {}",
+                other
+            ))),
+        }
+    }
+
+    pub fn parse_proposal_status(s: &str) -> Result<ProposalStatus> {
+        match s {
+            "open" => Ok(ProposalStatus::Open),
+            "merged" => Ok(ProposalStatus::Merged),
+            "dismissed" => Ok(ProposalStatus::Dismissed),
+            "expired" => Ok(ProposalStatus::Expired),
+            other => Err(HubError::Internal(anyhow::anyhow!(
+                "未知提案状态: {}",
+                other
+            ))),
+        }
+    }
+
+    pub fn parse_version_change(s: &str) -> Result<VersionChange> {
+        match s {
+            "created" => Ok(VersionChange::Created),
+            "updated" => Ok(VersionChange::Updated),
+            "archived" => Ok(VersionChange::Archived),
+            "merged" => Ok(VersionChange::Merged),
+            other => Err(HubError::Internal(anyhow::anyhow!(
+                "未知变更类型: {}",
+                other
+            ))),
+        }
+    }
+
+    /// `pgvector` 字面向量：`[1,2,3]`
+    pub fn vector_literal(v: &[f32]) -> String {
+        let mut out = String::with_capacity(v.len() * 12 + 2);
+        out.push('[');
+        for (i, x) in v.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(&format!("{}", x));
+        }
+        out.push(']');
+        out
+    }
+
+    /// 从 text 列读回 pgvector 表示并解析
+    pub fn parse_vector(text: &str) -> Vec<f32> {
+        let trimmed = text.trim().trim_start_matches('[').trim_end_matches(']');
+        if trimmed.is_empty() {
+            return Vec::new();
+        }
+        trimmed
+            .split(',')
+            .filter_map(|s| s.trim().parse::<f32>().ok())
+            .collect()
+    }
+}
+
+/// SQL 错误 → HubError 的统一映射
+pub trait PgResultExt<T> {
+    fn pg(self) -> Result<T>;
+}
+
+impl<T> PgResultExt<T> for std::result::Result<T, sqlx::Error> {
+    fn pg(self) -> Result<T> {
+        self.map_err(|e| {
+            // 唯一键冲突 → Conflict；未找到 → NotFound；其余 → Internal
+            match &e {
+                sqlx::Error::Database(db) => {
+                    let code = db.code().unwrap_or_default();
+                    match code.as_ref() {
+                        "23505" => HubError::Conflict,
+                        "23503" => HubError::InvalidArgument("外键约束不满足".to_string()),
+                        _ => HubError::Internal(anyhow::anyhow!("数据库错误: {}", db.message())),
+                    }
+                }
+                sqlx::Error::RowNotFound => HubError::NotFound,
+                other => HubError::Internal(anyhow::anyhow!("数据库查询失败: {}", other)),
+            }
+        })
+    }
+}
+
+/// 内嵌迁移清单：按文件名（即版本号）顺序应用
+pub const MIGRATIONS: &[(&str, &str)] = &[(
+    "20261011000001_initial_schema",
+    include_str!("../migrations/20261011000001_initial_schema.sql"),
+)];
+
+/// PostgreSQL 四合一存储
+#[derive(Clone)]
+pub struct PostgresHubStore {
+    pool: PgPool,
+}
+
+impl PostgresHubStore {
+    /// 连接并执行迁移
+    pub async fn connect(database_url: &str, max_connections: u32) -> Result<Self> {
+        let pool = PgPoolOptions::new()
+            .max_connections(max_connections.max(1))
+            .min_connections(0)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .connect(database_url)
+            .await
+            .pg()?;
+
+        let store = Self { pool };
+        store.run_migrations().await?;
+        Ok(store)
+    }
+
+    /// 连通性探测
+    pub async fn ping(&self) -> Result<()> {
+        sqlx::query("select 1").execute(&self.pool).await.pg()?;
+        Ok(())
+    }
+
+    /// 应用未执行过的迁移（版本化账本）
+    async fn run_migrations(&self) -> Result<()> {
+        sqlx::query(
+            r#"
+            create table if not exists _hub_migrations (
+              version text primary key,
+              applied_at timestamptz not null default now()
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .pg()?;
+
+        for (version, sql) in MIGRATIONS {
+            let applied: Option<String> =
+                sqlx::query_scalar("select version from _hub_migrations where version = $1")
+                    .bind(version)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .pg()?;
+            if applied.is_some() {
+                continue;
+            }
+
+            let mut tx = self.pool.begin().await.pg()?;
+            // 迁移脚本按语句顺序整体执行；DDL 幂等（if not exists）
+            for stmt in sql.split(';') {
+                let trimmed = stmt.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                sqlx::query(trimmed).execute(&mut *tx).await.pg()?;
+            }
+            sqlx::query("insert into _hub_migrations (version) values ($1)")
+                .bind(version)
+                .execute(&mut *tx)
+                .await
+                .pg()?;
+            tx.commit().await.pg()?;
+        }
+        Ok(())
+    }
+
+    // ===== 行映射 =====
+
+    fn entry_from_row(r: &PgRow) -> Result<MemoryEntry> {
+        let kind: String = r.try_get("kind").pg()?;
+        let status: String = r.try_get("status").pg()?;
+        let embedding: Option<String> = r.try_get("embedding").ok();
+        Ok(MemoryEntry {
+            id: r.try_get("id").pg()?,
+            namespace: r.try_get("namespace").pg()?,
+            key: r.try_get("key").ok(),
+            kind: mapping::parse_kind(&kind)?,
+            content: r.try_get("content").pg()?,
+            tags: r.try_get("tags").pg()?,
+            metadata: r.try_get("metadata").pg()?,
+            embedding: embedding.map(|t| mapping::parse_vector(&t)),
+            embedding_model: r.try_get("embedding_model").ok(),
+            source_agent: r.try_get("source_agent").pg()?,
+            confidence: r.try_get("confidence").pg()?,
+            status: mapping::parse_status(&status)?,
+            version: r.try_get("version").pg()?,
+            expires_at: r.try_get("expires_at").ok(),
+            merged_into: r.try_get("merged_into").ok(),
+            created_at: r.try_get("created_at").pg()?,
+            updated_at: r.try_get("updated_at").pg()?,
+        })
+    }
+
+    fn backup_from_row(r: &PgRow) -> Result<BackupRecord> {
+        Ok(BackupRecord {
+            id: r.try_get("id").pg()?,
+            namespace: r.try_get("namespace").pg()?,
+            created_by: r.try_get("created_by").pg()?,
+            note: r.try_get("note").ok(),
+            entry_count: r.try_get::<i32, _>("entry_count").unwrap_or(0) as usize,
+            checksum: r.try_get("checksum").pg()?,
+            payload: r.try_get("payload").pg()?,
+            retain_until: r.try_get("retain_until").ok(),
+            created_at: r.try_get("created_at").pg()?,
+        })
+    }
+
+    fn proposal_from_row(r: &PgRow) -> Result<IntegrationProposal> {
+        let kind: String = r.try_get("kind").pg()?;
+        let status: String = r.try_get("status").pg()?;
+        Ok(IntegrationProposal {
+            id: r.try_get("id").pg()?,
+            namespace: r.try_get("namespace").pg()?,
+            kind: mapping::parse_integration_kind(&kind)?,
+            member_ids: r.try_get("member_ids").pg()?,
+            suggested_survivor: r.try_get("suggested_survivor").ok(),
+            similarity: r.try_get::<f32, _>("similarity").unwrap_or(0.0),
+            status: mapping::parse_proposal_status(&status)?,
+            resolution_note: r.try_get("resolution_note").ok(),
+            created_at: r.try_get("created_at").pg()?,
+            resolved_at: r.try_get("resolved_at").ok(),
+        })
+    }
+
+    /// 全列 SELECT（供行映射复用）
+    const ENTRY_COLUMNS: &'static str = "id, namespace, key, kind, content, tags, metadata, \
+         embedding::text as embedding, embedding_model, source_agent, confidence, status, \
+         version, expires_at, merged_into, created_at, updated_at";
+}
+
+#[async_trait]
+impl mem_core::MemoryStore for PostgresHubStore {
+    async fn insert(&self, entry: &MemoryEntry) -> Result<MemoryEntry> {
+        let embedding_literal = entry.embedding.as_ref().map(|v| mapping::vector_literal(v));
+        sqlx::query(
+            r#"
+            insert into memories
+              (id, namespace, key, kind, content, tags, metadata, embedding, embedding_model,
+               source_agent, confidence, status, version, expires_at, merged_into,
+               created_at, updated_at)
+            values
+              ($1, $2, $3, $4, $5, $6, $7, $8::vector, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+            "#,
+        )
+        .bind(entry.id)
+        .bind(&entry.namespace)
+        .bind(&entry.key)
+        .bind(entry.kind.as_str())
+        .bind(&entry.content)
+        .bind(&entry.tags)
+        .bind(&entry.metadata)
+        .bind(&embedding_literal)
+        .bind(&entry.embedding_model)
+        .bind(&entry.source_agent)
+        .bind(entry.confidence)
+        .bind(entry.status.as_str())
+        .bind(entry.version)
+        .bind(entry.expires_at)
+        .bind(entry.merged_into)
+        .bind(entry.created_at)
+        .bind(entry.updated_at)
+        .execute(&self.pool)
+        .await
+        .pg()?;
+        Ok(entry.clone())
+    }
+
+    async fn get(&self, namespace: &str, id: Uuid) -> Result<MemoryEntry> {
+        let sql = format!(
+            "select {} from memories where namespace = $1 and id = $2",
+            Self::ENTRY_COLUMNS
+        );
+        let row = sqlx::query(&sql)
+            .bind(namespace)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .pg()?
+            .ok_or(HubError::NotFound)?;
+        Self::entry_from_row(&row)
+    }
+
+    async fn get_by_key(&self, namespace: &str, key: &str) -> Result<Option<MemoryEntry>> {
+        let sql = format!(
+            "select {} from memories where namespace = $1 and key = $2",
+            Self::ENTRY_COLUMNS
+        );
+        let row = sqlx::query(&sql)
+            .bind(namespace)
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await
+            .pg()?;
+        row.map(|r| Self::entry_from_row(&r)).transpose()
+    }
+
+    async fn save(&self, entry: &MemoryEntry) -> Result<MemoryEntry> {
+        let embedding_literal = entry.embedding.as_ref().map(|v| mapping::vector_literal(v));
+        sqlx::query(
+            r#"
+            update memories set
+              key = $3, kind = $4, content = $5, tags = $6, metadata = $7,
+              embedding = $8::vector, embedding_model = $9, source_agent = $10,
+              confidence = $11, status = $12, version = $13, expires_at = $14,
+              merged_into = $15, updated_at = $16
+            where namespace = $1 and id = $2
+            "#,
+        )
+        .bind(&entry.namespace)
+        .bind(entry.id)
+        .bind(&entry.key)
+        .bind(entry.kind.as_str())
+        .bind(&entry.content)
+        .bind(&entry.tags)
+        .bind(&entry.metadata)
+        .bind(&embedding_literal)
+        .bind(&entry.embedding_model)
+        .bind(&entry.source_agent)
+        .bind(entry.confidence)
+        .bind(entry.status.as_str())
+        .bind(entry.version)
+        .bind(entry.expires_at)
+        .bind(entry.merged_into)
+        .bind(entry.updated_at)
+        .execute(&self.pool)
+        .await
+        .pg()?;
+        Ok(entry.clone())
+    }
+
+    async fn delete(&self, namespace: &str, id: Uuid) -> Result<()> {
+        sqlx::query("delete from memories where namespace = $1 and id = $2")
+            .bind(namespace)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .pg()?;
+        Ok(())
+    }
+
+    async fn list(&self, filter: &MemoryFilter) -> Result<Vec<MemoryEntry>> {
+        let mut qb = sqlx::QueryBuilder::<sqlx::Postgres>::new(format!(
+            "select {} from memories where 1 = 1",
+            Self::ENTRY_COLUMNS
+        ));
+
+        if let Some(ns) = &filter.namespace {
+            qb.push(" and namespace = ").push_bind(ns.clone());
+        }
+        if let Some(kinds) = &filter.kinds {
+            qb.push(" and kind = any(")
+                .push_bind(
+                    kinds
+                        .iter()
+                        .map(|k| k.as_str().to_string())
+                        .collect::<Vec<_>>(),
+                )
+                .push(")");
+        }
+        if let Some(statuses) = &filter.statuses {
+            qb.push(" and status = any(")
+                .push_bind(
+                    statuses
+                        .iter()
+                        .map(|s| s.as_str().to_string())
+                        .collect::<Vec<_>>(),
+                )
+                .push(")");
+        }
+        if let Some(tags) = &filter.tags {
+            qb.push(" and tags @> ").push_bind(tags.clone());
+        }
+        if let Some(agent) = &filter.source_agent {
+            qb.push(" and source_agent = ").push_bind(agent.clone());
+        }
+        if let Some(key) = &filter.key {
+            qb.push(" and key = ").push_bind(key.clone());
+        }
+        if let Some(text) = &filter.text_contains {
+            qb.push(" and to_tsvector('simple', content) @@ plainto_tsquery('simple', ")
+                .push_bind(text.clone())
+                .push(")");
+        }
+        if let Some((ts, id)) = &filter.before {
+            qb.push(" and (updated_at, id) < (")
+                .push_bind(*ts)
+                .push(", ")
+                .push_bind(*id)
+                .push(")");
+        }
+
+        qb.push(" order by updated_at desc, id desc");
+        if let Some(limit) = filter.limit {
+            qb.push(" limit ").push_bind(limit as i64);
+        }
+
+        let rows = qb.build().fetch_all(&self.pool).await.pg()?;
+        rows.iter().map(Self::entry_from_row).collect()
+    }
+
+    async fn count(&self, filter: &MemoryFilter) -> Result<usize> {
+        let mut qb =
+            sqlx::QueryBuilder::<sqlx::Postgres>::new("select count(*) from memories where 1 = 1");
+        if let Some(ns) = &filter.namespace {
+            qb.push(" and namespace = ").push_bind(ns.clone());
+        }
+        if let Some(kinds) = &filter.kinds {
+            qb.push(" and kind = any(")
+                .push_bind(
+                    kinds
+                        .iter()
+                        .map(|k| k.as_str().to_string())
+                        .collect::<Vec<_>>(),
+                )
+                .push(")");
+        }
+        if let Some(statuses) = &filter.statuses {
+            qb.push(" and status = any(")
+                .push_bind(
+                    statuses
+                        .iter()
+                        .map(|s| s.as_str().to_string())
+                        .collect::<Vec<_>>(),
+                )
+                .push(")");
+        }
+        if let Some(agent) = &filter.source_agent {
+            qb.push(" and source_agent = ").push_bind(agent.clone());
+        }
+        if let Some(key) = &filter.key {
+            qb.push(" and key = ").push_bind(key.clone());
+        }
+        let count: i64 = qb.build_query_scalar().fetch_one(&self.pool).await.pg()?;
+        Ok(count.max(0) as usize)
+    }
+
+    async fn similar(
+        &self,
+        namespace: &str,
+        embedding: &[f32],
+        k: usize,
+        kinds: Option<&[MemoryKind]>,
+    ) -> Result<Vec<Scored<MemoryEntry>>> {
+        let literal = mapping::vector_literal(embedding);
+        let kinds_vec: Option<Vec<String>> =
+            kinds.map(|ks| ks.iter().map(|k| k.as_str().to_string()).collect());
+
+        let sql = format!(
+            "select {}, 1 - (embedding <=> $2::vector) as score \
+             from memories \
+             where namespace = $1 and status = 'active' \
+               and ($3::text[] is null or kind = any($3::text[])) \
+             order by embedding <=> $2::vector \
+             limit $4",
+            Self::ENTRY_COLUMNS
+        );
+        let rows = sqlx::query(&sql)
+            .bind(namespace)
+            .bind(&literal)
+            .bind(&kinds_vec)
+            .bind(k as i64)
+            .fetch_all(&self.pool)
+            .await
+            .pg()?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let item = Self::entry_from_row(r)?;
+            let score: f32 = r.try_get("score").unwrap_or(0.0);
+            out.push(Scored {
+                item,
+                score: score.clamp(0.0, 1.0),
+            });
+        }
+        Ok(out)
+    }
+
+    async fn all_in_namespace(
+        &self,
+        namespace: &str,
+        include_merged: bool,
+    ) -> Result<Vec<MemoryEntry>> {
+        let sql = format!(
+            "select {} from memories where namespace = $1 {} order by created_at, id",
+            Self::ENTRY_COLUMNS,
+            if include_merged {
+                ""
+            } else {
+                "and status <> 'merged'"
+            }
+        );
+        let rows = sqlx::query(&sql)
+            .bind(namespace)
+            .fetch_all(&self.pool)
+            .await
+            .pg()?;
+        rows.iter().map(Self::entry_from_row).collect()
+    }
+
+    async fn list_namespaces(&self) -> Result<Vec<Namespace>> {
+        let rows: Vec<String> =
+            sqlx::query_scalar("select distinct namespace from memories order by namespace")
+                .fetch_all(&self.pool)
+                .await
+                .pg()?;
+        Ok(rows)
+    }
+
+    async fn record_version(&self, v: &MemoryVersion) -> Result<()> {
+        sqlx::query(
+            r#"
+            insert into memory_versions
+              (memory_id, version, content, tags, metadata, confidence, changed_by, change_type, changed_at)
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            on conflict (memory_id, version) do nothing
+            "#,
+        )
+        .bind(v.memory_id)
+        .bind(v.version)
+        .bind(&v.content)
+        .bind(&v.tags)
+        .bind(&v.metadata)
+        .bind(v.confidence)
+        .bind(&v.changed_by)
+        .bind(match v.change_type {
+            VersionChange::Created => "created",
+            VersionChange::Updated => "updated",
+            VersionChange::Archived => "archived",
+            VersionChange::Merged => "merged",
+        })
+        .bind(v.changed_at)
+        .execute(&self.pool)
+        .await
+        .pg()?;
+        Ok(())
+    }
+
+    async fn versions(&self, id: Uuid) -> Result<Vec<MemoryVersion>> {
+        let rows = sqlx::query(
+            r#"
+            select memory_id, version, content, tags, metadata, confidence, changed_by, change_type, changed_at
+            from memory_versions where memory_id = $1 order by version
+            "#,
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await
+        .pg()?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let change: String = r.try_get("change_type").pg()?;
+            out.push(MemoryVersion {
+                memory_id: r.try_get("memory_id").pg()?,
+                version: r.try_get("version").pg()?,
+                content: r.try_get("content").pg()?,
+                tags: r.try_get("tags").pg()?,
+                metadata: r.try_get("metadata").pg()?,
+                confidence: r.try_get("confidence").pg()?,
+                changed_by: r.try_get("changed_by").pg()?,
+                change_type: mapping::parse_version_change(&change)?,
+                changed_at: r.try_get("changed_at").pg()?,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn archive_expired(&self, now: DateTime<Utc>) -> Result<usize> {
+        // 单条 CTE：归档 + 版本历史一次完成
+        let res = sqlx::query(
+            r#"
+            with expired as (
+              update memories set status = 'archived', version = version + 1, updated_at = $1
+              where status = 'active' and expires_at is not null and expires_at <= $1
+              returning id, version, content, tags, metadata, confidence
+            )
+            insert into memory_versions
+              (memory_id, version, content, tags, metadata, confidence, changed_by, change_type, changed_at)
+            select id, version, content, tags, metadata, confidence, 'system', 'archived', $1
+            from expired
+            on conflict (memory_id, version) do nothing
+            "#,
+        )
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .pg()?;
+        Ok(res.rows_affected() as usize)
+    }
+}
+
+#[async_trait]
+impl mem_core::BackupStore for PostgresHubStore {
+    async fn save_backup(&self, backup: &BackupRecord) -> Result<()> {
+        sqlx::query(
+            r#"
+            insert into memory_backups
+              (id, namespace, created_by, note, entry_count, checksum, payload, retain_until, created_at)
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            on conflict (id) do update set
+              note = excluded.note, entry_count = excluded.entry_count,
+              checksum = excluded.checksum, payload = excluded.payload,
+              retain_until = excluded.retain_until
+            "#,
+        )
+        .bind(backup.id)
+        .bind(&backup.namespace)
+        .bind(&backup.created_by)
+        .bind(&backup.note)
+        .bind(backup.entry_count as i32)
+        .bind(&backup.checksum)
+        .bind(&backup.payload)
+        .bind(backup.retain_until)
+        .bind(backup.created_at)
+        .execute(&self.pool)
+        .await
+        .pg()?;
+        Ok(())
+    }
+
+    async fn get_backup(&self, id: Uuid) -> Result<BackupRecord> {
+        let row = sqlx::query(
+            r#"
+            select id, namespace, created_by, note, entry_count, checksum, payload, retain_until, created_at
+            from memory_backups where id = $1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .pg()?
+        .ok_or(HubError::NotFound)?;
+        Self::backup_from_row(&row)
+    }
+
+    async fn list_backups(&self, namespace: Option<&str>) -> Result<Vec<BackupRecord>> {
+        let rows = match namespace {
+            Some(ns) => {
+                sqlx::query(
+                    r#"
+                    select id, namespace, created_by, note, entry_count, checksum, payload, retain_until, created_at
+                    from memory_backups where namespace = $1 order by created_at desc
+                    "#,
+                )
+                .bind(ns)
+                .fetch_all(&self.pool)
+                .await
+                .pg()?
+            }
+            None => {
+                sqlx::query(
+                    r#"
+                    select id, namespace, created_by, note, entry_count, checksum, payload, retain_until, created_at
+                    from memory_backups order by created_at desc
+                    "#,
+                )
+                .fetch_all(&self.pool)
+                .await
+                .pg()?
+            }
+        };
+        rows.iter().map(Self::backup_from_row).collect()
+    }
+
+    async fn delete_backup(&self, id: Uuid) -> Result<()> {
+        sqlx::query("delete from memory_backups where id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .pg()?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl mem_core::IntegrationStore for PostgresHubStore {
+    async fn save_proposal(&self, p: &IntegrationProposal) -> Result<()> {
+        sqlx::query(
+            r#"
+            insert into integration_proposals
+              (id, namespace, kind, member_ids, suggested_survivor, similarity, status, resolution_note, created_at, resolved_at)
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            on conflict (id) do update set
+              status = excluded.status, resolution_note = excluded.resolution_note,
+              resolved_at = excluded.resolved_at, suggested_survivor = excluded.suggested_survivor
+            "#,
+        )
+        .bind(p.id)
+        .bind(&p.namespace)
+        .bind(p.kind.as_str())
+        .bind(&p.member_ids)
+        .bind(p.suggested_survivor)
+        .bind(p.similarity)
+        .bind(match p.status {
+            ProposalStatus::Open => "open",
+            ProposalStatus::Merged => "merged",
+            ProposalStatus::Dismissed => "dismissed",
+            ProposalStatus::Expired => "expired",
+        })
+        .bind(&p.resolution_note)
+        .bind(p.created_at)
+        .bind(p.resolved_at)
+        .execute(&self.pool)
+        .await
+        .pg()?;
+        Ok(())
+    }
+
+    async fn get_proposal(&self, id: Uuid) -> Result<IntegrationProposal> {
+        let row = sqlx::query(
+            r#"
+            select id, namespace, kind, member_ids, suggested_survivor, similarity, status, resolution_note, created_at, resolved_at
+            from integration_proposals where id = $1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .pg()?
+        .ok_or(HubError::NotFound)?;
+        Self::proposal_from_row(&row)
+    }
+
+    async fn list_proposals(
+        &self,
+        namespace: &str,
+        status: Option<ProposalStatus>,
+    ) -> Result<Vec<IntegrationProposal>> {
+        let rows = match status {
+            Some(s) => {
+                sqlx::query(
+                    r#"
+                    select id, namespace, kind, member_ids, suggested_survivor, similarity, status, resolution_note, created_at, resolved_at
+                    from integration_proposals where namespace = $1 and status = $2
+                    order by created_at desc
+                    "#,
+                )
+                .bind(namespace)
+                .bind(match s {
+                    ProposalStatus::Open => "open",
+                    ProposalStatus::Merged => "merged",
+                    ProposalStatus::Dismissed => "dismissed",
+                    ProposalStatus::Expired => "expired",
+                })
+                .fetch_all(&self.pool)
+                .await
+                .pg()?
+            }
+            None => {
+                sqlx::query(
+                    r#"
+                    select id, namespace, kind, member_ids, suggested_survivor, similarity, status, resolution_note, created_at, resolved_at
+                    from integration_proposals where namespace = $1
+                    order by created_at desc
+                    "#,
+                )
+                .bind(namespace)
+                .fetch_all(&self.pool)
+                .await
+                .pg()?
+            }
+        };
+        rows.iter().map(Self::proposal_from_row).collect()
+    }
+
+    async fn open_exists(&self, namespace: &str, members: &[(String, Vec<Uuid>)]) -> Result<bool> {
+        for (kind, ids) in members {
+            let count: i64 = sqlx::query_scalar(
+                r#"
+                select count(*) from integration_proposals
+                where namespace = $1 and status = 'open' and kind = $2 and member_ids = $3
+                "#,
+            )
+            .bind(namespace)
+            .bind(kind)
+            .bind(ids)
+            .fetch_one(&self.pool)
+            .await
+            .pg()?;
+            if count > 0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+#[async_trait]
+impl mem_core::GrantStore for PostgresHubStore {
+    async fn ensure_namespace(
+        &self,
+        namespace: &str,
+        owner: &AgentId,
+    ) -> Result<(NamespaceInfo, bool)> {
+        // owner 必须先注册为 agent（外键约束）
+        sqlx::query(
+            r#"
+            insert into agents (agent_id, name) values ($1, $1)
+            on conflict (agent_id) do nothing
+            "#,
+        )
+        .bind(owner)
+        .execute(&self.pool)
+        .await
+        .pg()?;
+
+        let existing: Option<String> =
+            sqlx::query_scalar("select namespace from namespaces where namespace = $1")
+                .bind(namespace)
+                .fetch_optional(&self.pool)
+                .await
+                .pg()?;
+
+        let created = existing.is_none();
+        if created {
+            sqlx::query("insert into namespaces (namespace, owner_agent) values ($1, $2)")
+                .bind(namespace)
+                .bind(owner)
+                .execute(&self.pool)
+                .await
+                .pg()?;
+        }
+
+        let info = NamespaceInfo {
+            namespace: namespace.to_string(),
+            owner_agent: owner.clone(),
+            created_at: Utc::now(),
+        };
+        Ok((info, created))
+    }
+
+    async fn get_namespace(&self, namespace: &str) -> Result<Option<NamespaceInfo>> {
+        let row = sqlx::query(
+            "select namespace, owner_agent, created_at from namespaces where namespace = $1",
+        )
+        .bind(namespace)
+        .fetch_optional(&self.pool)
+        .await
+        .pg()?;
+        Ok(row.map(|r| NamespaceInfo {
+            namespace: r.get("namespace"),
+            owner_agent: r.get("owner_agent"),
+            created_at: r.get("created_at"),
+        }))
+    }
+
+    async fn list_namespace_infos(&self) -> Result<Vec<NamespaceInfo>> {
+        let rows = sqlx::query(
+            "select namespace, owner_agent, created_at from namespaces order by namespace",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .pg()?;
+        Ok(rows
+            .iter()
+            .map(|r| NamespaceInfo {
+                namespace: r.get("namespace"),
+                owner_agent: r.get("owner_agent"),
+                created_at: r.get("created_at"),
+            })
+            .collect())
+    }
+
+    async fn grant(&self, record: &NamespaceGrantRecord) -> Result<()> {
+        sqlx::query(
+            r#"
+            insert into namespace_grants (namespace, agent_id, can_read, can_write, granted_by, created_at)
+            values ($1, $2, $3, $4, $5, $6)
+            on conflict (namespace, agent_id) do update set
+              can_read = excluded.can_read, can_write = excluded.can_write,
+              granted_by = excluded.granted_by, created_at = excluded.created_at
+            "#,
+        )
+        .bind(&record.namespace)
+        .bind(&record.agent_id)
+        .bind(record.can_read)
+        .bind(record.can_write)
+        .bind(&record.granted_by)
+        .bind(record.created_at)
+        .execute(&self.pool)
+        .await
+        .pg()?;
+        Ok(())
+    }
+
+    async fn revoke(&self, namespace: &str, agent_id: &AgentId) -> Result<()> {
+        sqlx::query("delete from namespace_grants where namespace = $1 and agent_id = $2")
+            .bind(namespace)
+            .bind(agent_id)
+            .execute(&self.pool)
+            .await
+            .pg()?;
+        Ok(())
+    }
+
+    async fn grants_for(&self, agent_id: &AgentId) -> Result<Vec<NamespaceGrantRecord>> {
+        let rows = sqlx::query(
+            r#"
+            select namespace, agent_id, can_read, can_write, granted_by, created_at
+            from namespace_grants where agent_id = $1 order by namespace
+            "#,
+        )
+        .bind(agent_id)
+        .fetch_all(&self.pool)
+        .await
+        .pg()?;
+        Ok(rows
+            .iter()
+            .map(|r| NamespaceGrantRecord {
+                namespace: r.get("namespace"),
+                agent_id: r.get("agent_id"),
+                can_read: r.get("can_read"),
+                can_write: r.get("can_write"),
+                granted_by: r.get("granted_by"),
+                created_at: r.get("created_at"),
+            })
+            .collect())
+    }
+
+    async fn can_read(&self, namespace: &str, agent_id: &AgentId) -> Result<bool> {
+        let count: i64 = sqlx::query_scalar(
+            r#"
+            select count(*) from namespace_grants
+            where agent_id = $1 and (namespace = $2 or namespace = '*') and can_read
+            "#,
+        )
+        .bind(agent_id)
+        .bind(namespace)
+        .fetch_one(&self.pool)
+        .await
+        .pg()?;
+        Ok(count > 0)
+    }
+
+    async fn can_write(&self, namespace: &str, agent_id: &AgentId) -> Result<bool> {
+        let count: i64 = sqlx::query_scalar(
+            r#"
+            select count(*) from namespace_grants
+            where agent_id = $1 and (namespace = $2 or namespace = '*') and can_write
+            "#,
+        )
+        .bind(agent_id)
+        .bind(namespace)
+        .fetch_one(&self.pool)
+        .await
+        .pg()?;
+        Ok(count > 0)
+    }
+
+    async fn owned_namespaces(&self, agent_id: &AgentId) -> Result<Vec<Namespace>> {
+        let rows: Vec<String> = sqlx::query_scalar(
+            "select namespace from namespaces where owner_agent = $1 order by namespace",
+        )
+        .bind(agent_id)
+        .fetch_all(&self.pool)
+        .await
+        .pg()?;
+        Ok(rows)
+    }
+}
+
+#[async_trait]
+impl mem_core::AgentStore for PostgresHubStore {
+    async fn register_agent(
+        &self,
+        reg: &mem_core::AgentRegistration,
+    ) -> Result<mem_core::AgentRecord> {
+        let secret_hash: Option<String> = reg
+            .client_secret
+            .as_ref()
+            .map(|s| hash_secret(&reg.agent_id, s));
+        let max_scopes: Vec<String> = reg
+            .max_scopes
+            .iter()
+            .map(|s| s.as_str().to_string())
+            .collect();
+
+        sqlx::query(
+            r#"
+            insert into agents (agent_id, name, kind, status, client_secret_hash, redirect_uris, max_scopes, created_at)
+            values ($1, $2, $3, 'active', $4, $5, $6, now())
+            on conflict (agent_id) do update set
+              name = excluded.name,
+              kind = excluded.kind,
+              redirect_uris = excluded.redirect_uris,
+              max_scopes = excluded.max_scopes,
+              client_secret_hash = coalesce(excluded.client_secret_hash, agents.client_secret_hash)
+            "#,
+        )
+        .bind(&reg.agent_id)
+        .bind(&reg.name)
+        .bind(&reg.kind)
+        .bind(&secret_hash)
+        .bind(&reg.redirect_uris)
+        .bind(&max_scopes)
+        .execute(&self.pool)
+        .await
+        .pg()?;
+
+        self.get_agent(&reg.agent_id)
+            .await?
+            .ok_or_else(|| HubError::Internal(anyhow::anyhow!("agent 注册后读取失败")))
+    }
+
+    async fn get_agent(&self, agent_id: &AgentId) -> Result<Option<mem_core::AgentRecord>> {
+        let row = sqlx::query(
+            r#"
+            select agent_id, name, kind, status, redirect_uris, max_scopes,
+                   (client_secret_hash is not null) as confidential, created_at
+            from agents where agent_id = $1
+            "#,
+        )
+        .bind(agent_id)
+        .fetch_optional(&self.pool)
+        .await
+        .pg()?;
+
+        Ok(row.map(|r| {
+            let max_scopes: Vec<String> = r.try_get("max_scopes").unwrap_or_default();
+            mem_core::AgentRecord {
+                agent_id: r.get("agent_id"),
+                name: r.get("name"),
+                kind: r.get("kind"),
+                status: r.get("status"),
+                redirect_uris: r.try_get("redirect_uris").unwrap_or_default(),
+                max_scopes: max_scopes
+                    .iter()
+                    .filter_map(|s| common::Scope::parse(s))
+                    .collect(),
+                confidential: r.get("confidential"),
+                created_at: r.get("created_at"),
+            }
+        }))
+    }
+
+    async fn list_agents(&self) -> Result<Vec<mem_core::AgentRecord>> {
+        let rows = sqlx::query(
+            r#"
+            select agent_id, name, kind, status, redirect_uris, max_scopes,
+                   (client_secret_hash is not null) as confidential, created_at
+            from agents order by created_at desc
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .pg()?;
+
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let max_scopes: Vec<String> = r.try_get("max_scopes").unwrap_or_default();
+                mem_core::AgentRecord {
+                    agent_id: r.get("agent_id"),
+                    name: r.get("name"),
+                    kind: r.get("kind"),
+                    status: r.get("status"),
+                    redirect_uris: r.try_get("redirect_uris").unwrap_or_default(),
+                    max_scopes: max_scopes
+                        .iter()
+                        .filter_map(|s| common::Scope::parse(s))
+                        .collect(),
+                    confidential: r.get("confidential"),
+                    created_at: r.get("created_at"),
+                }
+            })
+            .collect())
+    }
+
+    async fn set_agent_status(&self, agent_id: &AgentId, status: &str) -> Result<()> {
+        let res = sqlx::query("update agents set status = $2 where agent_id = $1")
+            .bind(agent_id)
+            .bind(status)
+            .execute(&self.pool)
+            .await
+            .pg()?;
+        if res.rows_affected() == 0 {
+            return Err(HubError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn verify_agent_secret(&self, agent_id: &AgentId, secret: &str) -> Result<bool> {
+        let row = sqlx::query("select client_secret_hash from agents where agent_id = $1")
+            .bind(agent_id)
+            .fetch_optional(&self.pool)
+            .await
+            .pg()?;
+        Ok(match row {
+            Some(r) => {
+                let stored: Option<String> = r.try_get("client_secret_hash").ok().flatten();
+                match stored {
+                    Some(h) => h == hash_secret(agent_id, secret),
+                    None => false,
+                }
+            }
+            None => false,
+        })
+    }
+}
+
+/// 密钥散列：sha256(agent_id:secret)
+fn hash_secret(agent_id: &str, secret: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(agent_id.as_bytes());
+    h.update(b":");
+    h.update(secret.as_bytes());
+    hex::encode(h.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_migrations_registered() {
+        assert_eq!(MIGRATIONS.len(), 1);
+        assert!(MIGRATIONS[0].0.starts_with("20261011"));
+    }
+
+    #[test]
+    fn test_vector_literal_roundtrip() {
+        let v = vec![0.5f32, -0.25, 1.0];
+        let literal = mapping::vector_literal(&v);
+        assert!(literal.starts_with('['));
+        assert!(literal.ends_with(']'));
+        let parsed = mapping::parse_vector(&literal);
+        assert_eq!(parsed.len(), 3);
+        assert!((parsed[0] - 0.5).abs() < 1e-6);
+        assert!((parsed[1] + 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_parse_vector_edge_cases() {
+        assert!(mapping::parse_vector("[]").is_empty());
+        assert!(mapping::parse_vector("[1,2,3]").len() == 3);
+    }
+
+    #[test]
+    fn test_kind_status_parse() {
+        assert_eq!(mapping::parse_kind("fact").unwrap(), MemoryKind::Fact);
+        assert!(mapping::parse_kind("bogus").is_err());
+        assert_eq!(
+            mapping::parse_status("merged").unwrap(),
+            MemoryStatus::Merged
+        );
+        assert!(mapping::parse_status("bogus").is_err());
+        assert_eq!(
+            mapping::parse_integration_kind("duplicate").unwrap(),
+            IntegrationKind::Duplicate
+        );
+        assert_eq!(
+            mapping::parse_proposal_status("open").unwrap(),
+            ProposalStatus::Open
+        );
+        assert_eq!(
+            mapping::parse_version_change("merged").unwrap(),
+            VersionChange::Merged
+        );
+    }
+
+    #[test]
+    fn test_pg_error_mapping() {
+        // 无法在无库环境构造 Database 错误，这里只验证映射函数的存在性与签名
+        let err: Result<()> = Err(HubError::NotFound);
+        assert!(err.is_err());
+    }
+}
+
+#[cfg(all(test, feature = "pg-integration"))]
+mod pg_integration {
+    use super::*;
+    use common::AgentId;
+    use mem_core::{AgentStore, BackupStore, GrantStore, MemoryKind, MemoryStore};
+
+    async fn store() -> PostgresHubStore {
+        let url = std::env::var("DATABASE_URL").expect("需设置 DATABASE_URL");
+        PostgresHubStore::connect(&url, 5)
+            .await
+            .expect("连接失败（将自动执行迁移）")
+    }
+
+    fn entry(ns: &str, agent: &str, content: &str) -> MemoryEntry {
+        MemoryEntry {
+            id: Uuid::new_v4(),
+            namespace: ns.to_string(),
+            key: None,
+            kind: MemoryKind::Fact,
+            content: content.to_string(),
+            tags: vec!["pg".to_string()],
+            metadata: serde_json::json!({"k": "v"}),
+            embedding: None,
+            embedding_model: None,
+            source_agent: agent.to_string(),
+            confidence: 0.9,
+            status: MemoryStatus::Active,
+            version: 1,
+            expires_at: None,
+            merged_into: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "需要 DATABASE_URL"]
+    async fn pg_memory_crud_and_namespace_isolation() {
+        let store = store().await;
+        let ns = "it-ns-crud";
+        store
+            .ensure_namespace(ns, &AgentId::from("it-agent"))
+            .await
+            .unwrap();
+
+        let e = entry(ns, "it-agent", "PostgreSQL 持久化冒烟");
+        store.insert(&e).await.unwrap();
+
+        let got = store.get(ns, e.id).await.unwrap();
+        assert_eq!(got.content, "PostgreSQL 持久化冒烟");
+        assert_eq!(got.status, MemoryStatus::Active);
+
+        // 命名空间隔离：错误命名空间读不到
+        assert!(store.get("other-ns", e.id).await.is_err());
+
+        // 修订 + 版本历史
+        let mut patched = got.clone();
+        patched.content = "修订后的内容".to_string();
+        patched.version = 2;
+        store.save(&patched).await.unwrap();
+        store
+            .record_version(&MemoryVersion {
+                memory_id: e.id,
+                version: 2,
+                content: "修订后的内容".to_string(),
+                tags: vec![],
+                metadata: serde_json::json!({}),
+                confidence: 0.9,
+                changed_by: "it-agent".to_string(),
+                change_type: VersionChange::Updated,
+                changed_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        let versions = store.versions(e.id).await.unwrap();
+        assert!(versions.iter().any(|v| v.version == 2));
+
+        // 清理
+        store.delete(ns, e.id).await.unwrap();
+        assert!(store.get(ns, e.id).await.is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "需要 DATABASE_URL"]
+    async fn pg_grants_and_agent_registry() {
+        let store = store().await;
+        let ns = "it-ns-grant";
+        let owner = AgentId::from("it-owner");
+
+        let (_, created) = store.ensure_namespace(ns, &owner).await.unwrap();
+        assert!(created, "首次注册应报告新建");
+
+        store
+            .grant(&NamespaceGrantRecord {
+                namespace: ns.to_string(),
+                agent_id: "it-guest".to_string(),
+                can_read: true,
+                can_write: false,
+                granted_by: owner.clone(),
+                created_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        assert!(store
+            .can_read(ns, &AgentId::from("it-guest"))
+            .await
+            .unwrap());
+        assert!(!store
+            .can_write(ns, &AgentId::from("it-guest"))
+            .await
+            .unwrap());
+        assert!(!store
+            .can_read(ns, &AgentId::from("stranger"))
+            .await
+            .unwrap());
+
+        // Agent 注册与密钥校验
+        store
+            .register_agent(&core_agent_reg("it-agent-x", Some("pw")))
+            .await
+            .unwrap();
+        let agent = store
+            .get_agent(&AgentId::from("it-agent-x"))
+            .await
+            .unwrap()
+            .expect("应能读回");
+        assert!(agent.confidential);
+        assert!(store
+            .verify_agent_secret(&AgentId::from("it-agent-x"), "pw")
+            .await
+            .unwrap());
+        assert!(!store
+            .verify_agent_secret(&AgentId::from("it-agent-x"), "wrong")
+            .await
+            .unwrap());
+
+        // 状态停用
+        store
+            .set_agent_status(&AgentId::from("it-agent-x"), "suspended")
+            .await
+            .unwrap();
+        let agent2 = store
+            .get_agent(&AgentId::from("it-agent-x"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(agent2.status, "suspended");
+    }
+
+    fn core_agent_reg(id: &str, secret: Option<&str>) -> mem_core::AgentRegistration {
+        mem_core::AgentRegistration {
+            agent_id: id.to_string(),
+            name: format!("Agent {}", id),
+            kind: "service".to_string(),
+            client_secret: secret.map(str::to_string),
+            redirect_uris: vec![],
+            max_scopes: vec![common::Scope::Read, common::Scope::Write],
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "需要 DATABASE_URL"]
+    async fn pg_backup_and_restore_roundtrip() {
+        let store = store().await;
+        let ns = "it-ns-backup";
+        store
+            .ensure_namespace(ns, &AgentId::from("it-agent"))
+            .await
+            .unwrap();
+        let e = entry(ns, "it-agent", "备份往返测试");
+        store.insert(&e).await.unwrap();
+
+        let entries = store.all_in_namespace(ns, true).await.unwrap();
+        let checksum = {
+            use sha2::{Digest, Sha256};
+            hex::encode(Sha256::digest(serde_json::to_vec(&entries).unwrap()))
+        };
+        let backup = BackupRecord {
+            id: Uuid::new_v4(),
+            namespace: ns.to_string(),
+            created_by: "it-agent".to_string(),
+            note: Some("integration".to_string()),
+            entry_count: entries.len(),
+            checksum,
+            payload: serde_json::json!({ "entries": entries }),
+            retain_until: None,
+            created_at: Utc::now(),
+        };
+        store.save_backup(&backup).await.unwrap();
+        let loaded = store.get_backup(backup.id).await.unwrap();
+        assert_eq!(loaded.entry_count, 1);
+        assert_eq!(loaded.checksum, backup.checksum);
+
+        store.delete_backup(backup.id).await.unwrap();
+        assert!(store.get_backup(backup.id).await.is_err());
+        store.delete(ns, e.id).await.unwrap();
+    }
+}

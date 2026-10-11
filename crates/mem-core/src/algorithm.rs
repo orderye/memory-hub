@@ -1,0 +1,217 @@
+//! 检索打分与多样性重排算法
+//!
+//! 五维加权（sim 向量相似度, kw 关键词命中, conf 条目置信度,
+//! rec 近期性, fresh 版本新鲜度）后接 MMR 去冗余重排。
+
+use crate::domain::Namespace;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+/// 五维权重顺序
+pub const SCORE_WEIGHT_LEN: usize = 5;
+
+/// 余弦相似度（假定输入已归一化；点积即余弦值）
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() {
+        return 0.0;
+    }
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    dot.clamp(-1.0, 1.0)
+}
+
+/// L2 归一化（写入前调用，保证点积即余弦）
+pub fn l2_normalize(v: &mut [f32]) {
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for x in v.iter_mut() {
+            *x /= norm;
+        }
+    }
+}
+
+/// 关键词命中度（0.0 ~ 1.0）：查询词与标签在内容中的覆盖比例
+pub fn keyword_score(content: &str, query: &str, tags: &[String]) -> f32 {
+    let haystack = content.to_lowercase();
+    let mut hits = 0usize;
+    let mut total = 0usize;
+
+    for term in query.split_whitespace() {
+        if term.len() < 2 {
+            continue;
+        }
+        total += 1;
+        if haystack.contains(&term.to_lowercase()) {
+            hits += 1;
+        }
+    }
+    for tag in tags {
+        total += 1;
+        if haystack.contains(&tag.to_lowercase()) {
+            hits += 1;
+        }
+    }
+    if total == 0 {
+        return 0.0;
+    }
+    hits as f32 / total as f32
+}
+
+/// 近期性打分：半衰期 `tau_days` 天，返回 0.0 ~ 1.0
+pub fn recency_score(now: DateTime<Utc>, updated_at: DateTime<Utc>, tau_days: f32) -> f32 {
+    let days = (now - updated_at).num_seconds().max(0) as f32 / 86_400.0;
+    (-days / tau_days.max(1.0)).exp().clamp(0.0, 1.0)
+}
+
+/// 单条目五维打分参数
+#[derive(Debug, Clone, Copy)]
+pub struct ItemScoreParams {
+    pub sim: f32,
+    pub kw: f32,
+    pub conf: f32,
+    pub rec: f32,
+    pub fresh: f32,
+}
+
+/// 加权综合分 = Σ wᵢ·sᵢ
+pub fn calculate_item_score(p: &ItemScoreParams, w: &[f32; SCORE_WEIGHT_LEN]) -> f32 {
+    let raw = [
+        p.sim.clamp(0.0, 1.0),
+        p.kw.clamp(0.0, 1.0),
+        p.conf.clamp(0.0, 1.0),
+        p.rec.clamp(0.0, 1.0),
+        p.fresh.clamp(0.0, 1.0),
+    ];
+    raw.iter().zip(w.iter()).map(|(s, w)| s * w).sum()
+}
+
+/// MMR（最大边际相关性）重排
+///
+/// `scores` 为相关性分，`sim_matrix[i][j]` 为条目 i 与 j 的相似度。
+/// 返回至多 `k` 个索引，按选中顺序排列。
+pub fn mmr_rerank(scores: &[f32], sim_matrix: &[Vec<f32>], k: usize, lambda: f32) -> Vec<usize> {
+    let n = scores.len();
+    if n == 0 || k == 0 {
+        return Vec::new();
+    }
+    let lambda = lambda.clamp(0.0, 1.0);
+    let k = k.min(n);
+
+    let mut selected: Vec<usize> = Vec::with_capacity(k);
+    let mut remaining: Vec<usize> = (0..n).collect();
+
+    while selected.len() < k && !remaining.is_empty() {
+        let mut best_idx = remaining[0];
+        let mut best_score = f32::MIN;
+        for &i in &remaining {
+            let max_sim = selected
+                .iter()
+                .map(|&j| sim_matrix[i][j])
+                .fold(0.0f32, f32::max);
+            let mmr = lambda * scores[i] - (1.0 - lambda) * max_sim;
+            if mmr > best_score {
+                best_score = mmr;
+                best_idx = i;
+            }
+        }
+        selected.push(best_idx);
+        remaining.retain(|&i| i != best_idx);
+    }
+    selected
+}
+
+/// 检索查询（core 定义，retrieval crate 实现）
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SearchQuery {
+    pub namespace: Namespace,
+    /// 自然语言查询（可空：纯列表召回）
+    #[serde(default)]
+    pub query_text: String,
+    #[serde(default)]
+    pub kinds: Option<Vec<crate::domain::MemoryKind>>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    pub top_k: usize,
+    /// 是否包含已归档条目
+    #[serde(default)]
+    pub include_archived: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cosine_similarity_basic() {
+        let a = vec![1.0, 0.0];
+        let b = vec![1.0, 0.0];
+        assert!((cosine_similarity(&a, &b) - 1.0).abs() < 1e-6);
+
+        let c = vec![0.0, 1.0];
+        assert!((cosine_similarity(&a, &c)).abs() < 1e-6);
+
+        // 维度不匹配返回 0
+        assert_eq!(cosine_similarity(&a, &[1.0, 0.0, 0.0]), 0.0);
+    }
+
+    #[test]
+    fn test_l2_normalize() {
+        let mut v = vec![3.0, 4.0];
+        l2_normalize(&mut v);
+        assert!((v[0] - 0.6).abs() < 1e-6);
+        assert!((v[1] - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_keyword_score() {
+        let content = "用户偏好简短直接的中文回复";
+        let tags = vec!["沟通".to_string()];
+        let s = keyword_score(content, "简短", &tags);
+        assert!(s > 0.4 && s <= 1.0);
+
+        // 空查询且无标签：0
+        assert_eq!(keyword_score(content, "", &[]), 0.0);
+    }
+
+    #[test]
+    fn test_recency_score_decays() {
+        let now = Utc::now();
+        let fresh = recency_score(now, now, 30.0);
+        let old = recency_score(now, now - chrono::Duration::days(30), 30.0);
+        assert!(fresh > 0.99);
+        assert!(old < 0.4);
+    }
+
+    #[test]
+    fn test_weighted_score() {
+        let w = [0.5, 0.2, 0.1, 0.1, 0.1];
+        let p = ItemScoreParams {
+            sim: 1.0,
+            kw: 0.0,
+            conf: 0.0,
+            rec: 0.0,
+            fresh: 0.0,
+        };
+        assert!((calculate_item_score(&p, &w) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_mmr_rerank_diversifies() {
+        // 两条完全相同的冗余结果：MMR 应只选一条
+        let scores = vec![1.0, 0.95];
+        let sim = vec![vec![1.0, 1.0], vec![1.0, 1.0]];
+        let picked = mmr_rerank(&scores, &sim, 1, 0.7);
+        assert_eq!(picked.len(), 1);
+
+        // 两条完全不同：两条都选
+        let sim2 = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        let picked2 = mmr_rerank(&scores, &sim2, 2, 0.7);
+        assert_eq!(picked2.len(), 2);
+        assert_eq!(picked2[0], 0); // 相关性高的先选
+    }
+
+    #[test]
+    fn test_mmr_empty() {
+        assert!(mmr_rerank(&[], &[], 5, 0.7).is_empty());
+        assert!(mmr_rerank(&[1.0], &[vec![1.0]], 0, 0.7).is_empty());
+    }
+}

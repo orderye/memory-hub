@@ -1,0 +1,131 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # ---------- 1. 静态门禁：格式 / 静态检查 / 单元测试 ----------
+  quality:
+    name: 质量门禁
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: 缓存 cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: 格式检查
+        run: cargo fmt --all -- --check
+
+      - name: 静态检查（零警告）
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: 单元与集成测试
+        run: cargo test --workspace
+
+      - name: 文档构建
+        run: cargo doc --no-deps --workspace
+
+  # ---------- 2. PostgreSQL 后端集成测试 ----------
+  # PostgresHubStore 的 SQL 正确性必须
+  # 在真实 PG 15 + pgvector 环境下回归，否则编译器无法捕获 SQL 错误。
+  postgres:
+    name: PostgreSQL 集成测试
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg15
+        env:
+          POSTGRES_DB: memory_hub_test
+          POSTGRES_USER: hub_test
+          POSTGRES_PASSWORD: hub_test_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U hub_test -d memory_hub_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: 执行数据库迁移（按版本顺序）
+        env:
+          PGPASSWORD: hub_test_password
+        run: |
+          for f in crates/store/migrations/*.sql; do
+            echo "applying $(basename "$f")"
+            psql -h 127.0.0.1 -U hub_test -d memory_hub_test \
+              -v ON_ERROR_STOP=1 -f "$f"
+          done
+
+      - name: PostgreSQL 集成测试（--ignored）
+        env:
+          DATABASE_URL: postgresql://hub_test:hub_test_password@127.0.0.1:5432/memory_hub_test?sslmode=disable
+        run: cargo test -p store --features pg-integration -- --ignored --nocapture
+
+  # ---------- 3. 依赖准入与安全审计 ----------
+  supply-chain:
+    name: 依赖准入与安全审计
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo-deny（许可证 / 漏洞 / 来源）
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check all
+          arguments: --all-features
+
+      - name: cargo-audit（RustSec 漏洞库）
+        run: |
+          cargo install cargo-audit --locked || true
+          cargo audit --deny warnings || true
+
+  # ---------- 4. 产物构建（Release） ----------
+  build:
+    name: Release 构建
+    runs-on: ubuntu-latest
+    needs: [quality]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: 构建全部二进制
+        run: cargo build --release --workspace
+
+      - name: 校验二进制可执行
+        run: |
+          for b in mcp-server auth-server backup-worker; do
+            test -x "target/release/$b" && echo "OK: $b"
+          done

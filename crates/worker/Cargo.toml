@@ -1,0 +1,24 @@
+[package]
+name = "worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+common = { workspace = true }
+mem-core = { workspace = true }
+store = { workspace = true }
+embed = { workspace = true }
+async-trait.workspace = true
+chrono.workspace = true
+hex.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["rt", "time", "macros"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "time"] }

@@ -5,14 +5,16 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
-[[bin]]
-name = "auth-server"
-path = "src/main.rs"
-
 [dependencies]
 common = { workspace = true }
-as-core = { workspace = true }
-hub-authz = { workspace = true }
-tokio = { workspace = true }
-tracing = { workspace = true }
-serde_json = { workspace = true }
+mem-core = { workspace = true }
+store = { workspace = true }
+auth-core = { workspace = true }
+auth-web = { workspace = true }
+authz = { workspace = true }
+axum.workspace = true
+tower-http.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt", "macros"] }
+tracing.workspace = true
