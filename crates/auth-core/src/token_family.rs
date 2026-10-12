@@ -144,6 +144,12 @@ impl TokenFamilyManager {
         })
     }
 
+    /// 在轮换前预查令牌所属 Agent 主体（不触发状态变更与重放检测，供预鉴权使用）
+    pub fn peek_agent_id(&self, token: &str) -> Option<AgentId> {
+        let read = self.tokens.read().unwrap();
+        read.get(token).map(|r| r.agent_id.clone())
+    }
+
     /// 撤销给定刷新令牌所在的整个令牌族（RFC 7009 语义）
     pub fn revoke_family(&self, token: &str) {
         if let Ok(mut write) = self.tokens.write() {

@@ -1221,7 +1221,11 @@ mod tests {
         let a = auth("agent-a", vec![Scope::Write]);
         svc.put(&a, put_req("fresh-ns", "第一条")).await.unwrap();
 
-        let info = grants.get_namespace(&scoped_ns("fresh-ns")).await.unwrap().unwrap();
+        let info = grants
+            .get_namespace(&scoped_ns("fresh-ns"))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(info.owner_agent, "agent-a");
         assert!(grants
             .can_read(&scoped_ns("fresh-ns"), &"agent-a".to_string())

@@ -18,6 +18,6 @@ pub use idempotency::{
     result_hash, IdempotencyCheck, IdempotencyEntry, IdempotencyGuard, IdempotencyKey,
     IdempotencyRecord, IdempotencyStore, InMemoryIdempotencyStore,
 };
-pub use log::init_tracing;
+pub use log::{init_tracing, init_tracing_with_stdio};
 pub use rate_limit::{is_capacity_enabled, rate_limit_error, RateDimension, RateLimitStore};
 pub use runtime::build_runtime;

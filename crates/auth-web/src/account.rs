@@ -18,7 +18,6 @@ use mem_core::{AccountRecord, AccountStore};
 use secrecy::{ExposeSecret, SecretString};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use uuid::Uuid;
 
 /// 注册令牌有效期（秒）
 pub const REGISTRATION_TOKEN_TTL_S: i64 = 3600;
@@ -73,6 +72,11 @@ impl AccountService {
         self.invite_code.is_none()
     }
 
+    /// 会话有效期（秒）
+    pub fn session_ttl_secs(&self) -> i64 {
+        self.session_ttl_hours * 3600
+    }
+
     /// 注册：校验邀请码与口令强度，创建账户并直接建立登录会话
     pub async fn register(
         &self,
@@ -108,11 +112,7 @@ impl AccountService {
 
     /// 登录：口令校验通过后建立会话
     pub async fn login(&self, username: &str, password: &str) -> Result<(AccountRecord, String)> {
-        let account = match self
-            .store
-            .get_account_by_username(username.trim())
-            .await?
-        {
+        let account = match self.store.get_account_by_username(username.trim()).await? {
             Some(a) => a,
             None => return Err(invalid_credentials()),
         };
@@ -235,9 +235,7 @@ pub async fn ensure_bootstrap_account(
     if let Some(password) = password.filter(|p| !p.trim().is_empty()) {
         validate_password(password)?;
         let hash = hash_password(password)?;
-        store
-            .set_account_password(&account.id, &hash)
-            .await?;
+        store.set_account_password(&account.id, &hash).await?;
         return store
             .get_account(&account.id)
             .await?
@@ -309,11 +307,10 @@ pub fn session_token_hash(token: &str) -> Vec<u8> {
     Sha256::digest(token.as_bytes()).to_vec()
 }
 
-/// 32 字节随机（两个 UUIDv4 拼接，进程内无须额外 CSPRNG 依赖）
+/// 32 字节密码学安全随机字节（CSPRNG，无 UUID 固定版本位偏差）
 fn random_bytes() -> [u8; 32] {
     let mut out = [0u8; 32];
-    out[..16].copy_from_slice(Uuid::new_v4().as_bytes());
-    out[16..].copy_from_slice(Uuid::new_v4().as_bytes());
+    getrandom::getrandom(&mut out).expect("CSPRNG failure");
     out
 }
 
@@ -409,10 +406,7 @@ mod tests {
             .register("bob", "supersecret", "", Some("wrong"))
             .await
             .is_err());
-        assert!(svc
-            .register("bob", "supersecret", "", None)
-            .await
-            .is_err());
+        assert!(svc.register("bob", "supersecret", "", None).await.is_err());
         assert!(svc
             .register("bob", "supersecret", "", Some("open-sesame"))
             .await
@@ -439,17 +433,17 @@ mod tests {
             "https://hub.example.com",
             900,
         );
-        assert!(resource_tokens.verify(&token).is_err(), "aud 严格绑定必须生效");
+        assert!(
+            resource_tokens.verify(&token).is_err(),
+            "aud 严格绑定必须生效"
+        );
     }
 
     #[tokio::test]
     async fn test_suspended_account_session_rejected() {
         let store = Arc::new(InMemoryHubStore::new());
         let svc = service(store.clone(), None);
-        let (account, session) = svc
-            .register("dave", "supersecret", "", None)
-            .await
-            .unwrap();
+        let (account, session) = svc.register("dave", "supersecret", "", None).await.unwrap();
 
         store
             .set_account_status(&account.id, "suspended")
@@ -462,12 +456,16 @@ mod tests {
     #[tokio::test]
     async fn test_bootstrap_account_ensure_and_password() {
         let store = InMemoryHubStore::new();
-        let a1 = ensure_bootstrap_account(&store, "boss", Some("bootstrap-pass")).await.unwrap();
+        let a1 = ensure_bootstrap_account(&store, "boss", Some("bootstrap-pass"))
+            .await
+            .unwrap();
         assert_eq!(a1.id, common::BOOTSTRAP_ACCOUNT_ID);
         assert!(a1.has_password);
 
         // 幂等：再次 ensure 不改变账户
-        let a2 = ensure_bootstrap_account(&store, "boss", None).await.unwrap();
+        let a2 = ensure_bootstrap_account(&store, "boss", None)
+            .await
+            .unwrap();
         assert_eq!(a2.id, a1.id);
         assert!(a2.has_password);
     }

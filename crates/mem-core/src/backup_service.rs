@@ -819,7 +819,10 @@ mod tests {
             .unwrap();
 
         // 删掉一条、改写一条，再 replace 恢复
-        let items = store.all_in_namespace(&scoped_ns("ns"), true).await.unwrap();
+        let items = store
+            .all_in_namespace(&scoped_ns("ns"), true)
+            .await
+            .unwrap();
         store.delete(&scoped_ns("ns"), items[0].id).await.unwrap();
         let mut kept = store.get(&scoped_ns("ns"), items[1].id).await.unwrap();
         kept.content = "被改坏了".to_string();
@@ -842,7 +845,10 @@ mod tests {
         // replace 先清空当前状态再按快照重建，两条都应计为 created
         assert_eq!(report.created, 2, "replace 后两条都应按快照重建");
 
-        let after = store.all_in_namespace(&scoped_ns("ns"), true).await.unwrap();
+        let after = store
+            .all_in_namespace(&scoped_ns("ns"), true)
+            .await
+            .unwrap();
         assert_eq!(after.len(), 2);
         assert!(after.iter().any(|e| e.content == "旧内容一"));
         assert!(after.iter().any(|e| e.content == "旧内容二"));

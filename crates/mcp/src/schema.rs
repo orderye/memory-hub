@@ -432,6 +432,54 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                 }
             }),
         },
+        ToolDefinition {
+            name: "memory_consolidate",
+            description: "一键触发整合中枢全量整理（重复检测、语义与Key冲突检测、陈旧度评估与可选自动策略合并）。返回全量整合报告与健康度指标。",
+            read_only: false,
+            destructive: false,
+            idempotent: true,
+            required_scope: "memory:write",
+            input_schema: json!({
+                "type": "object",
+                "required": ["namespace"],
+                "additionalProperties": false,
+                "properties": {
+                    "namespace": ns_prop(),
+                    "dry_run": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "true = 只预演不落提案"
+                    },
+                    "sim_threshold": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1,
+                        "description": "覆盖默认重复判定阈值"
+                    },
+                    "auto_merge": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "是否对高相似度重复自动合并"
+                    }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "memory_consolidation_stats",
+            description: "获取命名空间的记忆整合健康度统计指标（活跃条目数、重复组数、冲突组数、陈旧条目数、冗余率、冲突率与综合健康度评分）。",
+            read_only: true,
+            destructive: false,
+            idempotent: true,
+            required_scope: "memory:read",
+            input_schema: json!({
+                "type": "object",
+                "required": ["namespace"],
+                "additionalProperties": false,
+                "properties": {
+                    "namespace": ns_prop()
+                }
+            }),
+        },
         // ===== 命名空间共享 =====
         ToolDefinition {
             name: "memory_grant",
@@ -484,7 +532,7 @@ mod tests {
     #[test]
     fn test_tool_count_and_names() {
         let defs = get_tool_definitions();
-        assert_eq!(defs.len(), 16);
+        assert_eq!(defs.len(), 18);
         let names: Vec<&str> = defs.iter().map(|d| d.name).collect();
         for expected in [
             "memory_put",
@@ -501,6 +549,8 @@ mod tests {
             "memory_integrate_scan",
             "memory_integration_list",
             "memory_integration_resolve",
+            "memory_consolidate",
+            "memory_consolidation_stats",
             "memory_grant",
             "memory_revoke",
         ] {

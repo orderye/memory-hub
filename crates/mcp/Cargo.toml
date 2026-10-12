@@ -9,6 +9,7 @@ authors.workspace = true
 anyhow.workspace = true
 common = { workspace = true }
 mem-core = { workspace = true }
+consolidation = { workspace = true }
 authz = { workspace = true }
 chrono.workspace = true
 uuid.workspace = true

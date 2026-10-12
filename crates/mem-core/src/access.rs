@@ -79,11 +79,16 @@ impl AccessChecker for GrantChecker {
     }
 }
 
-/// 命名空间名校验：非空、≤128 字符、仅小写字母/数字/`-`/`_`/`.`/`*`
+/// 命名空间名校验：非空、≤128 字符、仅小写字母/数字/`-`/`_`/`.`（禁止通配符 `*`，`*` 仅限备份保留使用）
 pub fn validate_namespace(ns: &str) -> Result<()> {
     if ns.is_empty() {
         return Err(common::HubError::InvalidArgument(
             "namespace 不能为空".to_string(),
+        ));
+    }
+    if ns == "*" {
+        return Err(common::HubError::InvalidArgument(
+            "namespace 不能为保留通配符 '*'".to_string(),
         ));
     }
     if ns.len() > 128 {
@@ -91,12 +96,12 @@ pub fn validate_namespace(ns: &str) -> Result<()> {
             "namespace 长度不得超过 128 字符".to_string(),
         ));
     }
-    let ok = ns.chars().all(|c| {
-        c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.' | '*')
-    });
+    let ok = ns
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.'));
     if !ok {
         return Err(common::HubError::InvalidArgument(format!(
-            "namespace 只允许小写字母/数字/-/_/./* ，当前为 {}",
+            "namespace 只允许小写字母/数字/-/_/. ，当前为 {}",
             ns
         )));
     }
@@ -126,7 +131,7 @@ mod tests {
     fn test_validate_namespace() {
         assert!(validate_namespace("default").is_ok());
         assert!(validate_namespace("team-x_1.y").is_ok());
-        assert!(validate_namespace("*").is_ok());
+        assert!(validate_namespace("*").is_err());
         assert!(validate_namespace("").is_err());
         assert!(validate_namespace("Team X").is_err());
         assert!(validate_namespace("团队").is_err());

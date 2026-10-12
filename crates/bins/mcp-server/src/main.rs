@@ -8,7 +8,7 @@
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use common::{init_tracing, AppConfig, AuthCtx, HubError};
+use common::{AppConfig, AuthCtx, HubError};
 use embed::HttpEmbedder;
 use mcp::transport::{mcp_router, run_stdio, McpTransportState};
 use mcp::ToolDispatcher;
@@ -34,8 +34,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
-    // 强制脱敏日志（LOG_REDACTION=always，不可关闭）
-    init_tracing();
+    let mode = std::env::var("HUB_SERVE_MODE").unwrap_or_else(|_| "http".to_string());
+    let is_stdio = mode == "stdio";
+    // 强制脱敏日志（LOG_REDACTION=always，不可关闭；stdio 模式下输出定向至 stderr，防破坏 stdout 的 JSON-RPC 帧流）
+    common::init_tracing_with_stdio(is_stdio);
 
     let cfg = AppConfig::from_env()?;
     info!(config = %cfg.redacted_summary(), "记忆中枢 MCP Server 启动中");

@@ -90,6 +90,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "common",
+ "hmac",
  "mem-core",
  "secrecy",
  "serde",
@@ -133,6 +134,7 @@ dependencies = [
  "axum",
  "chrono",
  "common",
+ "getrandom 0.2.17",
  "hex",
  "mem-core",
  "secrecy",
@@ -364,6 +366,23 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "consolidation"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "common",
+ "embed",
+ "mem-core",
+ "serde",
+ "serde_json",
+ "store",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -2947,6 +2966,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "common",
+ "consolidation",
  "embed",
  "hex",
  "mem-core",

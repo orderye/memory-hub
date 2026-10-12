@@ -10,6 +10,7 @@ members = [
     "crates/auth-core",
     "crates/auth-web",
     "crates/mcp",
+    "crates/consolidation",
     "crates/worker",
     "crates/bins/mcp-server",
     "crates/bins/auth-server",
@@ -29,6 +30,7 @@ mem-core = { path = "crates/mem-core" }
 embed = { path = "crates/embed" }
 store = { path = "crates/store" }
 retrieval = { path = "crates/retrieval" }
+consolidation = { path = "crates/consolidation" }
 authz = { path = "crates/authz" }
 auth-core = { path = "crates/auth-core" }
 auth-web = { path = "crates/auth-web" }
@@ -85,4 +87,6 @@ base64 = "0.22"
 arc-swap = "1.7"
 subtle = "2.6"
 argon2 = "0.5"
+hmac = "0.12"
+getrandom = "0.2"
 tikv-jemallocator = "0.6"

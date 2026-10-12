@@ -344,7 +344,9 @@ impl<S: GrantStore + ?Sized> GrantStore for AccountScopedStore<S> {
     }
 
     async fn can_write(&self, namespace: &str, agent_id: &AgentId) -> Result<bool> {
-        self.inner.can_write(&self.scoped(namespace), agent_id).await
+        self.inner
+            .can_write(&self.scoped(namespace), agent_id)
+            .await
     }
 
     async fn owned_namespaces(&self, agent_id: &AgentId) -> Result<Vec<Namespace>> {

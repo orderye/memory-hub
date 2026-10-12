@@ -407,9 +407,14 @@ impl mem_core::IntegrationStore for InMemoryHubStore {
         Ok(guard.values().any(|p| {
             p.status == ProposalStatus::Open
                 && p.namespace == namespace
-                && members
-                    .iter()
-                    .any(|(kind, ids)| kind == p.kind.as_str() && &p.member_ids == ids)
+                && members.iter().any(|(kind, ids)| {
+                    if kind != p.kind.as_str() || ids.len() != p.member_ids.len() {
+                        return false;
+                    }
+                    let s1: std::collections::HashSet<_> = ids.iter().collect();
+                    let s2: std::collections::HashSet<_> = p.member_ids.iter().collect();
+                    s1 == s2
+                })
         }))
     }
 }
@@ -639,14 +644,11 @@ impl mem_core::AccountStore for InMemoryHubStore {
         let normalized = username.trim().to_ascii_lowercase();
         let mut w = self.accounts.write().unwrap();
         // 用户名已被别的账户占用时，退回按 ID 查找（保持幂等）
-        let existing = w
-            .get(id)
-            .map(|a| (id.to_owned(), a.clone()))
-            .or_else(|| {
-                w.iter()
-                    .find(|(_, a)| a.username == normalized)
-                    .map(|(k, a)| (*k, a.clone()))
-            });
+        let existing = w.get(id).map(|a| (id.to_owned(), a.clone())).or_else(|| {
+            w.iter()
+                .find(|(_, a)| a.username == normalized)
+                .map(|(k, a)| (*k, a.clone()))
+        });
         if let Some((found_id, record)) = existing {
             return Ok(account_record(&found_id, &record));
         }
@@ -662,7 +664,12 @@ impl mem_core::AccountStore for InMemoryHubStore {
     }
 
     async fn get_account(&self, id: &AccountId) -> Result<Option<AccountRecord>> {
-        Ok(self.accounts.read().unwrap().get(id).map(|a| account_record(id, a)))
+        Ok(self
+            .accounts
+            .read()
+            .unwrap()
+            .get(id)
+            .map(|a| account_record(id, a)))
     }
 
     async fn get_account_by_username(&self, username: &str) -> Result<Option<AccountRecord>> {
@@ -717,7 +724,7 @@ impl mem_core::AccountStore for InMemoryHubStore {
             .iter()
             .map(|(id, a)| account_record(id, a))
             .collect();
-        out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        out.sort_by_key(|a| a.created_at);
         Ok(out)
     }
 
@@ -982,10 +989,7 @@ mod tests {
             .can_read("any-ns", &"agent-b".to_string())
             .await
             .unwrap());
-        assert!(!store
-            .can_write("ns", &"agent-b".to_string())
-            .await
-            .unwrap());
+        assert!(!store.can_write("ns", &"agent-b".to_string()).await.unwrap());
 
         // 撤销后失效
         store.revoke("ns", &"agent-a".to_string()).await.unwrap();
@@ -1010,10 +1014,7 @@ mod tests {
         assert!(acct.has_password);
 
         // 用户名冲突（大小写不敏感）
-        assert!(store
-            .create_account("ALICE", Some("x"), "")
-            .await
-            .is_err());
+        assert!(store.create_account("ALICE", Some("x"), "").await.is_err());
 
         // 按用户名查哈希（认证路径）
         assert_eq!(
@@ -1036,10 +1037,7 @@ mod tests {
         // 会话：创建 → 读取 → 过期清理 → 删除
         let hash = vec![7u8; 32];
         let future = Utc::now() + chrono::Duration::hours(1);
-        store
-            .create_session(&hash, &acct.id, future)
-            .await
-            .unwrap();
+        store.create_session(&hash, &acct.id, future).await.unwrap();
         assert_eq!(
             store.get_session(&hash).await.unwrap().unwrap().account_id,
             acct.id

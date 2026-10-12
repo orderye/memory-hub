@@ -23,6 +23,7 @@ hex.workspace = true
 subtle.workspace = true
 secrecy.workspace = true
 argon2.workspace = true
+getrandom.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, features = ["rt"] }

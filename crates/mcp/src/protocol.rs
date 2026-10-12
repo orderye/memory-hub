@@ -108,7 +108,7 @@ mod tests {
 
         let tools = handle_tools_list();
         let list = tools["tools"].as_array().expect("tools 应为数组");
-        assert_eq!(list.len(), 16, "应暴露全部 16 个记忆工具");
+        assert_eq!(list.len(), 18, "应暴露全部 18 个记忆工具");
         assert!(list.iter().any(|t| t["name"] == "memory_put"));
         assert!(list.iter().any(|t| t["name"] == "memory_search"));
         assert!(list.iter().any(|t| t["name"] == "memory_backup_create"));

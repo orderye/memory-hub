@@ -8,7 +8,9 @@
 //! 错误一律以 `isError = true` + 标准错误码对象返回（MCP 规定工具错误仍在 200 内表达）。
 
 use common::{AgentId, AuthCtx, HubError, Scope};
-use mem_core::{BackupService, GrantStore, IntegrationService, MemoryService, NamespaceGrantRecord};
+use mem_core::{
+    BackupService, GrantStore, IntegrationService, MemoryService, NamespaceGrantRecord,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;

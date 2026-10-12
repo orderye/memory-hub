@@ -344,8 +344,16 @@ impl AppConfig {
             self.integrate_sim_threshold,
             self.expiry_sweep_interval_h,
             self.allowed_origins.len(),
-            if self.invite_code.is_some() { "set" } else { "open" },
-            if self.bootstrap_password.is_some() { "set" } else { "unset" },
+            if self.invite_code.is_some() {
+                "set"
+            } else {
+                "open"
+            },
+            if self.bootstrap_password.is_some() {
+                "set"
+            } else {
+                "unset"
+            },
         )
     }
 }

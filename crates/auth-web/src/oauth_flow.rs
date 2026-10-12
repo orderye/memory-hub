@@ -362,6 +362,38 @@ impl AgentOAuthServer {
             return Err(HubError::AuthRequired);
         }
 
+        // 校验 client_id 一致性
+        if let Some(ref cid) = req.client_id {
+            if cid != &record.agent_id {
+                return Err(HubError::InvalidArgument(
+                    "client_id 与授权码不匹配".to_string(),
+                ));
+            }
+        }
+
+        // 校验 Agent 状态及机密客户端身份凭据
+        let agent = self
+            .store
+            .get_agent(&record.agent_id)
+            .await?
+            .ok_or(HubError::AuthRequired)?;
+        if agent.status != "active" {
+            return Err(HubError::AuthRequired);
+        }
+        if agent.confidential {
+            let secret = req
+                .client_secret
+                .as_deref()
+                .ok_or_else(|| HubError::AuthRequired)?;
+            if !self
+                .store
+                .verify_agent_secret(&record.agent_id, secret)
+                .await?
+            {
+                return Err(HubError::AuthRequired);
+            }
+        }
+
         let access = self.tokens.issue(
             &record.agent_id,
             record.account_id,
@@ -390,14 +422,41 @@ impl AgentOAuthServer {
             .clone()
             .ok_or_else(|| HubError::InvalidArgument("缺少 refresh_token".to_string()))?;
 
-        let rotated = self.families.rotate(&token)?;
-        // 账户归属以库内 Agent 记录为准（刷新令牌族不携带账户）
+        // 1. 在消费/轮换令牌前，先校验所属 Agent 及其机密客户端凭据（避免凭据错误导致意外轮换或重放封禁）
+        let agent_id = self
+            .families
+            .peek_agent_id(&token)
+            .ok_or(HubError::AuthRequired)?;
+
+        // 校验 client_id 一致性
+        if let Some(ref cid) = req.client_id {
+            if cid != &agent_id {
+                return Err(HubError::InvalidArgument(
+                    "client_id 与刷新令牌不匹配".to_string(),
+                ));
+            }
+        }
+
         let agent = self
             .store
-            .get_agent(&rotated.agent_id)
+            .get_agent(&agent_id)
             .await?
             .filter(|a| a.status == "active")
             .ok_or(HubError::AuthRequired)?;
+
+        // 若为机密客户端，强制校验 client_secret
+        if agent.confidential {
+            let secret = req
+                .client_secret
+                .as_deref()
+                .ok_or_else(|| HubError::AuthRequired)?;
+            if !self.store.verify_agent_secret(&agent_id, secret).await? {
+                return Err(HubError::AuthRequired);
+            }
+        }
+
+        // 2. 身份凭据校验通过后，执行原子轮换（包含过期、吊销与重放检测）
+        let rotated = self.families.rotate(&token)?;
         let access = self.tokens.issue(
             &rotated.agent_id,
             agent.owner_account_id,
@@ -608,7 +667,9 @@ mod tests {
     #[tokio::test]
     async fn test_register_and_client_credentials() {
         let (srv, _store) = server().await;
-        srv.register(register_req("agent-a", true), test_account()).await.unwrap();
+        srv.register(register_req("agent-a", true), test_account())
+            .await
+            .unwrap();
 
         let resp = srv
             .token(TokenRequest {
@@ -639,7 +700,9 @@ mod tests {
     #[tokio::test]
     async fn test_client_credentials_rejects_bad_secret() {
         let (srv, _store) = server().await;
-        srv.register(register_req("agent-a", true), test_account()).await.unwrap();
+        srv.register(register_req("agent-a", true), test_account())
+            .await
+            .unwrap();
 
         let err = srv
             .token(TokenRequest {
@@ -661,7 +724,9 @@ mod tests {
     #[tokio::test]
     async fn test_public_client_cannot_use_client_credentials() {
         let (srv, _store) = server().await;
-        srv.register(register_req("pub", false), test_account()).await.unwrap();
+        srv.register(register_req("pub", false), test_account())
+            .await
+            .unwrap();
 
         let err = srv
             .token(TokenRequest {
@@ -683,7 +748,9 @@ mod tests {
     #[tokio::test]
     async fn test_scope_cannot_exceed_registered_max() {
         let (srv, _store) = server().await;
-        srv.register(register_req("agent-a", true), test_account()).await.unwrap();
+        srv.register(register_req("agent-a", true), test_account())
+            .await
+            .unwrap();
 
         let err = srv
             .token(TokenRequest {
@@ -705,7 +772,10 @@ mod tests {
     #[tokio::test]
     async fn test_authorization_code_with_pkce() {
         let (srv, store) = server().await;
-        let agent = srv.register(register_req("agent-a", false), test_account()).await.unwrap();
+        let agent = srv
+            .register(register_req("agent-a", false), test_account())
+            .await
+            .unwrap();
 
         // 先给命名空间授权（模拟 owner 分享）
         store
@@ -778,7 +848,10 @@ mod tests {
     #[tokio::test]
     async fn test_authorization_code_rejects_wrong_verifier() {
         let (srv, _store) = server().await;
-        let agent = srv.register(register_req("agent-a", false), test_account()).await.unwrap();
+        let agent = srv
+            .register(register_req("agent-a", false), test_account())
+            .await
+            .unwrap();
 
         let challenge = compute_code_challenge_s256("correct-verifier");
         let params = AuthorizeParams {
@@ -815,7 +888,9 @@ mod tests {
     #[tokio::test]
     async fn test_authorize_rejects_bad_redirect_and_method() {
         let (srv, _store) = server().await;
-        srv.register(register_req("agent-a", false), test_account()).await.unwrap();
+        srv.register(register_req("agent-a", false), test_account())
+            .await
+            .unwrap();
 
         let mut params = AuthorizeParams {
             response_type: "token".to_string(), // 隐式流不允许
@@ -840,7 +915,10 @@ mod tests {
     #[tokio::test]
     async fn test_refresh_rotation() {
         let (srv, _store) = server().await;
-        let agent = srv.register(register_req("agent-a", false), test_account()).await.unwrap();
+        let agent = srv
+            .register(register_req("agent-a", false), test_account())
+            .await
+            .unwrap();
 
         let challenge = compute_code_challenge_s256("v1");
         let params = AuthorizeParams {
@@ -917,38 +995,47 @@ mod tests {
     async fn test_register_validates_inputs() {
         let (srv, _store) = server().await;
         assert!(srv
-            .register(RegisterAgentRequest {
-                agent_id: "".to_string(),
-                name: "x".to_string(),
-                kind: "service".to_string(),
-                client_secret: None,
-                redirect_uris: vec![],
-                max_scopes: None,
-            }, test_account())
+            .register(
+                RegisterAgentRequest {
+                    agent_id: "".to_string(),
+                    name: "x".to_string(),
+                    kind: "service".to_string(),
+                    client_secret: None,
+                    redirect_uris: vec![],
+                    max_scopes: None,
+                },
+                test_account()
+            )
             .await
             .is_err());
 
         assert!(srv
-            .register(RegisterAgentRequest {
-                agent_id: "a".to_string(),
-                name: "x".to_string(),
-                kind: "unknown-kind".to_string(),
-                client_secret: None,
-                redirect_uris: vec![],
-                max_scopes: None,
-            }, test_account())
+            .register(
+                RegisterAgentRequest {
+                    agent_id: "a".to_string(),
+                    name: "x".to_string(),
+                    kind: "unknown-kind".to_string(),
+                    client_secret: None,
+                    redirect_uris: vec![],
+                    max_scopes: None,
+                },
+                test_account()
+            )
             .await
             .is_err());
 
         assert!(srv
-            .register(RegisterAgentRequest {
-                agent_id: "a".to_string(),
-                name: "x".to_string(),
-                kind: "service".to_string(),
-                client_secret: None,
-                redirect_uris: vec!["http://insecure.example.com".to_string()],
-                max_scopes: None,
-            }, test_account())
+            .register(
+                RegisterAgentRequest {
+                    agent_id: "a".to_string(),
+                    name: "x".to_string(),
+                    kind: "service".to_string(),
+                    client_secret: None,
+                    redirect_uris: vec!["http://insecure.example.com".to_string()],
+                    max_scopes: None,
+                },
+                test_account()
+            )
             .await
             .is_err());
     }
@@ -956,7 +1043,9 @@ mod tests {
     #[tokio::test]
     async fn test_suspended_agent_cannot_get_tokens() {
         let (srv, store) = server().await;
-        srv.register(register_req("agent-a", true), test_account()).await.unwrap();
+        srv.register(register_req("agent-a", true), test_account())
+            .await
+            .unwrap();
         store
             .set_agent_status(&"agent-a".to_string(), "suspended")
             .await
@@ -988,6 +1077,106 @@ mod tests {
         assert_eq!(parse_scopes("memory:read memory:admin").len(), 2);
         assert!(parse_uuid("not-a-uuid").is_none());
         assert!(parse_uuid(&Uuid::new_v4().to_string()).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_confidential_client_requires_secret_in_auth_code_and_refresh() {
+        let (srv, _store) = server().await;
+        // 注册机密客户端（带密钥）
+        let agent = srv
+            .register(register_req("agent-conf", true), test_account())
+            .await
+            .unwrap();
+
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let challenge = compute_code_challenge_s256(verifier);
+        let params = AuthorizeParams {
+            response_type: "code".to_string(),
+            client_id: "agent-conf".to_string(),
+            redirect_uri: "https://app.example.com/cb".to_string(),
+            code_challenge: challenge,
+            code_challenge_method: "S256".to_string(),
+            state: Some("xyz".to_string()),
+            scope: None,
+        };
+
+        srv.validate_authorize(&params).await.unwrap();
+        let code = srv
+            .issue_authorization_code(&params, &agent, vec![Scope::Read])
+            .await
+            .unwrap();
+
+        // 1. 机密客户端换 code 缺失 client_secret 必须拒绝
+        let err = srv
+            .token(TokenRequest {
+                grant_type: "authorization_code".to_string(),
+                code: Some(code.clone()),
+                code_verifier: Some(verifier.to_string()),
+                redirect_uri: Some("https://app.example.com/cb".to_string()),
+                client_id: Some("agent-conf".to_string()),
+                client_secret: None,
+                refresh_token: None,
+                scope: None,
+                resource: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HubError::AuthRequired));
+
+        // 2. 重新颁发并提供正确密钥换取成功
+        let code2 = srv
+            .issue_authorization_code(&params, &agent, vec![Scope::Read])
+            .await
+            .unwrap();
+        let resp = srv
+            .token(TokenRequest {
+                grant_type: "authorization_code".to_string(),
+                code: Some(code2),
+                code_verifier: Some(verifier.to_string()),
+                redirect_uri: Some("https://app.example.com/cb".to_string()),
+                client_id: Some("agent-conf".to_string()),
+                client_secret: Some("s3cret".to_string()),
+                refresh_token: None,
+                scope: None,
+                resource: None,
+            })
+            .await
+            .unwrap();
+        let refresh_token = resp.refresh_token.unwrap();
+
+        // 3. 刷新令牌：缺失密钥必须拒绝
+        let err_refresh = srv
+            .token(TokenRequest {
+                grant_type: "refresh_token".to_string(),
+                code: None,
+                code_verifier: None,
+                redirect_uri: None,
+                client_id: Some("agent-conf".to_string()),
+                client_secret: None,
+                refresh_token: Some(refresh_token.clone()),
+                scope: None,
+                resource: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err_refresh, HubError::AuthRequired));
+
+        // 4. 刷新令牌：提供正确密钥成功
+        let resp_refresh = srv
+            .token(TokenRequest {
+                grant_type: "refresh_token".to_string(),
+                code: None,
+                code_verifier: None,
+                redirect_uri: None,
+                client_id: Some("agent-conf".to_string()),
+                client_secret: Some("s3cret".to_string()),
+                refresh_token: Some(refresh_token),
+                scope: None,
+                resource: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp_refresh.token_type, "Bearer");
     }
 
     // 编译期检查：内存存储满足聚合契约

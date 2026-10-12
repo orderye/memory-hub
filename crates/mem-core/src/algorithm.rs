@@ -29,18 +29,48 @@ pub fn l2_normalize(v: &mut [f32]) {
     }
 }
 
+fn is_cjk_char(c: char) -> bool {
+    matches!(c,
+        '\u{4e00}'..='\u{9fff}' |
+        '\u{3400}'..='\u{4dbf}' |
+        '\u{f900}'..='\u{faff}'
+    )
+}
+
+/// 提取检索词元（支持英文单词与 CJK 中文 2-gram 切分）
+pub fn extract_terms(query: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    for word in query.split_whitespace() {
+        let has_cjk = word.chars().any(is_cjk_char);
+        if !has_cjk {
+            if word.chars().count() >= 2 {
+                terms.push(word.to_lowercase());
+            }
+        } else {
+            let chars: Vec<char> = word.chars().collect();
+            if chars.len() <= 4 {
+                terms.push(word.to_lowercase());
+            }
+            if chars.len() > 2 {
+                for window in chars.windows(2) {
+                    let gram: String = window.iter().collect();
+                    terms.push(gram.to_lowercase());
+                }
+            }
+        }
+    }
+    terms
+}
+
 /// 关键词命中度（0.0 ~ 1.0）：查询词与标签在内容中的覆盖比例
 pub fn keyword_score(content: &str, query: &str, tags: &[String]) -> f32 {
     let haystack = content.to_lowercase();
     let mut hits = 0usize;
     let mut total = 0usize;
 
-    for term in query.split_whitespace() {
-        if term.len() < 2 {
-            continue;
-        }
+    for term in extract_terms(query) {
         total += 1;
-        if haystack.contains(&term.to_lowercase()) {
+        if haystack.contains(&term) {
             hits += 1;
         }
     }
@@ -170,6 +200,14 @@ mod tests {
 
         // 空查询且无标签：0
         assert_eq!(keyword_score(content, "", &[]), 0.0);
+    }
+
+    #[test]
+    fn test_cjk_keyword_matching() {
+        let content = "用户偏好简短直接的中文回复";
+        // 未分词的长中文查询通过 2-gram 依然能精确召回命中子串
+        let s = keyword_score(content, "偏好直接", &[]);
+        assert!(s > 0.0, "CJK 2-gram 应成功命中 '偏好' 与 '直接'");
     }
 
     #[test]

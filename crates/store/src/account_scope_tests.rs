@@ -58,7 +58,10 @@ fn hub() -> Arc<dyn mem_core::MemoryHubStore> {
     Arc::new(super::InMemoryHubStore::new())
 }
 
-fn scoped(store: &Arc<dyn mem_core::MemoryHubStore>, acct: AccountId) -> AccountScopedStore<dyn mem_core::MemoryHubStore> {
+fn scoped(
+    store: &Arc<dyn mem_core::MemoryHubStore>,
+    acct: AccountId,
+) -> AccountScopedStore<dyn mem_core::MemoryHubStore> {
     AccountScopedStore::new(store.clone(), acct)
 }
 
@@ -153,15 +156,22 @@ async fn test_backup_star_scoped_per_account() {
     let sa = scoped(&store, account(1));
     let sb = scoped(&store, account(2));
 
-    sa.insert(&entry("personal", "agent-a", "A1")).await.unwrap();
+    sa.insert(&entry("personal", "agent-a", "A1"))
+        .await
+        .unwrap();
     sa.insert(&entry("work", "agent-a", "A2")).await.unwrap();
-    sb.insert(&entry("personal", "agent-b", "B1")).await.unwrap();
+    sb.insert(&entry("personal", "agent-b", "B1"))
+        .await
+        .unwrap();
 
     // 账户内"全量"清单只包含本账户
     let mut ns = sa.list_namespaces().await.unwrap();
     ns.sort();
     assert_eq!(ns, vec!["personal".to_string(), "work".to_string()]);
-    assert_eq!(sb.list_namespaces().await.unwrap(), vec!["personal".to_string()]);
+    assert_eq!(
+        sb.list_namespaces().await.unwrap(),
+        vec!["personal".to_string()]
+    );
 
     // `*` 全量备份记录落库为账户内键，列表互不可见
     let record = BackupRecord {
@@ -193,7 +203,10 @@ async fn test_prefix_idempotent_roundtrip_from_payload() {
     let store = hub();
     let sa = scoped(&store, account(1));
     let already = scope_name(&account(1), "personal");
-    let e = sa.insert(&entry(&already, "agent-a", "往返")).await.unwrap();
+    let e = sa
+        .insert(&entry(&already, "agent-a", "往返"))
+        .await
+        .unwrap();
     assert_eq!(e.namespace, "personal");
     let raw = store.all_in_namespace(&already, true).await.unwrap();
     assert_eq!(raw.len(), 1, "不得出现双重前缀键");

@@ -103,9 +103,9 @@ jobs:
           arguments: --all-features
 
       - name: cargo-audit（RustSec 漏洞库）
-        run: |
-          cargo install cargo-audit --locked || true
-          cargo audit --deny warnings || true
+        uses: rustsec/audit-check@v1.4.1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   # ---------- 4. 产物构建（Release） ----------
   build:

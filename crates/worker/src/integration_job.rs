@@ -5,16 +5,17 @@
 
 use chrono::{DateTime, Utc};
 use common::{AgentId, Result};
+use consolidation::ConsolidationEngine;
 use mem_core::MemoryHubStore;
 use std::sync::Arc;
 use tracing::info;
 
 /// 整合扫描作业
 pub struct IntegrationScanJob {
+    engine: ConsolidationEngine,
     store: Arc<dyn MemoryHubStore>,
-    /// 重复判定阈值（worker 侧仅做 key 冲突识别，阈值供未来扩展使用）
-    #[allow(dead_code)]
     sim_threshold: f32,
+    #[allow(dead_code)]
     max_proposals: usize,
     /// 作业执行者标识
     worker_agent: AgentId,
@@ -36,11 +37,14 @@ impl IntegrationScanJob {
         max_proposals: usize,
         worker_agent: impl Into<String>,
     ) -> Self {
+        let agent = worker_agent.into();
+        let engine = ConsolidationEngine::new(store.clone(), sim_threshold, max_proposals);
         Self {
+            engine,
             store,
             sim_threshold: sim_threshold.clamp(0.0, 1.0),
             max_proposals: max_proposals.max(1),
-            worker_agent: worker_agent.into(),
+            worker_agent: agent,
         }
     }
 
@@ -74,71 +78,18 @@ impl IntegrationScanJob {
         Ok(report)
     }
 
-    /// 单命名空间扫描（直接操作存储；与 MCP 工具的扫描算法一致）
+    /// 单命名空间扫描（委托独立整合中枢引擎统一执行）
     async fn scan_namespace(&self, namespace: &str) -> Result<usize> {
-        let entries: Vec<_> = self
-            .store
-            .all_in_namespace(namespace, false)
-            .await?
-            .into_iter()
-            .filter(|e| e.status == mem_core::MemoryStatus::Active)
-            .collect();
-
-        // 同 key 不同内容 → 冲突提案（重复检测依赖嵌入，交给 Agent 侧扫描接口；
-        // worker 侧只做零成本的 key 冲突识别，避免对全量条目做 O(n²) 向量比较）
-        let mut by_key: std::collections::HashMap<&str, Vec<&mem_core::MemoryEntry>> =
-            std::collections::HashMap::new();
-        for e in &entries {
-            if let Some(k) = e.key.as_deref() {
-                by_key.entry(k).or_default().push(e);
-            }
-        }
-
-        let now = Utc::now();
-        let mut created = 0usize;
-        for (_key, members) in by_key {
-            if members.len() < 2 {
-                continue;
-            }
-            let distinct: std::collections::HashSet<&str> =
-                members.iter().map(|m| m.content.as_str()).collect();
-            if distinct.len() < 2 {
-                continue;
-            }
-
-            let mut sorted = members.clone();
-            sorted.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
-            let ids: Vec<uuid::Uuid> = sorted.iter().map(|m| m.id).collect();
-
-            // 去重：已有 open 提案则跳过
-            if self
-                .store
-                .open_exists(namespace, &[("conflict".to_string(), ids.clone())])
-                .await?
-            {
-                continue;
-            }
-
-            let proposal = mem_core::IntegrationProposal {
-                id: uuid::Uuid::new_v4(),
-                namespace: namespace.to_string(),
-                kind: mem_core::IntegrationKind::Conflict,
-                member_ids: ids,
-                suggested_survivor: Some(sorted[0].id),
-                similarity: 0.0,
-                status: mem_core::ProposalStatus::Open,
-                resolution_note: None,
-                created_at: now,
-                resolved_at: None,
-            };
-            self.store.save_proposal(&proposal).await?;
-            created += 1;
-            if created >= self.max_proposals {
-                break;
-            }
-        }
-
-        Ok(created)
+        let report = self
+            .engine
+            .consolidate_namespace(
+                namespace,
+                false,
+                Some(self.sim_threshold),
+                &self.worker_agent,
+            )
+            .await?;
+        Ok(report.proposals_created)
     }
 
     /// 归档过期条目（与备份作业共用的清理步骤）
@@ -220,6 +171,28 @@ mod tests {
         // 幂等：再扫一次不得重复建提案
         let report2 = job.run_once(Utc::now()).await.unwrap();
         assert_eq!(report2.proposals.get("ns"), Some(&0));
+    }
+
+    #[tokio::test]
+    async fn test_scan_creates_duplicate_proposals_for_embeddings() {
+        let store = Arc::new(InMemoryHubStore::new());
+        store
+            .ensure_namespace("ns2", &"agent-a".to_string())
+            .await
+            .unwrap();
+
+        let mut e1 = entry("ns2", None, "服务部署在华东区域");
+        e1.embedding = Some(vec![1.0, 0.0]);
+        let mut e2 = entry("ns2", None, "服务部署在华东服务器群");
+        e2.embedding = Some(vec![0.99, 0.01]);
+
+        store.insert(&e1).await.unwrap();
+        store.insert(&e2).await.unwrap();
+
+        let job = IntegrationScanJob::new(store.clone(), 0.90, 100, "scan-worker");
+        let report = job.run_once(Utc::now()).await.unwrap();
+        assert_eq!(report.scanned.get("ns2"), Some(&2));
+        assert_eq!(report.proposals.get("ns2"), Some(&1));
     }
 
     #[tokio::test]

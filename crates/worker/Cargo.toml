@@ -8,6 +8,7 @@ authors.workspace = true
 [dependencies]
 common = { workspace = true }
 mem-core = { workspace = true }
+consolidation = { workspace = true }
 store = { workspace = true }
 embed = { workspace = true }
 async-trait.workspace = true

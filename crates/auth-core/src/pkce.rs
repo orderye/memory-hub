@@ -18,7 +18,13 @@ pub fn verify_pkce_s256(code_verifier: &str, code_challenge: &str) -> bool {
     let hash = hasher.finalize();
 
     let expected_challenge = URL_SAFE_NO_PAD.encode(hash);
-    expected_challenge == code_challenge
+    use subtle::ConstantTimeEq;
+    expected_challenge.len() == code_challenge.len()
+        && expected_challenge
+            .as_bytes()
+            .ct_eq(code_challenge.as_bytes())
+            .unwrap_u8()
+            == 1
 }
 
 /// 为客户端或测试生成 S256 Challenge

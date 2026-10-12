@@ -136,6 +136,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "20261012000002_accounts_sandbox",
         include_str!("../migrations/20261012000002_accounts_sandbox.sql"),
     ),
+    (
+        "20261013000003_conditional_key_unique",
+        include_str!("../migrations/20261013000003_conditional_key_unique.sql"),
+    ),
 ];
 
 /// PostgreSQL 四合一存储
@@ -200,7 +204,10 @@ fn split_sql_statements(sql: &str) -> Vec<&str> {
         }
     }
     if start < b.len() {
-        stmts.push(&sql[start..]);
+        let remainder = &sql[start..];
+        if !remainder.trim().is_empty() {
+            stmts.push(remainder);
+        }
     }
     stmts
 }
@@ -889,7 +896,9 @@ impl mem_core::IntegrationStore for PostgresHubStore {
             let count: i64 = sqlx::query_scalar(
                 r#"
                 select count(*) from integration_proposals
-                where namespace = $1 and status = 'open' and kind = $2 and member_ids = $3
+                where namespace = $1 and status = 'open' and kind = $2
+                  and cardinality(member_ids) = cardinality($3)
+                  and member_ids @> $3
                 "#,
             )
             .bind(namespace)
@@ -1405,11 +1414,13 @@ impl mem_core::AccountStore for PostgresHubStore {
     }
 
     async fn get_session(&self, token_hash: &[u8]) -> Result<Option<SessionRecord>> {
-        let row = sqlx::query("select account_id, expires_at from account_sessions where token_hash = $1")
-            .bind(token_hash)
-            .fetch_optional(&self.pool)
-            .await
-            .pg()?;
+        let row = sqlx::query(
+            "select account_id, expires_at from account_sessions where token_hash = $1",
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .pg()?;
         Ok(row.map(|r| SessionRecord {
             account_id: r.get("account_id"),
             expires_at: r.get("expires_at"),
@@ -1463,16 +1474,22 @@ mod tests {
 
     #[test]
     fn test_migrations_registered() {
-        assert_eq!(MIGRATIONS.len(), 2);
+        assert_eq!(MIGRATIONS.len(), 3);
         assert!(MIGRATIONS[0].0.starts_with("20261011"));
         assert!(MIGRATIONS[1].0.starts_with("20261012"));
+        assert!(MIGRATIONS[2].0.starts_with("20261013"));
         // 迁移清单必须按版本号字典序排列（执行顺序依赖于此）
         assert!(MIGRATIONS[0].0 < MIGRATIONS[1].0);
+        assert!(MIGRATIONS[1].0 < MIGRATIONS[2].0);
         // 沙箱迁移必须可被语句切分器完整切开（每段以分号结尾）
         let (_, sql) = MIGRATIONS[1];
         let stmts = split_sql_statements(sql);
         assert!(stmts.len() > 10);
         assert!(stmts.iter().all(|s| s.trim_end().ends_with(';')));
+        let (_, sql3) = MIGRATIONS[2];
+        let stmts3 = split_sql_statements(sql3);
+        assert!(stmts3.len() >= 2);
+        assert!(stmts3.iter().all(|s| s.trim_end().ends_with(';')));
     }
 
     #[test]
@@ -1493,7 +1510,8 @@ mod tests {
 
     #[test]
     fn test_split_sql_statements_comments_and_strings() {
-        let sql = "-- 注释里的分号; 与引号 '\ninsert into t values ('a;b');\n/* 块注释 ; */ select 1;";
+        let sql =
+            "-- 注释里的分号; 与引号 '\ninsert into t values ('a;b');\n/* 块注释 ; */ select 1;";
         let stmts = split_sql_statements(sql);
         assert_eq!(stmts.len(), 2);
     }
@@ -1507,9 +1525,9 @@ mod tests {
             .filter(|s| !s.is_empty())
             .collect();
         assert!(stmts.len() > 10);
-        assert!(stmts
-            .iter()
-            .any(|s| s.contains("create role audit_writer") && s.contains("begin") && s.ends_with("$$;")));
+        assert!(stmts.iter().any(|s| s.contains("create role audit_writer")
+            && s.contains("begin")
+            && s.ends_with("$$;")));
     }
 
     #[test]

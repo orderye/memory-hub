@@ -290,7 +290,8 @@ impl IntegrationService for DefaultIntegrationService {
                         conflict_members.insert(i);
                     }
                     let sorted = sorted_by_recency(members, &entries);
-                    let ids: Vec<Uuid> = sorted.iter().map(|&i| entries[i].id).collect();
+                    let mut ids: Vec<Uuid> = sorted.iter().map(|&i| entries[i].id).collect();
+                    ids.sort(); // 规范化排序，保证 open_exists 跨数据库数组比较时判定稳定
                     dedupe_keys.push(("conflict".to_string(), ids.clone()));
                     new_proposals.push(IntegrationProposal {
                         id: Uuid::new_v4(),
@@ -318,7 +319,8 @@ impl IntegrationService for DefaultIntegrationService {
                 continue;
             }
             let sorted = sorted_by_recency(&members, &entries);
-            let ids: Vec<Uuid> = sorted.iter().map(|&i| entries[i].id).collect();
+            let mut ids: Vec<Uuid> = sorted.iter().map(|&i| entries[i].id).collect();
+            ids.sort(); // 规范化排序
             dedupe_keys.push(("duplicate".to_string(), ids.clone()));
             new_proposals.push(IntegrationProposal {
                 id: Uuid::new_v4(),

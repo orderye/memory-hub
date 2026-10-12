@@ -99,15 +99,24 @@ pub fn oauth_router(state: AsWebState) -> Router {
         .route("/oauth/token", post(handle_token))
         .route("/oauth/introspect", post(handle_introspect))
         .route("/oauth/revoke", post(handle_revoke))
-        .route("/account/register", get(handle_register_page).post(handle_register_submit))
-        .route("/account/login", get(handle_login_page).post(handle_login_submit))
+        .route(
+            "/account/register",
+            get(handle_register_page).post(handle_register_submit),
+        )
+        .route(
+            "/account/login",
+            get(handle_login_page).post(handle_login_submit),
+        )
         .route("/account/logout", post(handle_logout))
         .route("/account/token", post(handle_account_token))
         .route("/console", get(handle_console))
         .route("/console/agents", post(handle_console_register_agent))
         .route("/console/agents/status", post(handle_console_agent_status))
         .route("/console/grants/revoke", post(handle_console_grant_revoke))
-        .route("/console/accounts/status", post(handle_console_account_status))
+        .route(
+            "/console/accounts/status",
+            post(handle_console_account_status),
+        )
         .route("/healthz", axum::routing::get(handle_healthz))
         .route("/readyz", axum::routing::get(handle_healthz))
         .with_state(state)
@@ -558,10 +567,7 @@ async fn handle_logout(State(s): State<AsWebState>, headers: HeaderMap) -> Respo
     if let Some(token) = cookie_token(&headers) {
         let _ = s.accounts.logout(&token).await;
     }
-    with_cookie(
-        redirect("/account/login"),
-        clear_session_cookie(&s),
-    )
+    with_cookie(redirect("/account/login"), clear_session_cookie(&s))
 }
 
 /// POST /account/token：签发注册令牌（供 MCP 客户端 DCR 使用）
@@ -627,8 +633,16 @@ async fn handle_console(State(s): State<AsWebState>, headers: HeaderMap) -> Resp
         .collect();
     let mut agent_rows = String::new();
     for a in &agents {
-        let next_status = if a.status == "active" { "suspended" } else { "active" };
-        let action = if a.status == "active" { "停用" } else { "恢复" };
+        let next_status = if a.status == "active" {
+            "suspended"
+        } else {
+            "active"
+        };
+        let action = if a.status == "active" {
+            "停用"
+        } else {
+            "恢复"
+        };
         agent_rows.push_str(&format!(
             r#"<tr><td><code>{id}</code></td><td>{name}</td><td>{kind}</td><td>{client}</td><td>{status}</td><td>{scopes}</td>
 <td><form method="post" action="/console/agents/status"><input type="hidden" name="agent_id" value="{id}"><input type="hidden" name="status" value="{next_status}"><button class="mini">{action}</button></form></td></tr>"#,
@@ -690,8 +704,16 @@ async fn handle_console(State(s): State<AsWebState>, headers: HeaderMap) -> Resp
         let accounts = s.accounts.list_accounts().await.unwrap_or_default();
         let mut rows = String::new();
         for a in &accounts {
-            let next = if a.status == "active" { "suspended" } else { "active" };
-            let action = if a.status == "active" { "停用" } else { "恢复" };
+            let next = if a.status == "active" {
+                "suspended"
+            } else {
+                "active"
+            };
+            let action = if a.status == "active" {
+                "停用"
+            } else {
+                "恢复"
+            };
             rows.push_str(&format!(
                 r#"<tr><td><code>{id}</code></td><td>{username}</td><td>{name}</td><td>{status}</td><td>{pwd}</td>
 <td><form method="post" action="/console/accounts/status"><input type="hidden" name="account_id" value="{id}"><input type="hidden" name="status" value="{next}"><button class="mini">{action}</button></form></td></tr>"#,
@@ -772,10 +794,12 @@ async fn handle_console_register_agent(
         return login_redirect(&s);
     };
 
-    let confidential = form
-        .confidential
-        .as_deref()
-        .is_some_and(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "off" | ""));
+    let confidential = form.confidential.as_deref().is_some_and(|v| {
+        !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "false" | "0" | "off" | ""
+        )
+    });
     // 控制台注册默认生成密钥（控件实现"显示一次"）
     let secret = confidential.then(|| format!("hub_{}", crate::account::new_session_token()));
     let redirect_uris: Vec<String> = form
@@ -985,9 +1009,10 @@ fn with_session_cookie(s: &AsWebState, resp: Response, token: &str) -> Response 
 
 fn session_cookie(s: &AsWebState, token: &str) -> String {
     format!(
-        "{}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=43200{}",
+        "{}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}{}",
         SESSION_COOKIE,
         token,
+        s.accounts.session_ttl_secs(),
         if cookie_secure(s) { "; Secure" } else { "" }
     )
 }
@@ -1061,7 +1086,16 @@ fn page(title: &str, body: &str) -> Response {
         title = esc(title),
         body = body
     );
-    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response()
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::X_FRAME_OPTIONS, "DENY"),
+            (header::CONTENT_SECURITY_POLICY, "frame-ancestors 'none'"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        html,
+    )
+        .into_response()
 }
 
 /// HTML 转义（所有用户可控内容进入页面前必须经过）
@@ -1205,12 +1239,7 @@ mod tests {
 
         // 归属账户写入 Agent 记录
         let agent = s.oauth.get_agent("agent-a").await.unwrap().unwrap();
-        let account = s
-            .accounts
-            .session_account(&session)
-            .await
-            .unwrap()
-            .unwrap();
+        let account = s.accounts.session_account(&session).await.unwrap().unwrap();
         assert_eq!(agent.owner_account_id, account.id);
 
         // 注册令牌路径（无会话）
@@ -1297,7 +1326,10 @@ mod tests {
     #[tokio::test]
     async fn test_account_pages_render() {
         let s = state();
-        assert_eq!(handle_login_page(State(s.clone())).await.status(), StatusCode::OK);
+        assert_eq!(
+            handle_login_page(State(s.clone())).await.status(),
+            StatusCode::OK
+        );
         assert_eq!(
             handle_register_page(State(s.clone())).await.status(),
             StatusCode::OK
@@ -1346,7 +1378,9 @@ mod tests {
             }),
         )
         .await;
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let html = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(html.contains("邀请码不正确"));
     }
@@ -1386,7 +1420,10 @@ mod tests {
 
     #[test]
     fn test_esc_escapes_html() {
-        assert_eq!(esc(r#"<script>"x"&'y'"#), "&lt;script&gt;&quot;x&quot;&amp;&#39;y&#39;");
+        assert_eq!(
+            esc(r#"<script>"x"&'y'"#),
+            "&lt;script&gt;&quot;x&quot;&amp;&#39;y&#39;"
+        );
     }
 
     #[test]

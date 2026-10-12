@@ -10,7 +10,7 @@
 
 use anyhow::{anyhow, Result};
 use auth_web::oauth_router;
-use auth_web::{AccountService, AgentOAuthServer, ensure_bootstrap_account};
+use auth_web::{ensure_bootstrap_account, AccountService, AgentOAuthServer};
 use common::init_tracing;
 use mem_core::{AccountStore, MemoryHubStore};
 use std::sync::Arc;

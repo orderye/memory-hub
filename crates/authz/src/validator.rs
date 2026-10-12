@@ -153,9 +153,7 @@ mod tests {
     fn test_missing_account_rejected() {
         let validator = TokenValidator::new("https://hub.example.com", "https://auth.example.com");
         // 升级前签发的旧令牌没有 account 声明：一律拒收
-        let err = validator
-            .validate_claims(&claims_with(None))
-            .unwrap_err();
+        let err = validator.validate_claims(&claims_with(None)).unwrap_err();
         assert!(matches!(err, HubError::AuthRequired));
     }
 

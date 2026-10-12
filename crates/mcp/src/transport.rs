@@ -167,17 +167,20 @@ pub enum RateVerdict {
     },
 }
 
-/// 进程内令牌桶：单副本部署的默认实现
+struct AgentBucketState {
+    tokens: f64,
+    last_refill: std::time::Instant,
+}
+
+/// 进程内令牌桶：单副本部署的默认实现（Lazy Refill O(1)，无全局扫描锁争用）
 pub struct InMemoryRateLimitStore {
-    last_refill: std::sync::Mutex<std::time::Instant>,
-    agent_buckets: std::sync::Mutex<HashMap<String, f64>>,
+    buckets: std::sync::Mutex<HashMap<String, AgentBucketState>>,
 }
 
 impl Default for InMemoryRateLimitStore {
     fn default() -> Self {
         Self {
-            last_refill: std::sync::Mutex::new(std::time::Instant::now()),
-            agent_buckets: std::sync::Mutex::new(HashMap::new()),
+            buckets: std::sync::Mutex::new(HashMap::new()),
         }
     }
 }
@@ -192,7 +195,7 @@ impl InMemoryRateLimitStore {
 impl common::RateLimitStore for InMemoryRateLimitStore {
     async fn try_acquire(
         &self,
-        dimension: common::RateDimension,
+        _dimension: common::RateDimension,
         key: &str,
         capacity: u32,
     ) -> common::Result<bool> {
@@ -200,39 +203,34 @@ impl common::RateLimitStore for InMemoryRateLimitStore {
             return Ok(true);
         }
 
-        let _ = dimension; // 单维度：Agent
-        self.refill(capacity);
-
         let cap = f64::from(capacity);
-        let mut buckets = self.agent_buckets.lock().unwrap();
+        let now = std::time::Instant::now();
+        let mut buckets = self.buckets.lock().unwrap();
 
-        let left = buckets.entry(key.to_string()).or_insert(cap);
-        if *left < 1.0 {
+        // 超过 10000 个桶时做一次轻量级清理（淘汰 1 小时未活跃的桶，防无界内存泄漏）
+        if buckets.len() > 10000 {
+            buckets.retain(|_, b| now.saturating_duration_since(b.last_refill).as_secs() < 3600);
+        }
+
+        let bucket = buckets
+            .entry(key.to_string())
+            .or_insert_with(|| AgentBucketState {
+                tokens: cap,
+                last_refill: now,
+            });
+
+        // 局部惰性补充 (Lazy Refill)：仅根据当前 Agent 自身流逝时间补充令牌
+        let elapsed = now
+            .saturating_duration_since(bucket.last_refill)
+            .as_secs_f64();
+        bucket.tokens = (bucket.tokens + cap * elapsed).min(cap);
+        bucket.last_refill = now;
+
+        if bucket.tokens < 1.0 {
             return Ok(false);
         }
-        *left -= 1.0;
+        bucket.tokens -= 1.0;
         Ok(true)
-    }
-}
-
-impl InMemoryRateLimitStore {
-    /// 按经过时间等速补充令牌（单副本实现）
-    fn refill(&self, capacity: u32) {
-        let mut last = self.last_refill.lock().unwrap();
-        let elapsed = last.elapsed();
-        if elapsed.as_secs_f64() < 0.05 {
-            return;
-        }
-        *last = std::time::Instant::now();
-        let factor = elapsed.as_secs_f64();
-        drop(last);
-
-        let cap = f64::from(capacity);
-        if let Ok(mut b) = self.agent_buckets.lock() {
-            for left in b.values_mut() {
-                *left = (*left + cap * factor).min(cap);
-            }
-        }
     }
 }
 
@@ -382,6 +380,11 @@ pub async fn handle_jsonrpc(
             JsonRpcResponse::ok(id, payload)
         }
 
+        "notifications/initialized" | "notifications/cancelled" => {
+            // MCP 标准通知：若客户端附带 id，返回成功空对象；无 id 时由传输层静默消费
+            JsonRpcResponse::ok(id, json!({}))
+        }
+
         other => JsonRpcResponse::err(id, METHOD_NOT_FOUND, format!("未知方法: {}", other)),
     }
 }
@@ -396,6 +399,10 @@ pub async fn handle_raw_frame(state: &McpTransportState, raw: &str) -> Option<Js
     let parsed: std::result::Result<JsonRpcRequest, _> = serde_json::from_str(trimmed);
     match parsed {
         Ok(req) => {
+            // MCP 标准通知帧（无 id，如 notifications/initialized）：规范严禁产生任何回包
+            if req.id.is_none() && req.method.starts_with("notifications/") {
+                return None;
+            }
             // stdio 场景无 HTTP 头，鉴权由调用方通过 params 或环境注入的
             // 服务主体承担；此处视为"已认证的本地桥接"。
             Some(handle_jsonrpc(state, None, req).await)
@@ -542,7 +549,14 @@ async fn handle_http_mcp(
             Ok(reqs) => {
                 let mut out = Vec::with_capacity(reqs.len());
                 for r in reqs {
+                    // MCP 标准通知帧：不向回包数组中塞入响应
+                    if r.id.is_none() && r.method.starts_with("notifications/") {
+                        continue;
+                    }
                     out.push(handle_jsonrpc(&state, auth.as_ref(), r).await);
+                }
+                if out.is_empty() {
+                    return StatusCode::NO_CONTENT.into_response();
                 }
                 return (
                     StatusCode::OK,
@@ -574,35 +588,49 @@ async fn handle_http_mcp(
         }
     };
 
+    // MCP 标准通知（如 notifications/initialized）：客户端不期望任何回包
+    if req.id.is_none() && req.method.starts_with("notifications/") {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+
     let resp = handle_jsonrpc(&state, auth.as_ref(), req).await;
 
     // HTTP 状态码与 MCP 约定的错误码对齐：
-    // - 凭据缺失/无效 → 401（应带 WWW-Authenticate）
+    // - 凭据缺失/无效 → 401（附带 RFC 6750 WWW-Authenticate 头部）
     // - 令牌有效但权限不足 → 403
-    let status = match resp.error.as_ref().map(|e| e.code) {
-        Some(32001) => StatusCode::UNAUTHORIZED,
-        Some(32002) => StatusCode::FORBIDDEN, // 需用户确认
-        Some(32003) => StatusCode::TOO_MANY_REQUESTS,
-        Some(32004) => StatusCode::FAILED_DEPENDENCY, // 策略阻断
-        _ => StatusCode::OK,
+    let (status, auth_header) = match resp.error.as_ref().map(|e| e.code) {
+        Some(32001) => (
+            StatusCode::UNAUTHORIZED,
+            Some((header::WWW_AUTHENTICATE, r#"Bearer error="invalid_token""#)),
+        ),
+        Some(32002) => (StatusCode::FORBIDDEN, None), // 需用户确认
+        Some(32003) => (StatusCode::TOO_MANY_REQUESTS, None),
+        Some(32004) => (StatusCode::FAILED_DEPENDENCY, None), // 策略阻断
+        _ => (StatusCode::OK, None),
     };
 
-    (
-        status,
-        [(header::CONTENT_TYPE, "application/json")],
-        serde_json::to_string(&resp).unwrap_or_default(),
-    )
-        .into_response()
+    let mut builder = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some((k, v)) = auth_header {
+        builder = builder.header(k, v);
+    }
+    builder
+        .body(serde_json::to_string(&resp).unwrap_or_default().into())
+        .unwrap_or_else(|_| (status, "Internal Server Error").into_response())
 }
 
 fn jsonrpc_http(status: StatusCode, id: Option<Value>, code: i64, message: String) -> Response {
     let resp = JsonRpcResponse::err(id, code, message);
-    (
-        status,
-        [(header::CONTENT_TYPE, "application/json")],
-        serde_json::to_string(&resp).unwrap_or_default(),
-    )
-        .into_response()
+    let mut builder = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json");
+    if status == StatusCode::UNAUTHORIZED {
+        builder = builder.header(header::WWW_AUTHENTICATE, r#"Bearer error="invalid_token""#);
+    }
+    builder
+        .body(serde_json::to_string(&resp).unwrap_or_default().into())
+        .unwrap_or_else(|_| (status, "Internal Server Error").into_response())
 }
 
 /// 把 `ToolCallResult` 转为可直接回传的 axum 响应
@@ -945,6 +973,27 @@ mod tests {
         let body = Bytes::from_static(br#"{"jsonrpc":"2.0","id":12,"method":"ping"}"#);
         let resp = handle_http_mcp(State(Arc::new(s)), Method::POST, headers, body).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            resp.headers().contains_key(header::WWW_AUTHENTICATE),
+            "401 响应必须携带 RFC 6750 WWW-Authenticate 头部"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_notification_initialized_silently_handled() {
+        let s = state();
+        // 1. stdio 场景：raw_frame 收到通知帧应返回 None，不向 stdout 发送回包
+        let raw = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        let resp = handle_raw_frame(&s, raw).await;
+        assert!(resp.is_none(), "标准通知帧不得回复任何 JSON-RPC 响应");
+
+        // 2. HTTP 场景：POST 收到通知帧应返回 204 No Content
+        use axum::body::Bytes;
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "Bearer good".parse().unwrap());
+        let body = Bytes::from_static(br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+        let resp_http = handle_http_mcp(State(Arc::new(s)), Method::POST, headers, body).await;
+        assert_eq!(resp_http.status(), StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]

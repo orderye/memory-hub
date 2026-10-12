@@ -10,10 +10,13 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use chrono::{Duration, Utc};
 use common::{AccountId, AgentId, AuthCtx, HubError, NamespaceGrant, Result, Scope};
+use hmac::{Hmac, Mac};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use uuid::Uuid;
+
+type HmacSha256 = Hmac<Sha256>;
 
 /// JWT 头部
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,27 +60,10 @@ impl AccessTokenManager {
     }
 
     fn hmac_sha256(key: &[u8], msg: &[u8]) -> Vec<u8> {
-        // 标准 HMAC 构造：block size 64 字节
-        let mut block = [0u8; 64];
-        let key_len = key.len().min(64);
-        block[..key_len].copy_from_slice(&key[..key_len]);
-
-        let mut ipad = [0x36u8; 64];
-        let mut opad = [0x5cu8; 64];
-        for i in 0..64 {
-            ipad[i] ^= block[i];
-            opad[i] ^= block[i];
-        }
-
-        let mut inner = Sha256::new();
-        inner.update(ipad);
-        inner.update(msg);
-        let inner_digest = inner.finalize();
-
-        let mut outer = Sha256::new();
-        outer.update(opad);
-        outer.update(inner_digest);
-        outer.finalize().to_vec()
+        let mut mac = HmacSha256::new_from_slice(key)
+            .expect("HMAC supports keys of arbitrary length per RFC 2104");
+        mac.update(msg);
+        mac.finalize().into_bytes().to_vec()
     }
 
     /// 签发访问令牌
@@ -323,5 +309,27 @@ mod tests {
         assert!(m.verify("").is_err());
         assert!(m.verify("a.b").is_err());
         assert!(m.verify("a.b.c.d").is_err());
+    }
+
+    #[test]
+    fn test_long_secret_over_64_bytes_roundtrip() {
+        // RFC 2104 要求大于 64 字节的密钥先哈希再用于 HMAC，不可直接截断
+        let long_secret = "a".repeat(128);
+        let m = AccessTokenManager::new(
+            long_secret,
+            "https://auth.example.com",
+            "https://hub.example.com",
+            3600,
+        );
+        let token = m
+            .issue(
+                &"agent-alpha".to_string(),
+                account(),
+                vec![Scope::Read],
+                vec![],
+            )
+            .unwrap();
+        let claims = m.verify(&token).unwrap();
+        assert_eq!(claims.sub, "agent-alpha");
     }
 }
