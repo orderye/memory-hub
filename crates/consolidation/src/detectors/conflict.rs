@@ -51,7 +51,7 @@ impl ConflictDetector {
                 members.iter().map(|m| m.content.as_str()).collect();
             if distinct_contents.len() >= 2 {
                 let mut sorted = members.clone();
-                sorted.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+                sorted.sort_by_key(|a| std::cmp::Reverse(a.updated_at));
                 let ids: Vec<Uuid> = sorted.iter().map(|m| m.id).collect();
                 for id in &ids {
                     conflict_member_set.insert(*id);
@@ -62,7 +62,11 @@ impl ConflictDetector {
                     key: Some(k.to_string()),
                     member_ids: ids,
                     divergence: 1.0,
-                    description: format!("业务键 '{}' 下存在 {} 条不同内容的记忆条目", k, members.len()),
+                    description: format!(
+                        "业务键 '{}' 下存在 {} 条不同内容的记忆条目",
+                        k,
+                        members.len()
+                    ),
                     suggested_survivor: sorted[0].id,
                 });
             }
@@ -79,8 +83,7 @@ impl ConflictDetector {
             let e1 = active_unkeyed[i];
             let emb1 = e1.embedding.as_ref().unwrap();
 
-            for j in (i + 1)..active_unkeyed.len() {
-                let e2 = active_unkeyed[j];
+            for &e2 in active_unkeyed.iter().skip(i + 1) {
                 // 仅限相同类型
                 if e1.kind != e2.kind {
                     continue;

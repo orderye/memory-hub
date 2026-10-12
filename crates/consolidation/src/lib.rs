@@ -27,11 +27,16 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use mem_core::{MemoryEntry, MemoryKind, MemoryStatus, MemoryStore};
-    use store::InMemoryHubStore;
     use std::sync::Arc;
+    use store::InMemoryHubStore;
     use uuid::Uuid;
 
-    fn make_test_entry(ns: &str, content: &str, key: Option<&str>, emb: Option<Vec<f32>>) -> MemoryEntry {
+    fn make_test_entry(
+        ns: &str,
+        content: &str,
+        key: Option<&str>,
+        emb: Option<Vec<f32>>,
+    ) -> MemoryEntry {
         MemoryEntry {
             id: Uuid::new_v4(),
             namespace: ns.to_string(),
@@ -56,8 +61,18 @@ mod tests {
     #[tokio::test]
     async fn test_duplicate_detection_and_consolidation_flow() {
         let store = Arc::new(InMemoryHubStore::new());
-        let e1 = make_test_entry("ns", "PostgreSQL 是开源关系型数据库", None, Some(vec![1.0, 0.0]));
-        let e2 = make_test_entry("ns", "PostgreSQL 是开源关系型数据库系统", None, Some(vec![0.99, 0.01]));
+        let e1 = make_test_entry(
+            "ns",
+            "PostgreSQL 是开源关系型数据库",
+            None,
+            Some(vec![1.0, 0.0]),
+        );
+        let e2 = make_test_entry(
+            "ns",
+            "PostgreSQL 是开源关系型数据库系统",
+            None,
+            Some(vec![0.99, 0.01]),
+        );
 
         store.insert(&e1).await.unwrap();
         store.insert(&e2).await.unwrap();
@@ -70,7 +85,10 @@ mod tests {
 
         assert_eq!(report.scanned, 2);
         assert_eq!(report.proposals_created, 1);
-        assert_eq!(report.proposals[0].kind, mem_core::IntegrationKind::Duplicate);
+        assert_eq!(
+            report.proposals[0].kind,
+            mem_core::IntegrationKind::Duplicate
+        );
 
         let stats = engine.calculate_stats("ns").await.unwrap();
         assert_eq!(stats.duplicate_groups_count, 1);

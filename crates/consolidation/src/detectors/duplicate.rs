@@ -90,8 +90,7 @@ impl DuplicateDetector {
                 let i = indices[i_idx];
                 let emb_a = entries[i].embedding.as_ref().unwrap();
 
-                for j_idx in (i_idx + 1)..indices.len() {
-                    let j = indices[j_idx];
+                for &j in indices.iter().skip(i_idx + 1) {
                     let emb_b = entries[j].embedding.as_ref().unwrap();
 
                     let sim = cosine_similarity(emb_a, emb_b);

@@ -65,10 +65,7 @@ impl TieredMerger {
     }
 
     /// 元数据深度合并（记录 merged_from 溯源列表）
-    pub fn merge_metadata(
-        survivor: &MemoryEntry,
-        members: &[MemoryEntry],
-    ) -> serde_json::Value {
+    pub fn merge_metadata(survivor: &MemoryEntry, members: &[MemoryEntry]) -> serde_json::Value {
         let mut base = match survivor.metadata.clone() {
             serde_json::Value::Object(map) => map,
             _ => serde_json::Map::new(),

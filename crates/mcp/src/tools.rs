@@ -106,6 +106,8 @@ impl ToolDispatcher {
             "memory_integrate_scan" => self.integrate_scan(auth, arguments).await,
             "memory_integration_list" => self.integration_list(auth, arguments).await,
             "memory_integration_resolve" => self.integration_resolve(auth, arguments).await,
+            "memory_consolidate" => self.consolidate(auth, arguments).await,
+            "memory_consolidation_stats" => self.consolidation_stats(auth, arguments).await,
             "memory_grant" => self.grant(auth, arguments).await,
             "memory_revoke" => self.revoke(auth, arguments).await,
             other => {
@@ -427,6 +429,105 @@ impl ToolDispatcher {
                 "参数不符合 memory_integration_resolve schema: {}",
                 e
             ))),
+        }
+    }
+
+    async fn consolidate(&self, auth: &AuthCtx, args: Value) -> ToolCallResult {
+        #[derive(Deserialize)]
+        struct Req {
+            namespace: String,
+            #[serde(default)]
+            dry_run: bool,
+            #[serde(default)]
+            sim_threshold: Option<f32>,
+            #[serde(default)]
+            auto_merge: bool,
+        }
+        let req = match serde_json::from_value::<Req>(args) {
+            Ok(r) => r,
+            Err(e) => {
+                return ToolCallResult::error(&HubError::InvalidArgument(format!(
+                    "参数不符合 memory_consolidate schema: {}",
+                    e
+                )))
+            }
+        };
+
+        if !auth.has_scope(&Scope::Write) {
+            return ToolCallResult::error(&HubError::InsufficientScope);
+        }
+
+        let scoped = mem_core::AccountScopedStore::new(self.store.clone(), auth.account_id);
+        if !scoped
+            .can_write(&req.namespace, &auth.agent_id)
+            .await
+            .unwrap_or(false)
+        {
+            return ToolCallResult::error(&HubError::InsufficientScope);
+        }
+
+        let mut engine = consolidation::ConsolidationEngine::new(
+            Arc::new(scoped),
+            req.sim_threshold.unwrap_or(0.92),
+            100,
+        );
+        if req.auto_merge {
+            engine = engine.with_policy(consolidation::AutoPolicy::new(
+                consolidation::PolicyMode::SemiAuto,
+            ));
+        }
+
+        match engine
+            .consolidate_namespace(
+                &req.namespace,
+                req.dry_run,
+                req.sim_threshold,
+                &auth.agent_id,
+            )
+            .await
+        {
+            Ok(report) => {
+                ToolCallResult::success(serde_json::to_value(&report).unwrap_or(Value::Null))
+            }
+            Err(e) => ToolCallResult::error(&e),
+        }
+    }
+
+    async fn consolidation_stats(&self, auth: &AuthCtx, args: Value) -> ToolCallResult {
+        #[derive(Deserialize)]
+        struct Req {
+            namespace: String,
+        }
+        let req = match serde_json::from_value::<Req>(args) {
+            Ok(r) => r,
+            Err(e) => {
+                return ToolCallResult::error(&HubError::InvalidArgument(format!(
+                    "参数不符合 memory_consolidation_stats schema: {}",
+                    e
+                )))
+            }
+        };
+
+        if !auth.has_scope(&Scope::Read) {
+            return ToolCallResult::error(&HubError::InsufficientScope);
+        }
+
+        let scoped = mem_core::AccountScopedStore::new(self.store.clone(), auth.account_id);
+        if !scoped
+            .can_read(&req.namespace, &auth.agent_id)
+            .await
+            .unwrap_or(false)
+        {
+            return ToolCallResult::error(&HubError::InsufficientScope);
+        }
+
+        let engine = consolidation::ConsolidationEngine::new(Arc::new(scoped), 0.92, 100);
+
+        match engine.calculate_stats(&req.namespace).await {
+            Ok(stats) => {
+                ToolCallResult::success(serde_json::to_value(&stats).unwrap_or(Value::Null))
+            }
+            Err(e) => ToolCallResult::error(&e),
         }
     }
 
@@ -889,6 +990,45 @@ mod tests {
             .clone();
         assert_eq!(after.len(), 1);
         assert_eq!(after[0]["status"], json!("merged"));
+    }
+
+    #[tokio::test]
+    async fn test_consolidation_hub_tools() {
+        let (d, auth) = harness();
+        d.dispatch(
+            &auth,
+            "memory_put",
+            arg(json!({ "namespace": "team-hub", "kind": "fact", "content": "集群配置：节点规格 8C16G" })),
+        )
+        .await;
+        d.dispatch(
+            &auth,
+            "memory_put",
+            arg(json!({ "namespace": "team-hub", "kind": "fact", "content": "集群配置：节点规格 8C16G" })),
+        )
+        .await;
+
+        let stats = d
+            .dispatch(
+                &auth,
+                "memory_consolidation_stats",
+                arg(json!({ "namespace": "team-hub" })),
+            )
+            .await;
+        assert!(!stats.is_error, "统计应成功: {:?}", stats);
+        let sc = stats.structured_content.unwrap();
+        assert_eq!(sc["total_active"], 2);
+
+        let consolidate = d
+            .dispatch(
+                &auth,
+                "memory_consolidate",
+                arg(json!({ "namespace": "team-hub", "dry_run": false, "auto_merge": true })),
+            )
+            .await;
+        assert!(!consolidate.is_error, "整合中枢应成功: {:?}", consolidate);
+        let report = consolidate.structured_content.unwrap();
+        assert_eq!(report["auto_merged"], 1);
     }
 
     #[tokio::test]

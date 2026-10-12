@@ -3,21 +3,16 @@
 use serde::{Deserialize, Serialize};
 
 /// 自动化整合策略模式
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyMode {
     /// 全手动：仅生成提案，绝不自动裁决合并（默认安全模式）
+    #[default]
     Manual,
     /// 半自动：超高相似度（>= auto_merge_threshold）且成员数较少时自动合并，其余生成提案
     SemiAuto,
     /// 全自动：重复组自动合并，冲突保留提案
     FullAuto,
-}
-
-impl Default for PolicyMode {
-    fn default() -> Self {
-        PolicyMode::Manual
-    }
 }
 
 /// 整合策略配置

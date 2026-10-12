@@ -26,11 +26,7 @@ pub struct ConsolidationEngine {
 }
 
 impl ConsolidationEngine {
-    pub fn new(
-        store: Arc<dyn MemoryHubStore>,
-        sim_threshold: f32,
-        max_proposals: usize,
-    ) -> Self {
+    pub fn new(store: Arc<dyn MemoryHubStore>, sim_threshold: f32, max_proposals: usize) -> Self {
         Self {
             store,
             duplicate_detector: DuplicateDetector::new(sim_threshold),
@@ -94,7 +90,8 @@ impl ConsolidationEngine {
         let conflict_entries_count = conf_entries.len();
         let stale_entries_count = stale.len();
 
-        let redundancy_ratio = (duplicate_entries_count as f32 / total_active as f32).clamp(0.0, 1.0);
+        let redundancy_ratio =
+            (duplicate_entries_count as f32 / total_active as f32).clamp(0.0, 1.0);
         let conflict_ratio = (conflict_entries_count as f32 / total_active as f32).clamp(0.0, 1.0);
 
         // 健康度：1.0 减去冗余惩罚、冲突惩罚和陈旧惩罚
@@ -195,8 +192,11 @@ impl ConsolidationEngine {
             }
 
             // 检查自动合并策略
-            if !dry_run && self.policy.should_auto_merge(d.max_similarity, filtered_members.len()) {
-                if let Ok(_) = self
+            if !dry_run
+                && self
+                    .policy
+                    .should_auto_merge(d.max_similarity, filtered_members.len())
+                && self
                     .execute_merge(
                         namespace,
                         d.suggested_survivor,
@@ -205,10 +205,10 @@ impl ConsolidationEngine {
                         operator_agent,
                     )
                     .await
-                {
-                    report.auto_merged += 1;
-                    continue;
-                }
+                    .is_ok()
+            {
+                report.auto_merged += 1;
+                continue;
             }
 
             let mut ids = filtered_members;
@@ -256,7 +256,10 @@ impl ConsolidationEngine {
         }
 
         // 重新刷新统计
-        report.stats = self.calculate_stats(namespace).await.unwrap_or(report.stats);
+        report.stats = self
+            .calculate_stats(namespace)
+            .await
+            .unwrap_or(report.stats);
         Ok(report)
     }
 
@@ -279,21 +282,18 @@ impl ConsolidationEngine {
                 proposal.resolved_at = Some(now);
                 self.store.save_proposal(&proposal).await?;
 
-                let first_id = proposal
-                    .member_ids
-                    .first()
-                    .ok_or(HubError::NotFound)?;
+                let first_id = proposal.member_ids.first().ok_or(HubError::NotFound)?;
                 self.store.get(&proposal.namespace, *first_id).await
             }
             ResolveAction::Merge => {
-                let survivor_id = req
-                    .survivor_id
-                    .or(proposal.suggested_survivor)
-                    .ok_or_else(|| {
-                        HubError::InvalidArgument(
-                            "提案无建议幸存者，必须显式提供 survivor_id".to_string(),
-                        )
-                    })?;
+                let survivor_id =
+                    req.survivor_id
+                        .or(proposal.suggested_survivor)
+                        .ok_or_else(|| {
+                            HubError::InvalidArgument(
+                                "提案无建议幸存者，必须显式提供 survivor_id".to_string(),
+                            )
+                        })?;
 
                 if !proposal.member_ids.contains(&survivor_id) {
                     return Err(HubError::InvalidArgument(

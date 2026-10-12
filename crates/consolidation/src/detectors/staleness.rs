@@ -55,7 +55,11 @@ impl StalenessDetector {
     }
 
     /// 扫描命名空间中的陈旧记忆列表
-    pub fn detect_in_entries(&self, entries: &[MemoryEntry], now: DateTime<Utc>) -> Vec<StaleEntry> {
+    pub fn detect_in_entries(
+        &self,
+        entries: &[MemoryEntry],
+        now: DateTime<Utc>,
+    ) -> Vec<StaleEntry> {
         entries
             .iter()
             .map(|e| self.evaluate_entry(e, now))
