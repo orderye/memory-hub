@@ -143,6 +143,8 @@ pub struct McpTransportState {
     pub max_request_bytes: usize,
     /// 限流器（None 表示不限流）
     pub rate_limiter: Option<Arc<RateLimiter>>,
+    /// 工具拦截器（None 表示不拦截直接穿透）
+    pub interceptor: Option<Arc<dyn crate::ToolInterceptor>>,
 }
 
 /// 基于令牌桶的限流器：按调用方 Agent 单维度限流
@@ -287,6 +289,16 @@ pub async fn handle_jsonrpc(
     auth: Option<&AuthCtx>,
     req: JsonRpcRequest,
 ) -> JsonRpcResponse {
+    handle_jsonrpc_ext(state, auth, None, req).await
+}
+
+/// 处理单条 JSON-RPC 消息（支持传入 HTTP 头以支持中间件特征检测）
+pub async fn handle_jsonrpc_ext(
+    state: &McpTransportState,
+    auth: Option<&AuthCtx>,
+    headers: Option<&HeaderMap>,
+    req: JsonRpcRequest,
+) -> JsonRpcResponse {
     let id = req.id.clone();
 
     if req.jsonrpc != "2.0" {
@@ -334,7 +346,7 @@ pub async fn handle_jsonrpc(
                 None => return JsonRpcResponse::err(id, INVALID_PARAMS, "缺少 name"),
             };
 
-            let arguments = params
+            let mut arguments = params
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
@@ -374,7 +386,37 @@ pub async fn handle_jsonrpc(
                 }
             }
 
-            // 3. 分发执行
+            // 3. 拦截器前置钩子 (中间层介入点)
+            if let Some(interceptor) = &state.interceptor {
+                let mut args = arguments.clone();
+                match interceptor
+                    .intercept_tool_call(&state.dispatcher, auth, headers, name, &mut args)
+                    .await
+                {
+                    Ok(Some(intercepted_res)) => {
+                        let payload = serde_json::to_value(&intercepted_res).unwrap_or(Value::Null);
+                        return JsonRpcResponse::ok(id, payload);
+                    }
+                    Ok(None) => {
+                        arguments = args;
+                    }
+                    Err(e) => {
+                        let (code, msg, data) = hub_error_to_jsonrpc(&e);
+                        return JsonRpcResponse {
+                            jsonrpc: "2.0",
+                            id,
+                            result: None,
+                            error: Some(JsonRpcError {
+                                code,
+                                message: msg,
+                                data: Some(data),
+                            }),
+                        };
+                    }
+                }
+            }
+
+            // 4. 标准核心分发执行 (原有代码 100% 保持原样)
             let result: ToolCallResult = state.dispatcher.dispatch(auth, name, arguments).await;
             let payload = serde_json::to_value(&result).unwrap_or(Value::Null);
             JsonRpcResponse::ok(id, payload)
@@ -553,7 +595,7 @@ async fn handle_http_mcp(
                     if r.id.is_none() && r.method.starts_with("notifications/") {
                         continue;
                     }
-                    out.push(handle_jsonrpc(&state, auth.as_ref(), r).await);
+                    out.push(handle_jsonrpc_ext(&state, auth.as_ref(), Some(&headers), r).await);
                 }
                 if out.is_empty() {
                     return StatusCode::NO_CONTENT.into_response();
@@ -593,7 +635,7 @@ async fn handle_http_mcp(
         return StatusCode::NO_CONTENT.into_response();
     }
 
-    let resp = handle_jsonrpc(&state, auth.as_ref(), req).await;
+    let resp = handle_jsonrpc_ext(&state, auth.as_ref(), Some(&headers), req).await;
 
     // HTTP 状态码与 MCP 约定的错误码对齐：
     // - 凭据缺失/无效 → 401（附带 RFC 6750 WWW-Authenticate 头部）
@@ -708,6 +750,7 @@ mod tests {
             allowed_origins: vec![],
             max_request_bytes: 65536,
             rate_limiter: limiter,
+            interceptor: None,
         }
     }
 

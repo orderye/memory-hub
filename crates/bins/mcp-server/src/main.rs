@@ -99,12 +99,27 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.rate_limit_per_agent_rps,
     ));
 
+    // ===== 创界山智能接入层防腐中间件 =====
+    #[cfg(feature = "adapter-cjs")]
+    let interceptor: Option<Arc<dyn mcp::ToolInterceptor>> = {
+        let cjs_cfg = mcp::CjsAdapterConfig::from_env();
+        if cjs_cfg.enabled {
+            info!(default_world = %cjs_cfg.default_world, "已装配创界山智能接入层防腐中间件");
+            Some(Arc::new(mcp::CjsAdapter::new(cjs_cfg)))
+        } else {
+            None
+        }
+    };
+    #[cfg(not(feature = "adapter-cjs"))]
+    let interceptor: Option<Arc<dyn mcp::ToolInterceptor>> = None;
+
     let state = McpTransportState {
         dispatcher,
         introspector,
         allowed_origins: cfg.allowed_origins.clone(),
         max_request_bytes: cfg.max_request_bytes,
         rate_limiter,
+        interceptor,
     };
 
     // ===== 启动方式 =====
