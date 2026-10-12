@@ -143,12 +143,12 @@ BACKUP=$(curl -s -X POST http://localhost:3000 -H "Authorization: Bearer $TOKEN"
                  └───────────┬────────────────┘
                              │
             ┌────────────────┴────────────────┐
-            │ Consolidation Engine (整合中枢) │── 冲突检测 / 语义去重 / 分级融合 / 策略调度
+            │      Consolidation Engine       │── 整合中枢：冲突检测 / 语义去重 / 分级融合 / 策略调度
             └────────────────┬────────────────┘
                              │ 同一份存储
                  ┌───────────▼────────────────┐
                  │  PostgreSQL 15 + pgvector  │  memories / memory_versions /
-                 │  (或内存实现，开发模式)    │  memory_backups / integration_proposals /
+                 │    (or In-Memory Store)    │  memory_backups / integration_proposals /
                  └───────────▲────────────────│  namespaces / agents / namespace_grants
                              │                └───────────────────────────────────────┘
    Agent 注册/授权 ──▶ auth-server (OAuth 2.1 + DCR + 授权码/PKCE + 控制台)
