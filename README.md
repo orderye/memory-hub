@@ -37,9 +37,9 @@ cargo run --bin backup-worker  # 备份/整合作业（需要 PostgreSQL）
 
 | 进程 | 职责 |
 | :--- | :--- |
-| `mcp-server` | MCP 服务：16 个记忆工具 + Streamable HTTP / stdio 传输 |
+| `mcp-server` | MCP 服务：18 个记忆工具 + Streamable HTTP / stdio 传输 |
 | `auth-server` | 账户注册/登录/控制台（沙箱边界）+ OAuth 2.1：Agent 注册（DCR，需账户身份）、`client_credentials`、授权码+PKCE、令牌内省/撤销 |
-| `backup-worker` | 周期作业：定时快照（cron）、过期记忆归档、整合冲突扫描 |
+| `backup-worker` | 周期作业：定时快照（cron）、过期记忆归档、整合中枢冲突/重复扫描 |
 
 存储：PostgreSQL 15 + pgvector（生产）或内存实现（开发/测试）。嵌入器：OpenAI 兼容 `/embeddings` 服务或确定性 mock。
 
@@ -59,7 +59,7 @@ TOKEN=$(curl -s -X POST http://localhost:8080/oauth/token \
   -d 'grant_type=client_credentials&client_id=agent-alpha&client_secret=s3cret' \
   | jq -r .access_token)
 
-# 2. 写入记忆（首次写入的 Agent 自动成为命名空间 owner）
+# 1. 写入记忆（首次写入的 Agent 自动成为命名空间 owner）
 curl -X POST http://localhost:3000 -H "Authorization: Bearer $TOKEN" \
   -H 'content-type: application/json' -d '{
     "jsonrpc":"2.0","id":1,"method":"tools/call",
@@ -68,7 +68,7 @@ curl -X POST http://localhost:3000 -H "Authorization: Bearer $TOKEN" \
       "tags":["ops","infra"],"ttl_seconds":86400}}
   }'
 
-# 3. 混合检索（FTS + 向量 + MMR 重排）
+# 2. 混合检索（FTS 全文 + 向量语义 + 五维加权 + MMR 多样性重排）
 curl -X POST http://localhost:3000 -H "Authorization: Bearer $TOKEN" \
   -H 'content-type: application/json' -d '{
     "jsonrpc":"2.0","id":2,"method":"tools/call",
@@ -76,15 +76,40 @@ curl -X POST http://localhost:3000 -H "Authorization: Bearer $TOKEN" \
       "namespace":"team-x","query_text":"部署在哪里","top_k":5}}
   }'
 
+# 3. 整合中枢（扫描重复/冲突并一键融合，支持 dry_run 与 auto_merge）
+curl -X POST http://localhost:3000 -H "Authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' -d '{
+    "jsonrpc":"2.0","id":3,"method":"tools/call",
+    "params":{"name":"memory_consolidate","arguments":{
+      "namespace":"team-x","dry_run":false,"auto_merge":true}}
+  }'
+
 # 4. 备份 → 恢复（replace 前自动创建安全备份）
 BACKUP=$(curl -s -X POST http://localhost:3000 -H "Authorization: Bearer $TOKEN" \
   -H 'content-type: application/json' -d '{
-    "jsonrpc":"2.0","id":3,"method":"tools/call",
+    "jsonrpc":"2.0","id":4,"method":"tools/call",
     "params":{"name":"memory_backup_create","arguments":{"namespace":"team-x"}}}' \
   | jq -r .structuredContent.backup.id)
 ```
 
-## MCP 工具集（16 个）
+## 核心特性
+
+### 1. 快速混合检索（Hybrid Retrieval）
+- **双路并发召回**：全文倒排索引（FTS）与向量相似度（pgvector HNSW Cosine）并发检索，弥补单一关键词或纯语义的边界短板；
+- **五维打分融合**：综合向量相似度、关键词命中率、基于遗忘曲线的时间衰减（Recency）、显式记忆权重（Weight）以及访问频次；
+- **MMR 多样性重排**：通过 Maximal Marginal Relevance 算法降低冗余度，避免上下文窗口被高度相似的重复条目侵占。
+
+### 2. 整合中枢（Consolidation Engine）
+- **多维冲突与冗余检测**：精确识别相同 Key 的事实分歧（Conflict）、语义高相似的重复碎片（Duplicate，向量阈值可配）以及超期过期数据；
+- **分级融合器（Tiered Merger）**：正文内容智能合并，Tag 标签集自动并集，并在元数据深度写入 `merged_from` 完整溯源链；
+- **自适应策略调度**：
+  - `Manual`：仅生成审查提案，绝不静默合并，严格人工/Agent 裁决；
+  - `SemiAuto`：超高置信度（>= 阈值）且轻量条目自动融合，复杂冲突生成提案；
+  - `FullAuto`：全自动收敛并归档重复历史。
+
+---
+
+## MCP 工具集（18 个）
 
 | 工具 | 作用域 | 说明 |
 | :--- | :--- | :--- |
@@ -99,8 +124,10 @@ BACKUP=$(curl -s -X POST http://localhost:3000 -H "Authorization: Bearer $TOKEN"
 | `memory_backup_create` | admin | 创建快照（namespace 或全量 `*`） |
 | `memory_backup_list` | admin | 列举快照 |
 | `memory_restore` | admin | 恢复：dry_run / merge / replace |
-| `memory_integrate_scan` | write | 扫描重复/冲突，生成整合提案 |
-| `memory_integration_list` | read | 列举提案 |
+| `memory_consolidate` | write | 整合中枢：一键扫描/检测/归并（支持 dry_run 与 auto_merge） |
+| `memory_consolidation_stats` | read | 整合健康度与冗余统计（重复组、冲突组、活跃条目） |
+| `memory_integrate_scan` | write | 扫描重复/冲突，生成待审提案 |
+| `memory_integration_list` | read | 列举待审提案 |
 | `memory_integration_resolve` | write | 裁决提案：merge / dismiss |
 | `memory_grant` | admin | 命名空间授权给其他 Agent |
 | `memory_revoke` | admin | 撤销授权 |
@@ -111,9 +138,13 @@ BACKUP=$(curl -s -X POST http://localhost:3000 -H "Authorization: Bearer $TOKEN"
 
 ```
                  ┌────────────────────────────┐
-   Agent A ─────▶│  MCP Server (mcp-server)   │── 16 个记忆工具
+   Agent A ─────▶│  MCP Server (mcp-server)   │── 18 个记忆工具
    Agent B ─────▶│  HTTP(Streamable)/stdio    │
                  └───────────┬────────────────┘
+                             │
+            ┌────────────────┴────────────────┐
+            │   Consolidation Engine (整合中枢) │── 冲突检测 / 语义去重 / 分级融合 / 策略调度
+            └────────────────┬────────────────┘
                              │ 同一份存储
                  ┌───────────▼────────────────┐
                  │  PostgreSQL 15 + pgvector  │  memories / memory_versions /
@@ -127,7 +158,7 @@ BACKUP=$(curl -s -X POST http://localhost:3000 -H "Authorization: Bearer $TOKEN"
 ## 开发
 
 ```bash
-cargo test --workspace                 # 201 个测试
+cargo test --workspace                 # 237 个测试
 cargo clippy --all-targets             # 零警告
 cargo fmt --all
 # PostgreSQL 集成测试（需 DATABASE_URL）
@@ -138,16 +169,17 @@ cargo test -p store --features pg-integration -- --ignored
 
 ```
 crates/
-  common/     错误、脱敏日志、鉴权上下文、配置强校验、幂等、限流、cron
-  mem-core/   领域模型 + 记忆/备份/整合三大服务 + 命名空间 ACL + 检索打分算法
-  store/      PostgreSQL 与内存两套存储（记忆/备份/提案/授权/Agent）
-  embed/      嵌入器（OpenAI 兼容 HTTP / mock）
-  retrieval/  混合检索引擎（双路召回 + 加权融合 + MMR + 软超时）
-  authz/      令牌校验（HS256 离线验签、RFC 8707 aud 绑定、RFC 9728 元数据）
-  auth-core/  OAuth 安全原语（PKCE S256、Token Family 轮换、HS256）
-  auth-web/   OAuth 编排：DCR / client_credentials / 授权码 / 内省 / 撤销 / 控制台
-  mcp/        协议层（initialize/tools/list/tools/call）+ 16 工具 schema + 传输层
-  worker/     备份作业 / 过期清理 / 整合扫描 / cron 调度
+  common/        错误、脱敏日志、鉴权上下文、配置强校验、幂等、限流、cron
+  mem-core/      领域模型 + 记忆/备份/整合三大服务 + 命名空间 ACL + 检索打分算法
+  consolidation/ 整合中枢引擎（冲突/重复/时效性检测、分级融合器、全/半自动策略调度）
+  store/         PostgreSQL (含活跃条件唯一索引/迁移) 与内存两套存储
+  embed/         嵌入器（OpenAI 兼容 HTTP / mock）
+  retrieval/     混合检索引擎（双路召回 + 五维加权 + MMR 多样性重排 + 软超时）
+  authz/         令牌校验（HS256 离线验签、RFC 8707 aud 绑定、RFC 9728 元数据）
+  auth-core/     OAuth 安全原语（PKCE S256、Token Family 轮换、HS256）
+  auth-web/      OAuth 编排：DCR / client_credentials / 授权码 / 内省 / 撤销 / 控制台
+  mcp/           协议层（JSON-RPC 2.0 / Streamable HTTP / stdio）+ 18 工具 schema + 传输层
+  worker/        备份作业 / 过期清理 / 整合扫描作业 / cron 调度
 bins/
   mcp-server / auth-server / backup-worker
 ```
@@ -155,3 +187,4 @@ bins/
 ## License
 
 MIT OR Apache-2.0
+
