@@ -1,9 +1,12 @@
-version: '3.8'
-
 # 多智能体长期记忆服务一键部署（生产级资源配额与并发调优）
 #
-# 前置条件：`cp .env.example .env` 并至少修改 `HUB_TOKEN_SECRET`
-# （授权服务器与 MCP 服务必须使用同一密钥）。
+# 前置条件：`cp .env.example .env` 并至少设置两项：
+#   - `HUB_TOKEN_SECRET`（≥32 字节随机值；授权服务器与 MCP 服务必须一致）
+#   - `POSTGRES_PASSWORD`（必填；不再有内置默认口令）
+#
+# 说明：`deploy.resources.limits` 仅在 Swarm 或 `docker compose --profile` 的
+# 资源约束实现下生效；普通 `docker compose up` 会忽略它，需 `mem_limit`/`cpus`
+# 时才改用顶层 `mem_limit`。此处保留 deploy 段作为 Swarm 兼容写法。
 
 services:
   # 1. 核心持久化存储：PostgreSQL 15 + pgvector
@@ -26,9 +29,11 @@ services:
     environment:
       POSTGRES_DB: memory_hub
       POSTGRES_USER: hub_app
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hub_app_secure_password_2026}
+      # 必填：缺失时 compose 直接拒绝启动，避免带着公开默认口令上线
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?必须在 .env 中设置 POSTGRES_PASSWORD}"
     ports:
-      - "5432:5432"
+      # 只发布到回环地址：库端口不应暴露到宿主机所有网卡
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
       # 容器首次初始化时按文件名顺序自动执行全部迁移；schema 变更新增文件即可
@@ -49,6 +54,7 @@ services:
 
   # 2. OAuth 2.1 授权服务器（DCR / client_credentials / 授权码+PKCE / Agent 控制台）
   auth-server:
+    image: ${MEMORY_HUB_IMAGE:-docker.cnb.cool/toroyxxx/memory-hub:latest}
     build:
       context: .
       dockerfile: Dockerfile
@@ -57,7 +63,7 @@ services:
     entrypoint: ["/app/auth-server"]
     env_file: .env
     environment:
-      HUB_DB_URL: postgresql://hub_app:${POSTGRES_PASSWORD:-hub_app_secure_password_2026}@postgres:5432/memory_hub
+      HUB_DB_URL: "postgresql://hub_app:${POSTGRES_PASSWORD:?必须在 .env 中设置 POSTGRES_PASSWORD}@postgres:5432/memory_hub"
       AUTH_EXTERNAL_BASE_URL: http://localhost:8080
       # 引导账户与注册邀请码（无默认口令：仅归属存量数据；登录口令在 .env 设定）
       HUB_BOOTSTRAP_USERNAME: ${HUB_BOOTSTRAP_USERNAME:-bootstrap}
@@ -88,6 +94,7 @@ services:
 
   # 3. 记忆服务主 MCP Server（Streamable HTTP / stdio）
   mcp-server:
+    image: ${MEMORY_HUB_IMAGE:-docker.cnb.cool/toroyxxx/memory-hub:latest}
     build:
       context: .
       dockerfile: Dockerfile
@@ -97,7 +104,7 @@ services:
     env_file: .env
     environment:
       HUB_MCP_BIND: 0.0.0.0:3000
-      HUB_DB_URL: postgresql://hub_app:${POSTGRES_PASSWORD:-hub_app_secure_password_2026}@postgres:5432/memory_hub
+      HUB_DB_URL: "postgresql://hub_app:${POSTGRES_PASSWORD:?必须在 .env 中设置 POSTGRES_PASSWORD}@postgres:5432/memory_hub"
       TOKIO_WORKER_THREADS: 2
       HUB_DB_MAX_CONNECTIONS: 10
     ports:
@@ -124,6 +131,7 @@ services:
 
   # 4. 备份与整合作业守护进程（定时快照 / 过期清理 / 冲突扫描）
   backup-worker:
+    image: ${MEMORY_HUB_IMAGE:-docker.cnb.cool/toroyxxx/memory-hub:latest}
     build:
       context: .
       dockerfile: Dockerfile
@@ -132,7 +140,7 @@ services:
     entrypoint: ["/app/backup-worker"]
     env_file: .env
     environment:
-      HUB_DB_URL: postgresql://hub_app:${POSTGRES_PASSWORD:-hub_app_secure_password_2026}@postgres:5432/memory_hub
+      HUB_DB_URL: "postgresql://hub_app:${POSTGRES_PASSWORD:?必须在 .env 中设置 POSTGRES_PASSWORD}@postgres:5432/memory_hub"
       BACKUP_CRON: "0 3 * * *"
       TOKIO_WORKER_THREADS: 2
       HUB_DB_MAX_CONNECTIONS: 5

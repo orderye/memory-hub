@@ -19,7 +19,6 @@ use axum::Router;
 use common::{AuthCtx, HubError, Result, Scope};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// MCP 标准协议版本（设计规范 5.2 节）
@@ -169,72 +168,7 @@ pub enum RateVerdict {
     },
 }
 
-struct AgentBucketState {
-    tokens: f64,
-    last_refill: std::time::Instant,
-}
-
-/// 进程内令牌桶：单副本部署的默认实现（Lazy Refill O(1)，无全局扫描锁争用）
-pub struct InMemoryRateLimitStore {
-    buckets: std::sync::Mutex<HashMap<String, AgentBucketState>>,
-}
-
-impl Default for InMemoryRateLimitStore {
-    fn default() -> Self {
-        Self {
-            buckets: std::sync::Mutex::new(HashMap::new()),
-        }
-    }
-}
-
-impl InMemoryRateLimitStore {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-#[async_trait::async_trait]
-impl common::RateLimitStore for InMemoryRateLimitStore {
-    async fn try_acquire(
-        &self,
-        _dimension: common::RateDimension,
-        key: &str,
-        capacity: u32,
-    ) -> common::Result<bool> {
-        if capacity == 0 {
-            return Ok(true);
-        }
-
-        let cap = f64::from(capacity);
-        let now = std::time::Instant::now();
-        let mut buckets = self.buckets.lock().unwrap();
-
-        // 超过 10000 个桶时做一次轻量级清理（淘汰 1 小时未活跃的桶，防无界内存泄漏）
-        if buckets.len() > 10000 {
-            buckets.retain(|_, b| now.saturating_duration_since(b.last_refill).as_secs() < 3600);
-        }
-
-        let bucket = buckets
-            .entry(key.to_string())
-            .or_insert_with(|| AgentBucketState {
-                tokens: cap,
-                last_refill: now,
-            });
-
-        // 局部惰性补充 (Lazy Refill)：仅根据当前 Agent 自身流逝时间补充令牌
-        let elapsed = now
-            .saturating_duration_since(bucket.last_refill)
-            .as_secs_f64();
-        bucket.tokens = (bucket.tokens + cap * elapsed).min(cap);
-        bucket.last_refill = now;
-
-        if bucket.tokens < 1.0 {
-            return Ok(false);
-        }
-        bucket.tokens -= 1.0;
-        Ok(true)
-    }
-}
+pub use common::InMemoryRateLimitStore;
 
 impl RateLimiter {
     /// 以进程内存储构造（单副本部署的默认选择）
@@ -491,12 +425,27 @@ pub async fn run_stdio(state: Arc<McpTransportState>) -> Result<()> {
 }
 
 /// 构造 MCP axum 路由
+/// 单个 MCP 请求的硬超时（秒）。
+///
+/// `soft_timeout_ms` 只约束检索那一路的召回，DB/嵌入/整合等服务环节此前没有任何
+/// 上限；一个卡住的下游会让连接与 tokio 任务无限挂住。
+const REQUEST_TIMEOUT_SECS: u64 = 30;
+
 pub fn mcp_router(state: Arc<McpTransportState>) -> Router {
+    let max_body_bytes = state.max_request_bytes;
     Router::new()
         .route("/mcp", post(handle_http_mcp).get(handle_http_mcp_get))
         .route("/mcp/", post(handle_http_mcp).get(handle_http_mcp_get))
         .route("/healthz", axum::routing::get(handle_healthz))
-        .route("/readyz", axum::routing::get(handle_healthz))
+        .route("/readyz", axum::routing::get(handle_readyz))
+        // 体积上限必须在 axum 缓冲请求体之前生效：此前只在 handler 里比对
+        // max_request_bytes，那时默认 2MB 的整个 body 已经进了内存。
+        .layer(axum::extract::DefaultBodyLimit::max(max_body_bytes))
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS),
+        ))
+        .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
 }
 
@@ -511,9 +460,20 @@ async fn handle_http_mcp_get(State(state): State<SharedState>) -> Response {
         .into_response()
 }
 
-/// 就绪探针
+/// 存活探针
 async fn handle_healthz() -> Response {
     (StatusCode::OK, "ok").into_response()
+}
+
+/// 就绪探针（真探库：确认底层存储可用）
+async fn handle_readyz(State(state): State<SharedState>) -> Response {
+    match state.dispatcher.store.ping().await {
+        Ok(()) => (StatusCode::OK, "ready").into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "MCP 就绪探针失败：存储不可用");
+            (StatusCode::SERVICE_UNAVAILABLE, "database unreachable").into_response()
+        }
+    }
 }
 
 /// POST `/mcp`：Streamable HTTP 单消息模式
@@ -700,7 +660,8 @@ mod tests {
     use crate::tools::ToolDispatcher;
     use async_trait::async_trait;
     use common::{Acl, Scope};
-    use mem_core::{DefaultBackupService, DefaultIntegrationService, GrantChecker};
+    use consolidation::DefaultIntegrationService;
+    use mem_core::{DefaultBackupService, GrantChecker};
     use store::InMemoryHubStore;
     use uuid::Uuid;
 
@@ -1075,5 +1036,15 @@ mod tests {
     fn test_uuid_generation_for_ids() {
         // 传输层本身不生成 UUID；此处确保依赖的 uuid crate 可用
         assert!(!Uuid::new_v4().to_string().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_healthz_and_readyz() {
+        let resp = handle_healthz().await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let s = state();
+        let resp_ready = handle_readyz(State(Arc::new(s))).await;
+        assert_eq!(resp_ready.status(), StatusCode::OK);
     }
 }

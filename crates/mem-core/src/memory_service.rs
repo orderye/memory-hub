@@ -239,23 +239,6 @@ impl DefaultMemoryService {
             _ => (None, None),
         }
     }
-
-    /// 追加版本历史
-    async fn record_version(&self, entry: &MemoryEntry, change: VersionChange) -> Result<()> {
-        self.store
-            .record_version(&MemoryVersion {
-                memory_id: entry.id,
-                version: entry.version,
-                content: entry.content.clone(),
-                tags: entry.tags.clone(),
-                metadata: entry.metadata.clone(),
-                confidence: entry.confidence,
-                changed_by: entry.source_agent.clone(),
-                change_type: change,
-                changed_at: entry.updated_at,
-            })
-            .await
-    }
 }
 
 #[async_trait]
@@ -292,13 +275,16 @@ impl MemoryService for DefaultMemoryService {
                     updated.embedding = emb;
                     updated.embedding_model = model;
                     updated.source_agent = auth.agent_id.clone();
+                    // 乐观锁：以读到的版本为条件写回，并发修订者将收到 Conflict
+                    let expected = existing.version;
                     updated.version += 1;
                     updated.updated_at = now;
                     if updated.status == MemoryStatus::Archived {
                         updated.status = MemoryStatus::Active;
                     }
-                    let saved = store.save(&updated).await?;
-                    self.record_version(&saved, VersionChange::Updated).await?;
+                    let saved = store
+                        .revise(&updated, expected, VersionChange::Updated)
+                        .await?;
                     return Ok(saved);
                 }
             }
@@ -327,8 +313,7 @@ impl MemoryService for DefaultMemoryService {
             created_at: now,
             updated_at: now,
         };
-        let saved = store.insert(&entry).await?;
-        self.record_version(&saved, VersionChange::Created).await?;
+        let saved = store.insert_initial(&entry).await?;
         Ok(saved)
     }
 
@@ -414,6 +399,7 @@ impl MemoryService for DefaultMemoryService {
 
         let now = self.clock.now();
         entry.source_agent = auth.agent_id.clone();
+        let expected = entry.version;
         entry.version += 1;
         entry.updated_at = now;
         if content_changed {
@@ -421,8 +407,9 @@ impl MemoryService for DefaultMemoryService {
             entry.embedding = emb;
             entry.embedding_model = model;
         }
-        let saved = store.save(&entry).await?;
-        self.record_version(&saved, VersionChange::Updated).await?;
+        let saved = store
+            .revise(&entry, expected, VersionChange::Updated)
+            .await?;
         Ok(saved)
     }
 
@@ -437,11 +424,13 @@ impl MemoryService for DefaultMemoryService {
             )));
         }
         entry.status = MemoryStatus::Archived;
+        let expected = entry.version;
         entry.version += 1;
         entry.updated_at = self.clock.now();
         entry.source_agent = auth.agent_id.clone();
-        let saved = store.save(&entry).await?;
-        self.record_version(&saved, VersionChange::Archived).await?;
+        store
+            .revise(&entry, expected, VersionChange::Archived)
+            .await?;
         Ok(())
     }
 

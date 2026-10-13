@@ -13,7 +13,7 @@ use crate::domain::{
 };
 use crate::infra::{AccessChecker, BackupStore, Clock, MemoryHubStore, MemoryStore, SystemClock};
 use async_trait::async_trait;
-use common::{AgentId, AuthCtx, HubError, Result, Scope};
+use common::{AuthCtx, HubError, Result, Scope};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -21,6 +21,9 @@ use uuid::Uuid;
 
 /// 备份负载格式版本
 pub const BACKUP_PAYLOAD_VERSION: u32 = 1;
+
+/// 全量快照的保留命名空间标记（不对应任何真实命名空间，也不是授权对象）
+pub const ALL_NAMESPACES: &str = "*";
 
 /// 创建备份请求
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -214,8 +217,13 @@ impl BackupService for DefaultBackupService {
         let all = self.scoped(auth).list_backups(namespace).await?;
         let mut out = Vec::with_capacity(all.len());
         for b in &all {
-            // 逐份校验访问权：全量备份只对通配读授权可见
-            self.require_read(auth, &b.namespace).await?;
+            // 逐份校验访问权。全量快照的命名空间标记 `*` 不是授权对象（通配授权已废除），
+            // 若按命名空间判权必然落空并让整次列举失败，故改由 admin 作用域把关。
+            if b.namespace == ALL_NAMESPACES {
+                self.require_admin(auth).await?;
+            } else {
+                self.require_read(auth, &b.namespace).await?;
+            }
             out.push(BackupSummary::from(b));
         }
         Ok(out)
@@ -293,8 +301,8 @@ impl BackupService for DefaultBackupService {
                     e.version = cur.version + 1;
                     e.updated_at = now;
                     e.source_agent = auth.agent_id.clone();
-                    store.save(&e).await?;
-                    self.record_restore_version(&e, &auth.agent_id, VersionChange::Updated)
+                    store
+                        .revise(&e, cur.version, VersionChange::Updated)
                         .await?;
                     report.updated += 1;
                 }
@@ -302,9 +310,7 @@ impl BackupService for DefaultBackupService {
                     // 新建：保留快照的 created_at，updated_at 置为恢复时刻
                     e.updated_at = now;
                     e.source_agent = auth.agent_id.clone();
-                    store.insert(&e).await?;
-                    self.record_restore_version(&e, &auth.agent_id, VersionChange::Created)
-                        .await?;
+                    store.insert_initial(&e).await?;
                     report.created += 1;
                 }
             }
@@ -347,27 +353,6 @@ impl BackupService for DefaultBackupService {
 }
 
 impl DefaultBackupService {
-    /// 恢复操作记入版本历史（change_type 复用 Updated/Created）
-    async fn record_restore_version(
-        &self,
-        entry: &MemoryEntry,
-        agent: &AgentId,
-        change: VersionChange,
-    ) -> Result<()> {
-        self.store
-            .record_version(&crate::domain::MemoryVersion {
-                memory_id: entry.id,
-                version: entry.version,
-                content: entry.content.clone(),
-                tags: entry.tags.clone(),
-                metadata: entry.metadata.clone(),
-                confidence: entry.confidence,
-                changed_by: agent.clone(),
-                change_type: change,
-                changed_at: entry.updated_at,
-            })
-            .await
-    }
 }
 
 /// 便捷构造：GrantChecker 的再导出（供二进制装配复用）
@@ -388,7 +373,7 @@ mod tests {
     };
     use crate::infra::{BackupStore, Embedder, GrantStore, IntegrationStore, MemoryStore};
     use crate::testing::TestEmbedder;
-    use common::Scope;
+    use common::{AgentId, Scope};
     use std::collections::HashMap as StdHashMap;
     use std::sync::RwLock;
 
@@ -888,6 +873,9 @@ mod tests {
 
         // 篡改负载内容（校验和不变 → 恢复必须报错）
         let mut tampered = backup.clone();
+        // 存储层保存的是带账户前缀的内部键（服务层写入必经 scoped），
+        // 直接操作裸存储时需自行还原该形态。
+        tampered.namespace = scoped_ns("ns");
         tampered.payload = serde_json::json!({
             "version": BACKUP_PAYLOAD_VERSION,
             "namespace": "ns",
@@ -992,6 +980,55 @@ mod tests {
 
         // 陌生人即使有全部 scope 也看不到别人的命名空间备份
         let err = svc.list(&stranger, Some("ns")).await.unwrap_err();
+        assert!(matches!(err, HubError::InsufficientScope));
+    }
+
+    #[tokio::test]
+    async fn test_wildcard_backup_visible_to_admin_not_to_reader() {
+        let (svc, store) = setup();
+        let a = admin("agent-a");
+        store
+            .ensure_namespace(&scoped_ns("ns"), &"agent-a".to_string())
+            .await
+            .unwrap();
+        store
+            .grant(&NamespaceGrantRecord {
+                namespace: scoped_ns("ns"),
+                agent_id: "agent-a".to_string(),
+                can_read: true,
+                can_write: true,
+                granted_by: "agent-a".to_string(),
+                created_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        store.seed(&scoped_ns("ns"), "agent-a", "记忆");
+
+        svc.create(
+            &a,
+            BackupCreateRequest {
+                namespace: "*".to_string(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // 全量快照的 `*` 不是授权对象：过去按命名空间判权会让整次列举失败
+        let listed = svc
+            .list(&a, None)
+            .await
+            .expect("属主应能列举含全量快照的备份");
+        assert!(listed.iter().any(|b| b.namespace == "*"));
+
+        // 无 admin 作用域者不得看到全量快照
+        let reader = AuthCtx {
+            agent_id: "agent-a".to_string(),
+            account_id: common::BOOTSTRAP_ACCOUNT_ID,
+            scopes: vec![Scope::Read],
+            acl: Default::default(),
+        };
+        let err = svc.list(&reader, None).await.unwrap_err();
         assert!(matches!(err, HubError::InsufficientScope));
     }
 

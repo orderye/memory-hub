@@ -52,8 +52,8 @@ impl CjsAdapterConfig {
             .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
             .unwrap_or(true);
 
-        let default_world = std::env::var("HUB_CJS_DEFAULT_WORLD")
-            .unwrap_or_else(|_| "default".to_string());
+        let default_world =
+            std::env::var("HUB_CJS_DEFAULT_WORLD").unwrap_or_else(|_| "default".to_string());
 
         let auto_classify = std::env::var("HUB_CJS_AUTO_CLASSIFY")
             .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
@@ -116,16 +116,22 @@ impl ToolInterceptor for CjsAdapter {
         classifier::AutoClassifier::process(arguments, &fp, &self.config);
 
         // 4. 角色扮演防冲突整合策略 (RoleplayConsolidationPolicy)
-        if let Some(res) = consolidation::RoleplayConsolidationPolicy::intercept(name, arguments, &fp)? {
+        if let Some(res) =
+            consolidation::RoleplayConsolidationPolicy::intercept(name, arguments, &fp)?
+        {
             return Ok(Some(res));
         }
 
         // 5. 备份清单元数据透明联动 (BackupManifestCoordinator)
-        if let Some(res) = backup::BackupManifestCoordinator::intercept(dispatcher, auth, name, arguments, &fp).await? {
+        if let Some(res) =
+            backup::BackupManifestCoordinator::intercept(dispatcher, auth, name, arguments, &fp)
+                .await?
+        {
             return Ok(Some(res));
         }
 
         // 6. 智能命名空间路由与双路召回 (SmartNamespaceRouter)
-        router::SmartNamespaceRouter::intercept_or_route(dispatcher, auth, name, arguments, &fp).await
+        router::SmartNamespaceRouter::intercept_or_route(dispatcher, auth, name, arguments, &fp)
+            .await
     }
 }

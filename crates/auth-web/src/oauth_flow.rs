@@ -13,9 +13,7 @@
 //!
 //! 授权码刷新令牌默认存内存（单副本授权服务器）；生产多副本可替换存储实现。
 
-use auth_core::{
-    compute_code_challenge_s256, AccessTokenManager, ConfirmTokenManager, TokenFamilyManager,
-};
+use auth_core::{verify_pkce_s256, AccessTokenManager, ConfirmTokenManager, TokenFamilyManager};
 use chrono::{DateTime, Duration, Utc};
 use common::{AccountId, AgentId, HubError, NamespaceGrant, Result, Scope};
 use mem_core::{unscope_name, AgentRecord, MemoryHubStore, NamespaceGrantRecord};
@@ -221,12 +219,7 @@ impl AgentOAuthServer {
             ));
         }
         for uri in &req.redirect_uris {
-            if !(uri.starts_with("https://") || uri.starts_with("http://localhost")) {
-                return Err(HubError::InvalidArgument(format!(
-                    "redirect_uri 必须为 https（或 localhost 开发地址）: {}",
-                    uri
-                )));
-            }
+            validate_redirect_uri(uri)?;
         }
 
         let max_scopes = match &req.max_scopes {
@@ -356,9 +349,10 @@ impl AgentOAuthServer {
             rec.clone()
         };
 
-        // PKCE S256 强校验
-        let computed = compute_code_challenge_s256(&verifier);
-        if computed != record.code_challenge {
+        // PKCE S256 强校验：verifier 长度必须符合 RFC 7636 的 43..=128，
+        // 且派生值比对必须常量时间——早先直接 `computed != challenge` 既允许
+        // 客户端提交极短 verifier 把挑战熵压到可暴力枚举，也按字节提前短路。
+        if !verify_pkce_s256(&verifier, &record.code_challenge) {
             return Err(HubError::AuthRequired);
         }
 
@@ -554,9 +548,38 @@ impl AgentOAuthServer {
         }
     }
 
-    /// 撤销（refresh 令牌整族吊销；access 令牌由 TTL 自然过期）
-    pub fn revoke(&self, token: &str) {
-        self.families.revoke_family(token);
+    /// 端点级客户端认证（RFC 7662 §2.1 / RFC 7009 §2.1）。
+    ///
+    /// 内省与撤销端点原先不校验调用方身份：任何拿到令牌串的人都能确认它是否仍然有效、
+    /// 读出该 Agent 的整份命名空间授权清单，甚至撤销他人的刷新令牌。
+    pub async fn authenticate_client(&self, client_id: &str, secret: &str) -> Result<AgentId> {
+        let agent = self
+            .store
+            .get_agent(&client_id.to_string())
+            .await?
+            .ok_or(HubError::AuthRequired)?;
+        if agent.status != "active" || !agent.confidential {
+            // 公共客户端没有可校验的密钥，也就无权调用需要认证的端点
+            return Err(HubError::AuthRequired);
+        }
+        if !self
+            .store
+            .verify_agent_secret(&client_id.to_string(), secret)
+            .await?
+        {
+            return Err(HubError::AuthRequired);
+        }
+        Ok(agent.agent_id)
+    }
+
+    /// 撤销（refresh 令牌整族吊销；access 令牌由 TTL 自然过期）。
+    ///
+    /// 只允许撤销属于调用方客户端的令牌族。令牌不属于调用方时静默无操作——
+    /// RFC 7009 要求此端点一律回 200，不能用来探测他人令牌是否存在。
+    pub fn revoke_for_client(&self, token: &str, client_id: &str) {
+        if self.families.peek_agent_id(token).as_deref() == Some(client_id) {
+            self.families.revoke_family(token);
+        }
     }
 
     // ===== 辅助 =====
@@ -622,11 +645,102 @@ pub fn parse_uuid(s: &str) -> Option<Uuid> {
     Uuid::from_str(s).ok()
 }
 
+/// authority = scheme 之后、首个 `/` `?` `#` 之前的部分
+fn uri_authority(rest: &str) -> &str {
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    &rest[..end]
+}
+
+/// 注册期 redirect_uri 白名单校验。
+///
+/// 生产必须 https；开发回环地址只接受**精确**的 `localhost` / `127.0.0.1` / `[::1]`。
+/// 原先写作 `uri.starts_with("http://localhost")`，`http://localhost.evil.com`
+/// 会因前缀命中而通过注册，随后在授权阶段被当作合法回调主机精确比对放行。
+pub fn validate_redirect_uri(uri: &str) -> Result<()> {
+    let reject = |why: &str| {
+        Err(HubError::InvalidArgument(format!(
+            "redirect_uri 不合法（{}）: {}",
+            why, uri
+        )))
+    };
+
+    if let Some(rest) = uri.strip_prefix("https://") {
+        let authority = uri_authority(rest);
+        if authority.is_empty() {
+            return reject("缺少主机名");
+        }
+        if authority.contains('@') {
+            // userinfo 会掩盖真实主机（https://example.com@evil.com）
+            return reject("不允许包含 userinfo");
+        }
+        if authority.chars().any(char::is_whitespace) {
+            return reject("包含空白字符");
+        }
+        return Ok(());
+    }
+
+    if let Some(rest) = uri.strip_prefix("http://") {
+        let authority = uri_authority(rest);
+        let host = match authority.rfind(':') {
+            // 仅当冒号后面是端口号时才剥离（`[::1]` 的冒号在方括号内，不受影响）
+            Some(i) if authority[i + 1..].chars().all(|c| c.is_ascii_digit()) => &authority[..i],
+            _ => authority,
+        };
+        return match host {
+            "localhost" | "127.0.0.1" | "[::1]" => Ok(()),
+            other => reject(&format!("http 仅允许回环地址，收到 {}", other)),
+        };
+    }
+
+    reject("必须以 https:// 或 http:// 开头")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use auth_core::compute_code_challenge_s256;
     use mem_core::{AgentStore, GrantStore, MemoryHubStore};
     use store::InMemoryHubStore;
+
+    /// RFC 7636 合规的最小长度 verifier（43 字符）；`verify_pkce_s256` 会拒绝更短的
+    const OK_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    /// 与 `OK_VERIFIER` 等长、仅末位不同：确保被测的是"不匹配"而非"长度不合规"
+    const WRONG_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXl";
+
+    #[test]
+    fn test_validate_redirect_uri_rejects_lookaround_localhost() {
+        // 旧实现用 `starts_with("http://localhost")`，以下全部能通过注册
+        for bad in [
+            "http://localhost.evil.com/cb",
+            "http://localhostx.y.example/cb",
+            "http://127.0.0.1.evil.com/cb",
+            "https://example.com@evil.com/cb",
+            "https:///cb",
+            "javascript:alert(1)",
+            "http://Insecure.Example.com/cb",
+        ] {
+            assert!(
+                validate_redirect_uri(bad).is_err(),
+                "应拒绝 redirect_uri: {}",
+                bad
+            );
+        }
+
+        for ok in [
+            "https://app.example.com/cb",
+            "https://app.example.com",
+            "http://localhost",
+            "http://localhost:3000/cb",
+            "http://127.0.0.1:8080/cb",
+            "http://[::1]:9000/cb",
+        ] {
+            assert!(
+                validate_redirect_uri(ok).is_ok(),
+                "应放行 redirect_uri: {}",
+                ok
+            );
+        }
+    }
 
     async fn server() -> (AgentOAuthServer, Arc<InMemoryHubStore>) {
         let store = Arc::new(InMemoryHubStore::new());
@@ -853,7 +967,7 @@ mod tests {
             .await
             .unwrap();
 
-        let challenge = compute_code_challenge_s256("correct-verifier");
+        let challenge = compute_code_challenge_s256(OK_VERIFIER);
         let params = AuthorizeParams {
             response_type: "code".to_string(),
             client_id: "agent-a".to_string(),
@@ -872,7 +986,7 @@ mod tests {
             .token(TokenRequest {
                 grant_type: "authorization_code".to_string(),
                 code: Some(code),
-                code_verifier: Some("wrong-verifier".to_string()),
+                code_verifier: Some(WRONG_VERIFIER.to_string()),
                 redirect_uri: Some("https://app.example.com/cb".to_string()),
                 client_id: Some("agent-a".to_string()),
                 client_secret: None,
@@ -912,6 +1026,111 @@ mod tests {
         assert!(srv.validate_authorize(&params).await.is_err());
     }
 
+    /// 以刷新令牌换取下一轮令牌
+    fn refresh_req(token: String) -> TokenRequest {
+        TokenRequest {
+            grant_type: "refresh_token".to_string(),
+            code: None,
+            code_verifier: None,
+            redirect_uri: None,
+            client_id: None,
+            client_secret: None,
+            refresh_token: Some(token),
+            scope: None,
+            resource: None,
+        }
+    }
+
+    /// 走一遍授权码流，为指定 Agent 取回一个刷新令牌。
+    /// 用公共客户端（无密钥）走流，使刷新交换不必附带客户端凭据。
+    async fn issue_refresh_token(srv: &AgentOAuthServer, id: &str) -> String {
+        let agent = srv
+            .register(register_req(id, false), test_account())
+            .await
+            .unwrap();
+        let params = AuthorizeParams {
+            response_type: "code".to_string(),
+            client_id: id.to_string(),
+            redirect_uri: "https://app.example.com/cb".to_string(),
+            code_challenge: compute_code_challenge_s256(OK_VERIFIER),
+            code_challenge_method: "S256".to_string(),
+            state: None,
+            scope: None,
+        };
+        let code = srv
+            .issue_authorization_code(&params, &agent, vec![Scope::Read])
+            .await
+            .unwrap();
+        let resp = srv
+            .token(TokenRequest {
+                grant_type: "authorization_code".to_string(),
+                code: Some(code),
+                code_verifier: Some(OK_VERIFIER.to_string()),
+                redirect_uri: Some("https://app.example.com/cb".to_string()),
+                client_id: None,
+                client_secret: None,
+                refresh_token: None,
+                scope: None,
+                resource: None,
+            })
+            .await
+            .unwrap();
+        resp.refresh_token.expect("授权码流应下发刷新令牌")
+    }
+
+    #[tokio::test]
+    async fn test_introspect_revoke_endpoints_require_client_auth() {
+        let (srv, _store) = server().await;
+        srv.register(register_req("agent-a", true), test_account())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            srv.authenticate_client("agent-a", "s3cret").await.unwrap(),
+            "agent-a"
+        );
+        assert!(
+            srv.authenticate_client("agent-a", "wrong").await.is_err(),
+            "密钥不符必须拒绝"
+        );
+        assert!(
+            srv.authenticate_client("agent-ghost", "s3cret")
+                .await
+                .is_err(),
+            "未知客户端必须拒绝"
+        );
+
+        // 公共客户端（无密钥）不得调用需认证的端点
+        srv.register(register_req("agent-pub", false), test_account())
+            .await
+            .unwrap();
+        assert!(srv
+            .authenticate_client("agent-pub", "s3cret")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_revocation_is_scoped_to_owning_client() {
+        let (srv, _store) = server().await;
+
+        // 非属主客户端提交撤销：静默无操作，令牌族依旧可用
+        let rt_foreign = issue_refresh_token(&srv, "agent-a").await;
+        srv.revoke_for_client(&rt_foreign, "agent-b");
+        assert!(
+            srv.token(refresh_req(rt_foreign.clone())).await.is_ok(),
+            "别的客户端不应能撤销他人令牌族"
+        );
+
+        // 属主提交：整族失效
+        let rt_own = issue_refresh_token(&srv, "agent-b").await;
+        srv.revoke_for_client(&rt_own, "agent-b");
+        assert!(
+            srv.token(refresh_req(rt_own)).await.is_err(),
+            "属主撤销后整族应失效"
+        );
+    }
+
     #[tokio::test]
     async fn test_refresh_rotation() {
         let (srv, _store) = server().await;
@@ -920,7 +1139,7 @@ mod tests {
             .await
             .unwrap();
 
-        let challenge = compute_code_challenge_s256("v1");
+        let challenge = compute_code_challenge_s256(OK_VERIFIER);
         let params = AuthorizeParams {
             response_type: "code".to_string(),
             client_id: "agent-a".to_string(),
@@ -938,7 +1157,7 @@ mod tests {
             .token(TokenRequest {
                 grant_type: "authorization_code".to_string(),
                 code: Some(code),
-                code_verifier: Some("v1".to_string()),
+                code_verifier: Some(OK_VERIFIER.to_string()),
                 redirect_uri: Some("https://app.example.com/cb".to_string()),
                 client_id: None,
                 client_secret: None,

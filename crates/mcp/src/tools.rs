@@ -1,6 +1,6 @@
 //! MCP 工具执行器与双模输出生成
 //!
-//! 16 个工具全部围绕三件事：**存储**（put/get/update/delete/search/list/stats/history）、
+//! 18 个工具全部围绕三件事：**存储**（put/get/update/delete/search/list/stats/history）、
 //! **备份**（backup_create/backup_list/restore）、**整合**（integrate_scan/
 //! integration_list/integration_resolve），外加命名空间共享（grant/revoke）。
 //!
@@ -64,6 +64,26 @@ fn strip_embedding(mut v: Value) -> Value {
     v
 }
 
+/// 整合中枢的运行参数。
+///
+/// 此前这两个值在工具分发里写死为 `0.92 / 100`，绕过了 `AppConfig` 的
+/// `INTEGRATE_SIM_THRESHOLD` / `INTEGRATE_MAX_PROPOSALS`，改了环境变量也不生效。
+/// 默认值沿用历史行为，由二进制启动时按配置覆盖。
+#[derive(Debug, Clone, Copy)]
+pub struct ConsolidationParams {
+    pub sim_threshold: f32,
+    pub max_proposals: usize,
+}
+
+impl Default for ConsolidationParams {
+    fn default() -> Self {
+        Self {
+            sim_threshold: 0.92,
+            max_proposals: 100,
+        }
+    }
+}
+
 /// MCP 工具调用调度器
 #[derive(Clone)]
 pub struct ToolDispatcher {
@@ -72,6 +92,10 @@ pub struct ToolDispatcher {
     pub integration: Arc<dyn IntegrationService>,
     /// 底层存储（授权工具用；所有访问经账户作用域包装器）
     pub store: Arc<dyn mem_core::MemoryHubStore>,
+    /// 整合中枢参数（来自配置，而非硬编码）
+    pub consolidation: ConsolidationParams,
+    /// 嵌入器：整合合并后重算幸存者向量（未注入时合并会清空旧向量）
+    pub embedder: Option<Arc<dyn mem_core::Embedder>>,
 }
 
 impl ToolDispatcher {
@@ -86,7 +110,21 @@ impl ToolDispatcher {
             backup,
             integration,
             store,
+            consolidation: ConsolidationParams::default(),
+            embedder: None,
         }
+    }
+
+    /// 以配置注入整合参数
+    pub fn with_consolidation(mut self, params: ConsolidationParams) -> Self {
+        self.consolidation = params;
+        self
+    }
+
+    /// 注入嵌入器（合并后重算向量）
+    pub fn with_embedder(mut self, embedder: Arc<dyn mem_core::Embedder>) -> Self {
+        self.embedder = Some(embedder);
+        self
     }
 
     /// 分发执行
@@ -468,9 +506,13 @@ impl ToolDispatcher {
 
         let mut engine = consolidation::ConsolidationEngine::new(
             Arc::new(scoped),
-            req.sim_threshold.unwrap_or(0.92),
-            100,
+            req.sim_threshold
+                .unwrap_or(self.consolidation.sim_threshold),
+            self.consolidation.max_proposals,
         );
+        if let Some(embedder) = &self.embedder {
+            engine = engine.with_embedder(embedder.clone());
+        }
         if req.auto_merge {
             engine = engine.with_policy(consolidation::AutoPolicy::new(
                 consolidation::PolicyMode::SemiAuto,
@@ -521,7 +563,11 @@ impl ToolDispatcher {
             return ToolCallResult::error(&HubError::InsufficientScope);
         }
 
-        let engine = consolidation::ConsolidationEngine::new(Arc::new(scoped), 0.92, 100);
+        let engine = consolidation::ConsolidationEngine::new(
+            Arc::new(scoped),
+            self.consolidation.sim_threshold,
+            self.consolidation.max_proposals,
+        );
 
         match engine.calculate_stats(&req.namespace).await {
             Ok(stats) => {
@@ -671,7 +717,8 @@ impl ToolDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mem_core::{DefaultBackupService, DefaultIntegrationService, GrantChecker};
+    use consolidation::DefaultIntegrationService;
+    use mem_core::{DefaultBackupService, GrantChecker};
     use store::InMemoryHubStore;
     use uuid::Uuid;
 

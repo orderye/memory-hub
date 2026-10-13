@@ -56,8 +56,9 @@ tokio = { version = "1.40", features = ["full"] }
 
 # HTTP 服务与传输层
 axum = { version = "0.8", features = ["http1", "tokio", "json", "form", "query"] }
-tower-http = { version = "0.6", features = ["limit", "trace", "cors", "timeout"] }
-tower = { version = "0.5", features = ["limit"] }
+# 仅启用实际使用的中间件（请求硬超时 + 访问追踪）；体积上限走 axum 自带的
+# DefaultBodyLimit，无需 tower-http 的 limit/cors
+tower-http = { version = "0.6", features = ["timeout", "trace"] }
 
 # 持久化
 sqlx = { version = "0.8", default-features = false, features = [

@@ -69,7 +69,10 @@ impl FingerprintDetector {
                 }
             }
 
-            if let Some(val) = headers.get("x-cjs-app-version").and_then(|v| v.to_str().ok()) {
+            if let Some(val) = headers
+                .get("x-cjs-app-version")
+                .and_then(|v| v.to_str().ok())
+            {
                 let s = val.trim();
                 if !s.is_empty() {
                     fp.app_version = Some(s.to_string());

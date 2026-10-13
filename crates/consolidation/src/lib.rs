@@ -11,12 +11,14 @@ pub mod detectors;
 pub mod engine;
 pub mod merger;
 pub mod policy;
+pub mod service;
 pub mod types;
 
 pub use detectors::{ConflictDetector, DuplicateDetector, StalenessDetector, UnionFind};
 pub use engine::ConsolidationEngine;
 pub use merger::{ContentMerger, MergeStrategy, MergedOutput, TieredMerger};
 pub use policy::{AutoPolicy, PolicyMode};
+pub use service::DefaultIntegrationService;
 pub use types::{
     ConflictGroup, ConflictKind, ConsolidationReport, ConsolidationStats, DuplicateGroup,
     StaleEntry,

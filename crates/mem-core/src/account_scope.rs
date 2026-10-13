@@ -22,7 +22,7 @@ use crate::infra::{
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use common::{AccountId, AgentId, Result};
+use common::{AccountId, AgentId, HubError, Result};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -82,6 +82,17 @@ impl<S: ?Sized> AccountScopedStore<S> {
         unscope_name(&self.account, ns)
     }
 
+    /// 按主键（UUID）取回的记录必须先验归属：`unscoped` 对异账户键是"原样返回"的
+    /// 宽松语义，若直接透传会把他人数据连同其明文命名空间一起交给调用方，
+    /// 进而被 restore 写回本账户。此处在剥前缀之前 fail-closed 地拒绝跨账户读取。
+    fn assert_owned(&self, raw_namespace: &str) -> Result<()> {
+        if in_scope(&self.account, raw_namespace) {
+            Ok(())
+        } else {
+            Err(HubError::NotFound)
+        }
+    }
+
     fn entry_out(&self, mut e: MemoryEntry) -> MemoryEntry {
         e.namespace = self.unscoped(&e.namespace);
         e
@@ -107,6 +118,13 @@ impl<S: MemoryStore + ?Sized> MemoryStore for AccountScopedStore<S> {
         let mut scoped = entry.clone();
         scoped.namespace = self.scoped(&entry.namespace);
         let saved = self.inner.insert(&scoped).await?;
+        Ok(self.entry_out(saved))
+    }
+
+    async fn insert_initial(&self, entry: &MemoryEntry) -> Result<MemoryEntry> {
+        let mut scoped = entry.clone();
+        scoped.namespace = self.scoped(&entry.namespace);
+        let saved = self.inner.insert_initial(&scoped).await?;
         Ok(self.entry_out(saved))
     }
 
@@ -138,6 +156,32 @@ impl<S: MemoryStore + ?Sized> MemoryStore for AccountScopedStore<S> {
 
     async fn count(&self, filter: &MemoryFilter) -> Result<usize> {
         self.inner.count(&self.scoped_filter(filter)).await
+    }
+
+    async fn save_if_version(
+        &self,
+        entry: &MemoryEntry,
+        expected_version: i64,
+    ) -> Result<MemoryEntry> {
+        let mut scoped = entry.clone();
+        scoped.namespace = self.scoped(&entry.namespace);
+        let saved = self
+            .inner
+            .save_if_version(&scoped, expected_version)
+            .await?;
+        Ok(self.entry_out(saved))
+    }
+
+    async fn revise(
+        &self,
+        entry: &MemoryEntry,
+        expected_version: i64,
+        change: crate::domain::VersionChange,
+    ) -> Result<MemoryEntry> {
+        let mut scoped = entry.clone();
+        scoped.namespace = self.scoped(&entry.namespace);
+        let saved = self.inner.revise(&scoped, expected_version, change).await?;
+        Ok(self.entry_out(saved))
     }
 
     async fn similar(
@@ -198,6 +242,10 @@ impl<S: MemoryStore + ?Sized> MemoryStore for AccountScopedStore<S> {
         // 服务层不得依赖此方法做账户内归档。
         self.inner.archive_expired(now).await
     }
+
+    async fn ping(&self) -> Result<()> {
+        self.inner.ping().await
+    }
 }
 
 // ===== BackupStore =====
@@ -211,11 +259,13 @@ impl<S: BackupStore + ?Sized> BackupStore for AccountScopedStore<S> {
     }
 
     async fn get_backup(&self, id: Uuid) -> Result<BackupRecord> {
-        let mut b = self.inner.get_backup(id).await?;
-        b.namespace = self.unscoped(&b.namespace);
-        Ok(b)
+        let b = self.inner.get_backup(id).await?;
+        self.assert_owned(&b.namespace)?;
+        Ok(BackupRecord {
+            namespace: self.unscoped(&b.namespace),
+            ..b
+        })
     }
-
     async fn list_backups(&self, namespace: Option<&str>) -> Result<Vec<BackupRecord>> {
         let rows = match namespace {
             Some(ns) => self.inner.list_backups(Some(&self.scoped(ns))).await?,
@@ -253,9 +303,12 @@ impl<S: IntegrationStore + ?Sized> IntegrationStore for AccountScopedStore<S> {
     }
 
     async fn get_proposal(&self, id: Uuid) -> Result<IntegrationProposal> {
-        let mut p = self.inner.get_proposal(id).await?;
-        p.namespace = self.unscoped(&p.namespace);
-        Ok(p)
+        let p = self.inner.get_proposal(id).await?;
+        self.assert_owned(&p.namespace)?;
+        Ok(IntegrationProposal {
+            namespace: self.unscoped(&p.namespace),
+            ..p
+        })
     }
 
     async fn list_proposals(

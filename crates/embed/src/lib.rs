@@ -105,7 +105,49 @@ impl EmbedderKind {
     }
 }
 
-/// 按配置构建嵌入器；未提供完整 HTTP 配置时回退 Mock 并打印告警
+/// 按应用配置构建嵌入器（各二进制共用，避免每个进程各写一份选择逻辑）。
+///
+/// 关键约束：**同一个库内不得混用不同模型的向量**。余弦相似度、整合阈值
+/// 都是在同一向量空间里才有意义；若 mcp-server 用 http 模型而 backup-worker
+/// 用 mock，合并后重算出的向量会把条目挪到另一个空间，检索与整合双双失真。
+/// 因此提供方与维度都由启动期强校验的 `AppConfig` 决定，缺失即 fail-fast。
+pub fn build_from_config(cfg: &common::AppConfig) -> Result<Arc<dyn mem_core::Embedder>> {
+    let model = std::env::var("HUB_EMBED_MODEL").unwrap_or_else(|_| "bge-m3".to_string());
+    match cfg.embed_provider.as_str() {
+        "http" => {
+            let endpoint = cfg
+                .embed_endpoint
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    common::HubError::InvalidArgument(
+                    "HUB_EMBED_PROVIDER=http 必须提供 HUB_EMBED_ENDPOINT（离线开发请显式改用 mock）"
+                        .to_string(),
+                )
+                })?;
+            Ok(Arc::new(HttpEmbedder::new(
+                endpoint.to_string(),
+                model,
+                cfg.embed_dim,
+                cfg.embed_api_key.clone(),
+            )?))
+        }
+        "mock" => Ok(Arc::new(MockEmbedder::new(
+            "mock-embedder-v1",
+            cfg.embed_dim,
+        ))),
+        other => Err(common::HubError::InvalidArgument(format!(
+            "未知 HUB_EMBED_PROVIDER: {other}（支持 mock | http）"
+        ))),
+    }
+}
+
+/// 按配置构建嵌入器。
+///
+/// `kind=http` 而缺少 endpoint 时**拒绝构建**，不再静默退回 [`MockEmbedder`]：
+/// mock 向量由 SHA-256 字节构造，与真实模型的余弦分布完全不同，
+/// 一旦混入，0.92/0.82 这类相似度阈值就失去意义，"整合/检索正常"会变成假象。
 pub fn build_embedder(
     kind: EmbedderKind,
     model: &str,
@@ -119,12 +161,10 @@ pub fn build_embedder(
             Some(ep) if !ep.trim().is_empty() => {
                 Ok(Arc::new(HttpEmbedder::new(ep, model, dim, api_key)?))
             }
-            _ => {
-                tracing::warn!(
-                    "embedder=http 但未配置 HUB_EMBED_ENDPOINT，回退到 MockEmbedder（仅限开发环境）"
-                );
-                Ok(Arc::new(MockEmbedder::new(model, dim)))
-            }
+            _ => Err(common::HubError::InvalidArgument(
+                "embedder=http 必须提供 HUB_EMBED_ENDPOINT（离线开发请显式改用 HUB_EMBED_PROVIDER=mock）"
+                    .to_string(),
+            )),
         },
     }
 }
@@ -171,10 +211,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_build_embedder_falls_back_to_mock_without_endpoint() {
-        let e = build_embedder(EmbedderKind::Http, "bge-m3", 8, None, None).unwrap();
-        assert_eq!(e.dim(), 8);
-        assert_eq!(e.model_id(), "bge-m3");
+    async fn test_build_embedder_rejects_http_without_endpoint() {
+        // 不得静默退回 MockEmbedder：mock 向量的余弦分布与真实模型完全不同，
+        // 相似度阈值会在其上失真，"整合正常"变成假象。
+        assert!(build_embedder(EmbedderKind::Http, "bge-m3", 8, None, None).is_err());
+        assert!(build_embedder(EmbedderKind::Http, "bge-m3", 8, Some("   "), None).is_err());
     }
 
     #[tokio::test]

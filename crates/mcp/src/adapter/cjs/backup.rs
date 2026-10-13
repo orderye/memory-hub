@@ -32,9 +32,7 @@ impl BackupManifestCoordinator {
                 Self::handle_backup_create(arguments)?;
                 Ok(None)
             }
-            "memory_restore" => {
-                Self::handle_backup_restore(dispatcher, auth, arguments).await
-            }
+            "memory_restore" => Self::handle_backup_restore(dispatcher, auth, arguments).await,
             _ => Ok(None),
         }
     }
@@ -98,19 +96,21 @@ impl BackupManifestCoordinator {
         };
 
         if let Some(note) = &record.note {
-                if let Some(idx) = note.find(MANIFEST_PREFIX) {
-                    let json_slice = &note[idx + MANIFEST_PREFIX.len()..];
-                    let manifest_json = json_slice.split(" | ").next().unwrap_or(json_slice);
-                    if let Ok(parsed) = serde_json::from_str::<Value>(manifest_json) {
-                        if let Some(actual_hash) = parsed.get("cjsbak_sha256").and_then(Value::as_str) {
-                            if !actual_hash.eq_ignore_ascii_case(&expected_hash) {
-                                return Ok(Some(ToolCallResult::error(&HubError::InvalidArgument(format!(
+            if let Some(idx) = note.find(MANIFEST_PREFIX) {
+                let json_slice = &note[idx + MANIFEST_PREFIX.len()..];
+                let manifest_json = json_slice.split(" | ").next().unwrap_or(json_slice);
+                if let Ok(parsed) = serde_json::from_str::<Value>(manifest_json) {
+                    if let Some(actual_hash) = parsed.get("cjsbak_sha256").and_then(Value::as_str) {
+                        if !actual_hash.eq_ignore_ascii_case(&expected_hash) {
+                            return Ok(Some(ToolCallResult::error(&HubError::InvalidArgument(
+                                format!(
                                     "创界山备份快照哈希不匹配: 期望 {}, 实际快照记录为 {}",
                                     expected_hash, actual_hash
-                                )))));
-                            }
+                                ),
+                            ))));
                         }
                     }
+                }
             }
         }
 

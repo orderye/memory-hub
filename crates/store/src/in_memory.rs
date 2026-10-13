@@ -55,19 +55,30 @@ struct StoredAgent {
     created_at: Option<chrono::DateTime<Utc>>,
 }
 
-/// 密钥散列：sha256(agent_id:secret)（不落明文）
-fn hash_secret(agent_id: &str, secret: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(agent_id.as_bytes());
-    h.update(b":");
-    h.update(secret.as_bytes());
-    hex::encode(h.finalize())
-}
-
 impl InMemoryHubStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 写回条目。`expected_version` 为 `Some(v)` 时要求库中当前版本恰为 v，
+    /// 否则返回 Conflict（与 PostgreSQL 实现同一语义）。`None` 为无条件写回。
+    async fn apply_revision(
+        &self,
+        entry: &MemoryEntry,
+        expected_version: Option<i64>,
+    ) -> Result<MemoryEntry> {
+        let mut w = self.items.write().unwrap();
+        let key = (entry.namespace.clone(), entry.id);
+        match w.get_mut(&key) {
+            Some(current) => match expected_version {
+                Some(v) if current.version != v => Err(common::HubError::Conflict),
+                _ => {
+                    *current = entry.clone();
+                    Ok(entry.clone())
+                }
+            },
+            None => Err(common::HubError::NotFound),
+        }
     }
 
     /// 当前条目总数（测试辅助）
@@ -134,6 +145,31 @@ impl mem_core::MemoryStore for InMemoryHubStore {
         Ok(entry.clone())
     }
 
+    async fn insert_initial(&self, entry: &MemoryEntry) -> Result<MemoryEntry> {
+        let mut w = self.items.write().unwrap();
+        let key = (entry.namespace.clone(), entry.id);
+        if w.contains_key(&key) {
+            return Err(HubError::Conflict);
+        }
+        w.insert(key, entry.clone());
+        let version = MemoryVersion {
+            memory_id: entry.id,
+            version: entry.version,
+            content: entry.content.clone(),
+            tags: entry.tags.clone(),
+            metadata: entry.metadata.clone(),
+            confidence: entry.confidence,
+            changed_by: entry.source_agent.clone(),
+            change_type: VersionChange::Created,
+            changed_at: entry.created_at,
+        };
+        self.versions
+            .write()
+            .unwrap()
+            .push(version);
+        Ok(entry.clone())
+    }
+
     async fn get(&self, namespace: &str, id: Uuid) -> Result<MemoryEntry> {
         self.items
             .read()
@@ -144,13 +180,24 @@ impl mem_core::MemoryStore for InMemoryHubStore {
     }
 
     async fn get_by_key(&self, namespace: &str, key: &str) -> Result<Option<MemoryEntry>> {
-        Ok(self
-            .items
-            .read()
-            .unwrap()
+        let r = self.items.read().unwrap();
+        let mut candidates: Vec<_> = r
             .values()
-            .find(|e| e.namespace == namespace && e.key.as_deref() == Some(key))
-            .cloned())
+            .filter(|e| e.namespace == namespace && e.key.as_deref() == Some(key))
+            .cloned()
+            .collect();
+        // 状态优先级：active (0) > archived (1) > merged (2)，同状态按 updated_at 倒序
+        candidates.sort_by(|a, b| {
+            let status_priority = |s: MemoryStatus| match s {
+                MemoryStatus::Active => 0,
+                MemoryStatus::Archived => 1,
+                MemoryStatus::Merged => 2,
+            };
+            status_priority(a.status)
+                .cmp(&status_priority(b.status))
+                .then_with(|| b.updated_at.cmp(&a.updated_at))
+        });
+        Ok(candidates.into_iter().next())
     }
 
     async fn save(&self, entry: &MemoryEntry) -> Result<MemoryEntry> {
@@ -159,6 +206,41 @@ impl mem_core::MemoryStore for InMemoryHubStore {
             .unwrap()
             .insert((entry.namespace.clone(), entry.id), entry.clone());
         Ok(entry.clone())
+    }
+
+    /// 与 PostgreSQL 实现同一语义的乐观并发修订：库中当前版本不是
+    /// `expected_version` 就返回 Conflict，而不是静默覆盖。
+    /// 两套实现在这一点上必须一致，否则内存测试验不出生产的丢更新行为。
+    async fn save_if_version(
+        &self,
+        entry: &MemoryEntry,
+        expected_version: i64,
+    ) -> Result<MemoryEntry> {
+        Self::apply_revision(self, entry, Some(expected_version)).await
+    }
+
+    /// 原子修订：版本校验 + 写回条目 + 追加历史。
+    /// 条目锁在追加历史之前释放（`RwLock` 守卫不是 `Send`，不得跨 `await` 持有）。
+    async fn revise(
+        &self,
+        entry: &MemoryEntry,
+        expected_version: i64,
+        change: mem_core::domain::VersionChange,
+    ) -> Result<MemoryEntry> {
+        let saved = Self::apply_revision(self, entry, Some(expected_version)).await?;
+        self.record_version(&MemoryVersion {
+            memory_id: saved.id,
+            version: saved.version,
+            content: saved.content.clone(),
+            tags: saved.tags.clone(),
+            metadata: saved.metadata.clone(),
+            confidence: saved.confidence,
+            changed_by: saved.source_agent.clone(),
+            change_type: change,
+            changed_at: saved.updated_at,
+        })
+        .await?;
+        Ok(saved)
     }
 
     async fn delete(&self, namespace: &str, id: Uuid) -> Result<()> {
@@ -328,6 +410,10 @@ impl mem_core::MemoryStore for InMemoryHubStore {
         }
         Ok(count)
     }
+
+    async fn ping(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -349,6 +435,9 @@ impl mem_core::BackupStore for InMemoryHubStore {
             .ok_or(HubError::NotFound)
     }
 
+    /// 列举快照（摘要视图）：与 PostgreSQL 实现保持同一语义——不返回 `payload`，
+    /// 需要负载的调用方必须走 `get_backup(id)`。两套实现若在这一点上分叉，
+    /// 内存测试就会验不出生产行为。
     async fn list_backups(&self, namespace: Option<&str>) -> Result<Vec<BackupRecord>> {
         let mut out: Vec<BackupRecord> = self
             .backups
@@ -357,6 +446,10 @@ impl mem_core::BackupStore for InMemoryHubStore {
             .values()
             .filter(|b| namespace.is_none_or(|n| b.namespace == n))
             .cloned()
+            .map(|mut b| {
+                b.payload = serde_json::Value::Null;
+                b
+            })
             .collect();
         out.sort_by_key(|b| std::cmp::Reverse(b.created_at));
         Ok(out)
@@ -533,7 +626,7 @@ impl mem_core::AgentStore for InMemoryHubStore {
         entry.redirect_uris = reg.redirect_uris.clone();
         entry.max_scopes = reg.max_scopes.clone();
         if let Some(secret) = &reg.client_secret {
-            entry.secret_hash = Some(hash_secret(&reg.agent_id, secret));
+            entry.secret_hash = Some(crate::secret::hash_secret(&reg.agent_id, secret));
         }
         Ok(agent_record(&reg.agent_id, entry))
     }
@@ -572,7 +665,7 @@ impl mem_core::AgentStore for InMemoryHubStore {
         let w = self.agents.read().unwrap();
         Ok(match w.get(agent_id) {
             Some(a) => match &a.secret_hash {
-                Some(h) => h == &hash_secret(agent_id, secret),
+                Some(h) => crate::secret::verify_secret(agent_id, secret, h),
                 None => false,
             },
             None => false,

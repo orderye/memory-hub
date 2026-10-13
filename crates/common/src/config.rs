@@ -12,12 +12,22 @@ pub const SCORE_WEIGHT_LEN: usize = 5;
 /// 单次快照的默认条目上限（防止备份无限膨胀）
 pub const DEFAULT_BACKUP_MAX_ENTRIES: usize = 50_000;
 
+/// 令牌签名密钥的最小长度（字节）。HS256 要拿到 256 位密钥强度，
+/// 短于此值的口令可被离线爆破——而该密钥同时是三个进程共享的验签根。
+pub const MIN_TOKEN_SECRET_BYTES: usize = 32;
+
+/// 内置开发占位密钥。它绝不可以通过启动校验，否则等于用公开常量签发令牌。
+pub const INSECURE_DEFAULT_TOKEN_SECRET: &str = "dev-only-insecure-secret";
+
 /// 多智能体长期记忆服务配置项
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     // ===== 存储与模型 =====
     pub db_url: String,
     pub db_max_connections: u32,
+    /// 单条 SQL 的服务器端超时（毫秒）；0 = 不限制。
+    /// 没有它，一条被慢查询或锁等待拖住的语句会一直占着连接池里的坑位。
+    pub db_statement_timeout_ms: u64,
     pub embed_dim: usize,
     /// 嵌入器提供方：`mock` | `http`
     pub embed_provider: String,
@@ -148,6 +158,7 @@ impl Default for AppConfig {
         Self {
             db_url: "postgresql://mem_app:secret@localhost:5432/memory_hub".to_string(),
             db_max_connections: 10,
+            db_statement_timeout_ms: 30_000,
             embed_dim: 1024,
             embed_provider: "mock".to_string(),
             embed_endpoint: None,
@@ -191,6 +202,8 @@ impl AppConfig {
 
         cfg.db_url = var_or("HUB_DB_URL", &cfg.db_url);
         cfg.db_max_connections = parse_u32("HUB_DB_MAX_CONNECTIONS", cfg.db_max_connections)?;
+        cfg.db_statement_timeout_ms =
+            parse_u64("HUB_DB_STATEMENT_TIMEOUT_MS", cfg.db_statement_timeout_ms)?;
         cfg.embed_dim = parse_usize("HUB_EMBED_DIM", cfg.embed_dim)?;
         cfg.embed_provider = var_or("HUB_EMBED_PROVIDER", &cfg.embed_provider).to_lowercase();
         cfg.embed_endpoint = var("HUB_EMBED_ENDPOINT");
@@ -242,13 +255,50 @@ impl AppConfig {
         Ok(cfg)
     }
 
+    /// 后端是否为 PostgreSQL（三个二进制都用这一判定，避免各自复制字符串前缀检查）
+    pub fn is_postgres(&self) -> bool {
+        self.db_url.starts_with("postgres://") || self.db_url.starts_with("postgresql://")
+    }
+
     /// 强校验：任何越界配置都在启动期失败
     pub fn validate(&self) -> anyhow::Result<()> {
+        // 令牌签名根：auth-server 签发、mcp-server 与 backup-worker 离线验签，
+        // 三方共用一个字面量。占位值或弱口令一旦带上生产，
+        // 任何知道它的人都能伪造任意账户、任意 scope 的访问令牌，
+        // 且已泄露的密钥无法在不重启的情况下作废（无轮换、无 jti 黑名单）。
+        if self.token_secret.is_empty() {
+            anyhow::bail!("HUB_TOKEN_SECRET 必须设置，且 auth-server 与 mcp-server 取值一致");
+        }
+        if self.token_secret == INSECURE_DEFAULT_TOKEN_SECRET {
+            anyhow::bail!(
+                "HUB_TOKEN_SECRET 仍是内置开发占位值，拒绝启动；请替换为至少 {} 字节的随机密钥",
+                MIN_TOKEN_SECRET_BYTES
+            );
+        }
+        if self.token_secret.len() < MIN_TOKEN_SECRET_BYTES {
+            anyhow::bail!(
+                "HUB_TOKEN_SECRET 至少需要 {} 字节，当前 {} 字节",
+                MIN_TOKEN_SECRET_BYTES,
+                self.token_secret.len()
+            );
+        }
+
         if self.embed_dim == 0 {
             anyhow::bail!("HUB_EMBED_DIM 必须大于 0");
         }
         if self.embed_dim > 4096 {
             anyhow::bail!("HUB_EMBED_DIM 超过 pgvector 实用上限 4096");
+        }
+        // schema 里的列是固定的 vector(1024)（migrations/…001_initial_schema.sql）。
+        // 维度不符时启动期一切正常、首次写入才炸出 22000，因此在启动就拦住。
+        const SCHEMA_VECTOR_DIM: usize = 1024;
+        if self.is_postgres() && self.embed_dim != SCHEMA_VECTOR_DIM {
+            anyhow::bail!(
+                "PostgreSQL 后端的 memories.embedding 列固定为 vector({SCHEMA_VECTOR_DIM})，\
+                 HUB_EMBED_DIM 当前为 {}；请改用 {SCHEMA_VECTOR_DIM} 维模型，\
+                 或先迁移列定义",
+                self.embed_dim
+            );
         }
         if self.db_max_connections == 0 {
             anyhow::bail!("HUB_DB_MAX_CONNECTIONS 必须大于 0");
@@ -391,14 +441,26 @@ mod tests {
     /// 串行化环境变量读写，避免测试间相互干扰
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    /// 够长的测试密钥：validate() 拒收占位值与短密钥，用例需自带合规值，
+    /// 否则"密钥不合规"会让 from_env 以意料之外的原因失败。
+    const TEST_SECRET: &str = "unit-test-token-secret-0123456789abcdef";
+
     fn with_env<T>(vars: &[(&str, Option<&str>)], f: impl FnOnce() -> T) -> T {
         let _guard = ENV_LOCK.lock().unwrap();
-        let saved: Vec<(String, Option<String>)> = vars
+
+        // 未显式指定 HUB_TOKEN_SECRET 的用例统一注入合规测试密钥。
+        let mut effective: Vec<(&str, Option<&str>)> = vars.iter().map(|(k, v)| (*k, *v)).collect();
+        let declares_secret = vars.iter().any(|(k, _)| *k == "HUB_TOKEN_SECRET");
+        if !declares_secret {
+            effective.push(("HUB_TOKEN_SECRET", Some(TEST_SECRET)));
+        }
+
+        let saved: Vec<(String, Option<String>)> = effective
             .iter()
             .map(|(k, _)| ((*k).to_string(), env::var(k).ok()))
             .collect();
 
-        for (k, v) in vars {
+        for (k, v) in &effective {
             match v {
                 Some(val) => env::set_var(k, val),
                 None => env::remove_var(k),
@@ -419,8 +481,44 @@ mod tests {
     #[test]
     fn test_defaults_are_valid() {
         let cfg = AppConfig::default();
-        assert!(cfg.validate().is_ok());
+        // 默认值整体自洽，但内置占位密钥必须被拒——否则带着默认密钥也能启动。
+        assert!(
+            cfg.validate().is_err(),
+            "默认占位 token_secret 必须被 validate() 拒绝"
+        );
         assert_eq!(cfg.score_weights.iter().sum::<f32>(), 1.0);
+
+        let secured = AppConfig {
+            token_secret: TEST_SECRET.to_string(),
+            ..Default::default()
+        };
+        assert!(secured.validate().is_ok());
+    }
+
+    #[test]
+    fn test_token_secret_strength_enforced() {
+        let short = AppConfig {
+            token_secret: "too-short".to_string(),
+            ..Default::default()
+        };
+        assert!(short.validate().is_err(), "短密钥可被离线爆破，必须拒绝");
+
+        let empty = AppConfig {
+            token_secret: String::new(),
+            ..Default::default()
+        };
+        assert!(empty.validate().is_err());
+
+        // from_env 未设置 HUB_TOKEN_SECRET 时不得静默使用占位值
+        with_env(
+            &[("HUB_TOKEN_SECRET", Some(INSECURE_DEFAULT_TOKEN_SECRET))],
+            || {
+                assert!(
+                    AppConfig::from_env().is_err(),
+                    "占位密钥必须 fail-fast，而非告警后继续启动"
+                );
+            },
+        );
     }
 
     #[test]
@@ -430,6 +528,8 @@ mod tests {
                 ("HUB_MCP_BIND", Some("127.0.0.1:3999")),
                 ("AUTH_BIND", Some("127.0.0.1:3998")),
                 ("HUB_SOFT_TIMEOUT_MS", Some("250")),
+                // 768 维只在非 PostgreSQL 后端下合法（PG 列固定 vector(1024)）
+                ("HUB_DB_URL", Some("memory://local")),
                 ("HUB_EMBED_DIM", Some("768")),
                 ("HUB_EMBED_PROVIDER", Some("mock")),
                 ("BACKUP_CRON", Some("*/30 * * * *")),

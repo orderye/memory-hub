@@ -17,7 +17,6 @@ auth-core = { workspace = true }
 auth-web = { workspace = true }
 authz = { workspace = true }
 axum.workspace = true
-tower-http.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt", "macros"] }

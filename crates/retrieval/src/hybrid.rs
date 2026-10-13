@@ -76,37 +76,53 @@ impl HybridRetriever {
                 vec![MemoryStatus::Active]
             }),
             text_contains: Some(q.query_text.clone()),
-            limit: Some(self.fts_k),
+            // 候选池必须容得下 top_k：此前固定取 fts_k(默认 20)，
+            // 而工具契约允许 top_k 到 100，超出的请求会被静默截断。
+            limit: Some(self.fts_k.max(q.top_k)),
             ..Default::default()
         };
-        let items = self.store.list(&filter).await.unwrap_or_default();
+        let items = match self.store.list(&filter).await {
+            Ok(v) => v,
+            Err(e) => {
+                // 降级必须可观测：静默返回空会让"检索没结果"看起来像"库里没有"
+                tracing::warn!(error = %e, namespace = %q.namespace, "关键词召回失败，该路结果为空");
+                Vec::new()
+            }
+        };
         items
             .into_iter()
             .map(|item| Scored { item, score: 0.0 })
             .collect()
     }
 
-    /// 向量路召回
-    async fn vec_candidates(&self, q: &SearchQuery) -> Vec<Scored<MemoryEntry>> {
+    /// 向量路召回（查询向量由 `search` 统一算好后传入，避免双路各嵌一次）
+    async fn vec_candidates(
+        &self,
+        q: &SearchQuery,
+        qv: Option<&[f32]>,
+    ) -> Vec<Scored<MemoryEntry>> {
         if q.query_text.trim().is_empty() {
             return Vec::new();
         }
-        let vectors = match self
-            .embedder
-            .embed(std::slice::from_ref(&q.query_text))
+        let Some(qv) = qv else {
+            return Vec::new();
+        };
+        match self
+            .store
+            .similar(
+                &q.namespace,
+                qv,
+                self.vec_k.max(q.top_k),
+                q.kinds.as_deref(),
+            )
             .await
         {
             Ok(v) => v,
-            Err(_) => return Vec::new(),
-        };
-        let Some(mut qv) = vectors.into_iter().next() else {
-            return Vec::new();
-        };
-        l2_normalize(&mut qv);
-        self.store
-            .similar(&q.namespace, &qv, self.vec_k, q.kinds.as_deref())
-            .await
-            .unwrap_or_default()
+            Err(e) => {
+                tracing::warn!(error = %e, namespace = %q.namespace, "向量召回失败，该路结果为空");
+                Vec::new()
+            }
+        }
     }
 
     /// 兜底：纯列表召回（超时或查询为空时）
@@ -157,11 +173,21 @@ impl HybridRetriever {
         &self,
         candidates: Vec<(MemoryEntry, Option<f32>)>,
         q: &SearchQuery,
+        query_vec: Option<&[f32]>,
     ) -> Vec<Scored<MemoryEntry>> {
         let now = chrono::Utc::now();
         let mut scored: Vec<Scored<MemoryEntry>> = candidates
             .into_iter()
             .map(|(item, sim)| {
+                // 关键词路命中此前一律记 sim=0，而 sim 权重高达 0.50 —— 于是
+                // "全文精确命中"最高只能得 0.5 分，被任何中等向量命中压过，
+                // 双路融合名不副实。这里用条目自带向量与查询向量现算相似度。
+                let sim = sim.or_else(|| {
+                    let qv = query_vec?;
+                    item.embedding
+                        .as_deref()
+                        .map(|e| cosine_similarity(qv, e).clamp(0.0, 1.0))
+                });
                 let kw = keyword_score(&item.content, &q.query_text, &item.tags);
                 let rec = recency_score(now, item.updated_at, self.recency_tau_days);
                 let fresh = if item.version > 1 { 1.0 } else { 0.5 };
@@ -225,15 +251,41 @@ impl Retriever for HybridRetriever {
                 .map(|s| (s.item, None))
                 .collect::<Vec<_>>();
             return Ok(self
-                .score_items(candidates, q)
+                .score_items(candidates, q, None)
                 .into_iter()
                 .take(top_k)
                 .collect());
         }
 
+        // 查询向量只算一次，双路召回与打分共用
+        let query_vec: Option<Vec<f32>> = match self
+            .embedder
+            .embed(std::slice::from_ref(&q.query_text))
+            .await
+        {
+            Ok(mut vectors) => vectors
+                .pop()
+                .map(|mut v| {
+                    l2_normalize(&mut v);
+                    v
+                })
+                .or_else(|| {
+                    tracing::warn!(namespace = %q.namespace, "嵌入服务返回空向量列表");
+                    None
+                }),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    namespace = %q.namespace,
+                    "查询嵌入失败：向量路不可用，仅关键词召回"
+                );
+                None
+            }
+        };
+
         // 双路并行 + 软超时
         let fts = self.fts_candidates(q);
-        let vec_c = self.vec_candidates(q);
+        let vec_c = self.vec_candidates(q, query_vec.as_deref());
         let joined =
             tokio::time::timeout(self.soft_timeout, async { tokio::join!(fts, vec_c) }).await;
 
@@ -259,8 +311,9 @@ impl Retriever for HybridRetriever {
 
         let this = self.clone();
         let q_clone = q.clone();
+        let qv_clone = query_vec;
         let reranked = tokio::task::spawn_blocking(move || {
-            let scored = this.score_items(merged, &q_clone);
+            let scored = this.score_items(merged, &q_clone, qv_clone.as_deref());
             this.mmr_rerank(scored, top_k)
         })
         .await
@@ -453,6 +506,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_fts_hit_gets_similarity_from_query_vector() {
+        let r = retriever(Arc::new(TestStore::default()));
+        let embedder = TestEmbedder::default();
+        let text = "服务部署在东京区域";
+        let mut qv = embedder.embed(&[text.to_string()]).await.unwrap().remove(0);
+        l2_normalize(&mut qv);
+
+        let mut item = entry("ns", text);
+        item.embedding = Some(qv.clone());
+
+        // 没有查询向量时（如嵌入服务故障），关键词命中只能拿 sim=0 的那部分分
+        let without = r.score_items(vec![(item.clone(), None)], &query("ns", "东京"), None);
+        // 带查询向量时同一命中应现算出 sim≈1.0，而不是被当作零相似度判死
+        let with = r.score_items(vec![(item, None)], &query("ns", "东京"), Some(&qv));
+
+        assert!(
+            with[0].score > without[0].score,
+            "关键词命中的相似度不应恒为 0：{:#?} vs {:#?}",
+            with[0].score,
+            without[0].score
+        );
+        // sim 维度权重为 0.5，补回后总分应抬升接近 0.5
+        assert!(
+            with[0].score - without[0].score > 0.45,
+            "应补回 sim 权重的几乎全部：{:#?}",
+            with[0].score - without[0].score
+        );
+    }
+
+    #[tokio::test]
     async fn test_fts_only_when_no_embeddings() {
         let store = Arc::new(TestStore::default());
         store.add(entry("ns", "用户喜欢喝美式咖啡"), None);
@@ -528,5 +611,22 @@ mod tests {
         let res = r.search(&auth(), &query("ns-a", "咖啡")).await.unwrap();
         assert_eq!(res.len(), 1);
         assert_eq!(res[0].item.namespace, "ns-a");
+    }
+
+    #[test]
+    fn test_cjk_bigram_fts_tokenization_matching() {
+        let doc = "服务部署在东京区域，架构采用微服务";
+        let doc_tokens = mem_core::tokenize_for_fts(doc);
+
+        // 验证针对"东京"查询，词元中包含"东京"
+        let q1 = mem_core::tokenize_query_for_fts("东京");
+        assert_eq!(q1, "东京");
+        assert!(doc_tokens.contains(&q1));
+
+        // 验证针对"微服务"查询，查询拆成"微服 服务"，doc_tokens 均包含
+        let q2 = mem_core::tokenize_query_for_fts("微服务");
+        for term in q2.split_whitespace() {
+            assert!(doc_tokens.contains(term), "文档词元应包含查询 2-gram: {}", term);
+        }
     }
 }

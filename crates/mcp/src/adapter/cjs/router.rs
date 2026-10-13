@@ -52,7 +52,8 @@ impl SmartNamespaceRouter {
                 if !is_explicit_single {
                     let shared_ns = format!("w_{}_shared", world_id);
                     let bot_ns = format!("w_{}_bot_{}", world_id, bot_id);
-                    return Self::dual_search(dispatcher, auth, arguments, &shared_ns, &bot_ns).await;
+                    return Self::dual_search(dispatcher, auth, arguments, &shared_ns, &bot_ns)
+                        .await;
                 }
             }
         }

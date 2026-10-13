@@ -47,7 +47,11 @@ impl AutoClassifier {
             }
         }
 
-        let text = match obj.get("content").or_else(|| obj.get("text")).and_then(Value::as_str) {
+        let text = match obj
+            .get("content")
+            .or_else(|| obj.get("text"))
+            .and_then(Value::as_str)
+        {
             Some(t) => t,
             None => return,
         };
@@ -58,23 +62,45 @@ impl AutoClassifier {
             .and_then(Value::as_str)
             .map(|s| s.to_ascii_lowercase());
 
-        let needs_classification = match current_kind.as_deref() {
-            None | Some("") | Some("note") => true,
-            _ => false,
-        };
+        let needs_classification =
+            matches!(current_kind.as_deref(), None | Some("") | Some("note"));
 
         if !needs_classification {
             return;
         }
 
         const PREF_KEYWORDS: &[&str] = &[
-            "喜欢", "厌恶", "习惯于", "人设立场", "讨厌", "偏好", "倾向于", "喜好", "嗜好",
+            "喜欢",
+            "厌恶",
+            "习惯于",
+            "人设立场",
+            "讨厌",
+            "偏好",
+            "倾向于",
+            "喜好",
+            "嗜好",
         ];
         const FACT_KEYWORDS: &[&str] = &[
-            "法则", "世界观", "地理位于", "不可违背", "设定", "定律", "地理", "禁制", "规则",
+            "法则",
+            "世界观",
+            "地理位于",
+            "不可违背",
+            "设定",
+            "定律",
+            "地理",
+            "禁制",
+            "规则",
         ];
         const EPISODE_KEYWORDS: &[&str] = &[
-            "发生了", "击败了", "启程前往", "遇见了", "击败", "经历了", "战斗", "抵达", "遭遇",
+            "发生了",
+            "击败了",
+            "启程前往",
+            "遇见了",
+            "击败",
+            "经历了",
+            "战斗",
+            "抵达",
+            "遭遇",
         ];
 
         let mut inferred_kind = None;
@@ -118,10 +144,12 @@ impl AutoClassifier {
             if !metadata.contains_key("AIGC_Source") && !metadata.contains_key("aigc_source") {
                 metadata.insert("AIGC_Source".to_string(), json!("chuangjieshan"));
             }
-            if !metadata.contains_key("AIGC_Compliant") && !metadata.contains_key("aigc_compliant") {
+            if !metadata.contains_key("AIGC_Compliant") && !metadata.contains_key("aigc_compliant")
+            {
                 metadata.insert("AIGC_Compliant".to_string(), json!(true));
             }
-            if !metadata.contains_key("AIGC_Timestamp") && !metadata.contains_key("aigc_timestamp") {
+            if !metadata.contains_key("AIGC_Timestamp") && !metadata.contains_key("aigc_timestamp")
+            {
                 metadata.insert("AIGC_Timestamp".to_string(), json!(Utc::now().to_rfc3339()));
             }
         }
@@ -179,8 +207,14 @@ mod tests {
         AutoClassifier::process(&mut args, &fp, &cfg);
 
         let meta = args.get("metadata").and_then(Value::as_object).unwrap();
-        assert_eq!(meta.get("AIGC_Source").and_then(Value::as_str), Some("chuangjieshan"));
-        assert_eq!(meta.get("AIGC_Compliant").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            meta.get("AIGC_Source").and_then(Value::as_str),
+            Some("chuangjieshan")
+        );
+        assert_eq!(
+            meta.get("AIGC_Compliant").and_then(Value::as_bool),
+            Some(true)
+        );
         assert!(meta.contains_key("AIGC_Timestamp"));
     }
 }

@@ -9,8 +9,8 @@
 use chrono::Utc;
 use common::AccountId;
 use mem_core::{
-    scope_name, AccountScopedStore, BackupRecord, BackupStore, GrantStore, MemoryEntry,
-    MemoryFilter, MemoryKind, MemoryStatus, MemoryStore, NamespaceGrantRecord,
+    scope_name, AccountScopedStore, BackupRecord, BackupStore, GrantStore, IntegrationStore,
+    MemoryEntry, MemoryFilter, MemoryKind, MemoryStatus, MemoryStore, NamespaceGrantRecord,
 };
 use std::sync::Arc;
 
@@ -197,6 +197,131 @@ async fn test_backup_star_scoped_per_account() {
 }
 
 #[tokio::test]
+async fn test_get_by_id_is_fail_closed_across_accounts() {
+    let store = hub();
+    let sa = scoped(&store, account(1));
+    let sb = scoped(&store, account(2));
+
+    let backup = BackupRecord {
+        id: uuid::Uuid::new_v4(),
+        namespace: "personal".to_string(),
+        created_by: "agent-a".to_string(),
+        note: None,
+        entry_count: 1,
+        checksum: "x".to_string(),
+        payload: serde_json::json!({"entries": []}),
+        retain_until: None,
+        created_at: Utc::now(),
+    };
+    sa.save_backup(&backup).await.unwrap();
+
+    // 属主按 ID 可取回
+    let owned = sa.get_backup(backup.id).await.unwrap();
+    assert_eq!(owned.namespace, "personal");
+    // 他账户即使已知该 UUID，也必须当作不存在（而非拿到他人数据与明文命名空间）
+    assert!(matches!(
+        sb.get_backup(backup.id).await.unwrap_err(),
+        common::HubError::NotFound
+    ));
+
+    let proposal = mem_core::domain::IntegrationProposal {
+        id: uuid::Uuid::new_v4(),
+        namespace: "personal".to_string(),
+        kind: mem_core::IntegrationKind::Duplicate,
+        member_ids: vec![],
+        suggested_survivor: None,
+        similarity: 0.9,
+        status: mem_core::domain::ProposalStatus::Open,
+        resolution_note: None,
+        created_at: Utc::now(),
+        resolved_at: None,
+    };
+    sa.save_proposal(&proposal).await.unwrap();
+    assert!(sa.get_proposal(proposal.id).await.is_ok());
+    assert!(matches!(
+        sb.get_proposal(proposal.id).await.unwrap_err(),
+        common::HubError::NotFound
+    ));
+}
+
+#[tokio::test]
+async fn test_save_if_version_rejects_stale_revision() {
+    let store = hub();
+    let sa = scoped(&store, account(1));
+    let e = sa
+        .insert(&entry("personal", "agent-a", "初稿"))
+        .await
+        .unwrap();
+    assert_eq!(e.version, 1);
+
+    // 正常修订：以当前版本为条件
+    let mut rev = e.clone();
+    rev.content = "第二稿".to_string();
+    rev.version += 1;
+    let saved = sa.save_if_version(&rev, e.version).await.unwrap();
+    assert_eq!(saved.version, 2);
+
+    // 陈旧修订：另一个写者已把版本推进到 2，仍以 1 为条件的写入必须被拒
+    let mut stale = e.clone();
+    stale.content = "被并发覆盖的稿子".to_string();
+    stale.version += 1;
+    let err = sa.save_if_version(&stale, e.version).await.unwrap_err();
+    assert!(
+        matches!(err, common::HubError::Conflict),
+        "并发修订应判为冲突，实际 {err:?}"
+    );
+    // 未被静默覆盖
+    let now = sa.get("personal", e.id).await.unwrap();
+    assert_eq!(now.content, "第二稿");
+    assert_eq!(now.version, 2);
+}
+
+#[tokio::test]
+async fn test_revise_is_atomic_between_entry_and_history() {
+    let store = hub();
+    let sa = scoped(&store, account(1));
+    let e = sa
+        .insert(&entry("personal", "agent-a", "初稿"))
+        .await
+        .unwrap();
+
+    // 正常修订：条目推进 + 历史追加
+    let mut rev = e.clone();
+    rev.content = "第二稿".to_string();
+    rev.version += 1;
+    let saved = sa
+        .revise(&rev, e.version, mem_core::domain::VersionChange::Updated)
+        .await
+        .unwrap();
+    assert_eq!(saved.version, 2);
+    // 注：`insert` 本身不写历史，"created" 那一行由服务层在插入后追加；
+    // 这里只验 store 层 revise 的原子性——一次修订恰好一条历史。
+    let history = sa.versions(e.id).await.unwrap();
+    assert_eq!(history.len(), 1, "修订应追加一条历史，实际 {history:?}");
+    assert_eq!(history[0].content, "第二稿");
+
+    // 冲突修订：既不改条目，也不留历史（否则版本历史与条目分叉）
+    let mut stale = e.clone();
+    stale.content = "陈旧稿".to_string();
+    stale.version += 1;
+    let err = sa
+        .revise(&stale, e.version, mem_core::domain::VersionChange::Updated)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, common::HubError::Conflict));
+    assert_eq!(
+        sa.get("personal", e.id).await.unwrap().content,
+        "第二稿",
+        "冲突写入不得改动条目"
+    );
+    assert_eq!(
+        sa.versions(e.id).await.unwrap().len(),
+        1,
+        "冲突修订不得留下版本历史"
+    );
+}
+
+#[tokio::test]
 async fn test_prefix_idempotent_roundtrip_from_payload() {
     // 备份负载中的条目名义上是"用户可见名"，但即使拿到已作用域名
     // （如旧负载或未来格式变化），也不能二次加前缀
@@ -210,4 +335,46 @@ async fn test_prefix_idempotent_roundtrip_from_payload() {
     assert_eq!(e.namespace, "personal");
     let raw = store.all_in_namespace(&already, true).await.unwrap();
     assert_eq!(raw.len(), 1, "不得出现双重前缀键");
+}
+
+#[tokio::test]
+async fn test_insert_initial_creates_entry_and_version_atomically() {
+    let store = hub();
+    let sa = scoped(&store, account(1));
+    let e = sa
+        .insert_initial(&entry("personal", "agent-a", "第一条记忆"))
+        .await
+        .unwrap();
+    assert_eq!(e.version, 1);
+    let history = sa.versions(e.id).await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].change_type, mem_core::domain::VersionChange::Created);
+    assert_eq!(history[0].content, "第一条记忆");
+    assert_eq!(history[0].version, 1);
+}
+
+#[tokio::test]
+async fn test_get_by_key_prioritizes_active_over_merged_and_archived() {
+    let store = hub();
+    let sa = scoped(&store, account(1));
+
+    // 1. 先插入一条历史已合并条目（模拟历史合并留下的相同 key）
+    let mut merged = entry("personal", "agent-a", "历史合并内容");
+    merged.key = Some("unique-profile".to_string());
+    merged.status = MemoryStatus::Merged;
+    sa.insert(&merged).await.unwrap();
+
+    // 2. 插入一条当前活跃的条目（相同 key）
+    let mut active = entry("personal", "agent-a", "当前活跃内容");
+    active.key = Some("unique-profile".to_string());
+    active.status = MemoryStatus::Active;
+    sa.insert(&active).await.unwrap();
+
+    // get_by_key 必须确定性命中 active 条目，不得误取 merged
+    let found = sa.get_by_key("personal", "unique-profile").await.unwrap();
+    assert!(found.is_some());
+    let unwrapped = found.unwrap();
+    assert_eq!(unwrapped.id, active.id);
+    assert_eq!(unwrapped.content, "当前活跃内容");
+    assert_eq!(unwrapped.status, MemoryStatus::Active);
 }

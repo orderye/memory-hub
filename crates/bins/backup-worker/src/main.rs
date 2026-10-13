@@ -143,9 +143,13 @@ async fn build_store(cfg: &common::AppConfig) -> Result<Arc<dyn MemoryHubStore>>
             "backup-worker 需要 PostgreSQL（HUB_DB_URL 未配置 postgres 连接串）"
         ));
     }
-    let pg = store::PostgresHubStore::connect(&cfg.db_url, cfg.db_max_connections)
-        .await
-        .map_err(|e| anyhow!("PostgreSQL 连接失败: {}", e))?;
+    let pg = store::PostgresHubStore::connect(
+        &cfg.db_url,
+        cfg.db_max_connections,
+        cfg.db_statement_timeout_ms,
+    )
+    .await
+    .map_err(|e| anyhow!("PostgreSQL 连接失败: {}", e))?;
     info!("PostgreSQL 存储连接成功（含迁移执行）");
     Ok(Arc::new(pg))
 }

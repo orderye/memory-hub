@@ -158,8 +158,8 @@ BACKUP=$(curl -s -X POST http://localhost:3000 -H "Authorization: Bearer $TOKEN"
 ## 开发
 
 ```bash
-cargo test --workspace                 # 237 个测试
-cargo clippy --all-targets             # 零警告
+cargo test --workspace --all-features   # 271 个测试
+cargo clippy --all-targets --all-features -- -D warnings   # 零警告
 cargo fmt --all
 # PostgreSQL 集成测试（需 DATABASE_URL）
 cargo test -p store --features pg-integration -- --ignored

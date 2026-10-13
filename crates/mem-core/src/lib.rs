@@ -19,11 +19,14 @@ pub mod access;
 pub mod account_scope;
 pub mod algorithm;
 pub mod backup_service;
+pub mod cjk;
 pub mod domain;
 pub mod infra;
 pub mod integration_service;
 pub mod memory_service;
 pub mod testing;
+
+pub use cjk::{tokenize_for_fts, tokenize_query_for_fts};
 
 pub use access::{validate_key, validate_namespace, GrantChecker};
 pub use account_scope::{scope_name, unscope_name, AccountScopedStore};
@@ -47,8 +50,7 @@ pub use infra::{
     Retriever, SessionRecord, SystemClock, TokenIntrospector,
 };
 pub use integration_service::{
-    DefaultIntegrationService, IntegrationService, ResolveAction, ResolveRequest, ScanReport,
-    ScanRequest,
+    IntegrationService, ResolveAction, ResolveRequest, ScanReport, ScanRequest,
 };
 pub use memory_service::{
     decode_cursor, encode_cursor, DefaultMemoryService, GetRequest, ListRequest, MemoryService,

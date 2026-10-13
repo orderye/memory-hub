@@ -7,7 +7,7 @@ use crate::types::{ConsolidationReport, ConsolidationStats};
 use chrono::Utc;
 use common::{AgentId, HubError, Result};
 use mem_core::{
-    IntegrationKind, IntegrationProposal, MemoryEntry, MemoryHubStore, MemoryStatus,
+    Embedder, IntegrationKind, IntegrationProposal, MemoryEntry, MemoryHubStore, MemoryStatus,
     ProposalStatus, ResolveAction, ResolveRequest, VersionChange,
 };
 use std::collections::HashSet;
@@ -15,6 +15,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 /// 整合中枢引擎
+#[derive(Clone)]
 pub struct ConsolidationEngine {
     store: Arc<dyn MemoryHubStore>,
     duplicate_detector: DuplicateDetector,
@@ -23,6 +24,8 @@ pub struct ConsolidationEngine {
     merger: Arc<dyn ContentMerger>,
     policy: AutoPolicy,
     max_proposals: usize,
+    /// 合并后重算幸存者向量用；未配置时合并会清空幸存者向量而不是留下与正文不符的旧向量
+    embedder: Option<Arc<dyn Embedder>>,
 }
 
 impl ConsolidationEngine {
@@ -35,7 +38,14 @@ impl ConsolidationEngine {
             merger: Arc::new(TieredMerger::default()),
             policy: AutoPolicy::default(),
             max_proposals: max_proposals.max(1),
+            embedder: None,
         }
+    }
+
+    /// 注入嵌入器：合并后重算幸存者向量
+    pub fn with_embedder(mut self, embedder: Arc<dyn Embedder>) -> Self {
+        self.embedder = Some(embedder);
+        self
     }
 
     pub fn with_policy(mut self, policy: AutoPolicy) -> Self {
@@ -46,6 +56,13 @@ impl ConsolidationEngine {
     pub fn with_merger(mut self, merger: Arc<dyn ContentMerger>) -> Self {
         self.merger = merger;
         self
+    }
+
+    /// 切换底层存储（例如切换为特定请求的账户隔离存储 AccountScopedStore）
+    pub fn with_store(&self, store: Arc<dyn MemoryHubStore>) -> Self {
+        let mut cloned = self.clone();
+        cloned.store = store;
+        cloned
     }
 
     /// 计算命名空间的记忆整合健康度统计报告
@@ -354,23 +371,40 @@ impl ConsolidationEngine {
         updated_survivor.tags = merged_output.tags;
         updated_survivor.metadata = merged_output.metadata;
         updated_survivor.confidence = merged_output.confidence;
+
+        // 融合后正文已变，幸存者身上的旧向量不再代表新内容：留着它会污染
+        // 检索的相似度维度，并让下一轮扫描把同一批条目继续判成重复。
+        // 配了嵌入器就重算，没配则清空（宁可少一路召回，也不留错的向量）。
+        match &self.embedder {
+            Some(em) => match em.embed(&[updated_survivor.content.clone()]).await {
+                Ok(mut vectors) if !vectors.is_empty() => {
+                    let mut v = vectors.remove(0);
+                    mem_core::l2_normalize(&mut v);
+                    updated_survivor.embedding = Some(v);
+                    updated_survivor.embedding_model = Some(em.model_id().to_string());
+                }
+                other => {
+                    tracing::warn!(
+                        memory_id = %updated_survivor.id,
+                        embedding_empty = other.is_ok(),
+                        "合并后重嵌入失败，已清空该条目向量（下次写入时重建）"
+                    );
+                    updated_survivor.embedding = None;
+                }
+            },
+            None => {
+                updated_survivor.embedding = None;
+            }
+        }
+
+        let expected_survivor = updated_survivor.version;
         updated_survivor.version += 1;
         updated_survivor.updated_at = now;
         updated_survivor.source_agent = operator_agent.clone();
 
-        let saved = self.store.save(&updated_survivor).await?;
-        self.store
-            .record_version(&mem_core::MemoryVersion {
-                memory_id: saved.id,
-                version: saved.version,
-                content: saved.content.clone(),
-                tags: saved.tags.clone(),
-                metadata: saved.metadata.clone(),
-                confidence: saved.confidence,
-                changed_by: operator_agent.clone(),
-                change_type: VersionChange::Updated,
-                changed_at: now,
-            })
+        let saved = self
+            .store
+            .revise(&updated_survivor, expected_survivor, VersionChange::Updated)
             .await?;
 
         // 2. 归并其余成员
@@ -378,23 +412,13 @@ impl ConsolidationEngine {
             let mut archived = m;
             archived.status = MemoryStatus::Merged;
             archived.merged_into = Some(survivor_id);
+            let expected_member = archived.version;
             archived.version += 1;
             archived.updated_at = now;
             archived.source_agent = operator_agent.clone();
 
-            let saved_archived = self.store.save(&archived).await?;
             self.store
-                .record_version(&mem_core::MemoryVersion {
-                    memory_id: saved_archived.id,
-                    version: saved_archived.version,
-                    content: saved_archived.content.clone(),
-                    tags: saved_archived.tags.clone(),
-                    metadata: saved_archived.metadata.clone(),
-                    confidence: saved_archived.confidence,
-                    changed_by: operator_agent.clone(),
-                    change_type: VersionChange::Merged,
-                    changed_at: now,
-                })
+                .revise(&archived, expected_member, VersionChange::Merged)
                 .await?;
         }
 

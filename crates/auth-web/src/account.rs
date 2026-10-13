@@ -10,7 +10,7 @@
 //!   使程序化注册也能绑定到具体账户。
 
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
-use argon2::Argon2;
+use argon2::{Algorithm, Argon2, Params, Version};
 use auth_core::AccessTokenManager;
 use chrono::{Duration, Utc};
 use common::{AccountId, HubError, Result};
@@ -277,11 +277,17 @@ pub fn validate_password(password: &str) -> Result<()> {
     Ok(())
 }
 
-/// Argon2id 口令散列（返回 PHC 字符串）
+/// OWASP 基准参数的 Argon2id 实例：64MiB 内存硬度、3 轮迭代、1 并行度
+pub fn owasp_argon2() -> Argon2<'static> {
+    let params = Params::new(65536, 3, 1, None).expect("Valid OWASP Argon2 parameters");
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+}
+
+/// Argon2id 口令散列（返回 PHC 字符串，符合 OWASP 基线）
 pub fn hash_password(password: &str) -> Result<String> {
     let salt = SaltString::encode_b64(&random_bytes())
         .map_err(|e| HubError::Internal(anyhow::anyhow!("口令盐生成失败: {}", e)))?;
-    Argon2::default()
+    owasp_argon2()
         .hash_password(password.as_bytes(), &salt)
         .map(|h| h.to_string())
         .map_err(|e| HubError::Internal(anyhow::anyhow!("口令散列失败: {}", e)))
@@ -358,6 +364,11 @@ mod tests {
     fn test_password_hash_roundtrip() {
         let phc = hash_password("correct horse").unwrap();
         assert!(phc.starts_with("$argon2"));
+        assert!(
+            phc.contains("m=65536,t=3,p=1"),
+            "应符合 OWASP 基准参数: {}",
+            phc
+        );
         assert!(verify_password("correct horse", &phc));
         assert!(!verify_password("wrong horse", &phc));
         assert!(!verify_password("correct horse", "not-a-phc"));

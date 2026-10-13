@@ -21,6 +21,7 @@ use tracing::info;
 struct StoreHandle {
     memory: Arc<dyn MemoryHubStore>,
     accounts: Arc<dyn AccountStore>,
+    rate_limiter: Arc<dyn common::RateLimitStore>,
 }
 
 #[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
@@ -104,6 +105,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         accounts,
         external_base_url: external_base,
         allowed_origins: cfg.allowed_origins.clone(),
+        rate_limiter: handle.rate_limiter,
     };
 
     let app = oauth_router(state);
@@ -122,13 +124,22 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 async fn build_store(cfg: &common::AppConfig) -> Result<StoreHandle> {
     let is_pg = cfg.db_url.starts_with("postgres://") || cfg.db_url.starts_with("postgresql://");
     if is_pg {
-        match store::PostgresHubStore::connect(&cfg.db_url, cfg.db_max_connections).await {
+        match store::PostgresHubStore::connect(
+            &cfg.db_url,
+            cfg.db_max_connections,
+            cfg.db_statement_timeout_ms,
+        )
+        .await
+        {
             Ok(pg) => {
                 info!("PostgreSQL 存储连接成功（含迁移执行）");
+                let rate_limiter: Arc<dyn common::RateLimitStore> =
+                    Arc::new(store::PostgresRateLimitStore::from_pool(pg.pool()));
                 let pg = Arc::new(pg);
                 return Ok(StoreHandle {
                     memory: pg.clone(),
                     accounts: pg,
+                    rate_limiter,
                 });
             }
             Err(e) => {
@@ -151,9 +162,12 @@ async fn build_store(cfg: &common::AppConfig) -> Result<StoreHandle> {
     }
     info!("使用内存存储（开发/测试模式）");
     let mem = Arc::new(store::InMemoryHubStore::new());
+    let rate_limiter: Arc<dyn common::RateLimitStore> =
+        Arc::new(common::InMemoryRateLimitStore::new());
     Ok(StoreHandle {
         memory: mem.clone(),
         accounts: mem,
+        rate_limiter,
     })
 }
 

@@ -118,7 +118,6 @@ dependencies = [
  "store",
  "tikv-jemallocator",
  "tokio",
- "tower-http",
  "tracing",
 ]
 
@@ -132,6 +131,7 @@ dependencies = [
  "auth-core",
  "authz",
  "axum",
+ "base64 0.22.1",
  "chrono",
  "common",
  "getrandom 0.2.17",
@@ -1210,6 +1210,7 @@ dependencies = [
  "serde_json",
  "store",
  "tokio",
+ "tower-http",
  "tracing",
  "uuid",
 ]
@@ -1224,6 +1225,7 @@ dependencies = [
  "authz",
  "axum",
  "common",
+ "consolidation",
  "embed",
  "mcp",
  "mem-core",
@@ -2187,15 +2189,18 @@ name = "store"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "argon2",
  "async-trait",
  "chrono",
  "common",
+ "getrandom 0.2.17",
  "hex",
  "mem-core",
  "serde",
  "serde_json",
  "sha2",
  "sqlx",
+ "subtle",
  "tokio",
  "tracing",
  "uuid",
@@ -2415,7 +2420,6 @@ dependencies = [
  "futures-util",
  "http",
  "http-body",
- "http-body-util",
  "pin-project-lite",
  "tokio",
  "tower",

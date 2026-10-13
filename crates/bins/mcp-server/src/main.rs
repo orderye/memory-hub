@@ -8,13 +8,12 @@
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use common::{AppConfig, AuthCtx, HubError};
-use embed::HttpEmbedder;
+use common::{AppConfig, AuthCtx};
 use mcp::transport::{mcp_router, run_stdio, McpTransportState};
 use mcp::ToolDispatcher;
-use mem_core::testing::TestEmbedder;
+use consolidation::DefaultIntegrationService;
 use mem_core::{
-    DefaultBackupService, DefaultIntegrationService, DefaultMemoryService, Embedder, GrantChecker,
+    DefaultBackupService, DefaultMemoryService, Embedder, GrantChecker,
     MemoryHubStore, TokenIntrospector,
 };
 use std::sync::Arc;
@@ -43,11 +42,11 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     info!(config = %cfg.redacted_summary(), "记忆中枢 MCP Server 启动中");
 
     // ===== 存储 =====
-    let store: Arc<dyn MemoryHubStore> = build_store(&cfg).await?;
+    let (store, shared_rate_store) = build_store(&cfg).await?;
     info!(mode = %store::storage_mode_label(cfg_is_pg(&cfg)), "存储已就绪");
 
     // ===== 嵌入器 =====
-    let embedder: Arc<dyn Embedder> = build_embedder(&cfg)?;
+    let embedder: Arc<dyn Embedder> = embed::build_from_config(&cfg)?;
     info!(provider = %cfg.embed_provider, dim = cfg.embed_dim, "嵌入器已就绪");
 
     // ===== 访问控制 =====
@@ -80,12 +79,19 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.integrate_max_proposals,
     ));
 
-    let dispatcher = Arc::new(ToolDispatcher::new(
-        memory_service,
-        backup_service,
-        integration_service,
-        store.clone(),
-    ));
+    let dispatcher = Arc::new(
+        ToolDispatcher::new(
+            memory_service,
+            backup_service,
+            integration_service,
+            store.clone(),
+        )
+        .with_consolidation(mcp::ConsolidationParams {
+            sim_threshold: cfg.integrate_sim_threshold,
+            max_proposals: cfg.integrate_max_proposals,
+        })
+        .with_embedder(embedder.clone()),
+    );
 
     // ===== 鉴权 =====
     let introspector: Arc<dyn TokenIntrospector> = Arc::new(BearerIntrospector::new(
@@ -94,10 +100,15 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.resource_uri.clone(),
     ));
 
-    // ===== 限流（内存桶；多副本部署可注入 PostgreSQL 桶）=====
-    let rate_limiter = Some(mcp::transport::RateLimiter::new(
-        cfg.rate_limit_per_agent_rps,
-    ));
+    // ===== 限流 =====
+    // PG 后端一律走共享桶：进程内桶在多副本下每个副本各自放行，配额形同虚设。
+    let rate_limiter = Some(match shared_rate_store {
+        Some(shared) => {
+            info!("限流桶使用 PostgreSQL 共享存储（多副本配额一致）");
+            mcp::transport::RateLimiter::with_store(shared, cfg.rate_limit_per_agent_rps)
+        }
+        None => mcp::transport::RateLimiter::new(cfg.rate_limit_per_agent_rps),
+    });
 
     // ===== 创界山智能接入层防腐中间件 =====
     #[cfg(feature = "adapter-cjs")]
@@ -153,13 +164,30 @@ fn cfg_is_pg(cfg: &AppConfig) -> bool {
     cfg.db_url.starts_with("postgres://") || cfg.db_url.starts_with("postgresql://")
 }
 
-/// 构建存储：PostgreSQL 优先，连接失败时以显式环境变量开关决定是否退回内存
-async fn build_store(cfg: &AppConfig) -> anyhow::Result<Arc<dyn MemoryHubStore>> {
+/// 构建存储：PostgreSQL 优先，连接失败时以显式环境变量开关决定是否退回内存。
+///
+/// 第二个返回值是限流桶的共享存储：PG 模式下复用主存储的同一个连接池，
+/// 使多副本 `mcp-server` 对同一 Agent 的配额保持一致（进程内桶会让每个副本
+/// 各自放行，等于限流失效）。内存模式返回 None，由调用方退回进程内桶。
+async fn build_store(
+    cfg: &AppConfig,
+) -> Result<(
+    Arc<dyn MemoryHubStore>,
+    Option<Arc<dyn common::RateLimitStore>>,
+)> {
     if cfg_is_pg(cfg) {
-        match PostgresHubStore::connect(&cfg.db_url, cfg.db_max_connections).await {
+        match PostgresHubStore::connect(
+            &cfg.db_url,
+            cfg.db_max_connections,
+            cfg.db_statement_timeout_ms,
+        )
+        .await
+        {
             Ok(pg) => {
-                info!("PostgreSQL 存储连接成功（含迁移执行）");
-                return Ok(Arc::new(pg));
+                let shared: Arc<dyn common::RateLimitStore> =
+                    Arc::new(store::PostgresRateLimitStore::from_pool(pg.pool()));
+                info!("PostgreSQL 存储连接成功（含迁移执行）；限流桶使用共享库存储");
+                return Ok((Arc::new(pg), Some(shared)));
             }
             Err(e) => {
                 let allow_fallback = std::env::var("HUB_STORE_FALLBACK_MEMORY")
@@ -180,27 +208,7 @@ async fn build_store(cfg: &AppConfig) -> anyhow::Result<Arc<dyn MemoryHubStore>>
         }
     }
     info!("使用内存存储（开发/测试模式；重启即失忆）");
-    Ok(Arc::new(InMemoryHubStore::new()))
-}
-
-/// 构建嵌入器：http（OpenAI 兼容 /embeddings）或 mock
-fn build_embedder(cfg: &AppConfig) -> Result<Arc<dyn Embedder>> {
-    match cfg.embed_provider.as_str() {
-        "http" => {
-            let endpoint = cfg
-                .embed_endpoint
-                .clone()
-                .ok_or_else(|| HubError::InvalidArgument("缺少 HUB_EMBED_ENDPOINT".to_string()))?;
-            let embedder = HttpEmbedder::new(
-                endpoint,
-                std::env::var("HUB_EMBED_MODEL").unwrap_or_else(|_| "bge-m3".to_string()),
-                cfg.embed_dim,
-                cfg.embed_api_key.clone(),
-            )?;
-            Ok(Arc::new(embedder))
-        }
-        _ => Ok(Arc::new(TestEmbedder::new(cfg.embed_dim))),
-    }
+    Ok((Arc::new(InMemoryHubStore::new()), None))
 }
 
 /// Bearer 令牌 → AuthCtx 的内省器（离线验签，无需回调授权服务器）

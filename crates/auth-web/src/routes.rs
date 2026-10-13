@@ -9,8 +9,8 @@
 //! | GET | `/oauth/authorize` | 授权码 + PKCE 同意页（需登录；仅限本账户 Agent） |
 //! | POST | `/oauth/consent/submit` | 记录同意换发授权码，302 回 client |
 //! | POST | `/oauth/token` | client_credentials / 授权码 / 刷新令牌 |
-//! | POST | `/oauth/introspect` | 令牌内省（RFC 7662） |
-//! | POST | `/oauth/revoke` | 撤销刷新令牌（RFC 7009） |
+//! | POST | `/oauth/introspect` | 令牌内省（RFC 7662，需客户端认证） |
+//! | POST | `/oauth/revoke` | 撤销刷新令牌（RFC 7009，需客户端认证） |
 //! | GET | `/account/register` `POST` | 账户注册（可选邀请码） |
 //! | GET | `/account/login` `POST` | 账户登录（建立会话 Cookie） |
 //! | POST | `/account/logout` | 退出登录 |
@@ -44,6 +44,7 @@ pub struct AsWebState {
     pub external_base_url: String,
     /// Origin 白名单（非空时校验浏览器侧状态变更请求，防跨站请求伪造）
     pub allowed_origins: Vec<String>,
+    pub rate_limiter: Arc<dyn common::RateLimitStore>,
 }
 
 /// 同意页提交参数（表单）
@@ -118,12 +119,35 @@ pub fn oauth_router(state: AsWebState) -> Router {
             post(handle_console_account_status),
         )
         .route("/healthz", axum::routing::get(handle_healthz))
-        .route("/readyz", axum::routing::get(handle_healthz))
+        .route("/readyz", axum::routing::get(handle_readyz))
+        // 与 MCP 服务同一套传输层卫生：体积上限在缓冲前生效、单请求硬超时、访问追踪。
+        // 授权服务器是公网可达端点，此前这三项都没有。
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_AUTH_BODY_BYTES))
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            std::time::Duration::from_secs(AUTH_REQUEST_TIMEOUT_SECS),
+        ))
+        .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
 }
 
+/// 授权服务器请求体上限（表单与 JSON 都很小，64KB 已宽）
+const MAX_AUTH_BODY_BYTES: usize = 64 * 1024;
+/// 单个请求的硬超时（秒）
+const AUTH_REQUEST_TIMEOUT_SECS: u64 = 30;
+
 async fn handle_healthz() -> Response {
     (StatusCode::OK, "ok").into_response()
+}
+
+async fn handle_readyz(State(s): State<AsWebState>) -> Response {
+    match s.oauth.store().ping().await {
+        Ok(()) => (StatusCode::OK, "ready").into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "Auth 就绪探针失败：存储不可用");
+            (StatusCode::SERVICE_UNAVAILABLE, "database unreachable").into_response()
+        }
+    }
 }
 
 // ===== 元数据 =====
@@ -400,11 +424,69 @@ async fn handle_token(
     }
 }
 
+/// 还原调用方客户端凭据：优先 HTTP Basic（RFC 7662 §2.1 推荐），其次表单字段。
+fn client_credentials(
+    headers: &HeaderMap,
+    form_id: Option<&str>,
+    form_secret: Option<&str>,
+) -> Option<(String, String)> {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+
+    if let Some(value) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    {
+        if let Some(encoded) = value.strip_prefix("Basic ") {
+            let decoded = STANDARD.decode(encoded.trim()).ok()?;
+            let text = String::from_utf8(decoded).ok()?;
+            let (id, secret) = text.split_once(':')?;
+            return Some((id.to_string(), secret.to_string()));
+        }
+    }
+    match (form_id, form_secret) {
+        (Some(id), Some(secret)) => Some((id.to_string(), secret.to_string())),
+        _ => None,
+    }
+}
+
+/// 客户端认证失败：按 OAuth 错误格式回 401
+fn unauthenticated_client() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [
+            (header::WWW_AUTHENTICATE, "Basic realm=\"oauth\""),
+            (header::CONTENT_TYPE, "application/json"),
+        ],
+        serde_json::to_string(&json!({ "error": "invalid_client" })).unwrap_or_default(),
+    )
+        .into_response()
+}
+
 /// POST /oauth/introspect（RFC 7662）
+///
+/// 需客户端认证：否则任何持有令牌串的人都能确认其有效性并读出该 Agent
+/// 的整份命名空间授权清单。
 async fn handle_introspect(
     State(s): State<AsWebState>,
+    headers: HeaderMap,
     Form(form): Form<IntrospectForm>,
 ) -> Response {
+    let Some((client_id, secret)) = client_credentials(
+        &headers,
+        form.client_id.as_deref(),
+        form.client_secret.as_deref(),
+    ) else {
+        return unauthenticated_client();
+    };
+    if s.oauth
+        .authenticate_client(&client_id, &secret)
+        .await
+        .is_err()
+    {
+        return unauthenticated_client();
+    }
+
     let resp = s.oauth.introspect(&form.token).await.unwrap_or({
         crate::oauth_flow::IntrospectResponse {
             active: false,
@@ -423,11 +505,34 @@ pub struct IntrospectForm {
     pub token: String,
     #[serde(default)]
     pub token_type_hint: Option<String>,
+    /// 未使用 HTTP Basic 时以表单提交客户端凭据
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub client_secret: Option<String>,
 }
 
 /// POST /oauth/revoke（RFC 7009）
-async fn handle_revoke(State(s): State<AsWebState>, Form(form): Form<RevokeForm>) -> Response {
-    s.oauth.revoke(&form.token);
+///
+/// 需客户端认证，且只能撤销属于本客户端的令牌族；
+/// 不属于调用方时按规范静默返回 200（不得用于探测他人令牌）。
+async fn handle_revoke(
+    State(s): State<AsWebState>,
+    headers: HeaderMap,
+    Form(form): Form<RevokeForm>,
+) -> Response {
+    let Some((client_id, secret)) = client_credentials(
+        &headers,
+        form.client_id.as_deref(),
+        form.client_secret.as_deref(),
+    ) else {
+        return unauthenticated_client();
+    };
+    let authenticated = match s.oauth.authenticate_client(&client_id, &secret).await {
+        Ok(agent_id) => agent_id,
+        Err(_) => return unauthenticated_client(),
+    };
+    s.oauth.revoke_for_client(&form.token, &authenticated);
     (StatusCode::OK, "").into_response()
 }
 
@@ -436,6 +541,10 @@ pub struct RevokeForm {
     pub token: String,
     #[serde(default)]
     pub token_type_hint: Option<String>,
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub client_secret: Option<String>,
 }
 
 // ===== 账户：注册 / 登录 / 登出 / 注册令牌 =====
@@ -537,6 +646,21 @@ async fn handle_login_page(State(s): State<AsWebState>) -> Response {
     )
 }
 
+fn extract_client_ip(headers: &HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim().to_string())
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.trim().to_string())
+        })
+        .unwrap_or_else(|| "127.0.0.1".to_string())
+}
+
 /// POST /account/login
 async fn handle_login_submit(
     State(s): State<AsWebState>,
@@ -546,6 +670,36 @@ async fn handle_login_submit(
     if !origin_allowed(&s, &headers) {
         return (StatusCode::FORBIDDEN, "Origin 不被允许").into_response();
     }
+
+    let client_ip = extract_client_ip(&headers);
+    // 按 IP 限制每分钟 15 次
+    if !s
+        .rate_limiter
+        .try_acquire_in_window(common::RateDimension::Ip, &client_ip, 15, 60)
+        .await
+        .unwrap_or(true)
+    {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "请求过于频繁，请 1 分钟后重试",
+        )
+            .into_response();
+    }
+
+    // 按用户名限制每分钟 5 次
+    if !s
+        .rate_limiter
+        .try_acquire_in_window(common::RateDimension::User, form.username.trim(), 5, 60)
+        .await
+        .unwrap_or(true)
+    {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "该账户登录尝试过于频繁，请 1 分钟后重试",
+        )
+            .into_response();
+    }
+
     match s.accounts.login(&form.username, &form.password).await {
         Ok((_account, session)) => with_session_cookie(&s, redirect("/console"), &session),
         Err(e) => page(
@@ -1175,6 +1329,7 @@ mod tests {
             )),
             external_base_url: "https://auth.example.com".to_string(),
             allowed_origins: vec![],
+            rate_limiter: Arc::new(common::InMemoryRateLimitStore::new()),
         }
     }
 
@@ -1194,6 +1349,87 @@ mod tests {
             .await
             .unwrap();
         session
+    }
+
+    #[tokio::test]
+    async fn test_introspect_and_revoke_require_client_auth() {
+        let s = state();
+        let introspect = handle_introspect(
+            State(s.clone()),
+            HeaderMap::new(),
+            Form(IntrospectForm {
+                token: "whatever".to_string(),
+                token_type_hint: None,
+                client_id: None,
+                client_secret: None,
+            }),
+        )
+        .await;
+        assert_eq!(
+            introspect.status(),
+            StatusCode::UNAUTHORIZED,
+            "无客户端凭据的内省请求必须被拒（RFC 7662 §2.1）"
+        );
+
+        let revoke = handle_revoke(
+            State(s),
+            HeaderMap::new(),
+            Form(RevokeForm {
+                token: "whatever".to_string(),
+                token_type_hint: None,
+                client_id: None,
+                client_secret: None,
+            }),
+        )
+        .await;
+        assert_eq!(
+            revoke.status(),
+            StatusCode::UNAUTHORIZED,
+            "无客户端凭据的撤销请求必须被拒（RFC 7009 §2.1）"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_introspect_accepts_basic_credentials() {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+
+        let store = Arc::new(InMemoryHubStore::new());
+        let s = build_state(store, None);
+        s.oauth
+            .register(
+                RegisterAgentRequest {
+                    agent_id: "agent-a".to_string(),
+                    name: "Agent A".to_string(),
+                    kind: "service".to_string(),
+                    client_secret: Some("s3cret".to_string()),
+                    redirect_uris: vec!["https://app.example.com/cb".to_string()],
+                    max_scopes: None,
+                },
+                common::BOOTSTRAP_ACCOUNT_ID,
+            )
+            .await
+            .unwrap();
+
+        let mut headers = HeaderMap::new();
+        let encoded = STANDARD.encode("agent-a:s3cret".as_bytes());
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Basic {}", encoded).parse().unwrap(),
+        );
+
+        let resp = handle_introspect(
+            State(s),
+            headers,
+            Form(IntrospectForm {
+                token: "not-a-real-token".to_string(),
+                token_type_hint: None,
+                client_id: None,
+                client_secret: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "Basic 凭据应通过客户端认证");
     }
 
     #[tokio::test]
@@ -1462,6 +1698,13 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    #[tokio::test]
+    async fn test_readyz() {
+        let s = state();
+        let resp = handle_readyz(State(s)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
     #[test]
     fn test_header_helper() {
         let mut headers = HeaderMap::new();
@@ -1471,5 +1714,35 @@ mod tests {
             Some("application/json")
         );
         assert!(header_value(&headers, "x-missing").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_login_rate_limiting_username_and_ip() {
+        let s = state();
+        let _ = s.accounts.register("bob", "password123", "Bob", None).await.unwrap();
+
+        for _ in 0..5 {
+            let resp = handle_login_submit(
+                State(s.clone()),
+                HeaderMap::new(),
+                Form(LoginForm {
+                    username: "bob".to_string(),
+                    password: "wrong".to_string(),
+                }),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        let rate_limited = handle_login_submit(
+            State(s.clone()),
+            HeaderMap::new(),
+            Form(LoginForm {
+                username: "bob".to_string(),
+                password: "wrong".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(rate_limited.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 }

@@ -12,6 +12,7 @@ pub mod idempotency;
 pub mod in_memory;
 pub mod postgres;
 pub mod rate_limit;
+pub mod secret;
 pub mod sql_validation;
 
 pub use idempotency::PostgresIdempotencyStore;

@@ -30,14 +30,16 @@ jobs:
       - name: 格式检查
         run: cargo fmt --all -- --check
 
+      # 必须带 --all-features：否则 adapter-cjs 适配层与 pg-integration 里的代码
+      # 从头到尾不参与编译，编译错误要到发布构建甚至线上才暴露。
       - name: 静态检查（零警告）
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: 单元与集成测试
-        run: cargo test --workspace
+        run: cargo test --workspace --all-features
 
       - name: 文档构建
-        run: cargo doc --no-deps --workspace
+        run: cargo doc --no-deps --workspace --all-features
 
   # ---------- 2. PostgreSQL 后端集成测试 ----------
   # PostgresHubStore 的 SQL 正确性必须
@@ -121,8 +123,14 @@ jobs:
       - name: 缓存 cargo
         uses: Swatinem/rust-cache@v2
 
+      # 与 Dockerfile 的构建参数保持一致：镜像用 `--features jemalloc`，
+      # CI 若不带，该 feature 下的代码路径在合并前从未被编译过。
+      # feature 按包限定，避免虚拟 workspace 下 --features 的解析歧义。
       - name: 构建全部二进制
-        run: cargo build --release --workspace
+        run: |
+          cargo build --release \
+            -p mcp-server -p auth-server -p backup-worker \
+            --features mcp-server/jemalloc,auth-server/jemalloc,backup-worker/jemalloc
 
       - name: 校验二进制可执行
         run: |

@@ -17,6 +17,9 @@ chrono.workspace = true
 uuid.workspace = true
 sha2.workspace = true
 hex.workspace = true
+argon2.workspace = true
+getrandom.workspace = true
+subtle.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, features = ["rt"] }
 

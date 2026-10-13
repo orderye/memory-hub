@@ -18,6 +18,27 @@ pub trait MemoryStore: Send + Sync {
     /// 插入新条目（id 由调用方分配）
     async fn insert(&self, entry: &MemoryEntry) -> Result<MemoryEntry>;
 
+    /// 原子插入新条目并追加初始版本历史（VersionChange::Created）。
+    ///
+    /// 插入条目与写入初始版本历史必须同成同败，杜绝"有条目无创建历史"的脏数据分叉。
+    /// 默认实现按序执行两个既有操作，生产存储与内存存储都应覆盖为原子实现。
+    async fn insert_initial(&self, entry: &MemoryEntry) -> Result<MemoryEntry> {
+        let saved = self.insert(entry).await?;
+        self.record_version(&crate::domain::MemoryVersion {
+            memory_id: saved.id,
+            version: saved.version,
+            content: saved.content.clone(),
+            tags: saved.tags.clone(),
+            metadata: saved.metadata.clone(),
+            confidence: saved.confidence,
+            changed_by: saved.source_agent.clone(),
+            change_type: crate::domain::VersionChange::Created,
+            changed_at: saved.created_at,
+        })
+        .await?;
+        Ok(saved)
+    }
+
     /// 按 ID 读取（含任意状态）
     async fn get(&self, namespace: &str, id: uuid::Uuid) -> Result<MemoryEntry>;
 
@@ -26,6 +47,53 @@ pub trait MemoryStore: Send + Sync {
 
     /// 全量写回（service 层负责版本号与时间戳推进）
     async fn save(&self, entry: &MemoryEntry) -> Result<MemoryEntry>;
+
+    /// 乐观并发修订：仅当库中该行当前版本为 `expected_version` 时才写入。
+    ///
+    /// `save` 是无条件 `update ... where namespace/id`，两个 Agent 同时读到同一条目
+    /// 再各自写回时，后写者会静默覆盖前者的修订与版本推进（丢更新）。
+    /// 所有"读-改-写"路径都应改用本方法。
+    ///
+    /// 默认实现退化为无条件 `save`，供无需该保证的测试替身使用；
+    /// 生产存储与内存存储都必须覆盖。
+    async fn save_if_version(
+        &self,
+        entry: &MemoryEntry,
+        expected_version: i64,
+    ) -> Result<MemoryEntry> {
+        let _ = expected_version;
+        self.save(entry).await
+    }
+
+    /// 原子修订：写回条目（乐观锁）并追加版本历史，二者必须同成同败。
+    ///
+    /// `save` + `record_version` 分两步时，第二步失败会留下"条目已推进而历史缺那一版"
+    /// 的分叉——而版本历史正是备份与审计的事实来源。`changed_by` 取自
+    /// `entry.source_agent`（各服务在写前都已把作者设为操作者，与原先逐点传入等价）。
+    ///
+    /// 默认实现按序调用两个既有方法，供无此需求的测试替身使用；
+    /// 生产存储与内存存储都必须覆盖为真正原子的实现。
+    async fn revise(
+        &self,
+        entry: &MemoryEntry,
+        expected_version: i64,
+        change: crate::domain::VersionChange,
+    ) -> Result<MemoryEntry> {
+        let saved = self.save_if_version(entry, expected_version).await?;
+        self.record_version(&crate::domain::MemoryVersion {
+            memory_id: saved.id,
+            version: saved.version,
+            content: saved.content.clone(),
+            tags: saved.tags.clone(),
+            metadata: saved.metadata.clone(),
+            confidence: saved.confidence,
+            changed_by: saved.source_agent.clone(),
+            change_type: change,
+            changed_at: saved.updated_at,
+        })
+        .await?;
+        Ok(saved)
+    }
 
     /// 物理删除
     async fn delete(&self, namespace: &str, id: uuid::Uuid) -> Result<()>;
@@ -63,6 +131,11 @@ pub trait MemoryStore: Send + Sync {
 
     /// 批量归档过期条目（worker 用），返回归档条数
     async fn archive_expired(&self, now: DateTime<Utc>) -> Result<usize>;
+
+    /// 存储就绪探活（真探库）：执行底层探测以确认服务可用
+    async fn ping(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// 备份存储：快照持久化

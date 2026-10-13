@@ -11,7 +11,10 @@ use common::{Acl, AuthCtx, Scope};
 use mcp::adapter::cjs::{CjsAdapter, CjsAdapterConfig};
 use mcp::tools::ToolDispatcher;
 use mcp::transport::{handle_jsonrpc_ext, JsonRpcRequest, McpTransportState};
-use mem_core::{DefaultBackupService, DefaultIntegrationService, DefaultMemoryService, GrantChecker};
+use consolidation::DefaultIntegrationService;
+use mem_core::{
+    DefaultBackupService, DefaultMemoryService, GrantChecker,
+};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use store::InMemoryHubStore;
@@ -143,7 +146,10 @@ async fn test_milestone2_namespace_routing_and_dual_search() {
     let resp1 = handle_jsonrpc_ext(&state, Some(&auth), Some(&headers), req_shared).await;
     assert!(resp1.error.is_none());
     let res1_val = resp1.result.as_ref().unwrap();
-    assert_eq!(res1_val.get("isError").and_then(Value::as_bool), Some(false));
+    assert_eq!(
+        res1_val.get("isError").and_then(Value::as_bool),
+        Some(false)
+    );
     let mem1 = res1_val["structuredContent"]["memory"].clone();
     assert_eq!(mem1["namespace"], "w_world_alpha_shared");
 
@@ -242,8 +248,14 @@ async fn test_milestone3_auto_classifier_and_aigc_watermark() {
 
     // 验证：自动注入 AIGC 国家规范水印
     let meta = mem["metadata"].as_object().unwrap();
-    assert_eq!(meta.get("AIGC_Source").and_then(Value::as_str), Some("chuangjieshan"));
-    assert_eq!(meta.get("AIGC_Compliant").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        meta.get("AIGC_Source").and_then(Value::as_str),
+        Some("chuangjieshan")
+    );
+    assert_eq!(
+        meta.get("AIGC_Compliant").and_then(Value::as_bool),
+        Some(true)
+    );
     assert!(meta.contains_key("AIGC_Timestamp"));
 }
 

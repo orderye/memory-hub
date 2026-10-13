@@ -19,7 +19,7 @@ use mem_core::{
     MemoryKind, MemoryStatus, MemoryVersion, Namespace, NamespaceGrantRecord, NamespaceInfo,
     ProposalStatus, Scored, SessionRecord, VersionChange,
 };
-use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
+use sqlx::postgres::{PgConnection, PgPool, PgPoolOptions, PgRow};
 use sqlx::Row;
 use uuid::Uuid;
 
@@ -140,6 +140,14 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "20261013000003_conditional_key_unique",
         include_str!("../migrations/20261013000003_conditional_key_unique.sql"),
     ),
+    (
+        "20261013000004_query_indexes",
+        include_str!("../migrations/20261013000004_query_indexes.sql"),
+    ),
+    (
+        "20261013000005_cjk_bigram_fts",
+        include_str!("../migrations/20261013000005_cjk_bigram_fts.sql"),
+    ),
 ];
 
 /// PostgreSQL 四合一存储
@@ -228,14 +236,35 @@ fn parse_dollar_tag(b: &[u8], i: usize) -> Option<&[u8]> {
 
 impl PostgresHubStore {
     /// 连接并执行迁移
-    pub async fn connect(database_url: &str, max_connections: u32) -> Result<Self> {
-        let pool = PgPoolOptions::new()
+    ///
+    /// `statement_timeout_ms` 为 0 时不设置服务器端语句超时。连接池另设
+    /// `idle_timeout`/`max_lifetime`：没有它们，云端 LB 切断的空闲连接会长期
+    /// 占据池配额，而一条被锁等待拖住的语句会一直占着坑位。
+    pub async fn connect(
+        database_url: &str,
+        max_connections: u32,
+        statement_timeout_ms: u64,
+    ) -> Result<Self> {
+        let mut builder = PgPoolOptions::new()
             .max_connections(max_connections.max(1))
             .min_connections(0)
             .acquire_timeout(std::time::Duration::from_secs(5))
-            .connect(database_url)
-            .await
-            .pg()?;
+            .idle_timeout(std::time::Duration::from_secs(120))
+            .max_lifetime(std::time::Duration::from_secs(1800));
+
+        if statement_timeout_ms > 0 {
+            builder = builder.after_connect(move |conn, _| {
+                let ms = statement_timeout_ms.to_string();
+                Box::pin(async move {
+                    sqlx::query(&format!("set statement_timeout = '{ms}'"))
+                        .execute(conn)
+                        .await?;
+                    Ok(())
+                })
+            });
+        }
+
+        let pool = builder.connect(database_url).await.pg()?;
 
         let store = Self { pool };
         store.run_migrations().await?;
@@ -246,6 +275,12 @@ impl PostgresHubStore {
     pub async fn ping(&self) -> Result<()> {
         sqlx::query("select 1").execute(&self.pool).await.pg()?;
         Ok(())
+    }
+
+    /// 共享连接池句柄：让同一进程内的其他组件（如限流桶）复用同一池，
+    /// 而不是每个组件再开一份 `max_connections` 预算。
+    pub fn pool(&self) -> PgPool {
+        self.pool.clone()
     }
 
     /// 应用未执行过的迁移（版本化账本）
@@ -274,6 +309,11 @@ impl PostgresHubStore {
             }
 
             let mut tx = self.pool.begin().await.pg()?;
+            // 迁移可能包含索引构建，远超常规语句超时；本事务内关闭超时限制
+            sqlx::query("set local statement_timeout = 0")
+                .execute(&mut *tx)
+                .await
+                .pg()?;
             // 迁移脚本按语句顺序整体执行；DDL 幂等（if not exists）
             for stmt in split_sql_statements(sql) {
                 let trimmed = stmt.trim();
@@ -333,6 +373,107 @@ impl PostgresHubStore {
         })
     }
 
+    /// 摘要视图行映射：与 [`Self::backup_from_row`] 同构，但不带 `payload` 列。
+    /// 列举快照只需要元数据，负载体积是整份命名空间的 JSONB。
+    fn backup_meta_from_row(r: &PgRow) -> Result<BackupRecord> {
+        Ok(BackupRecord {
+            id: r.try_get("id").pg()?,
+            namespace: r.try_get("namespace").pg()?,
+            created_by: r.try_get("created_by").pg()?,
+            note: r.try_get("note").ok(),
+            entry_count: r.try_get::<i32, _>("entry_count").unwrap_or(0) as usize,
+            checksum: r.try_get("checksum").pg()?,
+            payload: serde_json::Value::Null,
+            retain_until: r.try_get("retain_until").ok(),
+            created_at: r.try_get("created_at").pg()?,
+        })
+    }
+
+    /// 在给定连接上写回条目，返回受影响行数。
+    ///
+    /// `expected_version` 为 `Some(v)` 时附加 `and version = $17`：库中当前版本不是 v
+    /// 就一行都不更新 —— 并发修订在此被判为冲突，而不是后写者静默覆盖先写者的
+    /// 修订与版本推进。`None`（trait 的 `save`）保持原有的无条件写回语义。
+    ///
+    /// 以连接为参数而非直接用池，是为了让 `revise` 能把"写条目 + 追加历史"
+    /// 放进同一个事务。
+    async fn apply_update_on(
+        conn: &mut PgConnection,
+        entry: &MemoryEntry,
+        expected_version: Option<i64>,
+    ) -> Result<u64> {
+        let embedding_literal = entry.embedding.as_ref().map(|v| mapping::vector_literal(v));
+        let tsv_tokens = mem_core::tokenize_for_fts(&entry.content);
+        let guard = if expected_version.is_some() {
+            " and version = $18"
+        } else {
+            ""
+        };
+        let sql = format!(
+            r#"
+            update memories set
+              key = $3, kind = $4, content = $5, tags = $6, metadata = $7,
+              embedding = $8::vector, embedding_model = $9, source_agent = $10,
+              confidence = $11, status = $12, version = $13, expires_at = $14,
+              merged_into = $15, updated_at = $16, tsv_tokens = $17
+            where namespace = $1 and id = $2{guard}
+            "#,
+        );
+        let mut query = sqlx::query(&sql)
+            .bind(&entry.namespace)
+            .bind(entry.id)
+            .bind(&entry.key)
+            .bind(entry.kind.as_str())
+            .bind(&entry.content)
+            .bind(&entry.tags)
+            .bind(&entry.metadata)
+            .bind(&embedding_literal)
+            .bind(&entry.embedding_model)
+            .bind(&entry.source_agent)
+            .bind(entry.confidence)
+            .bind(entry.status.as_str())
+            .bind(entry.version)
+            .bind(entry.expires_at)
+            .bind(entry.merged_into)
+            .bind(entry.updated_at)
+            .bind(&tsv_tokens);
+        if let Some(v) = expected_version {
+            query = query.bind(v);
+        }
+        let res = query.execute(&mut *conn).await.pg()?;
+        Ok(res.rows_affected())
+    }
+
+    /// 在给定连接上追加一条版本历史（主键冲突时保持幂等）
+    async fn insert_version_on(conn: &mut PgConnection, v: &MemoryVersion) -> Result<()> {
+        sqlx::query(
+            r#"
+            insert into memory_versions
+              (memory_id, version, content, tags, metadata, confidence, changed_by, change_type, changed_at)
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            on conflict (memory_id, version) do nothing
+            "#,
+        )
+        .bind(v.memory_id)
+        .bind(v.version)
+        .bind(&v.content)
+        .bind(&v.tags)
+        .bind(&v.metadata)
+        .bind(v.confidence)
+        .bind(&v.changed_by)
+        .bind(match v.change_type {
+            VersionChange::Created => "created",
+            VersionChange::Updated => "updated",
+            VersionChange::Archived => "archived",
+            VersionChange::Merged => "merged",
+        })
+        .bind(v.changed_at)
+        .execute(&mut *conn)
+        .await
+        .pg()?;
+        Ok(())
+    }
+
     fn proposal_from_row(r: &PgRow) -> Result<IntegrationProposal> {
         let kind: String = r.try_get("kind").pg()?;
         let status: String = r.try_get("status").pg()?;
@@ -360,14 +501,15 @@ impl PostgresHubStore {
 impl mem_core::MemoryStore for PostgresHubStore {
     async fn insert(&self, entry: &MemoryEntry) -> Result<MemoryEntry> {
         let embedding_literal = entry.embedding.as_ref().map(|v| mapping::vector_literal(v));
+        let tsv_tokens = mem_core::tokenize_for_fts(&entry.content);
         sqlx::query(
             r#"
             insert into memories
               (id, namespace, key, kind, content, tags, metadata, embedding, embedding_model,
                source_agent, confidence, status, version, expires_at, merged_into,
-               created_at, updated_at)
+               created_at, updated_at, tsv_tokens)
             values
-              ($1, $2, $3, $4, $5, $6, $7, $8::vector, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+              ($1, $2, $3, $4, $5, $6, $7, $8::vector, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
             "#,
         )
         .bind(entry.id)
@@ -387,9 +529,63 @@ impl mem_core::MemoryStore for PostgresHubStore {
         .bind(entry.merged_into)
         .bind(entry.created_at)
         .bind(entry.updated_at)
+        .bind(&tsv_tokens)
         .execute(&self.pool)
         .await
         .pg()?;
+        Ok(entry.clone())
+    }
+
+    /// 原子插入新条目并追加初始版本历史（VersionChange::Created）
+    async fn insert_initial(&self, entry: &MemoryEntry) -> Result<MemoryEntry> {
+        let mut tx = self.pool.begin().await.pg()?;
+        let embedding_literal = entry.embedding.as_ref().map(|v| mapping::vector_literal(v));
+        let tsv_tokens = mem_core::tokenize_for_fts(&entry.content);
+        sqlx::query(
+            r#"
+            insert into memories
+              (id, namespace, key, kind, content, tags, metadata, embedding, embedding_model,
+               source_agent, confidence, status, version, expires_at, merged_into,
+               created_at, updated_at, tsv_tokens)
+            values
+              ($1, $2, $3, $4, $5, $6, $7, $8::vector, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+            "#,
+        )
+        .bind(entry.id)
+        .bind(&entry.namespace)
+        .bind(&entry.key)
+        .bind(entry.kind.as_str())
+        .bind(&entry.content)
+        .bind(&entry.tags)
+        .bind(&entry.metadata)
+        .bind(&embedding_literal)
+        .bind(&entry.embedding_model)
+        .bind(&entry.source_agent)
+        .bind(entry.confidence)
+        .bind(entry.status.as_str())
+        .bind(entry.version)
+        .bind(entry.expires_at)
+        .bind(entry.merged_into)
+        .bind(entry.created_at)
+        .bind(entry.updated_at)
+        .bind(&tsv_tokens)
+        .execute(&mut *tx)
+        .await
+        .pg()?;
+
+        let row = MemoryVersion {
+            memory_id: entry.id,
+            version: entry.version,
+            content: entry.content.clone(),
+            tags: entry.tags.clone(),
+            metadata: entry.metadata.clone(),
+            confidence: entry.confidence,
+            changed_by: entry.source_agent.clone(),
+            change_type: VersionChange::Created,
+            changed_at: entry.created_at,
+        };
+        Self::insert_version_on(&mut tx, &row).await?;
+        tx.commit().await.pg()?;
         Ok(entry.clone())
     }
 
@@ -410,7 +606,13 @@ impl mem_core::MemoryStore for PostgresHubStore {
 
     async fn get_by_key(&self, namespace: &str, key: &str) -> Result<Option<MemoryEntry>> {
         let sql = format!(
-            "select {} from memories where namespace = $1 and key = $2",
+            r#"
+            select {} from memories
+            where namespace = $1 and key = $2
+            order by (case when status = 'active' then 0 when status = 'archived' then 1 else 2 end),
+                     updated_at desc
+            limit 1
+            "#,
             Self::ENTRY_COLUMNS
         );
         let row = sqlx::query(&sql)
@@ -423,36 +625,51 @@ impl mem_core::MemoryStore for PostgresHubStore {
     }
 
     async fn save(&self, entry: &MemoryEntry) -> Result<MemoryEntry> {
-        let embedding_literal = entry.embedding.as_ref().map(|v| mapping::vector_literal(v));
-        sqlx::query(
-            r#"
-            update memories set
-              key = $3, kind = $4, content = $5, tags = $6, metadata = $7,
-              embedding = $8::vector, embedding_model = $9, source_agent = $10,
-              confidence = $11, status = $12, version = $13, expires_at = $14,
-              merged_into = $15, updated_at = $16
-            where namespace = $1 and id = $2
-            "#,
-        )
-        .bind(&entry.namespace)
-        .bind(entry.id)
-        .bind(&entry.key)
-        .bind(entry.kind.as_str())
-        .bind(&entry.content)
-        .bind(&entry.tags)
-        .bind(&entry.metadata)
-        .bind(&embedding_literal)
-        .bind(&entry.embedding_model)
-        .bind(&entry.source_agent)
-        .bind(entry.confidence)
-        .bind(entry.status.as_str())
-        .bind(entry.version)
-        .bind(entry.expires_at)
-        .bind(entry.merged_into)
-        .bind(entry.updated_at)
-        .execute(&self.pool)
-        .await
-        .pg()?;
+        let mut conn = self.pool.acquire().await.pg()?;
+        Self::apply_update_on(&mut conn, entry, None).await?;
+        Ok(entry.clone())
+    }
+
+    /// 乐观并发修订：版本号不符即拒写，绝不静默覆盖并发修订
+    async fn save_if_version(
+        &self,
+        entry: &MemoryEntry,
+        expected_version: i64,
+    ) -> Result<MemoryEntry> {
+        let mut conn = self.pool.acquire().await.pg()?;
+        let rows = Self::apply_update_on(&mut conn, entry, Some(expected_version)).await?;
+        if rows == 0 {
+            return Err(HubError::Conflict);
+        }
+        Ok(entry.clone())
+    }
+
+    /// 原子修订：乐观锁写回条目 + 追加版本历史，同一事务同成同败
+    async fn revise(
+        &self,
+        entry: &MemoryEntry,
+        expected_version: i64,
+        change: mem_core::domain::VersionChange,
+    ) -> Result<MemoryEntry> {
+        let mut tx = self.pool.begin().await.pg()?;
+        let rows = Self::apply_update_on(&mut tx, entry, Some(expected_version)).await?;
+        if rows == 0 {
+            // 版本不符：不追加历史，事务在此丢弃
+            return Err(HubError::Conflict);
+        }
+        let row = MemoryVersion {
+            memory_id: entry.id,
+            version: entry.version,
+            content: entry.content.clone(),
+            tags: entry.tags.clone(),
+            metadata: entry.metadata.clone(),
+            confidence: entry.confidence,
+            changed_by: entry.source_agent.clone(),
+            change_type: change,
+            changed_at: entry.updated_at,
+        };
+        Self::insert_version_on(&mut tx, &row).await?;
+        tx.commit().await.pg()?;
         Ok(entry.clone())
     }
 
@@ -505,8 +722,9 @@ impl mem_core::MemoryStore for PostgresHubStore {
             qb.push(" and key = ").push_bind(key.clone());
         }
         if let Some(text) = &filter.text_contains {
-            qb.push(" and to_tsvector('simple', content) @@ plainto_tsquery('simple', ")
-                .push_bind(text.clone())
+            let query_tokens = mem_core::tokenize_query_for_fts(text);
+            qb.push(" and to_tsvector('simple', tsv_tokens) @@ plainto_tsquery('simple', ")
+                .push_bind(query_tokens)
                 .push(")");
         }
         if let Some((ts, id)) = &filter.before {
@@ -552,11 +770,20 @@ impl mem_core::MemoryStore for PostgresHubStore {
                 )
                 .push(")");
         }
+        if let Some(tags) = &filter.tags {
+            qb.push(" and tags @> ").push_bind(tags.clone());
+        }
         if let Some(agent) = &filter.source_agent {
             qb.push(" and source_agent = ").push_bind(agent.clone());
         }
         if let Some(key) = &filter.key {
             qb.push(" and key = ").push_bind(key.clone());
+        }
+        if let Some(text) = &filter.text_contains {
+            let query_tokens = mem_core::tokenize_query_for_fts(text);
+            qb.push(" and to_tsvector('simple', tsv_tokens) @@ plainto_tsquery('simple', ")
+                .push_bind(query_tokens)
+                .push(")");
         }
         let count: i64 = qb.build_query_scalar().fetch_one(&self.pool).await.pg()?;
         Ok(count.max(0) as usize)
@@ -635,32 +862,8 @@ impl mem_core::MemoryStore for PostgresHubStore {
     }
 
     async fn record_version(&self, v: &MemoryVersion) -> Result<()> {
-        sqlx::query(
-            r#"
-            insert into memory_versions
-              (memory_id, version, content, tags, metadata, confidence, changed_by, change_type, changed_at)
-            values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            on conflict (memory_id, version) do nothing
-            "#,
-        )
-        .bind(v.memory_id)
-        .bind(v.version)
-        .bind(&v.content)
-        .bind(&v.tags)
-        .bind(&v.metadata)
-        .bind(v.confidence)
-        .bind(&v.changed_by)
-        .bind(match v.change_type {
-            VersionChange::Created => "created",
-            VersionChange::Updated => "updated",
-            VersionChange::Archived => "archived",
-            VersionChange::Merged => "merged",
-        })
-        .bind(v.changed_at)
-        .execute(&self.pool)
-        .await
-        .pg()?;
-        Ok(())
+        let mut conn = self.pool.acquire().await.pg()?;
+        Self::insert_version_on(&mut conn, v).await
     }
 
     async fn versions(&self, id: Uuid) -> Result<Vec<MemoryVersion>> {
@@ -715,6 +918,14 @@ impl mem_core::MemoryStore for PostgresHubStore {
         .pg()?;
         Ok(res.rows_affected() as usize)
     }
+
+    async fn ping(&self) -> Result<()> {
+        sqlx::query("select 1")
+            .execute(&self.pool)
+            .await
+            .pg()?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -761,33 +972,32 @@ impl mem_core::BackupStore for PostgresHubStore {
         Self::backup_from_row(&row)
     }
 
+    /// 列举快照（摘要视图）。
+    ///
+    /// 刻意不取 `payload` 列：本方法被保留策略 `prune` 以 `None` 全库调用，
+    /// 历史上会把所有历史快照的整份 JSONB 一次性读进内存（每份都是全命名空间副本）。
+    /// 需要负载的调用方必须走 `get_backup(id)`。
     async fn list_backups(&self, namespace: Option<&str>) -> Result<Vec<BackupRecord>> {
+        const META_COLUMNS: &str =
+            "id, namespace, created_by, note, entry_count, checksum, retain_until, created_at";
         let rows = match namespace {
-            Some(ns) => {
-                sqlx::query(
-                    r#"
-                    select id, namespace, created_by, note, entry_count, checksum, payload, retain_until, created_at
-                    from memory_backups where namespace = $1 order by created_at desc
-                    "#,
-                )
-                .bind(ns)
-                .fetch_all(&self.pool)
-                .await
-                .pg()?
-            }
-            None => {
-                sqlx::query(
-                    r#"
-                    select id, namespace, created_by, note, entry_count, checksum, payload, retain_until, created_at
-                    from memory_backups order by created_at desc
-                    "#,
-                )
-                .fetch_all(&self.pool)
-                .await
-                .pg()?
-            }
+            Some(ns) => sqlx::query(&format!(
+                "select {} from memory_backups where namespace = $1 order by created_at desc",
+                META_COLUMNS
+            ))
+            .bind(ns)
+            .fetch_all(&self.pool)
+            .await
+            .pg()?,
+            None => sqlx::query(&format!(
+                "select {} from memory_backups order by created_at desc",
+                META_COLUMNS
+            ))
+            .fetch_all(&self.pool)
+            .await
+            .pg()?,
         };
-        rows.iter().map(Self::backup_from_row).collect()
+        rows.iter().map(Self::backup_meta_from_row).collect()
     }
 
     async fn delete_backup(&self, id: Uuid) -> Result<()> {
@@ -1100,7 +1310,7 @@ impl mem_core::AgentStore for PostgresHubStore {
         let secret_hash: Option<String> = reg
             .client_secret
             .as_ref()
-            .map(|s| hash_secret(&reg.agent_id, s));
+            .map(|s| crate::secret::hash_secret(&reg.agent_id, s));
         let max_scopes: Vec<String> = reg
             .max_scopes
             .iter()
@@ -1225,16 +1435,29 @@ impl mem_core::AgentStore for PostgresHubStore {
             .fetch_optional(&self.pool)
             .await
             .pg()?;
-        Ok(match row {
+        let stored = match row {
             Some(r) => {
-                let stored: Option<String> = r.try_get("client_secret_hash").ok().flatten();
-                match stored {
-                    Some(h) => h == hash_secret(agent_id, secret),
-                    None => false,
-                }
+                let h: Option<String> = r.try_get("client_secret_hash").ok().flatten();
+                h
             }
-            None => false,
-        })
+            None => None,
+        };
+        let stored = match stored {
+            Some(h) => h,
+            None => return Ok(false),
+        };
+        let ok = crate::secret::verify_secret(agent_id, secret, &stored);
+        // 存量旧摘要（无盐 sha256）在首次校验成功后就地升级为 Argon2id
+        if ok && crate::secret::is_legacy_digest(&stored) {
+            let upgraded = crate::secret::hash_secret(agent_id, secret);
+            sqlx::query("update agents set client_secret_hash = $2 where agent_id = $1")
+                .bind(agent_id)
+                .bind(&upgraded)
+                .execute(&self.pool)
+                .await
+                .pg()?;
+        }
+        Ok(ok)
     }
 }
 
@@ -1458,38 +1681,58 @@ fn account_record_of(r: &PgRow) -> AccountRecord {
     }
 }
 
-/// 密钥散列：sha256(agent_id:secret)
-fn hash_secret(agent_id: &str, secret: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(agent_id.as_bytes());
-    h.update(b":");
-    h.update(secret.as_bytes());
-    hex::encode(h.finalize())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_migrations_registered() {
-        assert_eq!(MIGRATIONS.len(), 3);
+        assert_eq!(MIGRATIONS.len(), 5);
         assert!(MIGRATIONS[0].0.starts_with("20261011"));
-        assert!(MIGRATIONS[1].0.starts_with("20261012"));
-        assert!(MIGRATIONS[2].0.starts_with("20261013"));
         // 迁移清单必须按版本号字典序排列（执行顺序依赖于此）
-        assert!(MIGRATIONS[0].0 < MIGRATIONS[1].0);
-        assert!(MIGRATIONS[1].0 < MIGRATIONS[2].0);
-        // 沙箱迁移必须可被语句切分器完整切开（每段以分号结尾）
-        let (_, sql) = MIGRATIONS[1];
-        let stmts = split_sql_statements(sql);
-        assert!(stmts.len() > 10);
-        assert!(stmts.iter().all(|s| s.trim_end().ends_with(';')));
-        let (_, sql3) = MIGRATIONS[2];
-        let stmts3 = split_sql_statements(sql3);
-        assert!(stmts3.len() >= 2);
-        assert!(stmts3.iter().all(|s| s.trim_end().ends_with(';')));
+        for w in MIGRATIONS.windows(2) {
+            assert!(
+                w[0].0 < w[1].0,
+                "迁移版本号必须递增: {} >= {}",
+                w[0].0,
+                w[1].0
+            );
+        }
+        // 每条迁移都必须能被语句切分器完整切开（每段以分号结尾）。
+        // 此前只抽查了 002/003，切分器对 dollar-quoted 块出错时另一条会被静默截断。
+        for (version, sql) in MIGRATIONS {
+            let stmts = split_sql_statements(sql);
+            assert!(stmts.len() > 1, "迁移 {} 应至少切出一条语句", version);
+            assert!(
+                stmts.iter().all(|s| s.trim_end().ends_with(';')),
+                "迁移 {} 存在未被切分的尾段",
+                version
+            );
+        }
+    }
+
+    /// `migrations/` 下的每个 .sql 都必须已登记进 MIGRATIONS。
+    /// 只断言固定条数时，新增文件却忘记登记会被静默跳过、线上 schema 落后。
+    #[test]
+    fn test_every_migration_file_is_registered() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        let mut count = 0usize;
+        for entry in std::fs::read_dir(&dir)
+            .expect("migrations 目录应存在")
+            .flatten()
+        {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Some(stem) = name.strip_suffix(".sql") else {
+                continue;
+            };
+            count += 1;
+            assert!(
+                MIGRATIONS.iter().any(|(v, _)| *v == stem),
+                "迁移 {} 有文件但未登记进 MIGRATIONS",
+                stem
+            );
+        }
+        assert_eq!(count, MIGRATIONS.len(), "迁移文件数与登记数不一致");
     }
 
     #[test]
@@ -1587,7 +1830,7 @@ mod pg_integration {
 
     async fn store() -> PostgresHubStore {
         let url = std::env::var("DATABASE_URL").expect("需设置 DATABASE_URL");
-        PostgresHubStore::connect(&url, 5)
+        PostgresHubStore::connect(&url, 5, 0)
             .await
             .expect("连接失败（将自动执行迁移）")
     }

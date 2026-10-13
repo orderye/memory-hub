@@ -140,6 +140,17 @@ impl ContentMerger for TieredMerger {
             MergeStrategy::ConcatenateUnique => Self::concatenate_unique_text(survivor, members),
         };
 
+        // 融合正文的长度护栏：schema 里有 `length(content) between 1 and 8192` 的 CHECK。
+        // 拼接不去限时，大组自动合并必然在写库时炸出约束错误，而调用方把它咽成"生成提案"，
+        // 表现为"整合跑了但没收敛"。这里提前判失败，让引擎留下待审提案而不是撞库。
+        if content.chars().count() > mem_core::memory_service::MAX_CONTENT_CHARS {
+            return Err(common::HubError::InvalidArgument(format!(
+                "合并正文 {} 字符，超出单条上限 {}，需人工裁决",
+                content.chars().count(),
+                mem_core::memory_service::MAX_CONTENT_CHARS
+            )));
+        }
+
         Ok(MergedOutput {
             content,
             tags,
