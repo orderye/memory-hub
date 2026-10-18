@@ -64,6 +64,63 @@ impl Embedder for TestEmbedder {
     }
 }
 
+use crate::domain::{ChatCognitiveInput, CognitiveCandidate};
+use crate::infra::ChatCognitiveExtractor;
+use std::sync::Mutex;
+
+/// 测试用可编程/确定性 Chat 认知抽取器
+#[derive(Default)]
+pub struct MockChatCognitiveExtractor {
+    pub candidates: Mutex<Vec<CognitiveCandidate>>,
+    pub failure_mode: Mutex<Option<String>>,
+}
+
+impl MockChatCognitiveExtractor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_candidates(self, candidates: Vec<CognitiveCandidate>) -> Self {
+        *self.candidates.lock().unwrap() = candidates;
+        self
+    }
+
+    pub fn with_failure(self, failure_mode: &str) -> Self {
+        *self.failure_mode.lock().unwrap() = Some(failure_mode.to_string());
+        self
+    }
+}
+
+#[async_trait]
+impl ChatCognitiveExtractor for MockChatCognitiveExtractor {
+    async fn extract_candidates(
+        &self,
+        _input: &ChatCognitiveInput,
+    ) -> Result<Vec<CognitiveCandidate>> {
+        if let Some(mode) = self.failure_mode.lock().unwrap().as_deref() {
+            match mode {
+                "timeout" => {
+                    return Err(common::HubError::Internal(anyhow::anyhow!(
+                        "LLM request timed out"
+                    )))
+                }
+                "invalid_json" => {
+                    return Err(common::HubError::InvalidArgument(
+                        "LLM response malformed JSON".into(),
+                    ))
+                }
+                _ => {
+                    return Err(common::HubError::Internal(anyhow::anyhow!(
+                        "LLM provider failure"
+                    )))
+                }
+            }
+        }
+        let list = self.candidates.lock().unwrap().clone();
+        Ok(list)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

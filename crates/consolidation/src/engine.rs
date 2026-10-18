@@ -417,6 +417,26 @@ impl ConsolidationEngine {
             archived.updated_at = now;
             archived.source_agent = operator_agent.clone();
 
+            // 若尚未标记失效时间，将其有效截止时间限制为合并裁决时间，支撑时间有效性过滤
+            if archived.valid_until.is_none() {
+                archived.valid_until = Some(now);
+            }
+
+            // 建立事实演化关系 (survivor supersedes archived)
+            let _ = self
+                .store
+                .add_relation(
+                    namespace,
+                    &mem_core::NewMemoryRelation {
+                        from_memory_id: survivor_id,
+                        to_memory_id: archived.id,
+                        relation_kind: mem_core::MemoryRelationKind::Supersedes,
+                        confidence: 1.0,
+                        source_evidence_id: None,
+                    },
+                )
+                .await;
+
             self.store
                 .revise(&archived, expected_member, VersionChange::Merged)
                 .await?;

@@ -243,6 +243,185 @@ fn default_relation_confidence() -> f32 {
     1.0
 }
 
+/// 消息角色（Chat 认知流）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatRole {
+    User,
+    Assistant,
+    System,
+    Tool,
+}
+
+impl ChatRole {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ChatRole::User => "user",
+            ChatRole::Assistant => "assistant",
+            ChatRole::System => "system",
+            ChatRole::Tool => "tool",
+        }
+    }
+}
+
+/// 对话消息项
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub role: ChatRole,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<DateTime<Utc>>,
+}
+
+/// Chat 认知提取请求输入
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatCognitiveInput {
+    pub namespace: Namespace,
+    pub session_id: String,
+    pub messages: Vec<ChatMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurred_at: Option<DateTime<Utc>>,
+}
+
+/// 从对话中提炼出的记忆候选
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CognitiveCandidate {
+    pub content: String,
+    pub scene: MemoryScene,
+    pub layer: CognitiveLayer,
+    pub confidence: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_from: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_until: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurred_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+    /// 认知关系类别（如取代旧记忆时填 Supersedes）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relation_kind: Option<MemoryRelationKind>,
+    /// 关联或演化目标记忆 ID
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_memory_id: Option<Uuid>,
+}
+
+/// 认知提案记录（供人工审查或审计状态流转）
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CognitiveProposalRecord {
+    pub id: Uuid,
+    pub namespace: Namespace,
+    pub candidate: CognitiveCandidate,
+    pub source_evidence_id: Uuid,
+    pub status: CognitiveProposalStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejection_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resulting_memory_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// 认知提炼治理模式
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CognitiveGovernanceMode {
+    /// 全手动：生成提案待审，绝不自动入库
+    #[default]
+    Manual,
+    /// 半自动：高置信度且无冲突自动入库，其余生成提案
+    SemiAuto,
+    /// 全自动：有效候选自动入库
+    FullAuto,
+}
+
+/// 认知治理策略
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CognitivePolicy {
+    pub mode: CognitiveGovernanceMode,
+    pub auto_accept_threshold: f32,
+}
+
+impl Default for CognitivePolicy {
+    fn default() -> Self {
+        Self {
+            mode: CognitiveGovernanceMode::Manual,
+            auto_accept_threshold: 0.95,
+        }
+    }
+}
+
+/// 校验候选条目合法性
+pub fn validate_cognitive_candidate(candidate: &CognitiveCandidate) -> common::Result<()> {
+    let trimmed = candidate.content.trim();
+    if trimmed.is_empty() {
+        return Err(common::HubError::InvalidArgument(
+            "候选记忆内容不能为空".into(),
+        ));
+    }
+    if trimmed.chars().count() > 8192 {
+        return Err(common::HubError::InvalidArgument(
+            "候选记忆内容超过 8192 字符上限".into(),
+        ));
+    }
+    if candidate.confidence < 0.0 || candidate.confidence > 1.0 {
+        return Err(common::HubError::InvalidArgument(
+            "置信度必须在 0.0 ~ 1.0 之间".into(),
+        ));
+    }
+    if candidate.tags.len() > 32 {
+        return Err(common::HubError::InvalidArgument(
+            "标签数不能超过 32".into(),
+        ));
+    }
+
+    // 意图规则：含糊猜测表述不可作为确定意图
+    if candidate.layer == CognitiveLayer::Intention && is_speculative_intention(trimmed) {
+        return Err(common::HubError::InvalidArgument(
+            "含糊猜测或未经确认的表述不能提取为确定意图".into(),
+        ));
+    }
+
+    Ok(())
+}
+
+/// 检查是否为含糊猜测表述（不能作为确定前瞻意图）
+pub fn is_speculative_intention(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let speculative_markers = [
+        "可能会考虑",
+        "可能考虑",
+        "或许会",
+        "也许会",
+        "还没想好",
+        "待定",
+        "说不定",
+        "maybe consider",
+        "might consider",
+        "possibly",
+        "tentatively",
+        "not decided",
+    ];
+    speculative_markers.iter().any(|m| lower.contains(m))
+}
+
+/// 检查意图是否在指定时刻处于有效期内
+pub fn is_intention_active(
+    layer: CognitiveLayer,
+    valid_until: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> bool {
+    if layer != CognitiveLayer::Intention {
+        return true;
+    }
+    match valid_until {
+        Some(vu) => vu > now,
+        None => true,
+    }
+}
+
 /// 记忆条目分类
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

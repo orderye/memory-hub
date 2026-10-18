@@ -8,9 +8,11 @@
 //! 调度器只依赖 `Clock` 与 cron 解析（`common::cron`），可整体注入测试时钟。
 
 pub mod backup_job;
+pub mod cognitive_job;
 pub mod integration_job;
 pub mod scheduler;
 
 pub use backup_job::{BackupJob, BackupJobReport};
+pub use cognitive_job::{ChatCognitiveJob, ChatCognitiveJobReport};
 pub use integration_job::{IntegrationScanJob, IntegrationScanReport};
 pub use scheduler::{JobScheduler, ScheduledTask};

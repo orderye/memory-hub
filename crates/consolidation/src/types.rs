@@ -22,6 +22,8 @@ pub enum ConflictKind {
     Key,
     /// 语义主题高度相近但断言事实矛盾
     Semantic,
+    /// 事实演化（新事实取代旧事实，演化取代 supersedes）
+    Evolution,
 }
 
 /// 冲突组

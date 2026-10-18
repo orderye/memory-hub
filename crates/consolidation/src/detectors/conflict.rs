@@ -99,16 +99,30 @@ impl ConflictDetector {
                         } else {
                             e2.id
                         };
+                        let is_evolution = Self::is_fact_evolution(&e1.content, &e2.content);
+                        let kind = if is_evolution {
+                            ConflictKind::Evolution
+                        } else {
+                            ConflictKind::Semantic
+                        };
+                        let description = if is_evolution {
+                            format!(
+                                "事实版本演进：新事实取代旧事实 (supersedes, 语义主题相似度 {:.2})",
+                                sim
+                            )
+                        } else {
+                            format!(
+                                "语义主题相似度高 ({:.2}) 但事实内容分歧显著 ({:.2})",
+                                sim, div
+                            )
+                        };
                         conflicts.push(ConflictGroup {
                             id: Uuid::new_v4(),
-                            kind: ConflictKind::Semantic,
+                            kind,
                             key: None,
                             member_ids: vec![e1.id, e2.id],
                             divergence: div,
-                            description: format!(
-                                "语义主题相似度高 ({:.2}) 但事实内容分歧显著 ({:.2})",
-                                sim, div
-                            ),
+                            description,
                             suggested_survivor: survivor,
                         });
                     }
@@ -133,5 +147,22 @@ impl ConflictDetector {
         } else {
             1.0 - (inter / union)
         }
+    }
+
+    /// 判断两段事实正文是否呈现事实演化/取代模式 (supersedes)
+    pub fn is_fact_evolution(c1: &str, c2: &str) -> bool {
+        let markers = [
+            "改用",
+            "决定改用",
+            "切换至",
+            "不再使用",
+            "过去使用",
+            "以前使用",
+            "supersede",
+            "replace",
+            "now use",
+            "deprecated",
+        ];
+        markers.iter().any(|m| c1.contains(m) || c2.contains(m))
     }
 }

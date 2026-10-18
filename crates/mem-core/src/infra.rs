@@ -4,9 +4,10 @@
 //! `store` crate 提供 PostgreSQL 与内存两套实现，可互换。
 
 use crate::domain::{
-    BackupRecord, EvidenceSourceKind, IntegrationProposal, MemoryEntry, MemoryEvidence,
-    MemoryFilter, MemoryKind, MemoryRelation, MemoryRelationKind, MemoryVersion, Namespace,
-    NamespaceGrantRecord, NamespaceInfo, NewEvidence, NewMemoryRelation, ProposalStatus, Scored,
+    BackupRecord, ChatCognitiveInput, CognitiveCandidate, EvidenceSourceKind, IntegrationProposal,
+    MemoryEntry, MemoryEvidence, MemoryFilter, MemoryKind, MemoryRelation, MemoryRelationKind,
+    MemoryVersion, Namespace, NamespaceGrantRecord, NamespaceInfo, NewEvidence, NewMemoryRelation,
+    ProposalStatus, Scored,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -442,4 +443,13 @@ pub trait AccessChecker: Send + Sync {
     async fn is_owner(&self, auth: &AuthCtx, namespace: &str) -> Result<bool>;
     /// 首次写入时自动注册命名空间并建立 owner 授权
     async fn ensure_namespace(&self, auth: &AuthCtx, namespace: &str) -> Result<()>;
+}
+
+/// 对话认知提炼抽取器（由外部 LLM provider 或 Mock 实现）
+#[async_trait]
+pub trait ChatCognitiveExtractor: Send + Sync {
+    async fn extract_candidates(
+        &self,
+        input: &ChatCognitiveInput,
+    ) -> Result<Vec<CognitiveCandidate>>;
 }

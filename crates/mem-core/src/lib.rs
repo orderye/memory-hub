@@ -19,6 +19,7 @@ pub mod access;
 pub mod account_scope;
 pub mod algorithm;
 pub mod backup_service;
+pub mod chat_cognitive_service;
 pub mod cjk;
 pub mod domain;
 pub mod infra;
@@ -38,17 +39,22 @@ pub use backup_service::{
     grant_checker, BackupCreateRequest, BackupService, DefaultBackupService, PruneReport,
     RestoreRequest,
 };
+pub use chat_cognitive_service::{ChatCognitiveResult, ChatCognitiveService};
 pub use domain::{
-    BackupRecord, BackupSummary, CognitiveLayer, CognitiveProposalStatus, EvidenceSourceKind,
-    IntegrationKind, IntegrationProposal, MemoryEntry, MemoryEvidence, MemoryFilter, MemoryKind,
-    MemoryPatch, MemoryRelation, MemoryRelationKind, MemoryScene, MemoryStats, MemoryStatus,
-    MemoryVersion, Namespace, NamespaceGrantRecord, NamespaceInfo, NewEvidence, NewMemory,
-    NewMemoryRelation, Page, ProposalStatus, RestoreMode, RestoreReport, Scored, VersionChange,
+    is_intention_active, is_speculative_intention, validate_cognitive_candidate, BackupRecord,
+    BackupSummary, ChatCognitiveInput, ChatMessage, ChatRole, CognitiveCandidate,
+    CognitiveGovernanceMode, CognitiveLayer, CognitivePolicy, CognitiveProposalRecord,
+    CognitiveProposalStatus, EvidenceSourceKind, IntegrationKind, IntegrationProposal, MemoryEntry,
+    MemoryEvidence, MemoryFilter, MemoryKind, MemoryPatch, MemoryRelation, MemoryRelationKind,
+    MemoryScene, MemoryStats, MemoryStatus, MemoryVersion, Namespace, NamespaceGrantRecord,
+    NamespaceInfo, NewEvidence, NewMemory, NewMemoryRelation, Page, ProposalStatus, RestoreMode,
+    RestoreReport, Scored, VersionChange,
 };
 pub use infra::{
     AccessChecker, AccountRecord, AccountStore, AgentRecord, AgentRegistration, AgentStore,
-    BackupStore, Clock, Embedder, EvidenceStore, GrantStore, IntegrationStore, MemoryHubStore,
-    MemoryStore, RelationStore, Retriever, SessionRecord, SystemClock, TokenIntrospector,
+    BackupStore, ChatCognitiveExtractor, Clock, Embedder, EvidenceStore, GrantStore,
+    IntegrationStore, MemoryHubStore, MemoryStore, RelationStore, Retriever, SessionRecord,
+    SystemClock, TokenIntrospector,
 };
 pub use integration_service::{
     IntegrationService, ResolveAction, ResolveRequest, ScanReport, ScanRequest,
