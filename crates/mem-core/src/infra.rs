@@ -4,8 +4,9 @@
 //! `store` crate 提供 PostgreSQL 与内存两套实现，可互换。
 
 use crate::domain::{
-    BackupRecord, IntegrationProposal, MemoryEntry, MemoryFilter, MemoryKind, MemoryVersion,
-    Namespace, NamespaceGrantRecord, NamespaceInfo, ProposalStatus, Scored,
+    BackupRecord, EvidenceSourceKind, IntegrationProposal, MemoryEntry, MemoryEvidence,
+    MemoryFilter, MemoryKind, MemoryRelation, MemoryRelationKind, MemoryVersion, Namespace,
+    NamespaceGrantRecord, NamespaceInfo, NewEvidence, NewMemoryRelation, ProposalStatus, Scored,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -34,6 +35,11 @@ pub trait MemoryStore: Send + Sync {
             changed_by: saved.source_agent.clone(),
             change_type: crate::domain::VersionChange::Created,
             changed_at: saved.created_at,
+            scene: saved.scene,
+            layer: saved.layer,
+            valid_from: saved.valid_from,
+            valid_until: saved.valid_until,
+            occurred_at: saved.occurred_at,
         })
         .await?;
         Ok(saved)
@@ -90,6 +96,11 @@ pub trait MemoryStore: Send + Sync {
             changed_by: saved.source_agent.clone(),
             change_type: change,
             changed_at: saved.updated_at,
+            scene: saved.scene,
+            layer: saved.layer,
+            valid_from: saved.valid_from,
+            valid_until: saved.valid_until,
+            occurred_at: saved.occurred_at,
         })
         .await?;
         Ok(saved)
@@ -136,6 +147,68 @@ pub trait MemoryStore: Send + Sync {
     async fn ping(&self) -> Result<()> {
         Ok(())
     }
+}
+
+/// 证据存根存储（不可变追加与查询，P1 引入）
+#[async_trait]
+pub trait EvidenceStore: Send + Sync {
+    /// 追加一条证据存根（返回持久化后的记录）
+    async fn append_evidence(&self, evidence: &NewEvidence) -> Result<MemoryEvidence>;
+
+    /// 按 ID 读取证据存根
+    async fn get_evidence(&self, namespace: &str, id: uuid::Uuid) -> Result<MemoryEvidence>;
+
+    /// 条件列表
+    async fn list_evidence(
+        &self,
+        namespace: &str,
+        source_kind: Option<EvidenceSourceKind>,
+        source_ref: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MemoryEvidence>>;
+
+    /// 命名空间下全部证据（备份/恢复用）
+    async fn all_evidence_in_namespace(&self, namespace: &str) -> Result<Vec<MemoryEvidence>>;
+
+    /// 物理删除单条证据
+    async fn delete_evidence(&self, namespace: &str, id: uuid::Uuid) -> Result<()>;
+}
+
+/// 关系网存储（P1 引入）
+#[async_trait]
+pub trait RelationStore: Send + Sync {
+    /// 增加一条关系（两端条目必须都属于 namespace）
+    async fn add_relation(
+        &self,
+        namespace: &str,
+        relation: &NewMemoryRelation,
+    ) -> Result<MemoryRelation>;
+
+    /// 列出某记忆条目出发的所有关系
+    async fn list_relations_from(
+        &self,
+        namespace: &str,
+        from_memory_id: uuid::Uuid,
+    ) -> Result<Vec<MemoryRelation>>;
+
+    /// 列出指向某记忆条目的所有关系
+    async fn list_relations_to(
+        &self,
+        namespace: &str,
+        to_memory_id: uuid::Uuid,
+    ) -> Result<Vec<MemoryRelation>>;
+
+    /// 删除指定关系
+    async fn delete_relation(
+        &self,
+        namespace: &str,
+        from_memory_id: uuid::Uuid,
+        to_memory_id: uuid::Uuid,
+        relation_kind: MemoryRelationKind,
+    ) -> Result<()>;
+
+    /// 命名空间下全部关系（备份/恢复用）
+    async fn all_relations_in_namespace(&self, namespace: &str) -> Result<Vec<MemoryRelation>>;
 }
 
 /// 备份存储：快照持久化
@@ -190,14 +263,27 @@ pub trait GrantStore: Send + Sync {
     async fn owned_namespaces(&self, agent_id: &AgentId) -> Result<Vec<Namespace>>;
 }
 
-/// 存储聚合：一套实现同时满足五类存储需求
+/// 存储聚合：一套实现同时满足七类存储需求
 pub trait MemoryHubStore:
-    MemoryStore + BackupStore + IntegrationStore + GrantStore + AgentStore
+    MemoryStore
+    + BackupStore
+    + IntegrationStore
+    + GrantStore
+    + AgentStore
+    + EvidenceStore
+    + RelationStore
 {
 }
 
-impl<T: MemoryStore + BackupStore + IntegrationStore + GrantStore + AgentStore> MemoryHubStore
-    for T
+impl<
+        T: MemoryStore
+            + BackupStore
+            + IntegrationStore
+            + GrantStore
+            + AgentStore
+            + EvidenceStore
+            + RelationStore,
+    > MemoryHubStore for T
 {
 }
 

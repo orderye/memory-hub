@@ -8,13 +8,11 @@
 
 use axum::http::{HeaderMap, HeaderValue};
 use common::{Acl, AuthCtx, Scope};
+use consolidation::DefaultIntegrationService;
 use mcp::adapter::cjs::{CjsAdapter, CjsAdapterConfig};
 use mcp::tools::ToolDispatcher;
 use mcp::transport::{handle_jsonrpc_ext, JsonRpcRequest, McpTransportState};
-use consolidation::DefaultIntegrationService;
-use mem_core::{
-    DefaultBackupService, DefaultMemoryService, GrantChecker,
-};
+use mem_core::{DefaultBackupService, DefaultMemoryService, GrantChecker};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use store::InMemoryHubStore;

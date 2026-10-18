@@ -152,9 +152,6 @@ mod tests {
         // 四字查询 -> 3 个 2-gram
         assert_eq!(tokenize_query_for_fts("东京区域"), "东京 京区 区域");
         // 混排查询
-        assert_eq!(
-            tokenize_query_for_fts("Tokyo 东京"),
-            "tokyo 东京"
-        );
+        assert_eq!(tokenize_query_for_fts("Tokyo 东京"), "tokyo 东京");
     }
 }

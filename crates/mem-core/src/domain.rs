@@ -13,6 +13,236 @@ use uuid::Uuid;
 /// 命名空间：记忆的逻辑隔离空间（如 `default`、`team-x`、`project-y`）
 pub type Namespace = String;
 
+/// 场景管线（P1 引入）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryScene {
+    /// 对话场景：事实/摘要/偏好/意图
+    Chat,
+    /// 工作任务场景：任务上下文与提炼经验
+    Working,
+    /// 编程场景：代码演进、diff 链与重构
+    Coding,
+}
+
+impl MemoryScene {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MemoryScene::Chat => "chat",
+            MemoryScene::Working => "working",
+            MemoryScene::Coding => "coding",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "chat" => Some(MemoryScene::Chat),
+            "working" => Some(MemoryScene::Working),
+            "coding" => Some(MemoryScene::Coding),
+            _ => None,
+        }
+    }
+}
+
+/// 认知分层（P1 引入）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CognitiveLayer {
+    /// 原始输入/存根
+    Raw,
+    /// 原子事实
+    Fact,
+    /// 事件/会话摘要
+    Summary,
+    /// 实体/角色画像
+    Identity,
+    /// 领域知识
+    Knowledge,
+    /// 稳定模式/认知图式
+    Schema,
+    /// 前瞻意图/待办动机
+    Intention,
+}
+
+impl CognitiveLayer {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CognitiveLayer::Raw => "raw",
+            CognitiveLayer::Fact => "fact",
+            CognitiveLayer::Summary => "summary",
+            CognitiveLayer::Identity => "identity",
+            CognitiveLayer::Knowledge => "knowledge",
+            CognitiveLayer::Schema => "schema",
+            CognitiveLayer::Intention => "intention",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "raw" => Some(CognitiveLayer::Raw),
+            "fact" => Some(CognitiveLayer::Fact),
+            "summary" => Some(CognitiveLayer::Summary),
+            "identity" => Some(CognitiveLayer::Identity),
+            "knowledge" => Some(CognitiveLayer::Knowledge),
+            "schema" => Some(CognitiveLayer::Schema),
+            "intention" => Some(CognitiveLayer::Intention),
+            _ => None,
+        }
+    }
+}
+
+/// 关系网关系类型（P1 引入）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryRelationKind {
+    /// 支撑关系
+    Supports,
+    /// 矛盾/冲突关系
+    Contradicts,
+    /// 取代/版本演进（新事实取代旧事实）
+    Supersedes,
+    /// 衍生自
+    DerivedFrom,
+    /// 一般相关
+    RelatedTo,
+    /// 任务提炼出的可复用经验
+    DerivedExperience,
+    /// 代码修订演进关系
+    CodeRevision,
+}
+
+impl MemoryRelationKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MemoryRelationKind::Supports => "supports",
+            MemoryRelationKind::Contradicts => "contradicts",
+            MemoryRelationKind::Supersedes => "supersedes",
+            MemoryRelationKind::DerivedFrom => "derived_from",
+            MemoryRelationKind::RelatedTo => "related_to",
+            MemoryRelationKind::DerivedExperience => "derived_experience",
+            MemoryRelationKind::CodeRevision => "code_revision",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "supports" => Some(MemoryRelationKind::Supports),
+            "contradicts" => Some(MemoryRelationKind::Contradicts),
+            "supersedes" => Some(MemoryRelationKind::Supersedes),
+            "derived_from" => Some(MemoryRelationKind::DerivedFrom),
+            "related_to" => Some(MemoryRelationKind::RelatedTo),
+            "derived_experience" => Some(MemoryRelationKind::DerivedExperience),
+            "code_revision" => Some(MemoryRelationKind::CodeRevision),
+            _ => None,
+        }
+    }
+}
+
+/// 证据来源类别（P1 引入）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceSourceKind {
+    Session,
+    Task,
+    ToolCall,
+    GitCommit,
+    Manual,
+}
+
+impl EvidenceSourceKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EvidenceSourceKind::Session => "session",
+            EvidenceSourceKind::Task => "task",
+            EvidenceSourceKind::ToolCall => "tool_call",
+            EvidenceSourceKind::GitCommit => "git_commit",
+            EvidenceSourceKind::Manual => "manual",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "session" => Some(EvidenceSourceKind::Session),
+            "task" => Some(EvidenceSourceKind::Task),
+            "tool_call" => Some(EvidenceSourceKind::ToolCall),
+            "git_commit" => Some(EvidenceSourceKind::GitCommit),
+            "manual" => Some(EvidenceSourceKind::Manual),
+            _ => None,
+        }
+    }
+}
+
+/// 认知提案状态（与旧版 Integration ProposalStatus 区分）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CognitiveProposalStatus {
+    Candidate,
+    PendingReview,
+    Accepted,
+    Rejected,
+    Superseded,
+}
+
+/// 原始证据存根（P1 引入，Append-only）
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryEvidence {
+    pub id: Uuid,
+    pub namespace: Namespace,
+    pub source_kind: EvidenceSourceKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_ref: Option<String>,
+    pub content_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excerpt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurred_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// 新证据存根追加请求
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewEvidence {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<Uuid>,
+    pub namespace: Namespace,
+    pub source_kind: EvidenceSourceKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_ref: Option<String>,
+    pub content_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excerpt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurred_at: Option<DateTime<Utc>>,
+}
+
+/// 记忆实体关系（P1 引入）
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryRelation {
+    pub from_memory_id: Uuid,
+    pub to_memory_id: Uuid,
+    pub relation_kind: MemoryRelationKind,
+    pub confidence: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_evidence_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// 新记忆关系添加请求
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NewMemoryRelation {
+    pub from_memory_id: Uuid,
+    pub to_memory_id: Uuid,
+    pub relation_kind: MemoryRelationKind,
+    #[serde(default = "default_relation_confidence")]
+    pub confidence: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_evidence_id: Option<Uuid>,
+}
+
+fn default_relation_confidence() -> f32 {
+    1.0
+}
+
 /// 记忆条目分类
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -146,6 +376,21 @@ pub struct MemoryEntry {
     pub merged_into: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// 场景管线（Chat / Working / Coding）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scene: Option<MemoryScene>,
+    /// 认知分层（Raw / Fact / Summary / Identity / Knowledge / Schema / Intention）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer: Option<CognitiveLayer>,
+    /// 事实生效时间
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_from: Option<DateTime<Utc>>,
+    /// 事实失效时间
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_until: Option<DateTime<Utc>>,
+    /// 客观事件发生时间
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurred_at: Option<DateTime<Utc>>,
 }
 
 /// 新记忆写入请求
@@ -161,6 +406,11 @@ pub struct NewMemory {
     /// 生存秒数（None 表示不过期）
     pub ttl_seconds: Option<i64>,
     pub source_agent: AgentId,
+    pub scene: Option<MemoryScene>,
+    pub layer: Option<CognitiveLayer>,
+    pub valid_from: Option<DateTime<Utc>>,
+    pub valid_until: Option<DateTime<Utc>>,
+    pub occurred_at: Option<DateTime<Utc>>,
 }
 
 /// 记忆修订补丁（只改显式提供的字段）
@@ -173,6 +423,11 @@ pub struct MemoryPatch {
     pub confidence: Option<f32>,
     /// 设置过期：`Some(n)` = n 秒后过期；`Some(0)` = 清除过期；`None` = 不变
     pub expires_in_seconds: Option<i64>,
+    pub scene: Option<MemoryScene>,
+    pub layer: Option<CognitiveLayer>,
+    pub valid_from: Option<DateTime<Utc>>,
+    pub valid_until: Option<DateTime<Utc>>,
+    pub occurred_at: Option<DateTime<Utc>>,
 }
 
 /// 记忆版本历史（每次内容修订追加一条，支撑备份与审计）
@@ -189,6 +444,16 @@ pub struct MemoryVersion {
     pub changed_by: AgentId,
     pub change_type: VersionChange,
     pub changed_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scene: Option<MemoryScene>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer: Option<CognitiveLayer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_from: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_until: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurred_at: Option<DateTime<Utc>>,
 }
 
 /// 版本变更类型
@@ -212,6 +477,10 @@ pub struct MemoryFilter {
     pub key: Option<String>,
     /// 内容/标签包含子串（不区分大小写）
     pub text_contains: Option<String>,
+    pub scene: Option<MemoryScene>,
+    pub layer: Option<CognitiveLayer>,
+    /// 查询在特定时刻有效的事实（valid_from <= t < valid_until）
+    pub valid_at: Option<DateTime<Utc>>,
     /// 游标分页：updated_at + id 复合键之前
     pub before: Option<(DateTime<Utc>, Uuid)>,
     pub limit: Option<usize>,

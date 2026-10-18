@@ -13,11 +13,12 @@ use crate::algorithm::{
     SearchQuery,
 };
 use crate::domain::{
-    MemoryEntry, MemoryFilter, MemoryKind, MemoryStats, MemoryStatus, MemoryVersion, Page, Scored,
-    VersionChange,
+    CognitiveLayer, MemoryEntry, MemoryFilter, MemoryKind, MemoryScene, MemoryStats, MemoryStatus,
+    MemoryVersion, Page, Scored, VersionChange,
 };
 use crate::infra::{AccessChecker, Clock, Embedder, MemoryStore, Retriever, SystemClock};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use common::{AgentId, AuthCtx, HubError, Result};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -54,6 +55,16 @@ pub struct PutRequest {
     /// 生存秒数（None = 不过期；0 = 立即过期由清理任务归档）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_seconds: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scene: Option<MemoryScene>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer: Option<CognitiveLayer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_from: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_until: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurred_at: Option<DateTime<Utc>>,
 }
 
 fn default_confidence() -> f32 {
@@ -84,6 +95,12 @@ pub struct ListRequest {
     pub source_agent: Option<AgentId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_contains: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scene: Option<MemoryScene>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer: Option<CognitiveLayer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
     #[serde(default = "default_list_limit")]
@@ -312,6 +329,11 @@ impl MemoryService for DefaultMemoryService {
             merged_into: None,
             created_at: now,
             updated_at: now,
+            scene: req.scene,
+            layer: req.layer,
+            valid_from: req.valid_from,
+            valid_until: req.valid_until,
+            occurred_at: req.occurred_at,
         };
         let saved = store.insert_initial(&entry).await?;
         Ok(saved)
@@ -395,6 +417,21 @@ impl MemoryService for DefaultMemoryService {
             }
             Some(_) => entry.expires_at = None,
             None => {}
+        }
+        if patch.scene.is_some() {
+            entry.scene = patch.scene;
+        }
+        if patch.layer.is_some() {
+            entry.layer = patch.layer;
+        }
+        if patch.valid_from.is_some() {
+            entry.valid_from = patch.valid_from;
+        }
+        if patch.valid_until.is_some() {
+            entry.valid_until = patch.valid_until;
+        }
+        if patch.occurred_at.is_some() {
+            entry.occurred_at = patch.occurred_at;
         }
 
         let now = self.clock.now();
@@ -511,6 +548,9 @@ impl MemoryService for DefaultMemoryService {
             source_agent: req.source_agent.clone(),
             key: None,
             text_contains: req.text_contains.clone(),
+            scene: req.scene,
+            layer: req.layer,
+            valid_at: req.valid_at,
             before,
             limit: Some(limit + 1),
         };
@@ -977,6 +1017,11 @@ mod tests {
             metadata: serde_json::json!({}),
             confidence: 1.0,
             ttl_seconds: None,
+            scene: None,
+            layer: None,
+            valid_from: None,
+            valid_until: None,
+            occurred_at: None,
         }
     }
 

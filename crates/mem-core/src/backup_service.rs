@@ -9,9 +9,13 @@
 use crate::access::GrantChecker;
 use crate::account_scope::AccountScopedStore;
 use crate::domain::{
-    BackupRecord, BackupSummary, MemoryEntry, RestoreMode, RestoreReport, VersionChange,
+    BackupRecord, BackupSummary, MemoryEntry, MemoryEvidence, MemoryRelation, NewEvidence,
+    NewMemoryRelation, RestoreMode, RestoreReport, VersionChange,
 };
-use crate::infra::{AccessChecker, BackupStore, Clock, MemoryHubStore, MemoryStore, SystemClock};
+use crate::infra::{
+    AccessChecker, BackupStore, Clock, EvidenceStore, MemoryHubStore, MemoryStore, RelationStore,
+    SystemClock,
+};
 use async_trait::async_trait;
 use common::{AuthCtx, HubError, Result, Scope};
 use serde::{Deserialize, Serialize};
@@ -19,8 +23,8 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use uuid::Uuid;
 
-/// 备份负载格式版本
-pub const BACKUP_PAYLOAD_VERSION: u32 = 1;
+/// 备份负载格式版本（升级至 v2 支持证据溯源与实体关系网）
+pub const BACKUP_PAYLOAD_VERSION: u32 = 2;
 
 /// 全量快照的保留命名空间标记（不对应任何真实命名空间，也不是授权对象）
 pub const ALL_NAMESPACES: &str = "*";
@@ -129,18 +133,58 @@ impl DefaultBackupService {
             .map_err(|e| HubError::Internal(anyhow::anyhow!("备份负载解析失败: {}", e)))
     }
 
-    /// 计算条目列表的规范校验和
-    fn checksum_of(entries: &[MemoryEntry]) -> String {
+    /// 从负载取出证据存根列表
+    fn evidences_of(backup: &BackupRecord) -> Result<Vec<MemoryEvidence>> {
+        match backup.payload.get("evidences") {
+            Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
+                HubError::Internal(anyhow::anyhow!("备份负载 evidences 解析失败: {}", e))
+            }),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// 从负载取出关系列表
+    fn relations_of(backup: &BackupRecord) -> Result<Vec<MemoryRelation>> {
+        match backup.payload.get("relations") {
+            Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
+                HubError::Internal(anyhow::anyhow!("备份负载 relations 解析失败: {}", e))
+            }),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// 计算 v1 负载的规范校验和（仅 entries）
+    fn checksum_v1(entries: &[MemoryEntry]) -> String {
         let bytes = serde_json::to_vec(entries).unwrap_or_default();
         hex::encode(Sha256::digest(&bytes))
     }
 
-    /// 构建备份负载
-    fn payload_of(namespace: &str, entries: &[MemoryEntry]) -> serde_json::Value {
+    /// 计算 v2 负载的规范校验和（entries + evidences + relations）
+    fn checksum_v2(
+        entries: &[MemoryEntry],
+        evidences: &[MemoryEvidence],
+        relations: &[MemoryRelation],
+    ) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(serde_json::to_vec(entries).unwrap_or_default());
+        hasher.update(serde_json::to_vec(evidences).unwrap_or_default());
+        hasher.update(serde_json::to_vec(relations).unwrap_or_default());
+        hex::encode(hasher.finalize())
+    }
+
+    /// 构建备份负载（v2 格式）
+    fn payload_of(
+        namespace: &str,
+        entries: &[MemoryEntry],
+        evidences: &[MemoryEvidence],
+        relations: &[MemoryRelation],
+    ) -> serde_json::Value {
         serde_json::json!({
             "version": BACKUP_PAYLOAD_VERSION,
             "namespace": namespace,
             "entries": entries,
+            "evidences": evidences,
+            "relations": relations,
         })
     }
 
@@ -157,7 +201,9 @@ impl DefaultBackupService {
         }
         let store = self.scoped(auth);
         let entries = store.all_in_namespace(namespace, true).await?;
-        if entries.is_empty() {
+        let evidences = store.all_evidence_in_namespace(namespace).await?;
+        let relations = store.all_relations_in_namespace(namespace).await?;
+        if entries.is_empty() && evidences.is_empty() && relations.is_empty() {
             return Ok(None);
         }
         let now = self.clock.now();
@@ -167,8 +213,8 @@ impl DefaultBackupService {
             created_by: auth.agent_id.clone(),
             note: Some(format!("restore-safety:{}", namespace)),
             entry_count: entries.len(),
-            checksum: Self::checksum_of(&entries),
-            payload: Self::payload_of(namespace, &entries),
+            checksum: Self::checksum_v2(&entries, &evidences, &relations),
+            payload: Self::payload_of(namespace, &entries, &evidences, &relations),
             retain_until: None,
             created_at: now,
         };
@@ -197,6 +243,26 @@ impl BackupService for DefaultBackupService {
             store.all_in_namespace(&req.namespace, true).await?
         };
 
+        let evidences: Vec<MemoryEvidence> = if req.namespace == "*" {
+            let mut all = Vec::new();
+            for ns in crate::infra::MemoryStore::list_namespaces(&store).await? {
+                all.extend(store.all_evidence_in_namespace(&ns).await?);
+            }
+            all
+        } else {
+            store.all_evidence_in_namespace(&req.namespace).await?
+        };
+
+        let relations: Vec<MemoryRelation> = if req.namespace == "*" {
+            let mut all = Vec::new();
+            for ns in crate::infra::MemoryStore::list_namespaces(&store).await? {
+                all.extend(store.all_relations_in_namespace(&ns).await?);
+            }
+            all
+        } else {
+            store.all_relations_in_namespace(&req.namespace).await?
+        };
+
         let now = self.clock.now();
         let record = BackupRecord {
             id: Uuid::new_v4(),
@@ -204,8 +270,8 @@ impl BackupService for DefaultBackupService {
             created_by: auth.agent_id.clone(),
             note: req.note.clone(),
             entry_count: entries.len(),
-            checksum: Self::checksum_of(&entries),
-            payload: Self::payload_of(&req.namespace, &entries),
+            checksum: Self::checksum_v2(&entries, &evidences, &relations),
+            payload: Self::payload_of(&req.namespace, &entries, &evidences, &relations),
             retain_until: None,
             created_at: now,
         };
@@ -234,9 +300,21 @@ impl BackupService for DefaultBackupService {
         let store = self.scoped(auth);
         let backup = store.get_backup(req.backup_id).await?;
 
-        // 完整性校验：重建校验和与写入时比对
+        // 完整性校验：重建校验和与写入时比对（兼容 v1 与 v2）
+        let ver = backup
+            .payload
+            .get("version")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1);
         let entries = Self::entries_of(&backup)?;
-        let actual = Self::checksum_of(&entries);
+        let evidences = Self::evidences_of(&backup)?;
+        let relations = Self::relations_of(&backup)?;
+
+        let actual = if ver >= 2 {
+            Self::checksum_v2(&entries, &evidences, &relations)
+        } else {
+            Self::checksum_v1(&entries)
+        };
         if actual != backup.checksum {
             return Err(HubError::Internal(anyhow::anyhow!(
                 "备份校验和不匹配（内容可能已损坏）"
@@ -283,6 +361,9 @@ impl BackupService for DefaultBackupService {
                 for cur in store.all_in_namespace(ns, true).await? {
                     store.delete(&cur.namespace, cur.id).await?;
                 }
+                for cur in store.all_evidence_in_namespace(ns).await? {
+                    store.delete_evidence(&cur.namespace, cur.id).await?;
+                }
             }
         } else {
             for ns in &namespaces {
@@ -290,7 +371,22 @@ impl BackupService for DefaultBackupService {
             }
         }
 
-        for mut e in entries {
+        // 恢复证据存根
+        for ev in &evidences {
+            let _ = store
+                .append_evidence(&NewEvidence {
+                    id: Some(ev.id),
+                    namespace: ev.namespace.clone(),
+                    source_kind: ev.source_kind,
+                    source_ref: ev.source_ref.clone(),
+                    content_hash: ev.content_hash.clone(),
+                    excerpt: ev.excerpt.clone(),
+                    occurred_at: ev.occurred_at,
+                })
+                .await;
+        }
+
+        for mut e in entries.clone() {
             match store.get(&e.namespace, e.id).await {
                 Ok(cur) => {
                     if cur == e {
@@ -314,6 +410,31 @@ impl BackupService for DefaultBackupService {
                     report.created += 1;
                 }
             }
+        }
+
+        // 恢复实体关系网
+        for rel in &relations {
+            let rel_ns = if backup.namespace != ALL_NAMESPACES {
+                backup.namespace.clone()
+            } else {
+                entries
+                    .iter()
+                    .find(|e| e.id == rel.from_memory_id)
+                    .map(|e| e.namespace.clone())
+                    .unwrap_or_else(|| backup.namespace.clone())
+            };
+            let _ = store
+                .add_relation(
+                    &rel_ns,
+                    &NewMemoryRelation {
+                        from_memory_id: rel.from_memory_id,
+                        to_memory_id: rel.to_memory_id,
+                        relation_kind: rel.relation_kind,
+                        confidence: rel.confidence,
+                        source_evidence_id: rel.source_evidence_id,
+                    },
+                )
+                .await;
         }
 
         Ok(report)
@@ -352,8 +473,7 @@ impl BackupService for DefaultBackupService {
     }
 }
 
-impl DefaultBackupService {
-}
+impl DefaultBackupService {}
 
 /// 便捷构造：GrantChecker 的再导出（供二进制装配复用）
 pub fn grant_checker(store: Arc<dyn MemoryHubStore>) -> Arc<GrantChecker> {
@@ -368,10 +488,14 @@ mod tests {
         crate::account_scope::scope_name(&common::BOOTSTRAP_ACCOUNT_ID, ns)
     }
     use crate::domain::{
-        IntegrationProposal, MemoryFilter, MemoryKind, MemoryStatus, MemoryVersion,
-        NamespaceGrantRecord, NamespaceInfo, ProposalStatus,
+        EvidenceSourceKind, IntegrationProposal, MemoryEvidence, MemoryFilter, MemoryKind,
+        MemoryRelation, MemoryRelationKind, MemoryStatus, MemoryVersion, NamespaceGrantRecord,
+        NamespaceInfo, NewEvidence, NewMemoryRelation, ProposalStatus,
     };
-    use crate::infra::{BackupStore, Embedder, GrantStore, IntegrationStore, MemoryStore};
+    use crate::infra::{
+        BackupStore, Embedder, EvidenceStore, GrantStore, IntegrationStore, MemoryStore,
+        RelationStore,
+    };
     use crate::testing::TestEmbedder;
     use common::{AgentId, Scope};
     use std::collections::HashMap as StdHashMap;
@@ -385,6 +509,8 @@ mod tests {
         namespaces: RwLock<StdHashMap<String, NamespaceInfo>>,
         grants: RwLock<Vec<NamespaceGrantRecord>>,
         versions: RwLock<Vec<MemoryVersion>>,
+        evidences: RwLock<Vec<MemoryEvidence>>,
+        relations: RwLock<Vec<MemoryRelation>>,
     }
 
     impl TestHubStore {
@@ -407,6 +533,11 @@ mod tests {
                 merged_into: None,
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
+                scene: None,
+                layer: None,
+                valid_from: None,
+                valid_until: None,
+                occurred_at: None,
             };
             self.items
                 .write()
@@ -679,6 +810,134 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl EvidenceStore for TestHubStore {
+        async fn append_evidence(&self, ev: &NewEvidence) -> Result<MemoryEvidence> {
+            let record = MemoryEvidence {
+                id: ev.id.unwrap_or_else(Uuid::new_v4),
+                namespace: ev.namespace.clone(),
+                source_kind: ev.source_kind,
+                source_ref: ev.source_ref.clone(),
+                content_hash: ev.content_hash.clone(),
+                excerpt: ev.excerpt.clone(),
+                occurred_at: ev.occurred_at,
+                created_at: chrono::Utc::now(),
+            };
+            self.evidences.write().unwrap().push(record.clone());
+            Ok(record)
+        }
+        async fn get_evidence(&self, ns: &str, id: Uuid) -> Result<MemoryEvidence> {
+            self.evidences
+                .read()
+                .unwrap()
+                .iter()
+                .find(|e| e.namespace == ns && e.id == id)
+                .cloned()
+                .ok_or(HubError::NotFound)
+        }
+        async fn list_evidence(
+            &self,
+            ns: &str,
+            source_kind: Option<EvidenceSourceKind>,
+            source_ref: Option<&str>,
+            limit: usize,
+        ) -> Result<Vec<MemoryEvidence>> {
+            let list: Vec<_> = self
+                .evidences
+                .read()
+                .unwrap()
+                .iter()
+                .filter(|e| e.namespace == ns)
+                .filter(|e| source_kind.is_none_or(|k| e.source_kind == k))
+                .filter(|e| source_ref.is_none_or(|r| e.source_ref.as_deref() == Some(r)))
+                .take(limit)
+                .cloned()
+                .collect();
+            Ok(list)
+        }
+        async fn all_evidence_in_namespace(&self, ns: &str) -> Result<Vec<MemoryEvidence>> {
+            Ok(self
+                .evidences
+                .read()
+                .unwrap()
+                .iter()
+                .filter(|e| e.namespace == ns)
+                .cloned()
+                .collect())
+        }
+        async fn delete_evidence(&self, ns: &str, id: Uuid) -> Result<()> {
+            let mut list = self.evidences.write().unwrap();
+            let before = list.len();
+            list.retain(|e| !(e.namespace == ns && e.id == id));
+            if list.len() < before {
+                Ok(())
+            } else {
+                Err(HubError::NotFound)
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RelationStore for TestHubStore {
+        async fn add_relation(&self, _ns: &str, rel: &NewMemoryRelation) -> Result<MemoryRelation> {
+            let record = MemoryRelation {
+                from_memory_id: rel.from_memory_id,
+                to_memory_id: rel.to_memory_id,
+                relation_kind: rel.relation_kind,
+                confidence: rel.confidence,
+                source_evidence_id: rel.source_evidence_id,
+                created_at: chrono::Utc::now(),
+            };
+            self.relations.write().unwrap().push(record.clone());
+            Ok(record)
+        }
+        async fn list_relations_from(
+            &self,
+            _ns: &str,
+            from_memory_id: Uuid,
+        ) -> Result<Vec<MemoryRelation>> {
+            Ok(self
+                .relations
+                .read()
+                .unwrap()
+                .iter()
+                .filter(|r| r.from_memory_id == from_memory_id)
+                .cloned()
+                .collect())
+        }
+        async fn list_relations_to(
+            &self,
+            _ns: &str,
+            to_memory_id: Uuid,
+        ) -> Result<Vec<MemoryRelation>> {
+            Ok(self
+                .relations
+                .read()
+                .unwrap()
+                .iter()
+                .filter(|r| r.to_memory_id == to_memory_id)
+                .cloned()
+                .collect())
+        }
+        async fn delete_relation(
+            &self,
+            _ns: &str,
+            from_memory_id: Uuid,
+            to_memory_id: Uuid,
+            relation_kind: MemoryRelationKind,
+        ) -> Result<()> {
+            self.relations.write().unwrap().retain(|r| {
+                !(r.from_memory_id == from_memory_id
+                    && r.to_memory_id == to_memory_id
+                    && r.relation_kind == relation_kind)
+            });
+            Ok(())
+        }
+        async fn all_relations_in_namespace(&self, _ns: &str) -> Result<Vec<MemoryRelation>> {
+            Ok(self.relations.read().unwrap().clone())
+        }
+    }
+
     fn admin(agent: &str) -> AuthCtx {
         AuthCtx {
             agent_id: agent.to_string(),
@@ -873,7 +1132,10 @@ mod tests {
             .unwrap();
 
         // 后续改动为版本 B
-        let all = store.all_in_namespace(&scoped_ns("ns"), true).await.unwrap();
+        let all = store
+            .all_in_namespace(&scoped_ns("ns"), true)
+            .await
+            .unwrap();
         let mut cur = all[0].clone();
         cur.content = "被修改后的数据 B".to_string();
         store.save(&cur).await.unwrap();
@@ -892,7 +1154,10 @@ mod tests {
         let safety_id = replace_report.safety_backup_id.expect("必须生成安全备份");
 
         // 验证当前已被 v1 替换
-        let items_v1 = store.all_in_namespace(&scoped_ns("ns"), true).await.unwrap();
+        let items_v1 = store
+            .all_in_namespace(&scoped_ns("ns"), true)
+            .await
+            .unwrap();
         assert_eq!(items_v1[0].content, "原始数据 A");
 
         // 验证：使用 safety_backup_id 恢复可成功找回数据 B
@@ -907,7 +1172,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rollback_report.total, 1);
-        let items_rollback = store.all_in_namespace(&scoped_ns("ns"), true).await.unwrap();
+        let items_rollback = store
+            .all_in_namespace(&scoped_ns("ns"), true)
+            .await
+            .unwrap();
         assert_eq!(items_rollback[0].content, "被修改后的数据 B");
     }
 
@@ -952,6 +1220,8 @@ mod tests {
             "version": BACKUP_PAYLOAD_VERSION,
             "namespace": "ns",
             "entries": [],
+            "evidences": [],
+            "relations": [],
         });
         store.save_backup(&tampered).await.unwrap();
 

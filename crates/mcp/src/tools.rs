@@ -203,6 +203,16 @@ impl ToolDispatcher {
             confidence: Option<f32>,
             #[serde(default)]
             expires_in_seconds: Option<i64>,
+            #[serde(default)]
+            scene: Option<mem_core::MemoryScene>,
+            #[serde(default)]
+            layer: Option<mem_core::CognitiveLayer>,
+            #[serde(default)]
+            valid_from: Option<chrono::DateTime<chrono::Utc>>,
+            #[serde(default)]
+            valid_until: Option<chrono::DateTime<chrono::Utc>>,
+            #[serde(default)]
+            occurred_at: Option<chrono::DateTime<chrono::Utc>>,
         }
         match serde_json::from_value::<Req>(args) {
             Ok(req) => {
@@ -213,6 +223,11 @@ impl ToolDispatcher {
                     metadata: req.metadata,
                     confidence: req.confidence,
                     expires_in_seconds: req.expires_in_seconds,
+                    scene: req.scene,
+                    layer: req.layer,
+                    valid_from: req.valid_from,
+                    valid_until: req.valid_until,
+                    occurred_at: req.occurred_at,
                 };
                 match self
                     .memory

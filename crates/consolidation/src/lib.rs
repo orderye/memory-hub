@@ -57,6 +57,11 @@ mod tests {
             merged_into: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            scene: None,
+            layer: None,
+            valid_from: None,
+            valid_until: None,
+            occurred_at: None,
         }
     }
 

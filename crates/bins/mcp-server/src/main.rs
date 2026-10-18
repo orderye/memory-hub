@@ -9,12 +9,12 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use common::{AppConfig, AuthCtx};
+use consolidation::DefaultIntegrationService;
 use mcp::transport::{mcp_router, run_stdio, McpTransportState};
 use mcp::ToolDispatcher;
-use consolidation::DefaultIntegrationService;
 use mem_core::{
-    DefaultBackupService, DefaultMemoryService, Embedder, GrantChecker,
-    MemoryHubStore, TokenIntrospector,
+    DefaultBackupService, DefaultMemoryService, Embedder, GrantChecker, MemoryHubStore,
+    TokenIntrospector,
 };
 use std::sync::Arc;
 use store::{InMemoryHubStore, PostgresHubStore};

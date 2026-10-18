@@ -39,7 +39,8 @@ pub trait RateLimitStore: Send + Sync {
         key: &str,
         capacity: u32,
     ) -> Result<bool> {
-        self.try_acquire_in_window(dimension, key, capacity, 1).await
+        self.try_acquire_in_window(dimension, key, capacity, 1)
+            .await
     }
 
     /// 在指定窗口（秒）内最多放行 capacity 个请求
@@ -158,12 +159,24 @@ mod tests {
     async fn test_in_memory_rate_limit_store_window() {
         let store = InMemoryRateLimitStore::new();
         // 允许 2 次
-        assert!(store.try_acquire_in_window(RateDimension::User, "alice", 2, 60).await.unwrap());
-        assert!(store.try_acquire_in_window(RateDimension::User, "alice", 2, 60).await.unwrap());
+        assert!(store
+            .try_acquire_in_window(RateDimension::User, "alice", 2, 60)
+            .await
+            .unwrap());
+        assert!(store
+            .try_acquire_in_window(RateDimension::User, "alice", 2, 60)
+            .await
+            .unwrap());
         // 第 3 次超限
-        assert!(!store.try_acquire_in_window(RateDimension::User, "alice", 2, 60).await.unwrap());
+        assert!(!store
+            .try_acquire_in_window(RateDimension::User, "alice", 2, 60)
+            .await
+            .unwrap());
 
         // 另一个 key 不受影响
-        assert!(store.try_acquire_in_window(RateDimension::User, "bob", 2, 60).await.unwrap());
+        assert!(store
+            .try_acquire_in_window(RateDimension::User, "bob", 2, 60)
+            .await
+            .unwrap());
     }
 }

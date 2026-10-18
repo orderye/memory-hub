@@ -470,6 +470,11 @@ mod tests {
             merged_into: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            scene: None,
+            layer: None,
+            valid_from: None,
+            valid_until: None,
+            occurred_at: None,
         }
     }
 
@@ -626,7 +631,11 @@ mod tests {
         // 验证针对"微服务"查询，查询拆成"微服 服务"，doc_tokens 均包含
         let q2 = mem_core::tokenize_query_for_fts("微服务");
         for term in q2.split_whitespace() {
-            assert!(doc_tokens.contains(term), "文档词元应包含查询 2-gram: {}", term);
+            assert!(
+                doc_tokens.contains(term),
+                "文档词元应包含查询 2-gram: {}",
+                term
+            );
         }
     }
 }

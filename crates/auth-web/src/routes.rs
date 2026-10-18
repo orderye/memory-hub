@@ -1719,7 +1719,11 @@ mod tests {
     #[tokio::test]
     async fn test_login_rate_limiting_username_and_ip() {
         let s = state();
-        let _ = s.accounts.register("bob", "password123", "Bob", None).await.unwrap();
+        let _ = s
+            .accounts
+            .register("bob", "password123", "Bob", None)
+            .await
+            .unwrap();
 
         for _ in 0..5 {
             let resp = handle_login_submit(

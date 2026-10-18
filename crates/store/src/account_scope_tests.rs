@@ -37,20 +37,18 @@ fn entry(ns: &str, agent: &str, content: &str) -> MemoryEntry {
         merged_into: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        scene: None,
+        layer: None,
+        valid_from: None,
+        valid_until: None,
+        occurred_at: None,
     }
 }
 
 fn filter_ns(ns: &str) -> MemoryFilter {
     MemoryFilter {
         namespace: Some(ns.to_string()),
-        kinds: None,
-        statuses: None,
-        tags: None,
-        source_agent: None,
-        key: None,
-        text_contains: None,
-        before: None,
-        limit: None,
+        ..Default::default()
     }
 }
 
@@ -348,7 +346,10 @@ async fn test_insert_initial_creates_entry_and_version_atomically() {
     assert_eq!(e.version, 1);
     let history = sa.versions(e.id).await.unwrap();
     assert_eq!(history.len(), 1);
-    assert_eq!(history[0].change_type, mem_core::domain::VersionChange::Created);
+    assert_eq!(
+        history[0].change_type,
+        mem_core::domain::VersionChange::Created
+    );
     assert_eq!(history[0].content, "第一条记忆");
     assert_eq!(history[0].version, 1);
 }

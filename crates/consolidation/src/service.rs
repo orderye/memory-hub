@@ -5,10 +5,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use common::{AuthCtx, HubError, Result, Scope};
 use mem_core::{
-    account_scope::AccountScopedStore,
-    AccessChecker, Clock, Embedder, IntegrationProposal, IntegrationService, IntegrationStore,
-    MemoryEntry, MemoryHubStore, ResolveRequest, ScanReport, ScanRequest,
-    SystemClock,
+    account_scope::AccountScopedStore, AccessChecker, Clock, Embedder, IntegrationProposal,
+    IntegrationService, IntegrationStore, MemoryEntry, MemoryHubStore, ResolveRequest, ScanReport,
+    ScanRequest, SystemClock,
 };
 use std::sync::Arc;
 
@@ -144,9 +143,7 @@ mod tests {
         access::GrantChecker,
         account_scope::scope_name,
         algorithm::l2_normalize,
-        domain::{
-            IntegrationKind, MemoryKind, MemoryStatus, NamespaceGrantRecord, ProposalStatus,
-        },
+        domain::{IntegrationKind, MemoryKind, MemoryStatus, NamespaceGrantRecord, ProposalStatus},
         infra::{GrantStore, MemoryStore},
         ResolveAction,
     };
@@ -185,6 +182,11 @@ mod tests {
             merged_into: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            scene: None,
+            layer: None,
+            valid_from: None,
+            valid_until: None,
+            occurred_at: None,
         }
     }
 

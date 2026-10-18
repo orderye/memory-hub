@@ -15,9 +15,11 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use common::{AccountId, AgentId, HubError, Result};
 use mem_core::{
-    AccountRecord, BackupRecord, IntegrationKind, IntegrationProposal, MemoryEntry, MemoryFilter,
-    MemoryKind, MemoryStatus, MemoryVersion, Namespace, NamespaceGrantRecord, NamespaceInfo,
-    ProposalStatus, Scored, SessionRecord, VersionChange,
+    AccountRecord, BackupRecord, CognitiveLayer, EvidenceSourceKind, EvidenceStore,
+    IntegrationKind, IntegrationProposal, MemoryEntry, MemoryEvidence, MemoryFilter, MemoryKind,
+    MemoryRelation, MemoryRelationKind, MemoryScene, MemoryStatus, MemoryVersion, Namespace,
+    NamespaceGrantRecord, NamespaceInfo, NewEvidence, NewMemoryRelation, ProposalStatus,
+    RelationStore, Scored, SessionRecord, VersionChange,
 };
 use sqlx::postgres::{PgConnection, PgPool, PgPoolOptions, PgRow};
 use sqlx::Row;
@@ -35,6 +37,26 @@ mod mapping {
     pub fn parse_status(s: &str) -> Result<MemoryStatus> {
         MemoryStatus::parse(s)
             .ok_or_else(|| HubError::Internal(anyhow::anyhow!("未知记忆状态: {}", s)))
+    }
+
+    pub fn parse_scene(s: &str) -> Result<MemoryScene> {
+        MemoryScene::parse(s)
+            .ok_or_else(|| HubError::Internal(anyhow::anyhow!("未知记忆场景: {}", s)))
+    }
+
+    pub fn parse_layer(s: &str) -> Result<CognitiveLayer> {
+        CognitiveLayer::parse(s)
+            .ok_or_else(|| HubError::Internal(anyhow::anyhow!("未知认知分层: {}", s)))
+    }
+
+    pub fn parse_relation_kind(s: &str) -> Result<MemoryRelationKind> {
+        MemoryRelationKind::parse(s)
+            .ok_or_else(|| HubError::Internal(anyhow::anyhow!("未知关系类型: {}", s)))
+    }
+
+    pub fn parse_source_kind(s: &str) -> Result<EvidenceSourceKind> {
+        EvidenceSourceKind::parse(s)
+            .ok_or_else(|| HubError::Internal(anyhow::anyhow!("未知证据来源类型: {}", s)))
     }
 
     pub fn parse_integration_kind(s: &str) -> Result<IntegrationKind> {
@@ -147,6 +169,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
     (
         "20261013000005_cjk_bigram_fts",
         include_str!("../migrations/20261013000005_cjk_bigram_fts.sql"),
+    ),
+    (
+        "20261018000006_cognitive_evidence_and_relations",
+        include_str!("../migrations/20261018000006_cognitive_evidence_and_relations.sql"),
     ),
 ];
 
@@ -337,25 +363,44 @@ impl PostgresHubStore {
     fn entry_from_row(r: &PgRow) -> Result<MemoryEntry> {
         let kind: String = r.try_get("kind").pg()?;
         let status: String = r.try_get("status").pg()?;
-        let embedding: Option<String> = r.try_get("embedding").ok();
+        let embedding: Option<String> = r.try_get("embedding").ok().flatten();
+        let scene_str: Option<String> = r.try_get("scene").ok().flatten();
+        let layer_str: Option<String> = r.try_get("layer").ok().flatten();
+        let scene = match scene_str.as_deref() {
+            Some(s) => Some(mapping::parse_scene(s)?),
+            None => None,
+        };
+        let layer = match layer_str.as_deref() {
+            Some(s) => Some(mapping::parse_layer(s)?),
+            None => None,
+        };
+        let valid_from: Option<DateTime<Utc>> = r.try_get("valid_from").ok().flatten();
+        let valid_until: Option<DateTime<Utc>> = r.try_get("valid_until").ok().flatten();
+        let occurred_at: Option<DateTime<Utc>> = r.try_get("occurred_at").ok().flatten();
+
         Ok(MemoryEntry {
             id: r.try_get("id").pg()?,
             namespace: r.try_get("namespace").pg()?,
-            key: r.try_get("key").ok(),
+            key: r.try_get("key").ok().flatten(),
             kind: mapping::parse_kind(&kind)?,
             content: r.try_get("content").pg()?,
             tags: r.try_get("tags").pg()?,
             metadata: r.try_get("metadata").pg()?,
             embedding: embedding.map(|t| mapping::parse_vector(&t)),
-            embedding_model: r.try_get("embedding_model").ok(),
+            embedding_model: r.try_get("embedding_model").ok().flatten(),
             source_agent: r.try_get("source_agent").pg()?,
             confidence: r.try_get("confidence").pg()?,
             status: mapping::parse_status(&status)?,
             version: r.try_get("version").pg()?,
-            expires_at: r.try_get("expires_at").ok(),
-            merged_into: r.try_get("merged_into").ok(),
+            expires_at: r.try_get("expires_at").ok().flatten(),
+            merged_into: r.try_get("merged_into").ok().flatten(),
             created_at: r.try_get("created_at").pg()?,
             updated_at: r.try_get("updated_at").pg()?,
+            scene,
+            layer,
+            valid_from,
+            valid_until,
+            occurred_at,
         })
     }
 
@@ -364,11 +409,11 @@ impl PostgresHubStore {
             id: r.try_get("id").pg()?,
             namespace: r.try_get("namespace").pg()?,
             created_by: r.try_get("created_by").pg()?,
-            note: r.try_get("note").ok(),
+            note: r.try_get("note").ok().flatten(),
             entry_count: r.try_get::<i32, _>("entry_count").unwrap_or(0) as usize,
             checksum: r.try_get("checksum").pg()?,
             payload: r.try_get("payload").pg()?,
-            retain_until: r.try_get("retain_until").ok(),
+            retain_until: r.try_get("retain_until").ok().flatten(),
             created_at: r.try_get("created_at").pg()?,
         })
     }
@@ -380,23 +425,44 @@ impl PostgresHubStore {
             id: r.try_get("id").pg()?,
             namespace: r.try_get("namespace").pg()?,
             created_by: r.try_get("created_by").pg()?,
-            note: r.try_get("note").ok(),
+            note: r.try_get("note").ok().flatten(),
             entry_count: r.try_get::<i32, _>("entry_count").unwrap_or(0) as usize,
             checksum: r.try_get("checksum").pg()?,
             payload: serde_json::Value::Null,
-            retain_until: r.try_get("retain_until").ok(),
+            retain_until: r.try_get("retain_until").ok().flatten(),
+            created_at: r.try_get("created_at").pg()?,
+        })
+    }
+
+    fn evidence_from_row(r: &PgRow) -> Result<MemoryEvidence> {
+        let source_kind_str: String = r.try_get("source_kind").pg()?;
+        let source_kind = mapping::parse_source_kind(&source_kind_str)?;
+        Ok(MemoryEvidence {
+            id: r.try_get("id").pg()?,
+            namespace: r.try_get("namespace").pg()?,
+            source_kind,
+            source_ref: r.try_get("source_ref").ok().flatten(),
+            content_hash: r.try_get("content_hash").pg()?,
+            excerpt: r.try_get("excerpt").ok().flatten(),
+            occurred_at: r.try_get("occurred_at").ok().flatten(),
+            created_at: r.try_get("created_at").pg()?,
+        })
+    }
+
+    fn relation_from_row(r: &PgRow) -> Result<MemoryRelation> {
+        let kind_str: String = r.try_get("relation_kind").pg()?;
+        let relation_kind = mapping::parse_relation_kind(&kind_str)?;
+        Ok(MemoryRelation {
+            from_memory_id: r.try_get("from_memory_id").pg()?,
+            to_memory_id: r.try_get("to_memory_id").pg()?,
+            relation_kind,
+            confidence: r.try_get::<f32, _>("confidence").unwrap_or(1.0),
+            source_evidence_id: r.try_get("source_evidence_id").ok().flatten(),
             created_at: r.try_get("created_at").pg()?,
         })
     }
 
     /// 在给定连接上写回条目，返回受影响行数。
-    ///
-    /// `expected_version` 为 `Some(v)` 时附加 `and version = $17`：库中当前版本不是 v
-    /// 就一行都不更新 —— 并发修订在此被判为冲突，而不是后写者静默覆盖先写者的
-    /// 修订与版本推进。`None`（trait 的 `save`）保持原有的无条件写回语义。
-    ///
-    /// 以连接为参数而非直接用池，是为了让 `revise` 能把"写条目 + 追加历史"
-    /// 放进同一个事务。
     async fn apply_update_on(
         conn: &mut PgConnection,
         entry: &MemoryEntry,
@@ -405,7 +471,7 @@ impl PostgresHubStore {
         let embedding_literal = entry.embedding.as_ref().map(|v| mapping::vector_literal(v));
         let tsv_tokens = mem_core::tokenize_for_fts(&entry.content);
         let guard = if expected_version.is_some() {
-            " and version = $18"
+            " and version = $23"
         } else {
             ""
         };
@@ -415,7 +481,8 @@ impl PostgresHubStore {
               key = $3, kind = $4, content = $5, tags = $6, metadata = $7,
               embedding = $8::vector, embedding_model = $9, source_agent = $10,
               confidence = $11, status = $12, version = $13, expires_at = $14,
-              merged_into = $15, updated_at = $16, tsv_tokens = $17
+              merged_into = $15, updated_at = $16, tsv_tokens = $17,
+              scene = $18, layer = $19, valid_from = $20, valid_until = $21, occurred_at = $22
             where namespace = $1 and id = $2{guard}
             "#,
         );
@@ -436,7 +503,12 @@ impl PostgresHubStore {
             .bind(entry.expires_at)
             .bind(entry.merged_into)
             .bind(entry.updated_at)
-            .bind(&tsv_tokens);
+            .bind(&tsv_tokens)
+            .bind(entry.scene.map(|s| s.as_str()))
+            .bind(entry.layer.map(|l| l.as_str()))
+            .bind(entry.valid_from)
+            .bind(entry.valid_until)
+            .bind(entry.occurred_at);
         if let Some(v) = expected_version {
             query = query.bind(v);
         }
@@ -449,8 +521,9 @@ impl PostgresHubStore {
         sqlx::query(
             r#"
             insert into memory_versions
-              (memory_id, version, content, tags, metadata, confidence, changed_by, change_type, changed_at)
-            values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+              (memory_id, version, content, tags, metadata, confidence, changed_by, change_type, changed_at,
+               scene, layer, valid_from, valid_until, occurred_at)
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             on conflict (memory_id, version) do nothing
             "#,
         )
@@ -468,6 +541,11 @@ impl PostgresHubStore {
             VersionChange::Merged => "merged",
         })
         .bind(v.changed_at)
+        .bind(v.scene.map(|s| s.as_str()))
+        .bind(v.layer.map(|l| l.as_str()))
+        .bind(v.valid_from)
+        .bind(v.valid_until)
+        .bind(v.occurred_at)
         .execute(&mut *conn)
         .await
         .pg()?;
@@ -482,19 +560,20 @@ impl PostgresHubStore {
             namespace: r.try_get("namespace").pg()?,
             kind: mapping::parse_integration_kind(&kind)?,
             member_ids: r.try_get("member_ids").pg()?,
-            suggested_survivor: r.try_get("suggested_survivor").ok(),
+            suggested_survivor: r.try_get("suggested_survivor").ok().flatten(),
             similarity: r.try_get::<f32, _>("similarity").unwrap_or(0.0),
             status: mapping::parse_proposal_status(&status)?,
-            resolution_note: r.try_get("resolution_note").ok(),
+            resolution_note: r.try_get("resolution_note").ok().flatten(),
             created_at: r.try_get("created_at").pg()?,
-            resolved_at: r.try_get("resolved_at").ok(),
+            resolved_at: r.try_get("resolved_at").ok().flatten(),
         })
     }
 
     /// 全列 SELECT（供行映射复用）
     const ENTRY_COLUMNS: &'static str = "id, namespace, key, kind, content, tags, metadata, \
          embedding::text as embedding, embedding_model, source_agent, confidence, status, \
-         version, expires_at, merged_into, created_at, updated_at";
+         version, expires_at, merged_into, created_at, updated_at, \
+         scene, layer, valid_from, valid_until, occurred_at";
 }
 
 #[async_trait]
@@ -507,9 +586,9 @@ impl mem_core::MemoryStore for PostgresHubStore {
             insert into memories
               (id, namespace, key, kind, content, tags, metadata, embedding, embedding_model,
                source_agent, confidence, status, version, expires_at, merged_into,
-               created_at, updated_at, tsv_tokens)
+               created_at, updated_at, tsv_tokens, scene, layer, valid_from, valid_until, occurred_at)
             values
-              ($1, $2, $3, $4, $5, $6, $7, $8::vector, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+              ($1, $2, $3, $4, $5, $6, $7, $8::vector, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
             "#,
         )
         .bind(entry.id)
@@ -530,6 +609,11 @@ impl mem_core::MemoryStore for PostgresHubStore {
         .bind(entry.created_at)
         .bind(entry.updated_at)
         .bind(&tsv_tokens)
+        .bind(entry.scene.map(|s| s.as_str()))
+        .bind(entry.layer.map(|l| l.as_str()))
+        .bind(entry.valid_from)
+        .bind(entry.valid_until)
+        .bind(entry.occurred_at)
         .execute(&self.pool)
         .await
         .pg()?;
@@ -546,9 +630,9 @@ impl mem_core::MemoryStore for PostgresHubStore {
             insert into memories
               (id, namespace, key, kind, content, tags, metadata, embedding, embedding_model,
                source_agent, confidence, status, version, expires_at, merged_into,
-               created_at, updated_at, tsv_tokens)
+               created_at, updated_at, tsv_tokens, scene, layer, valid_from, valid_until, occurred_at)
             values
-              ($1, $2, $3, $4, $5, $6, $7, $8::vector, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+              ($1, $2, $3, $4, $5, $6, $7, $8::vector, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
             "#,
         )
         .bind(entry.id)
@@ -569,6 +653,11 @@ impl mem_core::MemoryStore for PostgresHubStore {
         .bind(entry.created_at)
         .bind(entry.updated_at)
         .bind(&tsv_tokens)
+        .bind(entry.scene.map(|s| s.as_str()))
+        .bind(entry.layer.map(|l| l.as_str()))
+        .bind(entry.valid_from)
+        .bind(entry.valid_until)
+        .bind(entry.occurred_at)
         .execute(&mut *tx)
         .await
         .pg()?;
@@ -583,6 +672,11 @@ impl mem_core::MemoryStore for PostgresHubStore {
             changed_by: entry.source_agent.clone(),
             change_type: VersionChange::Created,
             changed_at: entry.created_at,
+            scene: entry.scene,
+            layer: entry.layer,
+            valid_from: entry.valid_from,
+            valid_until: entry.valid_until,
+            occurred_at: entry.occurred_at,
         };
         Self::insert_version_on(&mut tx, &row).await?;
         tx.commit().await.pg()?;
@@ -667,6 +761,11 @@ impl mem_core::MemoryStore for PostgresHubStore {
             changed_by: entry.source_agent.clone(),
             change_type: change,
             changed_at: entry.updated_at,
+            scene: entry.scene,
+            layer: entry.layer,
+            valid_from: entry.valid_from,
+            valid_until: entry.valid_until,
+            occurred_at: entry.occurred_at,
         };
         Self::insert_version_on(&mut tx, &row).await?;
         tx.commit().await.pg()?;
@@ -727,6 +826,19 @@ impl mem_core::MemoryStore for PostgresHubStore {
                 .push_bind(query_tokens)
                 .push(")");
         }
+        if let Some(scene) = &filter.scene {
+            qb.push(" and scene = ").push_bind(scene.as_str());
+        }
+        if let Some(layer) = &filter.layer {
+            qb.push(" and layer = ").push_bind(layer.as_str());
+        }
+        if let Some(valid_at) = &filter.valid_at {
+            qb.push(" and (valid_from is null or valid_from <= ")
+                .push_bind(*valid_at)
+                .push(") and (valid_until is null or valid_until > ")
+                .push_bind(*valid_at)
+                .push(")");
+        }
         if let Some((ts, id)) = &filter.before {
             qb.push(" and (updated_at, id) < (")
                 .push_bind(*ts)
@@ -783,6 +895,19 @@ impl mem_core::MemoryStore for PostgresHubStore {
             let query_tokens = mem_core::tokenize_query_for_fts(text);
             qb.push(" and to_tsvector('simple', tsv_tokens) @@ plainto_tsquery('simple', ")
                 .push_bind(query_tokens)
+                .push(")");
+        }
+        if let Some(scene) = &filter.scene {
+            qb.push(" and scene = ").push_bind(scene.as_str());
+        }
+        if let Some(layer) = &filter.layer {
+            qb.push(" and layer = ").push_bind(layer.as_str());
+        }
+        if let Some(valid_at) = &filter.valid_at {
+            qb.push(" and (valid_from is null or valid_from <= ")
+                .push_bind(*valid_at)
+                .push(") and (valid_until is null or valid_until > ")
+                .push_bind(*valid_at)
                 .push(")");
         }
         let count: i64 = qb.build_query_scalar().fetch_one(&self.pool).await.pg()?;
@@ -869,7 +994,8 @@ impl mem_core::MemoryStore for PostgresHubStore {
     async fn versions(&self, id: Uuid) -> Result<Vec<MemoryVersion>> {
         let rows = sqlx::query(
             r#"
-            select memory_id, version, content, tags, metadata, confidence, changed_by, change_type, changed_at
+            select memory_id, version, content, tags, metadata, confidence, changed_by, change_type, changed_at,
+                   scene, layer, valid_from, valid_until, occurred_at
             from memory_versions where memory_id = $1 order by version
             "#,
         )
@@ -881,6 +1007,19 @@ impl mem_core::MemoryStore for PostgresHubStore {
         let mut out = Vec::with_capacity(rows.len());
         for r in &rows {
             let change: String = r.try_get("change_type").pg()?;
+            let scene_str: Option<String> = r.try_get("scene").ok().flatten();
+            let layer_str: Option<String> = r.try_get("layer").ok().flatten();
+            let scene = match scene_str.as_deref() {
+                Some(s) => Some(mapping::parse_scene(s)?),
+                None => None,
+            };
+            let layer = match layer_str.as_deref() {
+                Some(s) => Some(mapping::parse_layer(s)?),
+                None => None,
+            };
+            let valid_from: Option<DateTime<Utc>> = r.try_get("valid_from").ok().flatten();
+            let valid_until: Option<DateTime<Utc>> = r.try_get("valid_until").ok().flatten();
+            let occurred_at: Option<DateTime<Utc>> = r.try_get("occurred_at").ok().flatten();
             out.push(MemoryVersion {
                 memory_id: r.try_get("memory_id").pg()?,
                 version: r.try_get("version").pg()?,
@@ -891,6 +1030,11 @@ impl mem_core::MemoryStore for PostgresHubStore {
                 changed_by: r.try_get("changed_by").pg()?,
                 change_type: mapping::parse_version_change(&change)?,
                 changed_at: r.try_get("changed_at").pg()?,
+                scene,
+                layer,
+                valid_from,
+                valid_until,
+                occurred_at,
             });
         }
         Ok(out)
@@ -903,11 +1047,12 @@ impl mem_core::MemoryStore for PostgresHubStore {
             with expired as (
               update memories set status = 'archived', version = version + 1, updated_at = $1
               where status = 'active' and expires_at is not null and expires_at <= $1
-              returning id, version, content, tags, metadata, confidence
+              returning id, version, content, tags, metadata, confidence, scene, layer, valid_from, valid_until, occurred_at
             )
             insert into memory_versions
-              (memory_id, version, content, tags, metadata, confidence, changed_by, change_type, changed_at)
-            select id, version, content, tags, metadata, confidence, 'system', 'archived', $1
+              (memory_id, version, content, tags, metadata, confidence, changed_by, change_type, changed_at,
+               scene, layer, valid_from, valid_until, occurred_at)
+            select id, version, content, tags, metadata, confidence, 'system', 'archived', $1, scene, layer, valid_from, valid_until, occurred_at
             from expired
             on conflict (memory_id, version) do nothing
             "#,
@@ -920,10 +1065,7 @@ impl mem_core::MemoryStore for PostgresHubStore {
     }
 
     async fn ping(&self) -> Result<()> {
-        sqlx::query("select 1")
-            .execute(&self.pool)
-            .await
-            .pg()?;
+        sqlx::query("select 1").execute(&self.pool).await.pg()?;
         Ok(())
     }
 }
@@ -1669,6 +1811,274 @@ impl mem_core::AccountStore for PostgresHubStore {
     }
 }
 
+#[async_trait]
+impl EvidenceStore for PostgresHubStore {
+    async fn append_evidence(&self, evidence: &NewEvidence) -> Result<MemoryEvidence> {
+        let id = evidence.id.unwrap_or_else(Uuid::new_v4);
+        let row = sqlx::query(
+            r#"
+            insert into memory_evidence (id, namespace, source_kind, source_ref, content_hash, excerpt, occurred_at, created_at)
+            values ($1, $2, $3, $4, $5, $6, $7, now())
+            returning id, namespace, source_kind, source_ref, content_hash, excerpt, occurred_at, created_at
+            "#,
+        )
+        .bind(id)
+        .bind(&evidence.namespace)
+        .bind(evidence.source_kind.as_str())
+        .bind(&evidence.source_ref)
+        .bind(&evidence.content_hash)
+        .bind(&evidence.excerpt)
+        .bind(evidence.occurred_at)
+        .fetch_one(&self.pool)
+        .await
+        .pg()?;
+
+        Self::evidence_from_row(&row)
+    }
+
+    async fn get_evidence(&self, namespace: &str, id: Uuid) -> Result<MemoryEvidence> {
+        let row = sqlx::query(
+            r#"
+            select id, namespace, source_kind, source_ref, content_hash, excerpt, occurred_at, created_at
+            from memory_evidence
+            where namespace = $1 and id = $2
+            "#,
+        )
+        .bind(namespace)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .pg()?;
+
+        match row {
+            Some(r) => Self::evidence_from_row(&r),
+            None => Err(HubError::NotFound),
+        }
+    }
+
+    async fn list_evidence(
+        &self,
+        namespace: &str,
+        source_kind: Option<EvidenceSourceKind>,
+        source_ref: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MemoryEvidence>> {
+        let mut builder: sqlx::QueryBuilder<'_, sqlx::Postgres> = sqlx::QueryBuilder::new(
+            "select id, namespace, source_kind, source_ref, content_hash, excerpt, occurred_at, created_at from memory_evidence where namespace = ",
+        );
+        builder.push_bind(namespace);
+
+        if let Some(sk) = source_kind {
+            builder.push(" and source_kind = ");
+            builder.push_bind(sk.as_str());
+        }
+        if let Some(sref) = source_ref {
+            builder.push(" and source_ref = ");
+            builder.push_bind(sref);
+        }
+
+        builder.push(" order by created_at desc limit ");
+        builder.push_bind(limit as i64);
+
+        let rows = builder.build().fetch_all(&self.pool).await.pg()?;
+        rows.iter().map(Self::evidence_from_row).collect()
+    }
+
+    async fn all_evidence_in_namespace(&self, namespace: &str) -> Result<Vec<MemoryEvidence>> {
+        let rows = sqlx::query(
+            r#"
+            select id, namespace, source_kind, source_ref, content_hash, excerpt, occurred_at, created_at
+            from memory_evidence
+            where namespace = $1
+            order by created_at desc
+            "#,
+        )
+        .bind(namespace)
+        .fetch_all(&self.pool)
+        .await
+        .pg()?;
+
+        rows.iter().map(Self::evidence_from_row).collect()
+    }
+
+    async fn delete_evidence(&self, namespace: &str, id: Uuid) -> Result<()> {
+        let res = sqlx::query("delete from memory_evidence where namespace = $1 and id = $2")
+            .bind(namespace)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .pg()?;
+
+        if res.rows_affected() == 0 {
+            Err(HubError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[async_trait]
+impl RelationStore for PostgresHubStore {
+    async fn add_relation(
+        &self,
+        namespace: &str,
+        relation: &NewMemoryRelation,
+    ) -> Result<MemoryRelation> {
+        if relation.from_memory_id == relation.to_memory_id {
+            return Err(HubError::InvalidArgument(
+                "实体自环关系不允许 (from == to)".into(),
+            ));
+        }
+
+        let count: i64 = sqlx::query_scalar(
+            "select count(*) from memories where namespace = $1 and id in ($2, $3)",
+        )
+        .bind(namespace)
+        .bind(relation.from_memory_id)
+        .bind(relation.to_memory_id)
+        .fetch_one(&self.pool)
+        .await
+        .pg()?;
+
+        if count != 2 {
+            return Err(HubError::NotFound);
+        }
+
+        if let Some(ev_id) = relation.source_evidence_id {
+            let ev_exists: bool = sqlx::query_scalar(
+                "select exists(select 1 from memory_evidence where namespace = $1 and id = $2)",
+            )
+            .bind(namespace)
+            .bind(ev_id)
+            .fetch_one(&self.pool)
+            .await
+            .pg()?;
+
+            if !ev_exists {
+                return Err(HubError::NotFound);
+            }
+        }
+
+        let row = sqlx::query(
+            r#"
+            insert into memory_relations (from_memory_id, to_memory_id, relation_kind, confidence, source_evidence_id, created_at)
+            values ($1, $2, $3, $4, $5, now())
+            on conflict (from_memory_id, to_memory_id, relation_kind) do update set
+                confidence = excluded.confidence,
+                source_evidence_id = coalesce(excluded.source_evidence_id, memory_relations.source_evidence_id)
+            returning from_memory_id, to_memory_id, relation_kind, confidence, source_evidence_id, created_at
+            "#,
+        )
+        .bind(relation.from_memory_id)
+        .bind(relation.to_memory_id)
+        .bind(relation.relation_kind.as_str())
+        .bind(relation.confidence)
+        .bind(relation.source_evidence_id)
+        .fetch_one(&self.pool)
+        .await
+        .pg()?;
+
+        Self::relation_from_row(&row)
+    }
+
+    async fn list_relations_from(
+        &self,
+        namespace: &str,
+        from_memory_id: Uuid,
+    ) -> Result<Vec<MemoryRelation>> {
+        let rows = sqlx::query(
+            r#"
+            select r.from_memory_id, r.to_memory_id, r.relation_kind, r.confidence, r.source_evidence_id, r.created_at
+            from memory_relations r
+            join memories m on r.from_memory_id = m.id
+            where m.namespace = $1 and r.from_memory_id = $2
+            order by r.created_at desc
+            "#,
+        )
+        .bind(namespace)
+        .bind(from_memory_id)
+        .fetch_all(&self.pool)
+        .await
+        .pg()?;
+
+        rows.iter().map(Self::relation_from_row).collect()
+    }
+
+    async fn list_relations_to(
+        &self,
+        namespace: &str,
+        to_memory_id: Uuid,
+    ) -> Result<Vec<MemoryRelation>> {
+        let rows = sqlx::query(
+            r#"
+            select r.from_memory_id, r.to_memory_id, r.relation_kind, r.confidence, r.source_evidence_id, r.created_at
+            from memory_relations r
+            join memories m on r.to_memory_id = m.id
+            where m.namespace = $1 and r.to_memory_id = $2
+            order by r.created_at desc
+            "#,
+        )
+        .bind(namespace)
+        .bind(to_memory_id)
+        .fetch_all(&self.pool)
+        .await
+        .pg()?;
+
+        rows.iter().map(Self::relation_from_row).collect()
+    }
+
+    async fn delete_relation(
+        &self,
+        namespace: &str,
+        from_memory_id: Uuid,
+        to_memory_id: Uuid,
+        relation_kind: MemoryRelationKind,
+    ) -> Result<()> {
+        let res = sqlx::query(
+            r#"
+            delete from memory_relations r
+            using memories m
+            where r.from_memory_id = m.id
+              and m.namespace = $1
+              and r.from_memory_id = $2
+              and r.to_memory_id = $3
+              and r.relation_kind = $4
+            "#,
+        )
+        .bind(namespace)
+        .bind(from_memory_id)
+        .bind(to_memory_id)
+        .bind(relation_kind.as_str())
+        .execute(&self.pool)
+        .await
+        .pg()?;
+
+        if res.rows_affected() == 0 {
+            Err(HubError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn all_relations_in_namespace(&self, namespace: &str) -> Result<Vec<MemoryRelation>> {
+        let rows = sqlx::query(
+            r#"
+            select r.from_memory_id, r.to_memory_id, r.relation_kind, r.confidence, r.source_evidence_id, r.created_at
+            from memory_relations r
+            join memories m on r.from_memory_id = m.id
+            where m.namespace = $1
+            order by r.created_at desc
+            "#,
+        )
+        .bind(namespace)
+        .fetch_all(&self.pool)
+        .await
+        .pg()?;
+
+        rows.iter().map(Self::relation_from_row).collect()
+    }
+}
+
 /// accounts 行 → AccountRecord
 fn account_record_of(r: &PgRow) -> AccountRecord {
     AccountRecord {
@@ -1687,7 +2097,7 @@ mod tests {
 
     #[test]
     fn test_migrations_registered() {
-        assert_eq!(MIGRATIONS.len(), 5);
+        assert_eq!(MIGRATIONS.len(), 6);
         assert!(MIGRATIONS[0].0.starts_with("20261011"));
         // 迁移清单必须按版本号字典序排列（执行顺序依赖于此）
         for w in MIGRATIONS.windows(2) {
@@ -1854,6 +2264,11 @@ mod pg_integration {
             merged_into: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            scene: None,
+            layer: None,
+            valid_from: None,
+            valid_until: None,
+            occurred_at: None,
         }
     }
 
@@ -1893,6 +2308,11 @@ mod pg_integration {
                 changed_by: "it-agent".to_string(),
                 change_type: VersionChange::Updated,
                 changed_at: Utc::now(),
+                scene: None,
+                layer: None,
+                valid_from: None,
+                valid_until: None,
+                occurred_at: None,
             })
             .await
             .unwrap();

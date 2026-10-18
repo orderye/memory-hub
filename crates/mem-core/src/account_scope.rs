@@ -13,12 +13,13 @@
 //! 因此备份负载（内部存用户可见名）恢复往返不会二次加前缀。
 
 use crate::domain::{
-    BackupRecord, IntegrationProposal, MemoryEntry, MemoryFilter, MemoryKind, MemoryVersion,
-    Namespace, NamespaceGrantRecord, NamespaceInfo, ProposalStatus, Scored,
+    BackupRecord, EvidenceSourceKind, IntegrationProposal, MemoryEntry, MemoryEvidence,
+    MemoryFilter, MemoryKind, MemoryRelation, MemoryRelationKind, MemoryVersion, Namespace,
+    NamespaceGrantRecord, NamespaceInfo, NewEvidence, NewMemoryRelation, ProposalStatus, Scored,
 };
 use crate::infra::{
-    AgentRecord, AgentRegistration, AgentStore, BackupStore, GrantStore, IntegrationStore,
-    MemoryStore,
+    AgentRecord, AgentRegistration, AgentStore, BackupStore, EvidenceStore, GrantStore,
+    IntegrationStore, MemoryStore, RelationStore,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -437,6 +438,126 @@ impl<S: AgentStore + ?Sized> AgentStore for AccountScopedStore<S> {
 
     async fn verify_agent_secret(&self, agent_id: &AgentId, secret: &str) -> Result<bool> {
         self.inner.verify_agent_secret(agent_id, secret).await
+    }
+}
+
+// ===== EvidenceStore =====
+
+#[async_trait]
+impl<S: EvidenceStore + ?Sized> EvidenceStore for AccountScopedStore<S> {
+    async fn append_evidence(&self, evidence: &NewEvidence) -> Result<MemoryEvidence> {
+        let mut ev = evidence.clone();
+        ev.namespace = self.scoped(&ev.namespace);
+        let mut saved = self.inner.append_evidence(&ev).await?;
+        saved.namespace = self.unscoped(&saved.namespace);
+        Ok(saved)
+    }
+
+    async fn get_evidence(&self, namespace: &str, id: Uuid) -> Result<MemoryEvidence> {
+        let mut ev = self.inner.get_evidence(&self.scoped(namespace), id).await?;
+        self.assert_owned(&ev.namespace)?;
+        ev.namespace = self.unscoped(&ev.namespace);
+        Ok(ev)
+    }
+
+    async fn list_evidence(
+        &self,
+        namespace: &str,
+        source_kind: Option<EvidenceSourceKind>,
+        source_ref: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MemoryEvidence>> {
+        let rows = self
+            .inner
+            .list_evidence(&self.scoped(namespace), source_kind, source_ref, limit)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter(|e| in_scope(&self.account, &e.namespace))
+            .map(|mut e| {
+                e.namespace = self.unscoped(&e.namespace);
+                e
+            })
+            .collect())
+    }
+
+    async fn all_evidence_in_namespace(&self, namespace: &str) -> Result<Vec<MemoryEvidence>> {
+        let rows = self
+            .inner
+            .all_evidence_in_namespace(&self.scoped(namespace))
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter(|e| in_scope(&self.account, &e.namespace))
+            .map(|mut e| {
+                e.namespace = self.unscoped(&e.namespace);
+                e
+            })
+            .collect())
+    }
+
+    async fn delete_evidence(&self, namespace: &str, id: Uuid) -> Result<()> {
+        self.inner
+            .delete_evidence(&self.scoped(namespace), id)
+            .await
+    }
+}
+
+// ===== RelationStore =====
+
+#[async_trait]
+impl<S: RelationStore + ?Sized> RelationStore for AccountScopedStore<S> {
+    async fn add_relation(
+        &self,
+        namespace: &str,
+        relation: &NewMemoryRelation,
+    ) -> Result<MemoryRelation> {
+        self.inner
+            .add_relation(&self.scoped(namespace), relation)
+            .await
+    }
+
+    async fn list_relations_from(
+        &self,
+        namespace: &str,
+        from_memory_id: Uuid,
+    ) -> Result<Vec<MemoryRelation>> {
+        self.inner
+            .list_relations_from(&self.scoped(namespace), from_memory_id)
+            .await
+    }
+
+    async fn list_relations_to(
+        &self,
+        namespace: &str,
+        to_memory_id: Uuid,
+    ) -> Result<Vec<MemoryRelation>> {
+        self.inner
+            .list_relations_to(&self.scoped(namespace), to_memory_id)
+            .await
+    }
+
+    async fn delete_relation(
+        &self,
+        namespace: &str,
+        from_memory_id: Uuid,
+        to_memory_id: Uuid,
+        relation_kind: MemoryRelationKind,
+    ) -> Result<()> {
+        self.inner
+            .delete_relation(
+                &self.scoped(namespace),
+                from_memory_id,
+                to_memory_id,
+                relation_kind,
+            )
+            .await
+    }
+
+    async fn all_relations_in_namespace(&self, namespace: &str) -> Result<Vec<MemoryRelation>> {
+        self.inner
+            .all_relations_in_namespace(&self.scoped(namespace))
+            .await
     }
 }
 

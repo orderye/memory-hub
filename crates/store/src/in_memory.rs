@@ -8,13 +8,17 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use common::{AccountId, AgentId, HubError, Result};
 use mem_core::{
-    AccountRecord, BackupRecord, IntegrationProposal, MemoryEntry, MemoryFilter, MemoryKind,
-    MemoryStats, MemoryStatus, MemoryVersion, Namespace, NamespaceGrantRecord, NamespaceInfo,
-    ProposalStatus, Scored, SessionRecord, VersionChange,
+    AccountRecord, BackupRecord, EvidenceSourceKind, IntegrationProposal, MemoryEntry,
+    MemoryEvidence, MemoryFilter, MemoryKind, MemoryRelation, MemoryRelationKind, MemoryStats,
+    MemoryStatus, MemoryVersion, Namespace, NamespaceGrantRecord, NamespaceInfo, NewEvidence,
+    NewMemoryRelation, ProposalStatus, Scored, SessionRecord, VersionChange,
 };
 use std::collections::BTreeMap;
 use std::sync::RwLock;
 use uuid::Uuid;
+
+type RelationKey = (Uuid, Uuid, MemoryRelationKind);
+type RelationEntry = (Namespace, MemoryRelation);
 
 /// 内存存储（多合一）
 #[derive(Default)]
@@ -22,6 +26,8 @@ pub struct InMemoryHubStore {
     /// (namespace, id) → 条目
     items: RwLock<BTreeMap<(Namespace, Uuid), MemoryEntry>>,
     versions: RwLock<Vec<MemoryVersion>>,
+    evidences: RwLock<BTreeMap<(Namespace, Uuid), MemoryEvidence>>,
+    relations: RwLock<BTreeMap<RelationKey, RelationEntry>>,
     backups: RwLock<BTreeMap<Uuid, BackupRecord>>,
     proposals: RwLock<BTreeMap<Uuid, IntegrationProposal>>,
     namespaces: RwLock<BTreeMap<Namespace, NamespaceInfo>>,
@@ -129,6 +135,28 @@ impl InMemoryHubStore {
                 return false;
             }
         }
+        if let Some(scene) = &f.scene {
+            if e.scene.as_ref() != Some(scene) {
+                return false;
+            }
+        }
+        if let Some(layer) = &f.layer {
+            if e.layer.as_ref() != Some(layer) {
+                return false;
+            }
+        }
+        if let Some(valid_at) = &f.valid_at {
+            if let Some(from) = e.valid_from {
+                if *valid_at < from {
+                    return false;
+                }
+            }
+            if let Some(until) = e.valid_until {
+                if *valid_at >= until {
+                    return false;
+                }
+            }
+        }
         true
     }
 }
@@ -162,11 +190,13 @@ impl mem_core::MemoryStore for InMemoryHubStore {
             changed_by: entry.source_agent.clone(),
             change_type: VersionChange::Created,
             changed_at: entry.created_at,
+            scene: entry.scene,
+            layer: entry.layer,
+            valid_from: entry.valid_from,
+            valid_until: entry.valid_until,
+            occurred_at: entry.occurred_at,
         };
-        self.versions
-            .write()
-            .unwrap()
-            .push(version);
+        self.versions.write().unwrap().push(version);
         Ok(entry.clone())
     }
 
@@ -238,16 +268,21 @@ impl mem_core::MemoryStore for InMemoryHubStore {
             changed_by: saved.source_agent.clone(),
             change_type: change,
             changed_at: saved.updated_at,
+            scene: saved.scene,
+            layer: saved.layer,
+            valid_from: saved.valid_from,
+            valid_until: saved.valid_until,
+            occurred_at: saved.occurred_at,
         })
         .await?;
         Ok(saved)
     }
 
     async fn delete(&self, namespace: &str, id: Uuid) -> Result<()> {
-        self.items
-            .write()
-            .unwrap()
-            .remove(&(namespace.to_string(), id));
+        let mut w = self.items.write().unwrap();
+        w.remove(&(namespace.to_string(), id));
+        let mut rels = self.relations.write().unwrap();
+        rels.retain(|(from_id, to_id, _), _| *from_id != id && *to_id != id);
         Ok(())
     }
 
@@ -400,6 +435,11 @@ impl mem_core::MemoryStore for InMemoryHubStore {
                 changed_by: "system".to_string(),
                 change_type: VersionChange::Archived,
                 changed_at: now,
+                scene: e.scene,
+                layer: e.layer,
+                valid_from: e.valid_from,
+                valid_until: e.valid_until,
+                occurred_at: e.occurred_at,
             };
             self.items
                 .write()
@@ -854,6 +894,188 @@ impl mem_core::AccountStore for InMemoryHubStore {
     }
 }
 
+#[async_trait]
+impl mem_core::infra::EvidenceStore for InMemoryHubStore {
+    async fn append_evidence(&self, evidence: &NewEvidence) -> Result<MemoryEvidence> {
+        let id = evidence.id.unwrap_or_else(Uuid::new_v4);
+        let created_at = Utc::now();
+        let ev = MemoryEvidence {
+            id,
+            namespace: evidence.namespace.clone(),
+            source_kind: evidence.source_kind,
+            source_ref: evidence.source_ref.clone(),
+            content_hash: evidence.content_hash.clone(),
+            excerpt: evidence.excerpt.clone(),
+            occurred_at: evidence.occurred_at,
+            created_at,
+        };
+        let mut w = self.evidences.write().unwrap();
+        w.insert((evidence.namespace.clone(), id), ev.clone());
+        Ok(ev)
+    }
+
+    async fn get_evidence(&self, namespace: &str, id: Uuid) -> Result<MemoryEvidence> {
+        let r = self.evidences.read().unwrap();
+        r.get(&(namespace.to_string(), id))
+            .cloned()
+            .ok_or(HubError::NotFound)
+    }
+
+    async fn list_evidence(
+        &self,
+        namespace: &str,
+        source_kind: Option<EvidenceSourceKind>,
+        source_ref: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MemoryEvidence>> {
+        let r = self.evidences.read().unwrap();
+        let mut list: Vec<MemoryEvidence> = r
+            .iter()
+            .filter(|((ns, _), _)| ns == namespace)
+            .map(|(_, ev)| ev.clone())
+            .filter(|ev| {
+                if let Some(kind) = source_kind {
+                    if ev.source_kind != kind {
+                        return false;
+                    }
+                }
+                if let Some(r_ref) = source_ref {
+                    if ev.source_ref.as_deref() != Some(r_ref) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .collect();
+        list.sort_by_key(|a| std::cmp::Reverse(a.created_at));
+        list.truncate(limit.max(1));
+        Ok(list)
+    }
+
+    async fn all_evidence_in_namespace(&self, namespace: &str) -> Result<Vec<MemoryEvidence>> {
+        let r = self.evidences.read().unwrap();
+        let mut list: Vec<MemoryEvidence> = r
+            .iter()
+            .filter(|((ns, _), _)| ns == namespace)
+            .map(|(_, ev)| ev.clone())
+            .collect();
+        list.sort_by_key(|e| (e.created_at, e.id));
+        Ok(list)
+    }
+
+    async fn delete_evidence(&self, namespace: &str, id: Uuid) -> Result<()> {
+        let mut w = self.evidences.write().unwrap();
+        if w.remove(&(namespace.to_string(), id)).is_none() {
+            Err(HubError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[async_trait]
+impl mem_core::infra::RelationStore for InMemoryHubStore {
+    async fn add_relation(
+        &self,
+        namespace: &str,
+        relation: &NewMemoryRelation,
+    ) -> Result<MemoryRelation> {
+        if relation.from_memory_id == relation.to_memory_id {
+            return Err(HubError::InvalidArgument("自环关系不合法".to_string()));
+        }
+        let items = self.items.read().unwrap();
+        let from_exists = items.contains_key(&(namespace.to_string(), relation.from_memory_id));
+        let to_exists = items.contains_key(&(namespace.to_string(), relation.to_memory_id));
+        if !from_exists || !to_exists {
+            return Err(HubError::NotFound);
+        }
+        if let Some(ev_id) = relation.source_evidence_id {
+            let evs = self.evidences.read().unwrap();
+            if !evs.contains_key(&(namespace.to_string(), ev_id)) {
+                return Err(HubError::NotFound);
+            }
+        }
+        let created_at = Utc::now();
+        let rel = MemoryRelation {
+            from_memory_id: relation.from_memory_id,
+            to_memory_id: relation.to_memory_id,
+            relation_kind: relation.relation_kind,
+            confidence: relation.confidence,
+            source_evidence_id: relation.source_evidence_id,
+            created_at,
+        };
+        let mut w = self.relations.write().unwrap();
+        w.insert(
+            (
+                relation.from_memory_id,
+                relation.to_memory_id,
+                relation.relation_kind,
+            ),
+            (namespace.to_string(), rel.clone()),
+        );
+        Ok(rel)
+    }
+
+    async fn list_relations_from(
+        &self,
+        namespace: &str,
+        from_memory_id: Uuid,
+    ) -> Result<Vec<MemoryRelation>> {
+        let r = self.relations.read().unwrap();
+        let mut list: Vec<MemoryRelation> = r
+            .values()
+            .filter(|(ns, rel)| ns == namespace && rel.from_memory_id == from_memory_id)
+            .map(|(_, rel)| rel.clone())
+            .collect();
+        list.sort_by_key(|a| std::cmp::Reverse(a.created_at));
+        Ok(list)
+    }
+
+    async fn list_relations_to(
+        &self,
+        namespace: &str,
+        to_memory_id: Uuid,
+    ) -> Result<Vec<MemoryRelation>> {
+        let r = self.relations.read().unwrap();
+        let mut list: Vec<MemoryRelation> = r
+            .values()
+            .filter(|(ns, rel)| ns == namespace && rel.to_memory_id == to_memory_id)
+            .map(|(_, rel)| rel.clone())
+            .collect();
+        list.sort_by_key(|a| std::cmp::Reverse(a.created_at));
+        Ok(list)
+    }
+
+    async fn delete_relation(
+        &self,
+        namespace: &str,
+        from_memory_id: Uuid,
+        to_memory_id: Uuid,
+        relation_kind: MemoryRelationKind,
+    ) -> Result<()> {
+        let mut w = self.relations.write().unwrap();
+        let key = (from_memory_id, to_memory_id, relation_kind);
+        if let Some((ns, _)) = w.get(&key) {
+            if ns == namespace {
+                w.remove(&key);
+                return Ok(());
+            }
+        }
+        Err(HubError::NotFound)
+    }
+
+    async fn all_relations_in_namespace(&self, namespace: &str) -> Result<Vec<MemoryRelation>> {
+        let r = self.relations.read().unwrap();
+        let mut list: Vec<MemoryRelation> = r
+            .values()
+            .filter(|(ns, _)| ns == namespace)
+            .map(|(_, rel)| rel.clone())
+            .collect();
+        list.sort_by_key(|rel| (rel.created_at, rel.from_memory_id, rel.to_memory_id));
+        Ok(list)
+    }
+}
+
 /// 便捷统计（运维排障）
 pub fn stats_of(store: &InMemoryHubStore) -> MemoryStats {
     let items = store.items.read().unwrap();
@@ -880,7 +1102,8 @@ pub fn stats_of(store: &InMemoryHubStore) -> MemoryStats {
 mod tests {
     use super::*;
     use mem_core::{
-        AccountStore, BackupStore, GrantStore, IntegrationStore, MemoryHubStore, MemoryStore,
+        AccountStore, BackupStore, EvidenceStore, GrantStore, IntegrationStore, MemoryHubStore,
+        MemoryStore, RelationStore,
     };
 
     fn entry(ns: &str, content: &str, key: Option<&str>) -> MemoryEntry {
@@ -902,6 +1125,11 @@ mod tests {
             merged_into: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            scene: None,
+            layer: None,
+            valid_from: None,
+            valid_until: None,
+            occurred_at: None,
         }
     }
 
@@ -1011,6 +1239,11 @@ mod tests {
             changed_by: "agent-a".to_string(),
             change_type: VersionChange::Updated,
             changed_at: Utc::now(),
+            scene: None,
+            layer: None,
+            valid_from: None,
+            valid_until: None,
+            occurred_at: None,
         };
         store.record_version(&mk(1)).await.unwrap();
         store.record_version(&mk(2)).await.unwrap();
@@ -1199,8 +1432,150 @@ mod tests {
 
     #[tokio::test]
     async fn test_hub_store_aggregation() {
-        // 编译期即验证：InMemoryHubStore 实现全部四个 trait
+        // 编译期即验证：InMemoryHubStore 实现全部七个 trait
         fn assert_impl<T: MemoryHubStore>() {}
         assert_impl::<InMemoryHubStore>();
+    }
+
+    #[tokio::test]
+    async fn test_evidence_store_crud() {
+        let store = InMemoryHubStore::new();
+        let ev1 = store
+            .append_evidence(&NewEvidence {
+                id: None,
+                namespace: "ns".to_string(),
+                source_kind: EvidenceSourceKind::Session,
+                source_ref: Some("sess-1".to_string()),
+                content_hash: "hash-1".to_string(),
+                excerpt: Some("对话片段1".to_string()),
+                occurred_at: Some(Utc::now()),
+            })
+            .await
+            .unwrap();
+
+        let ev2 = store
+            .append_evidence(&NewEvidence {
+                id: None,
+                namespace: "ns".to_string(),
+                source_kind: EvidenceSourceKind::GitCommit,
+                source_ref: Some("sha-abc".to_string()),
+                content_hash: "hash-2".to_string(),
+                excerpt: Some("commit diff".to_string()),
+                occurred_at: Some(Utc::now()),
+            })
+            .await
+            .unwrap();
+
+        // get_evidence
+        let fetched = store.get_evidence("ns", ev1.id).await.unwrap();
+        assert_eq!(fetched.id, ev1.id);
+        assert_eq!(fetched.source_kind, EvidenceSourceKind::Session);
+
+        // list_evidence with kind filter
+        let sessions = store
+            .list_evidence("ns", Some(EvidenceSourceKind::Session), None, 10)
+            .await
+            .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, ev1.id);
+
+        let commits = store
+            .list_evidence("ns", Some(EvidenceSourceKind::GitCommit), None, 10)
+            .await
+            .unwrap();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].id, ev2.id);
+
+        // all_evidence_in_namespace
+        let all = store.all_evidence_in_namespace("ns").await.unwrap();
+        assert_eq!(all.len(), 2);
+
+        // delete_evidence
+        store.delete_evidence("ns", ev1.id).await.unwrap();
+        assert!(store.get_evidence("ns", ev1.id).await.is_err());
+        assert_eq!(
+            store.all_evidence_in_namespace("ns").await.unwrap().len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_relation_store_semantics() {
+        let store = InMemoryHubStore::new();
+        let m1 = entry("ns-a", "条目1", None);
+        let m2 = entry("ns-a", "条目2", None);
+        let m_diff_ns = entry("ns-b", "异命名空间条目", None);
+        store.insert(&m1).await.unwrap();
+        store.insert(&m2).await.unwrap();
+        store.insert(&m_diff_ns).await.unwrap();
+
+        // 1. 自环拒绝
+        let loop_err = store
+            .add_relation(
+                "ns-a",
+                &NewMemoryRelation {
+                    from_memory_id: m1.id,
+                    to_memory_id: m1.id,
+                    relation_kind: MemoryRelationKind::Supports,
+                    confidence: 1.0,
+                    source_evidence_id: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(loop_err, HubError::InvalidArgument(_)));
+
+        // 2. 跨命名空间关系拒绝
+        let cross_err = store
+            .add_relation(
+                "ns-a",
+                &NewMemoryRelation {
+                    from_memory_id: m1.id,
+                    to_memory_id: m_diff_ns.id,
+                    relation_kind: MemoryRelationKind::Supports,
+                    confidence: 1.0,
+                    source_evidence_id: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(cross_err, HubError::NotFound));
+
+        // 3. 正常添加并双向查询
+        let rel = store
+            .add_relation(
+                "ns-a",
+                &NewMemoryRelation {
+                    from_memory_id: m1.id,
+                    to_memory_id: m2.id,
+                    relation_kind: MemoryRelationKind::Supports,
+                    confidence: 0.95,
+                    source_evidence_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(rel.confidence, 0.95);
+
+        let from = store.list_relations_from("ns-a", m1.id).await.unwrap();
+        assert_eq!(from.len(), 1);
+        assert_eq!(from[0].to_memory_id, m2.id);
+
+        let to = store.list_relations_to("ns-a", m2.id).await.unwrap();
+        assert_eq!(to.len(), 1);
+        assert_eq!(to[0].from_memory_id, m1.id);
+
+        // 4. 删除条目引发关联关系级联删除
+        store.delete("ns-a", m1.id).await.unwrap();
+        assert!(store
+            .list_relations_from("ns-a", m1.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .list_relations_to("ns-a", m2.id)
+            .await
+            .unwrap()
+            .is_empty());
     }
 }

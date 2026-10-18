@@ -39,15 +39,16 @@ pub use backup_service::{
     RestoreRequest,
 };
 pub use domain::{
-    BackupRecord, BackupSummary, IntegrationKind, IntegrationProposal, MemoryEntry, MemoryFilter,
-    MemoryKind, MemoryPatch, MemoryStats, MemoryStatus, MemoryVersion, Namespace,
-    NamespaceGrantRecord, NamespaceInfo, NewMemory, Page, ProposalStatus, RestoreMode,
-    RestoreReport, Scored, VersionChange,
+    BackupRecord, BackupSummary, CognitiveLayer, CognitiveProposalStatus, EvidenceSourceKind,
+    IntegrationKind, IntegrationProposal, MemoryEntry, MemoryEvidence, MemoryFilter, MemoryKind,
+    MemoryPatch, MemoryRelation, MemoryRelationKind, MemoryScene, MemoryStats, MemoryStatus,
+    MemoryVersion, Namespace, NamespaceGrantRecord, NamespaceInfo, NewEvidence, NewMemory,
+    NewMemoryRelation, Page, ProposalStatus, RestoreMode, RestoreReport, Scored, VersionChange,
 };
 pub use infra::{
     AccessChecker, AccountRecord, AccountStore, AgentRecord, AgentRegistration, AgentStore,
-    BackupStore, Clock, Embedder, GrantStore, IntegrationStore, MemoryHubStore, MemoryStore,
-    Retriever, SessionRecord, SystemClock, TokenIntrospector,
+    BackupStore, Clock, Embedder, EvidenceStore, GrantStore, IntegrationStore, MemoryHubStore,
+    MemoryStore, RelationStore, Retriever, SessionRecord, SystemClock, TokenIntrospector,
 };
 pub use integration_service::{
     IntegrationService, ResolveAction, ResolveRequest, ScanReport, ScanRequest,
