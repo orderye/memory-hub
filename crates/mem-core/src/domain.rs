@@ -422,6 +422,258 @@ pub fn is_intention_active(
     }
 }
 
+/// 任务状态（Working 场景）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl TaskStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TaskStatus::Running => "running",
+            TaskStatus::Completed => "completed",
+            TaskStatus::Failed => "failed",
+            TaskStatus::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "running" => Some(TaskStatus::Running),
+            "completed" => Some(TaskStatus::Completed),
+            "failed" => Some(TaskStatus::Failed),
+            "cancelled" => Some(TaskStatus::Cancelled),
+            _ => None,
+        }
+    }
+}
+
+/// 任务事实（Working 场景）
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryTask {
+    pub id: Uuid,
+    pub namespace: Namespace,
+    pub scene: MemoryScene,
+    pub task: String,
+    pub status: TaskStatus,
+    pub started_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_evidence_id: Option<Uuid>,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
+/// 新建任务事实请求
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NewMemoryTask {
+    pub id: Option<Uuid>,
+    pub namespace: Namespace,
+    pub scene: MemoryScene,
+    pub task: String,
+    pub status: TaskStatus,
+    pub started_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_evidence_id: Option<Uuid>,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
+/// 经验条目生命周期状态
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExperienceStatus {
+    Candidate,
+    Active,
+    Deprecated,
+    Archived,
+}
+
+impl ExperienceStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ExperienceStatus::Candidate => "candidate",
+            ExperienceStatus::Active => "active",
+            ExperienceStatus::Deprecated => "deprecated",
+            ExperienceStatus::Archived => "archived",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "candidate" => Some(ExperienceStatus::Candidate),
+            "active" => Some(ExperienceStatus::Active),
+            "deprecated" => Some(ExperienceStatus::Deprecated),
+            "archived" => Some(ExperienceStatus::Archived),
+            _ => None,
+        }
+    }
+}
+
+/// 经验记忆实体
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryExperience {
+    pub id: Uuid,
+    pub namespace: Namespace,
+    pub task: String,
+    #[serde(default)]
+    pub search_keys: Vec<String>,
+    pub solution: String,
+    #[serde(default)]
+    pub preconditions: serde_json::Value,
+    #[serde(default)]
+    pub boundary_envs: Vec<String>,
+    #[serde(default)]
+    pub failure_modes: Vec<String>,
+    #[serde(default)]
+    pub validation: serde_json::Value,
+    pub confidence: f32,
+    pub status: ExperienceStatus,
+    #[serde(default = "default_feedback_score")]
+    pub feedback_score: f32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+fn default_feedback_score() -> f32 {
+    1.0
+}
+
+/// 新建经验记忆请求
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NewMemoryExperience {
+    pub id: Option<Uuid>,
+    pub namespace: Namespace,
+    pub task: String,
+    pub search_keys: Vec<String>,
+    pub solution: String,
+    pub preconditions: serde_json::Value,
+    pub boundary_envs: Vec<String>,
+    pub failure_modes: Vec<String>,
+    pub validation: serde_json::Value,
+    pub confidence: f32,
+    pub status: ExperienceStatus,
+    pub feedback_score: f32,
+}
+
+/// 任务与经验关联映射
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryTaskExperience {
+    pub task_id: Uuid,
+    pub experience_id: Uuid,
+    pub relation_kind: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// 经验提炼候选结构
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExperienceCandidate {
+    pub task_pattern: String,
+    pub search_keys: Vec<String>,
+    pub solution: String,
+    pub preconditions: serde_json::Value,
+    pub boundary_envs: Vec<String>,
+    pub failure_modes: Vec<String>,
+    pub validation: serde_json::Value,
+    pub confidence: f32,
+    pub source_task_id: Uuid,
+}
+
+/// 扫描敏感凭证（API Token、私钥、密码模式）
+pub fn contains_sensitive_credentials(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let sensitive_patterns = [
+        "bearer ",
+        "sk-",
+        "ghp_",
+        "gho_",
+        "xoxb-",
+        "xoxp-",
+        "akia",
+        "-----begin private key-----",
+        "-----begin rsa private key-----",
+        "-----begin openssh private key-----",
+        "password=",
+        "secret_key",
+        "client_secret",
+    ];
+    sensitive_patterns.iter().any(|p| lower.contains(p))
+}
+
+/// 验证经验候选质量门槛
+pub fn validate_experience_candidate(candidate: &ExperienceCandidate) -> common::Result<()> {
+    if contains_sensitive_credentials(&candidate.solution)
+        || contains_sensitive_credentials(&candidate.task_pattern)
+        || contains_sensitive_credentials(&candidate.preconditions.to_string())
+    {
+        return Err(common::HubError::InvalidArgument(
+            "经验候选包含敏感凭证或密钥，严禁持久化".into(),
+        ));
+    }
+
+    let pattern = candidate.task_pattern.trim();
+    if pattern.is_empty() {
+        return Err(common::HubError::InvalidArgument("任务模式不能为空".into()));
+    }
+    let local_only_markers = [
+        "本次任务",
+        "刚才我",
+        "今天我完成了",
+        "刚刚执行了",
+        "this specific run",
+        "just completed task",
+    ];
+    if local_only_markers.iter().any(|m| pattern.contains(m)) {
+        return Err(common::HubError::InvalidArgument(
+            "经验必须具备通用可复用性，不得为单次任务的纯局部描述".into(),
+        ));
+    }
+
+    let solution = candidate.solution.trim();
+    if solution.is_empty() {
+        return Err(common::HubError::InvalidArgument("解决方案不能为空".into()));
+    }
+
+    if candidate.confidence < 0.5 {
+        return Err(common::HubError::InvalidArgument(
+            "经验置信度未达到 0.5 最低有效门槛".into(),
+        ));
+    }
+
+    let val_str = candidate.validation.to_string();
+    if val_str == "{}" || val_str == "null" || val_str.trim().is_empty() {
+        return Err(common::HubError::InvalidArgument(
+            "经验必须包含可验证结果或验证方法说明".into(),
+        ));
+    }
+
+    if candidate.boundary_envs.is_empty()
+        && (candidate.preconditions.is_null() || candidate.preconditions == serde_json::json!({}))
+    {
+        return Err(common::HubError::InvalidArgument(
+            "经验必须标明适用环境或前置条件".into(),
+        ));
+    }
+
+    Ok(())
+}
+
 /// 记忆条目分类
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

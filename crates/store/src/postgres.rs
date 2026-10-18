@@ -16,10 +16,12 @@ use chrono::{DateTime, Utc};
 use common::{AccountId, AgentId, HubError, Result};
 use mem_core::{
     AccountRecord, BackupRecord, CognitiveLayer, EvidenceSourceKind, EvidenceStore,
-    IntegrationKind, IntegrationProposal, MemoryEntry, MemoryEvidence, MemoryFilter, MemoryKind,
-    MemoryRelation, MemoryRelationKind, MemoryScene, MemoryStatus, MemoryVersion, Namespace,
-    NamespaceGrantRecord, NamespaceInfo, NewEvidence, NewMemoryRelation, ProposalStatus,
-    RelationStore, Scored, SessionRecord, VersionChange,
+    ExperienceStatus, ExperienceStore, IntegrationKind, IntegrationProposal, MemoryEntry,
+    MemoryEvidence, MemoryExperience, MemoryFilter, MemoryKind, MemoryRelation, MemoryRelationKind,
+    MemoryScene, MemoryStatus, MemoryTask, MemoryTaskExperience, MemoryVersion, Namespace,
+    NamespaceGrantRecord, NamespaceInfo, NewEvidence, NewMemoryExperience, NewMemoryRelation,
+    NewMemoryTask, ProposalStatus, RelationStore, Scored, SessionRecord, TaskStatus, TaskStore,
+    VersionChange,
 };
 use sqlx::postgres::{PgConnection, PgPool, PgPoolOptions, PgRow};
 use sqlx::Row;
@@ -57,6 +59,16 @@ mod mapping {
     pub fn parse_source_kind(s: &str) -> Result<EvidenceSourceKind> {
         EvidenceSourceKind::parse(s)
             .ok_or_else(|| HubError::Internal(anyhow::anyhow!("未知证据来源类型: {}", s)))
+    }
+
+    pub fn parse_task_status(s: &str) -> Result<TaskStatus> {
+        TaskStatus::parse(s)
+            .ok_or_else(|| HubError::Internal(anyhow::anyhow!("未知任务状态: {}", s)))
+    }
+
+    pub fn parse_experience_status(s: &str) -> Result<ExperienceStatus> {
+        ExperienceStatus::parse(s)
+            .ok_or_else(|| HubError::Internal(anyhow::anyhow!("未知经验状态: {}", s)))
     }
 
     pub fn parse_integration_kind(s: &str) -> Result<IntegrationKind> {
@@ -173,6 +185,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
     (
         "20261018000006_cognitive_evidence_and_relations",
         include_str!("../migrations/20261018000006_cognitive_evidence_and_relations.sql"),
+    ),
+    (
+        "20261018000007_working_memory_tasks_and_experiences",
+        include_str!("../migrations/20261018000007_working_memory_tasks_and_experiences.sql"),
     ),
 ];
 
@@ -458,6 +474,56 @@ impl PostgresHubStore {
             relation_kind,
             confidence: r.try_get::<f32, _>("confidence").unwrap_or(1.0),
             source_evidence_id: r.try_get("source_evidence_id").ok().flatten(),
+            created_at: r.try_get("created_at").pg()?,
+        })
+    }
+
+    fn task_from_row(r: &PgRow) -> Result<MemoryTask> {
+        let scene_str: String = r.try_get("scene").pg()?;
+        let scene = mapping::parse_scene(&scene_str)?;
+        let status_str: String = r.try_get("status").pg()?;
+        let status = mapping::parse_task_status(&status_str)?;
+        Ok(MemoryTask {
+            id: r.try_get("id").pg()?,
+            namespace: r.try_get("namespace").pg()?,
+            scene,
+            task: r.try_get("task").pg()?,
+            status,
+            started_at: r.try_get("started_at").pg()?,
+            finished_at: r.try_get("finished_at").ok().flatten(),
+            result_summary: r.try_get("result_summary").ok().flatten(),
+            failure_reason: r.try_get("failure_reason").ok().flatten(),
+            source_evidence_id: r.try_get("source_evidence_id").ok().flatten(),
+            metadata: r.try_get("metadata").pg()?,
+        })
+    }
+
+    fn experience_from_row(r: &PgRow) -> Result<MemoryExperience> {
+        let status_str: String = r.try_get("status").pg()?;
+        let status = mapping::parse_experience_status(&status_str)?;
+        Ok(MemoryExperience {
+            id: r.try_get("id").pg()?,
+            namespace: r.try_get("namespace").pg()?,
+            task: r.try_get("task").pg()?,
+            search_keys: r.try_get("search_keys").pg()?,
+            solution: r.try_get("solution").pg()?,
+            preconditions: r.try_get("preconditions").pg()?,
+            boundary_envs: r.try_get("boundary_envs").pg()?,
+            failure_modes: r.try_get("failure_modes").pg()?,
+            validation: r.try_get("validation").pg()?,
+            confidence: r.try_get::<f32, _>("confidence").unwrap_or(0.5),
+            status,
+            feedback_score: r.try_get::<f32, _>("feedback_score").unwrap_or(1.0),
+            created_at: r.try_get("created_at").pg()?,
+            updated_at: r.try_get("updated_at").pg()?,
+        })
+    }
+
+    fn task_experience_from_row(r: &PgRow) -> Result<MemoryTaskExperience> {
+        Ok(MemoryTaskExperience {
+            task_id: r.try_get("task_id").pg()?,
+            experience_id: r.try_get("experience_id").pg()?,
+            relation_kind: r.try_get("relation_kind").pg()?,
             created_at: r.try_get("created_at").pg()?,
         })
     }
@@ -2079,6 +2145,340 @@ impl RelationStore for PostgresHubStore {
     }
 }
 
+// ===== TaskStore =====
+
+#[async_trait]
+impl TaskStore for PostgresHubStore {
+    async fn create_task(&self, task: &NewMemoryTask) -> Result<MemoryTask> {
+        let id = task.id.unwrap_or_else(Uuid::new_v4);
+        let row = sqlx::query(
+            r#"
+            insert into memory_tasks (
+                id, namespace, scene, task, status, started_at, finished_at,
+                result_summary, failure_reason, source_evidence_id, metadata
+            )
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            returning id, namespace, scene, task, status, started_at, finished_at,
+                      result_summary, failure_reason, source_evidence_id, metadata
+            "#,
+        )
+        .bind(id)
+        .bind(&task.namespace)
+        .bind(task.scene.as_str())
+        .bind(&task.task)
+        .bind(task.status.as_str())
+        .bind(task.started_at)
+        .bind(task.finished_at)
+        .bind(&task.result_summary)
+        .bind(&task.failure_reason)
+        .bind(task.source_evidence_id)
+        .bind(&task.metadata)
+        .fetch_one(&self.pool)
+        .await
+        .pg()?;
+
+        Self::task_from_row(&row)
+    }
+
+    async fn update_task(&self, task: &MemoryTask) -> Result<MemoryTask> {
+        let row = sqlx::query(
+            r#"
+            update memory_tasks
+            set scene = $3,
+                task = $4,
+                status = $5,
+                started_at = $6,
+                finished_at = $7,
+                result_summary = $8,
+                failure_reason = $9,
+                source_evidence_id = $10,
+                metadata = $11
+            where namespace = $1 and id = $2
+            returning id, namespace, scene, task, status, started_at, finished_at,
+                      result_summary, failure_reason, source_evidence_id, metadata
+            "#,
+        )
+        .bind(&task.namespace)
+        .bind(task.id)
+        .bind(task.scene.as_str())
+        .bind(&task.task)
+        .bind(task.status.as_str())
+        .bind(task.started_at)
+        .bind(task.finished_at)
+        .bind(&task.result_summary)
+        .bind(&task.failure_reason)
+        .bind(task.source_evidence_id)
+        .bind(&task.metadata)
+        .fetch_optional(&self.pool)
+        .await
+        .pg()?;
+
+        match row {
+            Some(r) => Self::task_from_row(&r),
+            None => Err(HubError::NotFound),
+        }
+    }
+
+    async fn get_task(&self, namespace: &str, id: Uuid) -> Result<Option<MemoryTask>> {
+        let row = sqlx::query(
+            r#"
+            select id, namespace, scene, task, status, started_at, finished_at,
+                   result_summary, failure_reason, source_evidence_id, metadata
+            from memory_tasks
+            where namespace = $1 and id = $2
+            "#,
+        )
+        .bind(namespace)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .pg()?;
+
+        row.map(|r| Self::task_from_row(&r)).transpose()
+    }
+
+    async fn list_tasks(
+        &self,
+        namespace: &str,
+        status: Option<TaskStatus>,
+        limit: usize,
+    ) -> Result<Vec<MemoryTask>> {
+        let mut builder: sqlx::QueryBuilder<'_, sqlx::Postgres> = sqlx::QueryBuilder::new(
+            "select id, namespace, scene, task, status, started_at, finished_at, result_summary, failure_reason, source_evidence_id, metadata from memory_tasks where namespace = ",
+        );
+        builder.push_bind(namespace);
+
+        if let Some(s) = status {
+            builder.push(" and status = ");
+            builder.push_bind(s.as_str());
+        }
+
+        builder.push(" order by started_at desc limit ");
+        builder.push_bind(limit.max(1) as i64);
+
+        let rows = builder.build().fetch_all(&self.pool).await.pg()?;
+        rows.iter().map(Self::task_from_row).collect()
+    }
+
+    async fn all_tasks_in_namespace(&self, namespace: &str) -> Result<Vec<MemoryTask>> {
+        let rows = sqlx::query(
+            r#"
+            select id, namespace, scene, task, status, started_at, finished_at,
+                   result_summary, failure_reason, source_evidence_id, metadata
+            from memory_tasks
+            where namespace = $1
+            order by started_at asc, id asc
+            "#,
+        )
+        .bind(namespace)
+        .fetch_all(&self.pool)
+        .await
+        .pg()?;
+
+        rows.iter().map(Self::task_from_row).collect()
+    }
+}
+
+// ===== ExperienceStore =====
+
+#[async_trait]
+impl ExperienceStore for PostgresHubStore {
+    async fn save_experience(&self, exp: &NewMemoryExperience) -> Result<MemoryExperience> {
+        let id = exp.id.unwrap_or_else(Uuid::new_v4);
+        let row = sqlx::query(
+            r#"
+            insert into memory_experiences (
+                id, namespace, task, search_keys, solution, preconditions,
+                boundary_envs, failure_modes, validation, confidence, status,
+                feedback_score, created_at, updated_at
+            )
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now(), now())
+            returning id, namespace, task, search_keys, solution, preconditions,
+                      boundary_envs, failure_modes, validation, confidence, status,
+                      feedback_score, created_at, updated_at
+            "#,
+        )
+        .bind(id)
+        .bind(&exp.namespace)
+        .bind(&exp.task)
+        .bind(&exp.search_keys)
+        .bind(&exp.solution)
+        .bind(&exp.preconditions)
+        .bind(&exp.boundary_envs)
+        .bind(&exp.failure_modes)
+        .bind(&exp.validation)
+        .bind(exp.confidence)
+        .bind(exp.status.as_str())
+        .bind(exp.feedback_score)
+        .fetch_one(&self.pool)
+        .await
+        .pg()?;
+
+        Self::experience_from_row(&row)
+    }
+
+    async fn update_experience(&self, exp: &MemoryExperience) -> Result<MemoryExperience> {
+        let row = sqlx::query(
+            r#"
+            update memory_experiences
+            set task = $3,
+                search_keys = $4,
+                solution = $5,
+                preconditions = $6,
+                boundary_envs = $7,
+                failure_modes = $8,
+                validation = $9,
+                confidence = $10,
+                status = $11,
+                feedback_score = $12,
+                updated_at = now()
+            where namespace = $1 and id = $2
+            returning id, namespace, task, search_keys, solution, preconditions,
+                      boundary_envs, failure_modes, validation, confidence, status,
+                      feedback_score, created_at, updated_at
+            "#,
+        )
+        .bind(&exp.namespace)
+        .bind(exp.id)
+        .bind(&exp.task)
+        .bind(&exp.search_keys)
+        .bind(&exp.solution)
+        .bind(&exp.preconditions)
+        .bind(&exp.boundary_envs)
+        .bind(&exp.failure_modes)
+        .bind(&exp.validation)
+        .bind(exp.confidence)
+        .bind(exp.status.as_str())
+        .bind(exp.feedback_score)
+        .fetch_optional(&self.pool)
+        .await
+        .pg()?;
+
+        match row {
+            Some(r) => Self::experience_from_row(&r),
+            None => Err(HubError::NotFound),
+        }
+    }
+
+    async fn get_experience(&self, namespace: &str, id: Uuid) -> Result<Option<MemoryExperience>> {
+        let row = sqlx::query(
+            r#"
+            select id, namespace, task, search_keys, solution, preconditions,
+                   boundary_envs, failure_modes, validation, confidence, status,
+                   feedback_score, created_at, updated_at
+            from memory_experiences
+            where namespace = $1 and id = $2
+            "#,
+        )
+        .bind(namespace)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .pg()?;
+
+        row.map(|r| Self::experience_from_row(&r)).transpose()
+    }
+
+    async fn list_experiences(
+        &self,
+        namespace: &str,
+        status: Option<ExperienceStatus>,
+        limit: usize,
+    ) -> Result<Vec<MemoryExperience>> {
+        let mut builder: sqlx::QueryBuilder<'_, sqlx::Postgres> = sqlx::QueryBuilder::new(
+            "select id, namespace, task, search_keys, solution, preconditions, boundary_envs, failure_modes, validation, confidence, status, feedback_score, created_at, updated_at from memory_experiences where namespace = ",
+        );
+        builder.push_bind(namespace);
+
+        if let Some(s) = status {
+            builder.push(" and status = ");
+            builder.push_bind(s.as_str());
+        }
+
+        builder.push(" order by updated_at desc limit ");
+        builder.push_bind(limit.max(1) as i64);
+
+        let rows = builder.build().fetch_all(&self.pool).await.pg()?;
+        rows.iter().map(Self::experience_from_row).collect()
+    }
+
+    async fn link_task_experience(&self, link: &MemoryTaskExperience) -> Result<()> {
+        sqlx::query(
+            r#"
+            insert into memory_task_experiences (task_id, experience_id, relation_kind, created_at)
+            values ($1, $2, $3, $4)
+            on conflict (task_id, experience_id, relation_kind) do nothing
+            "#,
+        )
+        .bind(link.task_id)
+        .bind(link.experience_id)
+        .bind(&link.relation_kind)
+        .bind(link.created_at)
+        .execute(&self.pool)
+        .await
+        .pg()?;
+
+        Ok(())
+    }
+
+    async fn list_experiences_for_task(&self, task_id: Uuid) -> Result<Vec<MemoryTaskExperience>> {
+        let rows = sqlx::query(
+            r#"
+            select task_id, experience_id, relation_kind, created_at
+            from memory_task_experiences
+            where task_id = $1
+            order by created_at desc
+            "#,
+        )
+        .bind(task_id)
+        .fetch_all(&self.pool)
+        .await
+        .pg()?;
+
+        rows.iter().map(Self::task_experience_from_row).collect()
+    }
+
+    async fn all_experiences_in_namespace(&self, namespace: &str) -> Result<Vec<MemoryExperience>> {
+        let rows = sqlx::query(
+            r#"
+            select id, namespace, task, search_keys, solution, preconditions,
+                   boundary_envs, failure_modes, validation, confidence, status,
+                   feedback_score, created_at, updated_at
+            from memory_experiences
+            where namespace = $1
+            order by created_at asc, id asc
+            "#,
+        )
+        .bind(namespace)
+        .fetch_all(&self.pool)
+        .await
+        .pg()?;
+
+        rows.iter().map(Self::experience_from_row).collect()
+    }
+
+    async fn all_task_experiences_in_namespace(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<MemoryTaskExperience>> {
+        let rows = sqlx::query(
+            r#"
+            select mte.task_id, mte.experience_id, mte.relation_kind, mte.created_at
+            from memory_task_experiences mte
+            join memory_tasks mt on mt.id = mte.task_id
+            where mt.namespace = $1
+            order by mte.created_at asc, mte.task_id asc
+            "#,
+        )
+        .bind(namespace)
+        .fetch_all(&self.pool)
+        .await
+        .pg()?;
+
+        rows.iter().map(Self::task_experience_from_row).collect()
+    }
+}
+
 /// accounts 行 → AccountRecord
 fn account_record_of(r: &PgRow) -> AccountRecord {
     AccountRecord {
@@ -2097,7 +2497,7 @@ mod tests {
 
     #[test]
     fn test_migrations_registered() {
-        assert_eq!(MIGRATIONS.len(), 6);
+        assert_eq!(MIGRATIONS.len(), 7);
         assert!(MIGRATIONS[0].0.starts_with("20261011"));
         // 迁移清单必须按版本号字典序排列（执行顺序依赖于此）
         for w in MIGRATIONS.windows(2) {

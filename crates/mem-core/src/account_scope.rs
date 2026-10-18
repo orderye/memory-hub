@@ -13,13 +13,15 @@
 //! 因此备份负载（内部存用户可见名）恢复往返不会二次加前缀。
 
 use crate::domain::{
-    BackupRecord, EvidenceSourceKind, IntegrationProposal, MemoryEntry, MemoryEvidence,
-    MemoryFilter, MemoryKind, MemoryRelation, MemoryRelationKind, MemoryVersion, Namespace,
-    NamespaceGrantRecord, NamespaceInfo, NewEvidence, NewMemoryRelation, ProposalStatus, Scored,
+    BackupRecord, EvidenceSourceKind, ExperienceStatus, IntegrationProposal, MemoryEntry,
+    MemoryEvidence, MemoryExperience, MemoryFilter, MemoryKind, MemoryRelation, MemoryRelationKind,
+    MemoryTask, MemoryTaskExperience, MemoryVersion, Namespace, NamespaceGrantRecord,
+    NamespaceInfo, NewEvidence, NewMemoryExperience, NewMemoryRelation, NewMemoryTask,
+    ProposalStatus, Scored, TaskStatus,
 };
 use crate::infra::{
-    AgentRecord, AgentRegistration, AgentStore, BackupStore, EvidenceStore, GrantStore,
-    IntegrationStore, MemoryStore, RelationStore,
+    AgentRecord, AgentRegistration, AgentStore, BackupStore, EvidenceStore, ExperienceStore,
+    GrantStore, IntegrationStore, MemoryStore, RelationStore, TaskStore,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -557,6 +559,162 @@ impl<S: RelationStore + ?Sized> RelationStore for AccountScopedStore<S> {
     async fn all_relations_in_namespace(&self, namespace: &str) -> Result<Vec<MemoryRelation>> {
         self.inner
             .all_relations_in_namespace(&self.scoped(namespace))
+            .await
+    }
+}
+
+// ===== TaskStore =====
+
+#[async_trait]
+impl<S: TaskStore + ?Sized> TaskStore for AccountScopedStore<S> {
+    async fn create_task(&self, task: &NewMemoryTask) -> Result<MemoryTask> {
+        let mut t = task.clone();
+        t.namespace = self.scoped(&t.namespace);
+        let mut saved = self.inner.create_task(&t).await?;
+        saved.namespace = self.unscoped(&saved.namespace);
+        Ok(saved)
+    }
+
+    async fn update_task(&self, task: &MemoryTask) -> Result<MemoryTask> {
+        let mut t = task.clone();
+        t.namespace = self.scoped(&t.namespace);
+        let mut updated = self.inner.update_task(&t).await?;
+        updated.namespace = self.unscoped(&updated.namespace);
+        Ok(updated)
+    }
+
+    async fn get_task(&self, namespace: &str, id: Uuid) -> Result<Option<MemoryTask>> {
+        let opt = self.inner.get_task(&self.scoped(namespace), id).await?;
+        Ok(opt.and_then(|mut t| {
+            if in_scope(&self.account, &t.namespace) {
+                t.namespace = self.unscoped(&t.namespace);
+                Some(t)
+            } else {
+                None
+            }
+        }))
+    }
+
+    async fn list_tasks(
+        &self,
+        namespace: &str,
+        status: Option<TaskStatus>,
+        limit: usize,
+    ) -> Result<Vec<MemoryTask>> {
+        let rows = self
+            .inner
+            .list_tasks(&self.scoped(namespace), status, limit)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter(|t| in_scope(&self.account, &t.namespace))
+            .map(|mut t| {
+                t.namespace = self.unscoped(&t.namespace);
+                t
+            })
+            .collect())
+    }
+
+    async fn all_tasks_in_namespace(&self, namespace: &str) -> Result<Vec<MemoryTask>> {
+        let rows = self
+            .inner
+            .all_tasks_in_namespace(&self.scoped(namespace))
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter(|t| in_scope(&self.account, &t.namespace))
+            .map(|mut t| {
+                t.namespace = self.unscoped(&t.namespace);
+                t
+            })
+            .collect())
+    }
+}
+
+// ===== ExperienceStore =====
+
+#[async_trait]
+impl<S: ExperienceStore + ?Sized> ExperienceStore for AccountScopedStore<S> {
+    async fn save_experience(&self, experience: &NewMemoryExperience) -> Result<MemoryExperience> {
+        let mut exp = experience.clone();
+        exp.namespace = self.scoped(&exp.namespace);
+        let mut saved = self.inner.save_experience(&exp).await?;
+        saved.namespace = self.unscoped(&saved.namespace);
+        Ok(saved)
+    }
+
+    async fn update_experience(&self, experience: &MemoryExperience) -> Result<MemoryExperience> {
+        let mut exp = experience.clone();
+        exp.namespace = self.scoped(&exp.namespace);
+        let mut updated = self.inner.update_experience(&exp).await?;
+        updated.namespace = self.unscoped(&updated.namespace);
+        Ok(updated)
+    }
+
+    async fn get_experience(&self, namespace: &str, id: Uuid) -> Result<Option<MemoryExperience>> {
+        let opt = self
+            .inner
+            .get_experience(&self.scoped(namespace), id)
+            .await?;
+        Ok(opt.and_then(|mut e| {
+            if in_scope(&self.account, &e.namespace) {
+                e.namespace = self.unscoped(&e.namespace);
+                Some(e)
+            } else {
+                None
+            }
+        }))
+    }
+
+    async fn list_experiences(
+        &self,
+        namespace: &str,
+        status: Option<ExperienceStatus>,
+        limit: usize,
+    ) -> Result<Vec<MemoryExperience>> {
+        let rows = self
+            .inner
+            .list_experiences(&self.scoped(namespace), status, limit)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter(|e| in_scope(&self.account, &e.namespace))
+            .map(|mut e| {
+                e.namespace = self.unscoped(&e.namespace);
+                e
+            })
+            .collect())
+    }
+
+    async fn link_task_experience(&self, link: &MemoryTaskExperience) -> Result<()> {
+        self.inner.link_task_experience(link).await
+    }
+
+    async fn list_experiences_for_task(&self, task_id: Uuid) -> Result<Vec<MemoryTaskExperience>> {
+        self.inner.list_experiences_for_task(task_id).await
+    }
+
+    async fn all_experiences_in_namespace(&self, namespace: &str) -> Result<Vec<MemoryExperience>> {
+        let rows = self
+            .inner
+            .all_experiences_in_namespace(&self.scoped(namespace))
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter(|e| in_scope(&self.account, &e.namespace))
+            .map(|mut e| {
+                e.namespace = self.unscoped(&e.namespace);
+                e
+            })
+            .collect())
+    }
+
+    async fn all_task_experiences_in_namespace(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<MemoryTaskExperience>> {
+        self.inner
+            .all_task_experiences_in_namespace(&self.scoped(namespace))
             .await
     }
 }

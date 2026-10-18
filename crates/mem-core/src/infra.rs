@@ -4,10 +4,11 @@
 //! `store` crate 提供 PostgreSQL 与内存两套实现，可互换。
 
 use crate::domain::{
-    BackupRecord, ChatCognitiveInput, CognitiveCandidate, EvidenceSourceKind, IntegrationProposal,
-    MemoryEntry, MemoryEvidence, MemoryFilter, MemoryKind, MemoryRelation, MemoryRelationKind,
-    MemoryVersion, Namespace, NamespaceGrantRecord, NamespaceInfo, NewEvidence, NewMemoryRelation,
-    ProposalStatus, Scored,
+    BackupRecord, ChatCognitiveInput, CognitiveCandidate, EvidenceSourceKind, ExperienceStatus,
+    IntegrationProposal, MemoryEntry, MemoryEvidence, MemoryExperience, MemoryFilter, MemoryKind,
+    MemoryRelation, MemoryRelationKind, MemoryTask, MemoryTaskExperience, MemoryVersion, Namespace,
+    NamespaceGrantRecord, NamespaceInfo, NewEvidence, NewMemoryExperience, NewMemoryRelation,
+    NewMemoryTask, ProposalStatus, Scored, TaskStatus,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -264,7 +265,74 @@ pub trait GrantStore: Send + Sync {
     async fn owned_namespaces(&self, agent_id: &AgentId) -> Result<Vec<Namespace>>;
 }
 
-/// 存储聚合：一套实现同时满足七类存储需求
+/// 任务事实存储（Working 场景，P3 引入）
+#[async_trait]
+pub trait TaskStore: Send + Sync {
+    /// 创建一条任务记录
+    async fn create_task(&self, task: &NewMemoryTask) -> Result<MemoryTask>;
+
+    /// 更新任务状态及执行结果
+    async fn update_task(&self, task: &MemoryTask) -> Result<MemoryTask>;
+
+    /// 按 ID 读取任务
+    async fn get_task(&self, namespace: &str, id: uuid::Uuid) -> Result<Option<MemoryTask>>;
+
+    /// 列表任务
+    async fn list_tasks(
+        &self,
+        namespace: &str,
+        status: Option<TaskStatus>,
+        limit: usize,
+    ) -> Result<Vec<MemoryTask>>;
+
+    /// 命名空间下全部任务（备份/恢复用）
+    async fn all_tasks_in_namespace(&self, namespace: &str) -> Result<Vec<MemoryTask>>;
+}
+
+/// 经验记忆存储（Working 场景，P3 引入）
+#[async_trait]
+pub trait ExperienceStore: Send + Sync {
+    /// 插入经验记忆条目
+    async fn save_experience(&self, experience: &NewMemoryExperience) -> Result<MemoryExperience>;
+
+    /// 更新经验记忆条目（包括反馈分、状态、方案等）
+    async fn update_experience(&self, experience: &MemoryExperience) -> Result<MemoryExperience>;
+
+    /// 按 ID 读取经验记忆
+    async fn get_experience(
+        &self,
+        namespace: &str,
+        id: uuid::Uuid,
+    ) -> Result<Option<MemoryExperience>>;
+
+    /// 列表经验记忆
+    async fn list_experiences(
+        &self,
+        namespace: &str,
+        status: Option<ExperienceStatus>,
+        limit: usize,
+    ) -> Result<Vec<MemoryExperience>>;
+
+    /// 关联任务与经验
+    async fn link_task_experience(&self, link: &MemoryTaskExperience) -> Result<()>;
+
+    /// 查询某任务衍生的所有经验关联
+    async fn list_experiences_for_task(
+        &self,
+        task_id: uuid::Uuid,
+    ) -> Result<Vec<MemoryTaskExperience>>;
+
+    /// 命名空间下全部经验记忆（备份/恢复用）
+    async fn all_experiences_in_namespace(&self, namespace: &str) -> Result<Vec<MemoryExperience>>;
+
+    /// 命名空间下全部任务-经验映射（备份/恢复用）
+    async fn all_task_experiences_in_namespace(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<MemoryTaskExperience>>;
+}
+
+/// 存储聚合：一套实现同时满足全部核心与认知存储需求
 pub trait MemoryHubStore:
     MemoryStore
     + BackupStore
@@ -273,6 +341,8 @@ pub trait MemoryHubStore:
     + AgentStore
     + EvidenceStore
     + RelationStore
+    + TaskStore
+    + ExperienceStore
 {
 }
 
@@ -283,7 +353,9 @@ impl<
             + GrantStore
             + AgentStore
             + EvidenceStore
-            + RelationStore,
+            + RelationStore
+            + TaskStore
+            + ExperienceStore,
     > MemoryHubStore for T
 {
 }

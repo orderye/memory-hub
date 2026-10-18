@@ -9,12 +9,13 @@
 use crate::access::GrantChecker;
 use crate::account_scope::AccountScopedStore;
 use crate::domain::{
-    BackupRecord, BackupSummary, MemoryEntry, MemoryEvidence, MemoryRelation, NewEvidence,
-    NewMemoryRelation, RestoreMode, RestoreReport, VersionChange,
+    BackupRecord, BackupSummary, MemoryEntry, MemoryEvidence, MemoryExperience, MemoryRelation,
+    MemoryTask, MemoryTaskExperience, NewEvidence, NewMemoryExperience, NewMemoryRelation,
+    NewMemoryTask, RestoreMode, RestoreReport, VersionChange,
 };
 use crate::infra::{
-    AccessChecker, BackupStore, Clock, EvidenceStore, MemoryHubStore, MemoryStore, RelationStore,
-    SystemClock,
+    AccessChecker, BackupStore, Clock, EvidenceStore, ExperienceStore, MemoryHubStore, MemoryStore,
+    RelationStore, SystemClock, TaskStore,
 };
 use async_trait::async_trait;
 use common::{AuthCtx, HubError, Result, Scope};
@@ -23,8 +24,8 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use uuid::Uuid;
 
-/// 备份负载格式版本（升级至 v2 支持证据溯源与实体关系网）
-pub const BACKUP_PAYLOAD_VERSION: u32 = 2;
+/// 备份负载格式版本（升级至 v3 支持任务事实与经验记忆）
+pub const BACKUP_PAYLOAD_VERSION: u32 = 3;
 
 /// 全量快照的保留命名空间标记（不对应任何真实命名空间，也不是授权对象）
 pub const ALL_NAMESPACES: &str = "*";
@@ -153,6 +154,35 @@ impl DefaultBackupService {
         }
     }
 
+    /// 从负载取出任务列表
+    fn tasks_of(backup: &BackupRecord) -> Result<Vec<MemoryTask>> {
+        match backup.payload.get("tasks") {
+            Some(v) => serde_json::from_value(v.clone())
+                .map_err(|e| HubError::Internal(anyhow::anyhow!("备份负载 tasks 解析失败: {}", e))),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// 从负载取出经验列表
+    fn experiences_of(backup: &BackupRecord) -> Result<Vec<MemoryExperience>> {
+        match backup.payload.get("experiences") {
+            Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
+                HubError::Internal(anyhow::anyhow!("备份负载 experiences 解析失败: {}", e))
+            }),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// 从负载取出任务-经验映射列表
+    fn task_experiences_of(backup: &BackupRecord) -> Result<Vec<MemoryTaskExperience>> {
+        match backup.payload.get("task_experiences") {
+            Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
+                HubError::Internal(anyhow::anyhow!("备份负载 task_experiences 解析失败: {}", e))
+            }),
+            None => Ok(Vec::new()),
+        }
+    }
+
     /// 计算 v1 负载的规范校验和（仅 entries）
     fn checksum_v1(entries: &[MemoryEntry]) -> String {
         let bytes = serde_json::to_vec(entries).unwrap_or_default();
@@ -172,12 +202,34 @@ impl DefaultBackupService {
         hex::encode(hasher.finalize())
     }
 
-    /// 构建备份负载（v2 格式）
+    /// 计算 v3 负载的规范校验和（包含任务与经验实体）
+    fn checksum_v3(
+        entries: &[MemoryEntry],
+        evidences: &[MemoryEvidence],
+        relations: &[MemoryRelation],
+        tasks: &[MemoryTask],
+        experiences: &[MemoryExperience],
+        task_experiences: &[MemoryTaskExperience],
+    ) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(serde_json::to_vec(entries).unwrap_or_default());
+        hasher.update(serde_json::to_vec(evidences).unwrap_or_default());
+        hasher.update(serde_json::to_vec(relations).unwrap_or_default());
+        hasher.update(serde_json::to_vec(tasks).unwrap_or_default());
+        hasher.update(serde_json::to_vec(experiences).unwrap_or_default());
+        hasher.update(serde_json::to_vec(task_experiences).unwrap_or_default());
+        hex::encode(hasher.finalize())
+    }
+
+    /// 构建备份负载（v3 格式）
     fn payload_of(
         namespace: &str,
         entries: &[MemoryEntry],
         evidences: &[MemoryEvidence],
         relations: &[MemoryRelation],
+        tasks: &[MemoryTask],
+        experiences: &[MemoryExperience],
+        task_experiences: &[MemoryTaskExperience],
     ) -> serde_json::Value {
         serde_json::json!({
             "version": BACKUP_PAYLOAD_VERSION,
@@ -185,6 +237,9 @@ impl DefaultBackupService {
             "entries": entries,
             "evidences": evidences,
             "relations": relations,
+            "tasks": tasks,
+            "experiences": experiences,
+            "task_experiences": task_experiences,
         })
     }
 
@@ -203,7 +258,15 @@ impl DefaultBackupService {
         let entries = store.all_in_namespace(namespace, true).await?;
         let evidences = store.all_evidence_in_namespace(namespace).await?;
         let relations = store.all_relations_in_namespace(namespace).await?;
-        if entries.is_empty() && evidences.is_empty() && relations.is_empty() {
+        let tasks = store.all_tasks_in_namespace(namespace).await?;
+        let experiences = store.all_experiences_in_namespace(namespace).await?;
+        let task_experiences = store.all_task_experiences_in_namespace(namespace).await?;
+        if entries.is_empty()
+            && evidences.is_empty()
+            && relations.is_empty()
+            && tasks.is_empty()
+            && experiences.is_empty()
+        {
             return Ok(None);
         }
         let now = self.clock.now();
@@ -213,8 +276,23 @@ impl DefaultBackupService {
             created_by: auth.agent_id.clone(),
             note: Some(format!("restore-safety:{}", namespace)),
             entry_count: entries.len(),
-            checksum: Self::checksum_v2(&entries, &evidences, &relations),
-            payload: Self::payload_of(namespace, &entries, &evidences, &relations),
+            checksum: Self::checksum_v3(
+                &entries,
+                &evidences,
+                &relations,
+                &tasks,
+                &experiences,
+                &task_experiences,
+            ),
+            payload: Self::payload_of(
+                namespace,
+                &entries,
+                &evidences,
+                &relations,
+                &tasks,
+                &experiences,
+                &task_experiences,
+            ),
             retain_until: None,
             created_at: now,
         };
@@ -263,6 +341,38 @@ impl BackupService for DefaultBackupService {
             store.all_relations_in_namespace(&req.namespace).await?
         };
 
+        let tasks: Vec<MemoryTask> = if req.namespace == "*" {
+            let mut all = Vec::new();
+            for ns in crate::infra::MemoryStore::list_namespaces(&store).await? {
+                all.extend(store.all_tasks_in_namespace(&ns).await?);
+            }
+            all
+        } else {
+            store.all_tasks_in_namespace(&req.namespace).await?
+        };
+
+        let experiences: Vec<MemoryExperience> = if req.namespace == "*" {
+            let mut all = Vec::new();
+            for ns in crate::infra::MemoryStore::list_namespaces(&store).await? {
+                all.extend(store.all_experiences_in_namespace(&ns).await?);
+            }
+            all
+        } else {
+            store.all_experiences_in_namespace(&req.namespace).await?
+        };
+
+        let task_experiences: Vec<MemoryTaskExperience> = if req.namespace == "*" {
+            let mut all = Vec::new();
+            for ns in crate::infra::MemoryStore::list_namespaces(&store).await? {
+                all.extend(store.all_task_experiences_in_namespace(&ns).await?);
+            }
+            all
+        } else {
+            store
+                .all_task_experiences_in_namespace(&req.namespace)
+                .await?
+        };
+
         let now = self.clock.now();
         let record = BackupRecord {
             id: Uuid::new_v4(),
@@ -270,8 +380,23 @@ impl BackupService for DefaultBackupService {
             created_by: auth.agent_id.clone(),
             note: req.note.clone(),
             entry_count: entries.len(),
-            checksum: Self::checksum_v2(&entries, &evidences, &relations),
-            payload: Self::payload_of(&req.namespace, &entries, &evidences, &relations),
+            checksum: Self::checksum_v3(
+                &entries,
+                &evidences,
+                &relations,
+                &tasks,
+                &experiences,
+                &task_experiences,
+            ),
+            payload: Self::payload_of(
+                &req.namespace,
+                &entries,
+                &evidences,
+                &relations,
+                &tasks,
+                &experiences,
+                &task_experiences,
+            ),
             retain_until: None,
             created_at: now,
         };
@@ -300,22 +425,29 @@ impl BackupService for DefaultBackupService {
         let store = self.scoped(auth);
         let backup = store.get_backup(req.backup_id).await?;
 
-        // 完整性校验：重建校验和与写入时比对（兼容 v1 与 v2）
-        let ver = backup
-            .payload
-            .get("version")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(1);
+        // 完整性校验：重建校验和与写入时比对（兼容 v1、v2 与 v3）
         let entries = Self::entries_of(&backup)?;
         let evidences = Self::evidences_of(&backup)?;
         let relations = Self::relations_of(&backup)?;
+        let tasks = Self::tasks_of(&backup)?;
+        let experiences = Self::experiences_of(&backup)?;
+        let task_experiences = Self::task_experiences_of(&backup)?;
 
-        let actual = if ver >= 2 {
-            Self::checksum_v2(&entries, &evidences, &relations)
-        } else {
-            Self::checksum_v1(&entries)
-        };
-        if actual != backup.checksum {
+        let actual_v3 = Self::checksum_v3(
+            &entries,
+            &evidences,
+            &relations,
+            &tasks,
+            &experiences,
+            &task_experiences,
+        );
+        let actual_v2 = Self::checksum_v2(&entries, &evidences, &relations);
+        let actual_v1 = Self::checksum_v1(&entries);
+
+        let valid = backup.checksum == actual_v3
+            || backup.checksum == actual_v2
+            || backup.checksum == actual_v1;
+        if !valid {
             return Err(HubError::Internal(anyhow::anyhow!(
                 "备份校验和不匹配（内容可能已损坏）"
             )));
@@ -437,6 +569,50 @@ impl BackupService for DefaultBackupService {
                 .await;
         }
 
+        // 恢复任务事实
+        for t in &tasks {
+            let _ = store
+                .create_task(&NewMemoryTask {
+                    id: Some(t.id),
+                    namespace: t.namespace.clone(),
+                    scene: t.scene,
+                    task: t.task.clone(),
+                    status: t.status,
+                    started_at: t.started_at,
+                    finished_at: t.finished_at,
+                    result_summary: t.result_summary.clone(),
+                    failure_reason: t.failure_reason.clone(),
+                    source_evidence_id: t.source_evidence_id,
+                    metadata: t.metadata.clone(),
+                })
+                .await;
+        }
+
+        // 恢复经验记忆
+        for exp in &experiences {
+            let _ = store
+                .save_experience(&NewMemoryExperience {
+                    id: Some(exp.id),
+                    namespace: exp.namespace.clone(),
+                    task: exp.task.clone(),
+                    search_keys: exp.search_keys.clone(),
+                    solution: exp.solution.clone(),
+                    preconditions: exp.preconditions.clone(),
+                    boundary_envs: exp.boundary_envs.clone(),
+                    failure_modes: exp.failure_modes.clone(),
+                    validation: exp.validation.clone(),
+                    confidence: exp.confidence,
+                    status: exp.status,
+                    feedback_score: exp.feedback_score,
+                })
+                .await;
+        }
+
+        // 恢复任务-经验关联映射
+        for te in &task_experiences {
+            let _ = store.link_task_experience(te).await;
+        }
+
         Ok(report)
     }
 
@@ -488,9 +664,10 @@ mod tests {
         crate::account_scope::scope_name(&common::BOOTSTRAP_ACCOUNT_ID, ns)
     }
     use crate::domain::{
-        EvidenceSourceKind, IntegrationProposal, MemoryEvidence, MemoryFilter, MemoryKind,
-        MemoryRelation, MemoryRelationKind, MemoryStatus, MemoryVersion, NamespaceGrantRecord,
-        NamespaceInfo, NewEvidence, NewMemoryRelation, ProposalStatus,
+        EvidenceSourceKind, ExperienceStatus, IntegrationProposal, MemoryEvidence, MemoryFilter,
+        MemoryKind, MemoryRelation, MemoryRelationKind, MemoryStatus, MemoryVersion,
+        NamespaceGrantRecord, NamespaceInfo, NewEvidence, NewMemoryRelation, ProposalStatus,
+        TaskStatus,
     };
     use crate::infra::{
         BackupStore, Embedder, EvidenceStore, GrantStore, IntegrationStore, MemoryStore,
@@ -511,6 +688,9 @@ mod tests {
         versions: RwLock<Vec<MemoryVersion>>,
         evidences: RwLock<Vec<MemoryEvidence>>,
         relations: RwLock<Vec<MemoryRelation>>,
+        tasks: RwLock<StdHashMap<(String, Uuid), MemoryTask>>,
+        experiences: RwLock<StdHashMap<(String, Uuid), MemoryExperience>>,
+        task_experiences: RwLock<Vec<MemoryTaskExperience>>,
     }
 
     impl TestHubStore {
@@ -935,6 +1115,192 @@ mod tests {
         }
         async fn all_relations_in_namespace(&self, _ns: &str) -> Result<Vec<MemoryRelation>> {
             Ok(self.relations.read().unwrap().clone())
+        }
+    }
+
+    #[async_trait]
+    impl TaskStore for TestHubStore {
+        async fn create_task(&self, task: &NewMemoryTask) -> Result<MemoryTask> {
+            let id = task.id.unwrap_or_else(Uuid::new_v4);
+            let record = MemoryTask {
+                id,
+                namespace: task.namespace.clone(),
+                scene: task.scene,
+                task: task.task.clone(),
+                status: task.status,
+                started_at: task.started_at,
+                finished_at: task.finished_at,
+                result_summary: task.result_summary.clone(),
+                failure_reason: task.failure_reason.clone(),
+                source_evidence_id: task.source_evidence_id,
+                metadata: task.metadata.clone(),
+            };
+            self.tasks
+                .write()
+                .unwrap()
+                .insert((task.namespace.clone(), id), record.clone());
+            Ok(record)
+        }
+
+        async fn update_task(&self, task: &MemoryTask) -> Result<MemoryTask> {
+            self.tasks
+                .write()
+                .unwrap()
+                .insert((task.namespace.clone(), task.id), task.clone());
+            Ok(task.clone())
+        }
+
+        async fn get_task(&self, namespace: &str, id: Uuid) -> Result<Option<MemoryTask>> {
+            Ok(self
+                .tasks
+                .read()
+                .unwrap()
+                .get(&(namespace.to_string(), id))
+                .cloned())
+        }
+
+        async fn list_tasks(
+            &self,
+            namespace: &str,
+            status: Option<TaskStatus>,
+            limit: usize,
+        ) -> Result<Vec<MemoryTask>> {
+            let r = self.tasks.read().unwrap();
+            let mut list: Vec<_> = r
+                .values()
+                .filter(|t| t.namespace == namespace && status.is_none_or(|s| t.status == s))
+                .cloned()
+                .collect();
+            list.sort_by_key(|a| std::cmp::Reverse(a.started_at));
+            list.truncate(limit);
+            Ok(list)
+        }
+
+        async fn all_tasks_in_namespace(&self, namespace: &str) -> Result<Vec<MemoryTask>> {
+            let r = self.tasks.read().unwrap();
+            Ok(r.values()
+                .filter(|t| t.namespace == namespace)
+                .cloned()
+                .collect())
+        }
+    }
+
+    #[async_trait]
+    impl ExperienceStore for TestHubStore {
+        async fn save_experience(
+            &self,
+            experience: &NewMemoryExperience,
+        ) -> Result<MemoryExperience> {
+            let id = experience.id.unwrap_or_else(Uuid::new_v4);
+            let now = chrono::Utc::now();
+            let record = MemoryExperience {
+                id,
+                namespace: experience.namespace.clone(),
+                task: experience.task.clone(),
+                search_keys: experience.search_keys.clone(),
+                solution: experience.solution.clone(),
+                preconditions: experience.preconditions.clone(),
+                boundary_envs: experience.boundary_envs.clone(),
+                failure_modes: experience.failure_modes.clone(),
+                validation: experience.validation.clone(),
+                confidence: experience.confidence,
+                status: experience.status,
+                feedback_score: experience.feedback_score,
+                created_at: now,
+                updated_at: now,
+            };
+            self.experiences
+                .write()
+                .unwrap()
+                .insert((experience.namespace.clone(), id), record.clone());
+            Ok(record)
+        }
+
+        async fn update_experience(
+            &self,
+            experience: &MemoryExperience,
+        ) -> Result<MemoryExperience> {
+            self.experiences.write().unwrap().insert(
+                (experience.namespace.clone(), experience.id),
+                experience.clone(),
+            );
+            Ok(experience.clone())
+        }
+
+        async fn get_experience(
+            &self,
+            namespace: &str,
+            id: Uuid,
+        ) -> Result<Option<MemoryExperience>> {
+            Ok(self
+                .experiences
+                .read()
+                .unwrap()
+                .get(&(namespace.to_string(), id))
+                .cloned())
+        }
+
+        async fn list_experiences(
+            &self,
+            namespace: &str,
+            status: Option<ExperienceStatus>,
+            limit: usize,
+        ) -> Result<Vec<MemoryExperience>> {
+            let r = self.experiences.read().unwrap();
+            let mut list: Vec<_> = r
+                .values()
+                .filter(|e| e.namespace == namespace && status.is_none_or(|s| e.status == s))
+                .cloned()
+                .collect();
+            list.sort_by_key(|a| std::cmp::Reverse(a.created_at));
+            list.truncate(limit);
+            Ok(list)
+        }
+
+        async fn link_task_experience(&self, link: &MemoryTaskExperience) -> Result<()> {
+            let mut r = self.task_experiences.write().unwrap();
+            if !r
+                .iter()
+                .any(|l| l.task_id == link.task_id && l.experience_id == link.experience_id)
+            {
+                r.push(link.clone());
+            }
+            Ok(())
+        }
+
+        async fn list_experiences_for_task(
+            &self,
+            task_id: Uuid,
+        ) -> Result<Vec<MemoryTaskExperience>> {
+            let r = self.task_experiences.read().unwrap();
+            Ok(r.iter()
+                .filter(|te| te.task_id == task_id)
+                .cloned()
+                .collect())
+        }
+
+        async fn all_experiences_in_namespace(
+            &self,
+            namespace: &str,
+        ) -> Result<Vec<MemoryExperience>> {
+            let r = self.experiences.read().unwrap();
+            Ok(r.values()
+                .filter(|e| e.namespace == namespace)
+                .cloned()
+                .collect())
+        }
+
+        async fn all_task_experiences_in_namespace(
+            &self,
+            namespace: &str,
+        ) -> Result<Vec<MemoryTaskExperience>> {
+            let exps = self.all_experiences_in_namespace(namespace).await?;
+            let exp_ids: std::collections::HashSet<_> = exps.into_iter().map(|e| e.id).collect();
+            let r = self.task_experiences.read().unwrap();
+            Ok(r.iter()
+                .filter(|te| exp_ids.contains(&te.experience_id))
+                .cloned()
+                .collect())
         }
     }
 

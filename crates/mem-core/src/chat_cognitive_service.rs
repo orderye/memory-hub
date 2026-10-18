@@ -460,7 +460,9 @@ impl ChatCognitiveService {
 mod tests {
     use super::*;
     use crate::domain::{
-        ChatMessage, ChatRole, MemoryEvidence, MemoryRelation, MemoryVersion,
+        ChatMessage, ChatRole, ExperienceStatus, MemoryEvidence, MemoryExperience, MemoryRelation,
+        MemoryTask, MemoryTaskExperience, MemoryVersion, NewMemoryExperience, NewMemoryTask,
+        TaskStatus,
     };
     use crate::infra::*;
     use crate::testing::MockChatCognitiveExtractor;
@@ -475,6 +477,9 @@ mod tests {
         versions: RwLock<Vec<MemoryVersion>>,
         evidences: RwLock<Vec<MemoryEvidence>>,
         relations: RwLock<Vec<MemoryRelation>>,
+        tasks: RwLock<HashMap<(String, Uuid), MemoryTask>>,
+        experiences: RwLock<HashMap<(String, Uuid), MemoryExperience>>,
+        task_experiences: RwLock<Vec<MemoryTaskExperience>>,
     }
 
     #[async_trait]
@@ -815,6 +820,186 @@ mod tests {
         }
         async fn verify_agent_secret(&self, _id: &AgentId, _sec: &str) -> Result<bool> {
             Ok(false)
+        }
+    }
+
+    #[async_trait]
+    impl TaskStore for TestHubStore {
+        async fn create_task(&self, task: &NewMemoryTask) -> Result<MemoryTask> {
+            let id = task.id.unwrap_or_else(Uuid::new_v4);
+            let record = MemoryTask {
+                id,
+                namespace: task.namespace.clone(),
+                scene: task.scene,
+                task: task.task.clone(),
+                status: task.status,
+                started_at: task.started_at,
+                finished_at: task.finished_at,
+                result_summary: task.result_summary.clone(),
+                failure_reason: task.failure_reason.clone(),
+                source_evidence_id: task.source_evidence_id,
+                metadata: task.metadata.clone(),
+            };
+            self.tasks
+                .write()
+                .unwrap()
+                .insert((task.namespace.clone(), id), record.clone());
+            Ok(record)
+        }
+
+        async fn update_task(&self, task: &MemoryTask) -> Result<MemoryTask> {
+            self.tasks
+                .write()
+                .unwrap()
+                .insert((task.namespace.clone(), task.id), task.clone());
+            Ok(task.clone())
+        }
+
+        async fn get_task(&self, namespace: &str, id: Uuid) -> Result<Option<MemoryTask>> {
+            Ok(self
+                .tasks
+                .read()
+                .unwrap()
+                .get(&(namespace.to_string(), id))
+                .cloned())
+        }
+
+        async fn list_tasks(
+            &self,
+            namespace: &str,
+            status: Option<TaskStatus>,
+            limit: usize,
+        ) -> Result<Vec<MemoryTask>> {
+            let r = self.tasks.read().unwrap();
+            let mut list: Vec<_> = r
+                .values()
+                .filter(|t| t.namespace == namespace && status.is_none_or(|s| t.status == s))
+                .cloned()
+                .collect();
+            list.sort_by_key(|a| std::cmp::Reverse(a.started_at));
+            list.truncate(limit);
+            Ok(list)
+        }
+
+        async fn all_tasks_in_namespace(&self, namespace: &str) -> Result<Vec<MemoryTask>> {
+            let r = self.tasks.read().unwrap();
+            Ok(r.values()
+                .filter(|t| t.namespace == namespace)
+                .cloned()
+                .collect())
+        }
+    }
+
+    #[async_trait]
+    impl ExperienceStore for TestHubStore {
+        async fn save_experience(
+            &self,
+            experience: &NewMemoryExperience,
+        ) -> Result<MemoryExperience> {
+            let id = experience.id.unwrap_or_else(Uuid::new_v4);
+            let now = Utc::now();
+            let record = MemoryExperience {
+                id,
+                namespace: experience.namespace.clone(),
+                task: experience.task.clone(),
+                search_keys: experience.search_keys.clone(),
+                solution: experience.solution.clone(),
+                preconditions: experience.preconditions.clone(),
+                boundary_envs: experience.boundary_envs.clone(),
+                failure_modes: experience.failure_modes.clone(),
+                validation: experience.validation.clone(),
+                confidence: experience.confidence,
+                status: experience.status,
+                feedback_score: experience.feedback_score,
+                created_at: now,
+                updated_at: now,
+            };
+            self.experiences
+                .write()
+                .unwrap()
+                .insert((experience.namespace.clone(), id), record.clone());
+            Ok(record)
+        }
+
+        async fn update_experience(
+            &self,
+            experience: &MemoryExperience,
+        ) -> Result<MemoryExperience> {
+            self.experiences.write().unwrap().insert(
+                (experience.namespace.clone(), experience.id),
+                experience.clone(),
+            );
+            Ok(experience.clone())
+        }
+
+        async fn get_experience(
+            &self,
+            namespace: &str,
+            id: Uuid,
+        ) -> Result<Option<MemoryExperience>> {
+            Ok(self
+                .experiences
+                .read()
+                .unwrap()
+                .get(&(namespace.to_string(), id))
+                .cloned())
+        }
+
+        async fn list_experiences(
+            &self,
+            namespace: &str,
+            status: Option<ExperienceStatus>,
+            limit: usize,
+        ) -> Result<Vec<MemoryExperience>> {
+            let r = self.experiences.read().unwrap();
+            let mut list: Vec<_> = r
+                .values()
+                .filter(|e| e.namespace == namespace && status.is_none_or(|s| e.status == s))
+                .cloned()
+                .collect();
+            list.sort_by_key(|a| std::cmp::Reverse(a.created_at));
+            list.truncate(limit);
+            Ok(list)
+        }
+
+        async fn link_task_experience(&self, link: &MemoryTaskExperience) -> Result<()> {
+            self.task_experiences.write().unwrap().push(link.clone());
+            Ok(())
+        }
+
+        async fn list_experiences_for_task(
+            &self,
+            task_id: Uuid,
+        ) -> Result<Vec<MemoryTaskExperience>> {
+            let r = self.task_experiences.read().unwrap();
+            Ok(r.iter()
+                .filter(|te| te.task_id == task_id)
+                .cloned()
+                .collect())
+        }
+
+        async fn all_experiences_in_namespace(
+            &self,
+            namespace: &str,
+        ) -> Result<Vec<MemoryExperience>> {
+            let r = self.experiences.read().unwrap();
+            Ok(r.values()
+                .filter(|e| e.namespace == namespace)
+                .cloned()
+                .collect())
+        }
+
+        async fn all_task_experiences_in_namespace(
+            &self,
+            namespace: &str,
+        ) -> Result<Vec<MemoryTaskExperience>> {
+            let exps = self.all_experiences_in_namespace(namespace).await?;
+            let exp_ids: std::collections::HashSet<_> = exps.into_iter().map(|e| e.id).collect();
+            let r = self.task_experiences.read().unwrap();
+            Ok(r.iter()
+                .filter(|te| exp_ids.contains(&te.experience_id))
+                .cloned()
+                .collect())
         }
     }
 

@@ -8,10 +8,12 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use common::{AccountId, AgentId, HubError, Result};
 use mem_core::{
-    AccountRecord, BackupRecord, EvidenceSourceKind, IntegrationProposal, MemoryEntry,
-    MemoryEvidence, MemoryFilter, MemoryKind, MemoryRelation, MemoryRelationKind, MemoryStats,
-    MemoryStatus, MemoryVersion, Namespace, NamespaceGrantRecord, NamespaceInfo, NewEvidence,
-    NewMemoryRelation, ProposalStatus, Scored, SessionRecord, VersionChange,
+    AccountRecord, BackupRecord, EvidenceSourceKind, ExperienceStatus, IntegrationProposal,
+    MemoryEntry, MemoryEvidence, MemoryExperience, MemoryFilter, MemoryKind, MemoryRelation,
+    MemoryRelationKind, MemoryStats, MemoryStatus, MemoryTask, MemoryTaskExperience, MemoryVersion,
+    Namespace, NamespaceGrantRecord, NamespaceInfo, NewEvidence, NewMemoryExperience,
+    NewMemoryRelation, NewMemoryTask, ProposalStatus, Scored, SessionRecord, TaskStatus,
+    VersionChange,
 };
 use std::collections::BTreeMap;
 use std::sync::RwLock;
@@ -28,6 +30,9 @@ pub struct InMemoryHubStore {
     versions: RwLock<Vec<MemoryVersion>>,
     evidences: RwLock<BTreeMap<(Namespace, Uuid), MemoryEvidence>>,
     relations: RwLock<BTreeMap<RelationKey, RelationEntry>>,
+    tasks: RwLock<BTreeMap<(Namespace, Uuid), MemoryTask>>,
+    experiences: RwLock<BTreeMap<(Namespace, Uuid), MemoryExperience>>,
+    task_experiences: RwLock<Vec<(Namespace, MemoryTaskExperience)>>,
     backups: RwLock<BTreeMap<Uuid, BackupRecord>>,
     proposals: RwLock<BTreeMap<Uuid, IntegrationProposal>>,
     namespaces: RwLock<BTreeMap<Namespace, NamespaceInfo>>,
@@ -1072,6 +1077,199 @@ impl mem_core::infra::RelationStore for InMemoryHubStore {
             .map(|(_, rel)| rel.clone())
             .collect();
         list.sort_by_key(|rel| (rel.created_at, rel.from_memory_id, rel.to_memory_id));
+        Ok(list)
+    }
+}
+
+#[async_trait]
+impl mem_core::infra::TaskStore for InMemoryHubStore {
+    async fn create_task(&self, task: &NewMemoryTask) -> Result<MemoryTask> {
+        let id = task.id.unwrap_or_else(Uuid::new_v4);
+        let record = MemoryTask {
+            id,
+            namespace: task.namespace.clone(),
+            scene: task.scene,
+            task: task.task.clone(),
+            status: task.status,
+            started_at: task.started_at,
+            finished_at: task.finished_at,
+            result_summary: task.result_summary.clone(),
+            failure_reason: task.failure_reason.clone(),
+            source_evidence_id: task.source_evidence_id,
+            metadata: task.metadata.clone(),
+        };
+        let mut w = self.tasks.write().unwrap();
+        w.insert((task.namespace.clone(), id), record.clone());
+        Ok(record)
+    }
+
+    async fn update_task(&self, task: &MemoryTask) -> Result<MemoryTask> {
+        let mut w = self.tasks.write().unwrap();
+        let key = (task.namespace.clone(), task.id);
+        if !w.contains_key(&key) {
+            return Err(HubError::NotFound);
+        }
+        w.insert(key, task.clone());
+        Ok(task.clone())
+    }
+
+    async fn get_task(&self, namespace: &str, id: Uuid) -> Result<Option<MemoryTask>> {
+        let r = self.tasks.read().unwrap();
+        Ok(r.get(&(namespace.to_string(), id)).cloned())
+    }
+
+    async fn list_tasks(
+        &self,
+        namespace: &str,
+        status: Option<TaskStatus>,
+        limit: usize,
+    ) -> Result<Vec<MemoryTask>> {
+        let r = self.tasks.read().unwrap();
+        let mut list: Vec<MemoryTask> = r
+            .iter()
+            .filter(|((ns, _), _)| ns == namespace)
+            .map(|(_, t)| t.clone())
+            .filter(|t| {
+                if let Some(s) = status {
+                    t.status == s
+                } else {
+                    true
+                }
+            })
+            .collect();
+        list.sort_by_key(|t| std::cmp::Reverse(t.started_at));
+        list.truncate(limit.max(1));
+        Ok(list)
+    }
+
+    async fn all_tasks_in_namespace(&self, namespace: &str) -> Result<Vec<MemoryTask>> {
+        let r = self.tasks.read().unwrap();
+        let mut list: Vec<MemoryTask> = r
+            .iter()
+            .filter(|((ns, _), _)| ns == namespace)
+            .map(|(_, t)| t.clone())
+            .collect();
+        list.sort_by_key(|t| (t.started_at, t.id));
+        Ok(list)
+    }
+}
+
+#[async_trait]
+impl mem_core::infra::ExperienceStore for InMemoryHubStore {
+    async fn save_experience(&self, exp: &NewMemoryExperience) -> Result<MemoryExperience> {
+        let id = exp.id.unwrap_or_else(Uuid::new_v4);
+        let now = Utc::now();
+        let record = MemoryExperience {
+            id,
+            namespace: exp.namespace.clone(),
+            task: exp.task.clone(),
+            search_keys: exp.search_keys.clone(),
+            solution: exp.solution.clone(),
+            preconditions: exp.preconditions.clone(),
+            boundary_envs: exp.boundary_envs.clone(),
+            failure_modes: exp.failure_modes.clone(),
+            validation: exp.validation.clone(),
+            confidence: exp.confidence,
+            status: exp.status,
+            feedback_score: exp.feedback_score,
+            created_at: now,
+            updated_at: now,
+        };
+        let mut w = self.experiences.write().unwrap();
+        w.insert((exp.namespace.clone(), id), record.clone());
+        Ok(record)
+    }
+
+    async fn update_experience(&self, exp: &MemoryExperience) -> Result<MemoryExperience> {
+        let mut w = self.experiences.write().unwrap();
+        let key = (exp.namespace.clone(), exp.id);
+        if !w.contains_key(&key) {
+            return Err(HubError::NotFound);
+        }
+        let mut updated = exp.clone();
+        updated.updated_at = Utc::now();
+        w.insert(key, updated.clone());
+        Ok(updated)
+    }
+
+    async fn get_experience(&self, namespace: &str, id: Uuid) -> Result<Option<MemoryExperience>> {
+        let r = self.experiences.read().unwrap();
+        Ok(r.get(&(namespace.to_string(), id)).cloned())
+    }
+
+    async fn list_experiences(
+        &self,
+        namespace: &str,
+        status: Option<ExperienceStatus>,
+        limit: usize,
+    ) -> Result<Vec<MemoryExperience>> {
+        let r = self.experiences.read().unwrap();
+        let mut list: Vec<MemoryExperience> = r
+            .iter()
+            .filter(|((ns, _), _)| ns == namespace)
+            .map(|(_, e)| e.clone())
+            .filter(|e| {
+                if let Some(s) = status {
+                    e.status == s
+                } else {
+                    true
+                }
+            })
+            .collect();
+        list.sort_by_key(|e| std::cmp::Reverse(e.updated_at));
+        list.truncate(limit.max(1));
+        Ok(list)
+    }
+
+    async fn link_task_experience(&self, link: &MemoryTaskExperience) -> Result<()> {
+        let mut w = self.task_experiences.write().unwrap();
+        if !w.iter().any(|(_, l)| {
+            l.task_id == link.task_id
+                && l.experience_id == link.experience_id
+                && l.relation_kind == link.relation_kind
+        }) {
+            let tasks = self.tasks.read().unwrap();
+            let ns = tasks
+                .iter()
+                .find(|((_, tid), _)| *tid == link.task_id)
+                .map(|((ns, _), _)| ns.clone())
+                .unwrap_or_default();
+            w.push((ns, link.clone()));
+        }
+        Ok(())
+    }
+
+    async fn list_experiences_for_task(&self, task_id: Uuid) -> Result<Vec<MemoryTaskExperience>> {
+        let r = self.task_experiences.read().unwrap();
+        let list: Vec<MemoryTaskExperience> = r
+            .iter()
+            .filter(|(_, l)| l.task_id == task_id)
+            .map(|(_, l)| l.clone())
+            .collect();
+        Ok(list)
+    }
+
+    async fn all_experiences_in_namespace(&self, namespace: &str) -> Result<Vec<MemoryExperience>> {
+        let r = self.experiences.read().unwrap();
+        let mut list: Vec<MemoryExperience> = r
+            .iter()
+            .filter(|((ns, _), _)| ns == namespace)
+            .map(|(_, e)| e.clone())
+            .collect();
+        list.sort_by_key(|e| (e.created_at, e.id));
+        Ok(list)
+    }
+
+    async fn all_task_experiences_in_namespace(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<MemoryTaskExperience>> {
+        let r = self.task_experiences.read().unwrap();
+        let list: Vec<MemoryTaskExperience> = r
+            .iter()
+            .filter(|(ns, _)| ns == namespace)
+            .map(|(_, l)| l.clone())
+            .collect();
         Ok(list)
     }
 }
