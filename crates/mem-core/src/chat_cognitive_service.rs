@@ -460,9 +460,9 @@ impl ChatCognitiveService {
 mod tests {
     use super::*;
     use crate::domain::{
-        ChatMessage, ChatRole, ExperienceStatus, MemoryEvidence, MemoryExperience, MemoryRelation,
-        MemoryTask, MemoryTaskExperience, MemoryVersion, NewMemoryExperience, NewMemoryTask,
-        TaskStatus,
+        ChatMessage, ChatRole, CodingRevision, CodingThread, ExperienceStatus, MemoryEvidence,
+        MemoryExperience, MemoryRelation, MemoryTask, MemoryTaskExperience, MemoryVersion,
+        NewCodingRevision, NewCodingThread, NewMemoryExperience, NewMemoryTask, TaskStatus,
     };
     use crate::infra::*;
     use crate::testing::MockChatCognitiveExtractor;
@@ -1000,6 +1000,72 @@ mod tests {
                 .filter(|te| exp_ids.contains(&te.experience_id))
                 .cloned()
                 .collect())
+        }
+    }
+
+    #[async_trait]
+    impl CodingStore for TestHubStore {
+        async fn create_thread(&self, _thread: &NewCodingThread) -> Result<CodingThread> {
+            Err(HubError::Unavailable)
+        }
+        async fn get_thread(&self, _namespace: &str, _id: Uuid) -> Result<Option<CodingThread>> {
+            Ok(None)
+        }
+        async fn list_threads(
+            &self,
+            _namespace: &str,
+            _repository: Option<&str>,
+            _limit: usize,
+        ) -> Result<Vec<CodingThread>> {
+            Ok(vec![])
+        }
+        async fn save_revision(
+            &self,
+            _rev: &NewCodingRevision,
+            _diff_hash: &str,
+        ) -> Result<CodingRevision> {
+            Err(HubError::Unavailable)
+        }
+        async fn get_revision(
+            &self,
+            _namespace: &str,
+            _id: Uuid,
+        ) -> Result<Option<CodingRevision>> {
+            Ok(None)
+        }
+        async fn get_revision_by_hash(
+            &self,
+            _namespace: &str,
+            _repository: &str,
+            _diff_hash: &str,
+        ) -> Result<Option<CodingRevision>> {
+            Ok(None)
+        }
+        async fn list_revisions_for_thread(
+            &self,
+            _namespace: &str,
+            _thread_id: Uuid,
+            _limit: usize,
+        ) -> Result<Vec<CodingRevision>> {
+            Ok(vec![])
+        }
+        async fn list_revisions_for_file(
+            &self,
+            _namespace: &str,
+            _repository: &str,
+            _file_path: &str,
+            _limit: usize,
+        ) -> Result<Vec<CodingRevision>> {
+            Ok(vec![])
+        }
+        async fn all_threads_in_namespace(&self, _namespace: &str) -> Result<Vec<CodingThread>> {
+            Ok(vec![])
+        }
+        async fn all_revisions_in_namespace(
+            &self,
+            _namespace: &str,
+        ) -> Result<Vec<CodingRevision>> {
+            Ok(vec![])
         }
     }
 

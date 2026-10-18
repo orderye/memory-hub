@@ -15,13 +15,14 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use common::{AccountId, AgentId, HubError, Result};
 use mem_core::{
-    AccountRecord, BackupRecord, CognitiveLayer, EvidenceSourceKind, EvidenceStore,
-    ExperienceStatus, ExperienceStore, IntegrationKind, IntegrationProposal, MemoryEntry,
-    MemoryEvidence, MemoryExperience, MemoryFilter, MemoryKind, MemoryRelation, MemoryRelationKind,
-    MemoryScene, MemoryStatus, MemoryTask, MemoryTaskExperience, MemoryVersion, Namespace,
-    NamespaceGrantRecord, NamespaceInfo, NewEvidence, NewMemoryExperience, NewMemoryRelation,
-    NewMemoryTask, ProposalStatus, RelationStore, Scored, SessionRecord, TaskStatus, TaskStore,
-    VersionChange,
+    AccountRecord, BackupRecord, CodeChangeKind, CodingRevision, CodingStore, CodingThread,
+    CognitiveLayer, EvidenceSourceKind, EvidenceStore, ExperienceStatus, ExperienceStore,
+    IntegrationKind, IntegrationProposal, MemoryEntry, MemoryEvidence, MemoryExperience,
+    MemoryFilter, MemoryKind, MemoryRelation, MemoryRelationKind, MemoryScene, MemoryStatus,
+    MemoryTask, MemoryTaskExperience, MemoryVersion, Namespace, NamespaceGrantRecord,
+    NamespaceInfo, NewCodingRevision, NewCodingThread, NewEvidence, NewMemoryExperience,
+    NewMemoryRelation, NewMemoryTask, ProposalStatus, RelationStore, Scored, SessionRecord,
+    TaskStatus, TaskStore, VersionChange,
 };
 use sqlx::postgres::{PgConnection, PgPool, PgPoolOptions, PgRow};
 use sqlx::Row;
@@ -69,6 +70,11 @@ mod mapping {
     pub fn parse_experience_status(s: &str) -> Result<ExperienceStatus> {
         ExperienceStatus::parse(s)
             .ok_or_else(|| HubError::Internal(anyhow::anyhow!("未知经验状态: {}", s)))
+    }
+
+    pub fn parse_change_kind(s: &str) -> Result<CodeChangeKind> {
+        CodeChangeKind::parse(s)
+            .ok_or_else(|| HubError::Internal(anyhow::anyhow!("未知代码变更类型: {}", s)))
     }
 
     pub fn parse_integration_kind(s: &str) -> Result<IntegrationKind> {
@@ -189,6 +195,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
     (
         "20261018000007_working_memory_tasks_and_experiences",
         include_str!("../migrations/20261018000007_working_memory_tasks_and_experiences.sql"),
+    ),
+    (
+        "20261018000008_coding_memory_revisions",
+        include_str!("../migrations/20261018000008_coding_memory_revisions.sql"),
     ),
 ];
 
@@ -525,6 +535,45 @@ impl PostgresHubStore {
             experience_id: r.try_get("experience_id").pg()?,
             relation_kind: r.try_get("relation_kind").pg()?,
             created_at: r.try_get("created_at").pg()?,
+        })
+    }
+
+    fn thread_from_row(r: &PgRow) -> Result<CodingThread> {
+        Ok(CodingThread {
+            id: r.try_get("id").pg()?,
+            namespace: r.try_get("namespace").pg()?,
+            repository: r.try_get("repository").pg()?,
+            branch: r.try_get("branch").ok().flatten(),
+            task_id: r.try_get("task_id").ok().flatten(),
+            title: r.try_get("title").pg()?,
+            description: r.try_get("description").ok().flatten(),
+            created_at: r.try_get("created_at").pg()?,
+            updated_at: r.try_get("updated_at").pg()?,
+        })
+    }
+
+    fn revision_from_row(r: &PgRow) -> Result<CodingRevision> {
+        let change_kind_str: String = r.try_get("change_kind").pg()?;
+        let change_kind = mapping::parse_change_kind(&change_kind_str)?;
+        Ok(CodingRevision {
+            id: r.try_get("id").pg()?,
+            thread_id: r.try_get("thread_id").ok().flatten(),
+            namespace: r.try_get("namespace").pg()?,
+            repository: r.try_get("repository").pg()?,
+            branch: r.try_get("branch").ok().flatten(),
+            commit_sha: r.try_get("commit_sha").ok().flatten(),
+            parent_sha: r.try_get("parent_sha").ok().flatten(),
+            file_path: r.try_get("file_path").pg()?,
+            change_kind,
+            diff_content: r.try_get("diff_content").pg()?,
+            diff_hash: r.try_get("diff_hash").pg()?,
+            symbol_fingerprint: r.try_get("symbol_fingerprint").ok().flatten(),
+            is_committed: r.try_get("is_committed").pg()?,
+            author: r.try_get("author").ok().flatten(),
+            occurred_at: r.try_get("occurred_at").pg()?,
+            created_at: r.try_get("created_at").pg()?,
+            source_evidence_id: r.try_get("source_evidence_id").ok().flatten(),
+            source_task_id: r.try_get("source_task_id").ok().flatten(),
         })
     }
 
@@ -2479,6 +2528,261 @@ impl ExperienceStore for PostgresHubStore {
     }
 }
 
+#[async_trait]
+impl CodingStore for PostgresHubStore {
+    async fn create_thread(&self, thread: &NewCodingThread) -> Result<CodingThread> {
+        let id = thread.id.unwrap_or_else(Uuid::new_v4);
+        let now = Utc::now();
+        let row = sqlx::query(
+            r#"
+            insert into coding_threads (
+                id, namespace, repository, branch, task_id, title, description, created_at, updated_at
+            )
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $8)
+            returning id, namespace, repository, branch, task_id, title, description, created_at, updated_at
+            "#,
+        )
+        .bind(id)
+        .bind(&thread.namespace)
+        .bind(&thread.repository)
+        .bind(&thread.branch)
+        .bind(thread.task_id)
+        .bind(&thread.title)
+        .bind(&thread.description)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await
+        .pg()?;
+
+        Self::thread_from_row(&row)
+    }
+
+    async fn get_thread(&self, namespace: &str, id: Uuid) -> Result<Option<CodingThread>> {
+        let row = sqlx::query(
+            r#"
+            select id, namespace, repository, branch, task_id, title, description, created_at, updated_at
+            from coding_threads
+            where namespace = $1 and id = $2
+            "#,
+        )
+        .bind(namespace)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .pg()?;
+
+        row.as_ref().map(Self::thread_from_row).transpose()
+    }
+
+    async fn list_threads(
+        &self,
+        namespace: &str,
+        repository: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<CodingThread>> {
+        let rows = sqlx::query(
+            r#"
+            select id, namespace, repository, branch, task_id, title, description, created_at, updated_at
+            from coding_threads
+            where namespace = $1 and ($2::text is null or repository = $2)
+            order by updated_at desc, id asc
+            limit $3
+            "#,
+        )
+        .bind(namespace)
+        .bind(repository)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .pg()?;
+
+        rows.iter().map(Self::thread_from_row).collect()
+    }
+
+    async fn save_revision(
+        &self,
+        revision: &NewCodingRevision,
+        diff_hash: &str,
+    ) -> Result<CodingRevision> {
+        let id = revision.id.unwrap_or_else(Uuid::new_v4);
+        let now = Utc::now();
+        let occurred_at = revision.occurred_at.unwrap_or(now);
+        let row = sqlx::query(
+            r#"
+            insert into coding_revisions (
+                id, thread_id, namespace, repository, branch, commit_sha, parent_sha,
+                file_path, change_kind, diff_content, diff_hash, symbol_fingerprint,
+                is_committed, author, occurred_at, created_at, source_evidence_id, source_task_id
+            )
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+            returning id, thread_id, namespace, repository, branch, commit_sha, parent_sha,
+                      file_path, change_kind, diff_content, diff_hash, symbol_fingerprint,
+                      is_committed, author, occurred_at, created_at, source_evidence_id, source_task_id
+            "#,
+        )
+        .bind(id)
+        .bind(revision.thread_id)
+        .bind(&revision.namespace)
+        .bind(&revision.repository)
+        .bind(&revision.branch)
+        .bind(&revision.commit_sha)
+        .bind(&revision.parent_sha)
+        .bind(&revision.file_path)
+        .bind(revision.change_kind.as_str())
+        .bind(&revision.diff_content)
+        .bind(diff_hash)
+        .bind(&revision.symbol_fingerprint)
+        .bind(revision.is_committed)
+        .bind(&revision.author)
+        .bind(occurred_at)
+        .bind(now)
+        .bind(revision.source_evidence_id)
+        .bind(revision.source_task_id)
+        .fetch_one(&self.pool)
+        .await
+        .pg()?;
+
+        Self::revision_from_row(&row)
+    }
+
+    async fn get_revision(&self, namespace: &str, id: Uuid) -> Result<Option<CodingRevision>> {
+        let row = sqlx::query(
+            r#"
+            select id, thread_id, namespace, repository, branch, commit_sha, parent_sha,
+                   file_path, change_kind, diff_content, diff_hash, symbol_fingerprint,
+                   is_committed, author, occurred_at, created_at, source_evidence_id, source_task_id
+            from coding_revisions
+            where namespace = $1 and id = $2
+            "#,
+        )
+        .bind(namespace)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .pg()?;
+
+        row.as_ref().map(Self::revision_from_row).transpose()
+    }
+
+    async fn get_revision_by_hash(
+        &self,
+        namespace: &str,
+        repository: &str,
+        diff_hash: &str,
+    ) -> Result<Option<CodingRevision>> {
+        let row = sqlx::query(
+            r#"
+            select id, thread_id, namespace, repository, branch, commit_sha, parent_sha,
+                   file_path, change_kind, diff_content, diff_hash, symbol_fingerprint,
+                   is_committed, author, occurred_at, created_at, source_evidence_id, source_task_id
+            from coding_revisions
+            where namespace = $1 and repository = $2 and diff_hash = $3
+            limit 1
+            "#,
+        )
+        .bind(namespace)
+        .bind(repository)
+        .bind(diff_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .pg()?;
+
+        row.as_ref().map(Self::revision_from_row).transpose()
+    }
+
+    async fn list_revisions_for_thread(
+        &self,
+        namespace: &str,
+        thread_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<CodingRevision>> {
+        let rows = sqlx::query(
+            r#"
+            select id, thread_id, namespace, repository, branch, commit_sha, parent_sha,
+                   file_path, change_kind, diff_content, diff_hash, symbol_fingerprint,
+                   is_committed, author, occurred_at, created_at, source_evidence_id, source_task_id
+            from coding_revisions
+            where namespace = $1 and thread_id = $2
+            order by occurred_at desc, id asc
+            limit $3
+            "#,
+        )
+        .bind(namespace)
+        .bind(thread_id)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .pg()?;
+
+        rows.iter().map(Self::revision_from_row).collect()
+    }
+
+    async fn list_revisions_for_file(
+        &self,
+        namespace: &str,
+        repository: &str,
+        file_path: &str,
+        limit: usize,
+    ) -> Result<Vec<CodingRevision>> {
+        let rows = sqlx::query(
+            r#"
+            select id, thread_id, namespace, repository, branch, commit_sha, parent_sha,
+                   file_path, change_kind, diff_content, diff_hash, symbol_fingerprint,
+                   is_committed, author, occurred_at, created_at, source_evidence_id, source_task_id
+            from coding_revisions
+            where namespace = $1 and repository = $2 and file_path = $3
+            order by occurred_at desc, id asc
+            limit $4
+            "#,
+        )
+        .bind(namespace)
+        .bind(repository)
+        .bind(file_path)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .pg()?;
+
+        rows.iter().map(Self::revision_from_row).collect()
+    }
+
+    async fn all_threads_in_namespace(&self, namespace: &str) -> Result<Vec<CodingThread>> {
+        let rows = sqlx::query(
+            r#"
+            select id, namespace, repository, branch, task_id, title, description, created_at, updated_at
+            from coding_threads
+            where namespace = $1
+            order by created_at asc, id asc
+            "#,
+        )
+        .bind(namespace)
+        .fetch_all(&self.pool)
+        .await
+        .pg()?;
+
+        rows.iter().map(Self::thread_from_row).collect()
+    }
+
+    async fn all_revisions_in_namespace(&self, namespace: &str) -> Result<Vec<CodingRevision>> {
+        let rows = sqlx::query(
+            r#"
+            select id, thread_id, namespace, repository, branch, commit_sha, parent_sha,
+                   file_path, change_kind, diff_content, diff_hash, symbol_fingerprint,
+                   is_committed, author, occurred_at, created_at, source_evidence_id, source_task_id
+            from coding_revisions
+            where namespace = $1
+            order by occurred_at asc, id asc
+            "#,
+        )
+        .bind(namespace)
+        .fetch_all(&self.pool)
+        .await
+        .pg()?;
+
+        rows.iter().map(Self::revision_from_row).collect()
+    }
+}
+
 /// accounts 行 → AccountRecord
 fn account_record_of(r: &PgRow) -> AccountRecord {
     AccountRecord {
@@ -2497,7 +2801,7 @@ mod tests {
 
     #[test]
     fn test_migrations_registered() {
-        assert_eq!(MIGRATIONS.len(), 7);
+        assert_eq!(MIGRATIONS.len(), 8);
         assert!(MIGRATIONS[0].0.starts_with("20261011"));
         // 迁移清单必须按版本号字典序排列（执行顺序依赖于此）
         for w in MIGRATIONS.windows(2) {

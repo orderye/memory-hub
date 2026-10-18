@@ -13,15 +13,15 @@
 //! 因此备份负载（内部存用户可见名）恢复往返不会二次加前缀。
 
 use crate::domain::{
-    BackupRecord, EvidenceSourceKind, ExperienceStatus, IntegrationProposal, MemoryEntry,
-    MemoryEvidence, MemoryExperience, MemoryFilter, MemoryKind, MemoryRelation, MemoryRelationKind,
-    MemoryTask, MemoryTaskExperience, MemoryVersion, Namespace, NamespaceGrantRecord,
-    NamespaceInfo, NewEvidence, NewMemoryExperience, NewMemoryRelation, NewMemoryTask,
-    ProposalStatus, Scored, TaskStatus,
+    BackupRecord, CodingRevision, CodingThread, EvidenceSourceKind, ExperienceStatus,
+    IntegrationProposal, MemoryEntry, MemoryEvidence, MemoryExperience, MemoryFilter, MemoryKind,
+    MemoryRelation, MemoryRelationKind, MemoryTask, MemoryTaskExperience, MemoryVersion, Namespace,
+    NamespaceGrantRecord, NamespaceInfo, NewCodingRevision, NewCodingThread, NewEvidence,
+    NewMemoryExperience, NewMemoryRelation, NewMemoryTask, ProposalStatus, Scored, TaskStatus,
 };
 use crate::infra::{
-    AgentRecord, AgentRegistration, AgentStore, BackupStore, EvidenceStore, ExperienceStore,
-    GrantStore, IntegrationStore, MemoryStore, RelationStore, TaskStore,
+    AgentRecord, AgentRegistration, AgentStore, BackupStore, CodingStore, EvidenceStore,
+    ExperienceStore, GrantStore, IntegrationStore, MemoryStore, RelationStore, TaskStore,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -716,6 +716,158 @@ impl<S: ExperienceStore + ?Sized> ExperienceStore for AccountScopedStore<S> {
         self.inner
             .all_task_experiences_in_namespace(&self.scoped(namespace))
             .await
+    }
+}
+
+#[async_trait]
+impl<S: CodingStore + ?Sized> CodingStore for AccountScopedStore<S> {
+    async fn create_thread(&self, thread: &NewCodingThread) -> Result<CodingThread> {
+        let mut scoped_thread = thread.clone();
+        scoped_thread.namespace = self.scoped(&thread.namespace);
+        let mut res = self.inner.create_thread(&scoped_thread).await?;
+        res.namespace = self.unscoped(&res.namespace);
+        Ok(res)
+    }
+
+    async fn get_thread(&self, namespace: &str, id: Uuid) -> Result<Option<CodingThread>> {
+        let opt = self.inner.get_thread(&self.scoped(namespace), id).await?;
+        Ok(opt
+            .filter(|t| in_scope(&self.account, &t.namespace))
+            .map(|mut t| {
+                t.namespace = self.unscoped(&t.namespace);
+                t
+            }))
+    }
+
+    async fn list_threads(
+        &self,
+        namespace: &str,
+        repository: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<CodingThread>> {
+        let rows = self
+            .inner
+            .list_threads(&self.scoped(namespace), repository, limit)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter(|t| in_scope(&self.account, &t.namespace))
+            .map(|mut t| {
+                t.namespace = self.unscoped(&t.namespace);
+                t
+            })
+            .collect())
+    }
+
+    async fn save_revision(
+        &self,
+        revision: &NewCodingRevision,
+        diff_hash: &str,
+    ) -> Result<CodingRevision> {
+        let mut scoped_rev = revision.clone();
+        scoped_rev.namespace = self.scoped(&revision.namespace);
+        let mut res = self.inner.save_revision(&scoped_rev, diff_hash).await?;
+        res.namespace = self.unscoped(&res.namespace);
+        Ok(res)
+    }
+
+    async fn get_revision(&self, namespace: &str, id: Uuid) -> Result<Option<CodingRevision>> {
+        let opt = self.inner.get_revision(&self.scoped(namespace), id).await?;
+        Ok(opt
+            .filter(|r| in_scope(&self.account, &r.namespace))
+            .map(|mut r| {
+                r.namespace = self.unscoped(&r.namespace);
+                r
+            }))
+    }
+
+    async fn get_revision_by_hash(
+        &self,
+        namespace: &str,
+        repository: &str,
+        diff_hash: &str,
+    ) -> Result<Option<CodingRevision>> {
+        let opt = self
+            .inner
+            .get_revision_by_hash(&self.scoped(namespace), repository, diff_hash)
+            .await?;
+        Ok(opt
+            .filter(|r| in_scope(&self.account, &r.namespace))
+            .map(|mut r| {
+                r.namespace = self.unscoped(&r.namespace);
+                r
+            }))
+    }
+
+    async fn list_revisions_for_thread(
+        &self,
+        namespace: &str,
+        thread_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<CodingRevision>> {
+        let rows = self
+            .inner
+            .list_revisions_for_thread(&self.scoped(namespace), thread_id, limit)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter(|r| in_scope(&self.account, &r.namespace))
+            .map(|mut r| {
+                r.namespace = self.unscoped(&r.namespace);
+                r
+            })
+            .collect())
+    }
+
+    async fn list_revisions_for_file(
+        &self,
+        namespace: &str,
+        repository: &str,
+        file_path: &str,
+        limit: usize,
+    ) -> Result<Vec<CodingRevision>> {
+        let rows = self
+            .inner
+            .list_revisions_for_file(&self.scoped(namespace), repository, file_path, limit)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter(|r| in_scope(&self.account, &r.namespace))
+            .map(|mut r| {
+                r.namespace = self.unscoped(&r.namespace);
+                r
+            })
+            .collect())
+    }
+
+    async fn all_threads_in_namespace(&self, namespace: &str) -> Result<Vec<CodingThread>> {
+        let rows = self
+            .inner
+            .all_threads_in_namespace(&self.scoped(namespace))
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter(|t| in_scope(&self.account, &t.namespace))
+            .map(|mut t| {
+                t.namespace = self.unscoped(&t.namespace);
+                t
+            })
+            .collect())
+    }
+
+    async fn all_revisions_in_namespace(&self, namespace: &str) -> Result<Vec<CodingRevision>> {
+        let rows = self
+            .inner
+            .all_revisions_in_namespace(&self.scoped(namespace))
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter(|r| in_scope(&self.account, &r.namespace))
+            .map(|mut r| {
+                r.namespace = self.unscoped(&r.namespace);
+                r
+            })
+            .collect())
     }
 }
 

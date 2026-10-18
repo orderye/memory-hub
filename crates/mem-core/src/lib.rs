@@ -21,6 +21,7 @@ pub mod algorithm;
 pub mod backup_service;
 pub mod chat_cognitive_service;
 pub mod cjk;
+pub mod coding_memory_service;
 pub mod domain;
 pub mod infra;
 pub mod integration_service;
@@ -41,23 +42,25 @@ pub use backup_service::{
     RestoreRequest,
 };
 pub use chat_cognitive_service::{ChatCognitiveResult, ChatCognitiveService};
+pub use coding_memory_service::CodingMemoryService;
 pub use domain::{
-    is_intention_active, is_speculative_intention, validate_cognitive_candidate,
-    validate_experience_candidate, BackupRecord, BackupSummary, ChatCognitiveInput, ChatMessage,
-    ChatRole, CognitiveCandidate, CognitiveGovernanceMode, CognitiveLayer, CognitivePolicy,
+    is_intention_active, is_speculative_intention, validate_coding_revision,
+    validate_cognitive_candidate, validate_experience_candidate, BackupRecord, BackupSummary,
+    ChatCognitiveInput, ChatMessage, ChatRole, CodeChangeKind, CodingRevision, CodingThread,
+    CognitiveCandidate, CognitiveGovernanceMode, CognitiveLayer, CognitivePolicy,
     CognitiveProposalRecord, CognitiveProposalStatus, EvidenceSourceKind, ExperienceCandidate,
     ExperienceStatus, IntegrationKind, IntegrationProposal, MemoryEntry, MemoryEvidence,
     MemoryExperience, MemoryFilter, MemoryKind, MemoryPatch, MemoryRelation, MemoryRelationKind,
     MemoryScene, MemoryStats, MemoryStatus, MemoryTask, MemoryTaskExperience, MemoryVersion,
-    Namespace, NamespaceGrantRecord, NamespaceInfo, NewEvidence, NewMemory, NewMemoryExperience,
-    NewMemoryRelation, NewMemoryTask, Page, ProposalStatus, RestoreMode, RestoreReport, Scored,
-    TaskStatus, VersionChange,
+    Namespace, NamespaceGrantRecord, NamespaceInfo, NewCodingRevision, NewCodingThread,
+    NewEvidence, NewMemory, NewMemoryExperience, NewMemoryRelation, NewMemoryTask, Page,
+    ProposalStatus, RestoreMode, RestoreReport, Scored, TaskStatus, VersionChange,
 };
 pub use infra::{
     AccessChecker, AccountRecord, AccountStore, AgentRecord, AgentRegistration, AgentStore,
-    BackupStore, ChatCognitiveExtractor, Clock, Embedder, EvidenceStore, ExperienceStore,
-    GrantStore, IntegrationStore, MemoryHubStore, MemoryStore, RelationStore, Retriever,
-    SessionRecord, SystemClock, TaskStore, TokenIntrospector,
+    BackupStore, ChatCognitiveExtractor, Clock, CodingStore, Embedder, EvidenceStore,
+    ExperienceStore, GrantStore, IntegrationStore, MemoryHubStore, MemoryStore, RelationStore,
+    Retriever, SessionRecord, SystemClock, TaskStore, TokenIntrospector,
 };
 pub use integration_service::{
     IntegrationService, ResolveAction, ResolveRequest, ScanReport, ScanRequest,

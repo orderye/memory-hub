@@ -674,6 +674,187 @@ pub fn validate_experience_candidate(candidate: &ExperienceCandidate) -> common:
     Ok(())
 }
 
+/// 代码变更类型 (P4)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeChangeKind {
+    Add,
+    Modify,
+    Delete,
+    Rename,
+}
+
+impl CodeChangeKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CodeChangeKind::Add => "add",
+            CodeChangeKind::Modify => "modify",
+            CodeChangeKind::Delete => "delete",
+            CodeChangeKind::Rename => "rename",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "add" => Some(CodeChangeKind::Add),
+            "modify" => Some(CodeChangeKind::Modify),
+            "delete" => Some(CodeChangeKind::Delete),
+            "rename" => Some(CodeChangeKind::Rename),
+            _ => None,
+        }
+    }
+}
+
+/// 代码演进逻辑线程 (P4)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CodingThread {
+    pub id: Uuid,
+    pub namespace: Namespace,
+    pub repository: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<Uuid>,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// 新建代码演进线程请求
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NewCodingThread {
+    pub id: Option<Uuid>,
+    pub namespace: Namespace,
+    pub repository: String,
+    pub branch: Option<String>,
+    pub task_id: Option<Uuid>,
+    pub title: String,
+    pub description: Option<String>,
+}
+
+/// 代码修订快照 (P4)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CodingRevision {
+    pub id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<Uuid>,
+    pub namespace: Namespace,
+    pub repository: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_sha: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_sha: Option<String>,
+    pub file_path: String,
+    pub change_kind: CodeChangeKind,
+    pub diff_content: String,
+    pub diff_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol_fingerprint: Option<String>,
+    pub is_committed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    pub occurred_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_evidence_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_task_id: Option<Uuid>,
+}
+
+/// 新建代码修订请求
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NewCodingRevision {
+    pub id: Option<Uuid>,
+    pub thread_id: Option<Uuid>,
+    pub namespace: Namespace,
+    pub repository: String,
+    pub branch: Option<String>,
+    pub commit_sha: Option<String>,
+    pub parent_sha: Option<String>,
+    pub file_path: String,
+    pub change_kind: CodeChangeKind,
+    pub diff_content: String,
+    pub symbol_fingerprint: Option<String>,
+    pub is_committed: bool,
+    pub author: Option<String>,
+    pub occurred_at: Option<DateTime<Utc>>,
+    pub source_evidence_id: Option<Uuid>,
+    pub source_task_id: Option<Uuid>,
+}
+
+/// 最大单条 diff 大小限制：512 KB
+pub const MAX_DIFF_SIZE_BYTES: usize = 512 * 1024;
+
+/// 校验代码修订记录安全门槛 (P4)
+pub fn validate_coding_revision(revision: &NewCodingRevision) -> common::Result<()> {
+    let repo = revision.repository.trim();
+    if repo.is_empty() {
+        return Err(common::HubError::InvalidArgument("仓库标识不能为空".into()));
+    }
+
+    let path = revision.file_path.trim();
+    if path.is_empty() {
+        return Err(common::HubError::InvalidArgument("文件路径不能为空".into()));
+    }
+
+    // 路径安全检查：防止路径穿越和非法的绝对路径
+    if path.contains("..") || path.starts_with('/') || path.starts_with('\\') {
+        return Err(common::HubError::InvalidArgument(
+            "文件路径存在路径穿越或非法的绝对路径".into(),
+        ));
+    }
+
+    let path_lower = path.to_lowercase();
+    let forbidden_path_patterns = [
+        ".env",
+        ".git/",
+        "id_rsa",
+        "id_ed25519",
+        ".pem",
+        ".key",
+        "credentials.json",
+        "service-account",
+    ];
+    if forbidden_path_patterns
+        .iter()
+        .any(|p| path_lower.contains(p))
+    {
+        return Err(common::HubError::InvalidArgument(format!(
+            "禁止将敏感配置文件或私钥路径纳入代码演进记忆: {}",
+            path
+        )));
+    }
+
+    // Diff 大小限制
+    if revision.diff_content.len() > MAX_DIFF_SIZE_BYTES {
+        return Err(common::HubError::InvalidArgument(format!(
+            "Diff 内容超出最大允许上限 ({} 字节 > {} 字节)",
+            revision.diff_content.len(),
+            MAX_DIFF_SIZE_BYTES
+        )));
+    }
+
+    // 二进制文件检测 (包含 \0 字符)
+    if revision.diff_content.as_bytes().contains(&0) {
+        return Err(common::HubError::InvalidArgument(
+            "检测到二进制文件变更，严禁纳入文本代码演进记忆".into(),
+        ));
+    }
+
+    // 敏感凭证扫描
+    if contains_sensitive_credentials(&revision.diff_content) {
+        return Err(common::HubError::InvalidArgument(
+            "Diff 内容中包含敏感凭证或密钥，严禁持久化".into(),
+        ));
+    }
+
+    Ok(())
+}
+
 /// 记忆条目分类
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

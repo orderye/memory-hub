@@ -4,10 +4,11 @@
 //! `store` crate 提供 PostgreSQL 与内存两套实现，可互换。
 
 use crate::domain::{
-    BackupRecord, ChatCognitiveInput, CognitiveCandidate, EvidenceSourceKind, ExperienceStatus,
-    IntegrationProposal, MemoryEntry, MemoryEvidence, MemoryExperience, MemoryFilter, MemoryKind,
-    MemoryRelation, MemoryRelationKind, MemoryTask, MemoryTaskExperience, MemoryVersion, Namespace,
-    NamespaceGrantRecord, NamespaceInfo, NewEvidence, NewMemoryExperience, NewMemoryRelation,
+    BackupRecord, ChatCognitiveInput, CodingRevision, CodingThread, CognitiveCandidate,
+    EvidenceSourceKind, ExperienceStatus, IntegrationProposal, MemoryEntry, MemoryEvidence,
+    MemoryExperience, MemoryFilter, MemoryKind, MemoryRelation, MemoryRelationKind, MemoryTask,
+    MemoryTaskExperience, MemoryVersion, Namespace, NamespaceGrantRecord, NamespaceInfo,
+    NewCodingRevision, NewCodingThread, NewEvidence, NewMemoryExperience, NewMemoryRelation,
     NewMemoryTask, ProposalStatus, Scored, TaskStatus,
 };
 use async_trait::async_trait;
@@ -332,6 +333,66 @@ pub trait ExperienceStore: Send + Sync {
     ) -> Result<Vec<MemoryTaskExperience>>;
 }
 
+/// 代码演进存储（Coding 场景，P4 引入）
+#[async_trait]
+pub trait CodingStore: Send + Sync {
+    /// 创建代码演进逻辑线程
+    async fn create_thread(&self, thread: &NewCodingThread) -> Result<CodingThread>;
+
+    /// 获取代码演进线程
+    async fn get_thread(&self, namespace: &str, id: uuid::Uuid) -> Result<Option<CodingThread>>;
+
+    /// 列表代码演进线程
+    async fn list_threads(
+        &self,
+        namespace: &str,
+        repository: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<CodingThread>>;
+
+    /// 保存代码修订记录
+    async fn save_revision(
+        &self,
+        revision: &NewCodingRevision,
+        diff_hash: &str,
+    ) -> Result<CodingRevision>;
+
+    /// 按 ID 获取代码修订记录
+    async fn get_revision(&self, namespace: &str, id: uuid::Uuid)
+        -> Result<Option<CodingRevision>>;
+
+    /// 按 Diff 哈希查重检索
+    async fn get_revision_by_hash(
+        &self,
+        namespace: &str,
+        repository: &str,
+        diff_hash: &str,
+    ) -> Result<Option<CodingRevision>>;
+
+    /// 列表某线程下的全部修订记录
+    async fn list_revisions_for_thread(
+        &self,
+        namespace: &str,
+        thread_id: uuid::Uuid,
+        limit: usize,
+    ) -> Result<Vec<CodingRevision>>;
+
+    /// 列表某文件路径下的修订历史链
+    async fn list_revisions_for_file(
+        &self,
+        namespace: &str,
+        repository: &str,
+        file_path: &str,
+        limit: usize,
+    ) -> Result<Vec<CodingRevision>>;
+
+    /// 命名空间下全部代码线程（备份/恢复用）
+    async fn all_threads_in_namespace(&self, namespace: &str) -> Result<Vec<CodingThread>>;
+
+    /// 命名空间下全部代码修订记录（备份/恢复用）
+    async fn all_revisions_in_namespace(&self, namespace: &str) -> Result<Vec<CodingRevision>>;
+}
+
 /// 存储聚合：一套实现同时满足全部核心与认知存储需求
 pub trait MemoryHubStore:
     MemoryStore
@@ -343,6 +404,7 @@ pub trait MemoryHubStore:
     + RelationStore
     + TaskStore
     + ExperienceStore
+    + CodingStore
 {
 }
 
@@ -355,7 +417,8 @@ impl<
             + EvidenceStore
             + RelationStore
             + TaskStore
-            + ExperienceStore,
+            + ExperienceStore
+            + CodingStore,
     > MemoryHubStore for T
 {
 }

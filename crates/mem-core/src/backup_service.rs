@@ -9,13 +9,14 @@
 use crate::access::GrantChecker;
 use crate::account_scope::AccountScopedStore;
 use crate::domain::{
-    BackupRecord, BackupSummary, MemoryEntry, MemoryEvidence, MemoryExperience, MemoryRelation,
-    MemoryTask, MemoryTaskExperience, NewEvidence, NewMemoryExperience, NewMemoryRelation,
-    NewMemoryTask, RestoreMode, RestoreReport, VersionChange,
+    BackupRecord, BackupSummary, CodingRevision, CodingThread, MemoryEntry, MemoryEvidence,
+    MemoryExperience, MemoryRelation, MemoryTask, MemoryTaskExperience, NewCodingRevision,
+    NewCodingThread, NewEvidence, NewMemoryExperience, NewMemoryRelation, NewMemoryTask,
+    RestoreMode, RestoreReport, VersionChange,
 };
 use crate::infra::{
-    AccessChecker, BackupStore, Clock, EvidenceStore, ExperienceStore, MemoryHubStore, MemoryStore,
-    RelationStore, SystemClock, TaskStore,
+    AccessChecker, BackupStore, Clock, CodingStore, EvidenceStore, ExperienceStore, MemoryHubStore,
+    MemoryStore, RelationStore, SystemClock, TaskStore,
 };
 use async_trait::async_trait;
 use common::{AuthCtx, HubError, Result, Scope};
@@ -24,8 +25,8 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use uuid::Uuid;
 
-/// 备份负载格式版本（升级至 v3 支持任务事实与经验记忆）
-pub const BACKUP_PAYLOAD_VERSION: u32 = 3;
+/// 备份负载格式版本（升级至 v4 支持代码演进线程与修订记录）
+pub const BACKUP_PAYLOAD_VERSION: u32 = 4;
 
 /// 全量快照的保留命名空间标记（不对应任何真实命名空间，也不是授权对象）
 pub const ALL_NAMESPACES: &str = "*";
@@ -183,6 +184,26 @@ impl DefaultBackupService {
         }
     }
 
+    /// 从负载取出代码演进线程列表
+    fn coding_threads_of(backup: &BackupRecord) -> Result<Vec<CodingThread>> {
+        match backup.payload.get("coding_threads") {
+            Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
+                HubError::Internal(anyhow::anyhow!("备份负载 coding_threads 解析失败: {}", e))
+            }),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// 从负载取出代码修订记录列表
+    fn coding_revisions_of(backup: &BackupRecord) -> Result<Vec<CodingRevision>> {
+        match backup.payload.get("coding_revisions") {
+            Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
+                HubError::Internal(anyhow::anyhow!("备份负载 coding_revisions 解析失败: {}", e))
+            }),
+            None => Ok(Vec::new()),
+        }
+    }
+
     /// 计算 v1 负载的规范校验和（仅 entries）
     fn checksum_v1(entries: &[MemoryEntry]) -> String {
         let bytes = serde_json::to_vec(entries).unwrap_or_default();
@@ -221,7 +242,32 @@ impl DefaultBackupService {
         hex::encode(hasher.finalize())
     }
 
-    /// 构建备份负载（v3 格式）
+    /// 计算 v4 负载的规范校验和（包含代码演进线程与修订记录）
+    #[allow(clippy::too_many_arguments)]
+    fn checksum_v4(
+        entries: &[MemoryEntry],
+        evidences: &[MemoryEvidence],
+        relations: &[MemoryRelation],
+        tasks: &[MemoryTask],
+        experiences: &[MemoryExperience],
+        task_experiences: &[MemoryTaskExperience],
+        coding_threads: &[CodingThread],
+        coding_revisions: &[CodingRevision],
+    ) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(serde_json::to_vec(entries).unwrap_or_default());
+        hasher.update(serde_json::to_vec(evidences).unwrap_or_default());
+        hasher.update(serde_json::to_vec(relations).unwrap_or_default());
+        hasher.update(serde_json::to_vec(tasks).unwrap_or_default());
+        hasher.update(serde_json::to_vec(experiences).unwrap_or_default());
+        hasher.update(serde_json::to_vec(task_experiences).unwrap_or_default());
+        hasher.update(serde_json::to_vec(coding_threads).unwrap_or_default());
+        hasher.update(serde_json::to_vec(coding_revisions).unwrap_or_default());
+        hex::encode(hasher.finalize())
+    }
+
+    /// 构建备份负载（v4 格式）
+    #[allow(clippy::too_many_arguments)]
     fn payload_of(
         namespace: &str,
         entries: &[MemoryEntry],
@@ -230,6 +276,8 @@ impl DefaultBackupService {
         tasks: &[MemoryTask],
         experiences: &[MemoryExperience],
         task_experiences: &[MemoryTaskExperience],
+        coding_threads: &[CodingThread],
+        coding_revisions: &[CodingRevision],
     ) -> serde_json::Value {
         serde_json::json!({
             "version": BACKUP_PAYLOAD_VERSION,
@@ -240,6 +288,8 @@ impl DefaultBackupService {
             "tasks": tasks,
             "experiences": experiences,
             "task_experiences": task_experiences,
+            "coding_threads": coding_threads,
+            "coding_revisions": coding_revisions,
         })
     }
 
@@ -261,11 +311,15 @@ impl DefaultBackupService {
         let tasks = store.all_tasks_in_namespace(namespace).await?;
         let experiences = store.all_experiences_in_namespace(namespace).await?;
         let task_experiences = store.all_task_experiences_in_namespace(namespace).await?;
+        let coding_threads = store.all_threads_in_namespace(namespace).await?;
+        let coding_revisions = store.all_revisions_in_namespace(namespace).await?;
         if entries.is_empty()
             && evidences.is_empty()
             && relations.is_empty()
             && tasks.is_empty()
             && experiences.is_empty()
+            && coding_threads.is_empty()
+            && coding_revisions.is_empty()
         {
             return Ok(None);
         }
@@ -276,13 +330,15 @@ impl DefaultBackupService {
             created_by: auth.agent_id.clone(),
             note: Some(format!("restore-safety:{}", namespace)),
             entry_count: entries.len(),
-            checksum: Self::checksum_v3(
+            checksum: Self::checksum_v4(
                 &entries,
                 &evidences,
                 &relations,
                 &tasks,
                 &experiences,
                 &task_experiences,
+                &coding_threads,
+                &coding_revisions,
             ),
             payload: Self::payload_of(
                 namespace,
@@ -292,6 +348,8 @@ impl DefaultBackupService {
                 &tasks,
                 &experiences,
                 &task_experiences,
+                &coding_threads,
+                &coding_revisions,
             ),
             retain_until: None,
             created_at: now,
@@ -373,6 +431,26 @@ impl BackupService for DefaultBackupService {
                 .await?
         };
 
+        let coding_threads: Vec<CodingThread> = if req.namespace == "*" {
+            let mut all = Vec::new();
+            for ns in crate::infra::MemoryStore::list_namespaces(&store).await? {
+                all.extend(store.all_threads_in_namespace(&ns).await?);
+            }
+            all
+        } else {
+            store.all_threads_in_namespace(&req.namespace).await?
+        };
+
+        let coding_revisions: Vec<CodingRevision> = if req.namespace == "*" {
+            let mut all = Vec::new();
+            for ns in crate::infra::MemoryStore::list_namespaces(&store).await? {
+                all.extend(store.all_revisions_in_namespace(&ns).await?);
+            }
+            all
+        } else {
+            store.all_revisions_in_namespace(&req.namespace).await?
+        };
+
         let now = self.clock.now();
         let record = BackupRecord {
             id: Uuid::new_v4(),
@@ -380,13 +458,15 @@ impl BackupService for DefaultBackupService {
             created_by: auth.agent_id.clone(),
             note: req.note.clone(),
             entry_count: entries.len(),
-            checksum: Self::checksum_v3(
+            checksum: Self::checksum_v4(
                 &entries,
                 &evidences,
                 &relations,
                 &tasks,
                 &experiences,
                 &task_experiences,
+                &coding_threads,
+                &coding_revisions,
             ),
             payload: Self::payload_of(
                 &req.namespace,
@@ -396,6 +476,8 @@ impl BackupService for DefaultBackupService {
                 &tasks,
                 &experiences,
                 &task_experiences,
+                &coding_threads,
+                &coding_revisions,
             ),
             retain_until: None,
             created_at: now,
@@ -425,14 +507,26 @@ impl BackupService for DefaultBackupService {
         let store = self.scoped(auth);
         let backup = store.get_backup(req.backup_id).await?;
 
-        // 完整性校验：重建校验和与写入时比对（兼容 v1、v2 与 v3）
+        // 完整性校验：重建校验和与写入时比对（兼容 v1、v2、v3 与 v4）
         let entries = Self::entries_of(&backup)?;
         let evidences = Self::evidences_of(&backup)?;
         let relations = Self::relations_of(&backup)?;
         let tasks = Self::tasks_of(&backup)?;
         let experiences = Self::experiences_of(&backup)?;
         let task_experiences = Self::task_experiences_of(&backup)?;
+        let coding_threads = Self::coding_threads_of(&backup)?;
+        let coding_revisions = Self::coding_revisions_of(&backup)?;
 
+        let actual_v4 = Self::checksum_v4(
+            &entries,
+            &evidences,
+            &relations,
+            &tasks,
+            &experiences,
+            &task_experiences,
+            &coding_threads,
+            &coding_revisions,
+        );
         let actual_v3 = Self::checksum_v3(
             &entries,
             &evidences,
@@ -444,7 +538,8 @@ impl BackupService for DefaultBackupService {
         let actual_v2 = Self::checksum_v2(&entries, &evidences, &relations);
         let actual_v1 = Self::checksum_v1(&entries);
 
-        let valid = backup.checksum == actual_v3
+        let valid = backup.checksum == actual_v4
+            || backup.checksum == actual_v3
             || backup.checksum == actual_v2
             || backup.checksum == actual_v1;
         if !valid {
@@ -613,6 +708,48 @@ impl BackupService for DefaultBackupService {
             let _ = store.link_task_experience(te).await;
         }
 
+        // 恢复代码演进线程
+        for th in &coding_threads {
+            let _ = store
+                .create_thread(&NewCodingThread {
+                    id: Some(th.id),
+                    namespace: th.namespace.clone(),
+                    repository: th.repository.clone(),
+                    branch: th.branch.clone(),
+                    task_id: th.task_id,
+                    title: th.title.clone(),
+                    description: th.description.clone(),
+                })
+                .await;
+        }
+
+        // 恢复代码修订记录
+        for rev in &coding_revisions {
+            let _ = store
+                .save_revision(
+                    &NewCodingRevision {
+                        id: Some(rev.id),
+                        thread_id: rev.thread_id,
+                        namespace: rev.namespace.clone(),
+                        repository: rev.repository.clone(),
+                        branch: rev.branch.clone(),
+                        commit_sha: rev.commit_sha.clone(),
+                        parent_sha: rev.parent_sha.clone(),
+                        file_path: rev.file_path.clone(),
+                        change_kind: rev.change_kind,
+                        diff_content: rev.diff_content.clone(),
+                        symbol_fingerprint: rev.symbol_fingerprint.clone(),
+                        is_committed: rev.is_committed,
+                        author: rev.author.clone(),
+                        occurred_at: Some(rev.occurred_at),
+                        source_evidence_id: rev.source_evidence_id,
+                        source_task_id: rev.source_task_id,
+                    },
+                    &rev.diff_hash,
+                )
+                .await;
+        }
+
         Ok(report)
     }
 
@@ -691,6 +828,8 @@ mod tests {
         tasks: RwLock<StdHashMap<(String, Uuid), MemoryTask>>,
         experiences: RwLock<StdHashMap<(String, Uuid), MemoryExperience>>,
         task_experiences: RwLock<Vec<MemoryTaskExperience>>,
+        coding_threads: RwLock<StdHashMap<(String, Uuid), CodingThread>>,
+        coding_revisions: RwLock<StdHashMap<(String, Uuid), CodingRevision>>,
     }
 
     impl TestHubStore {
@@ -1301,6 +1440,170 @@ mod tests {
                 .filter(|te| exp_ids.contains(&te.experience_id))
                 .cloned()
                 .collect())
+        }
+    }
+
+    #[async_trait]
+    impl CodingStore for TestHubStore {
+        async fn create_thread(&self, thread: &NewCodingThread) -> Result<CodingThread> {
+            let id = thread.id.unwrap_or_else(Uuid::new_v4);
+            let now = chrono::Utc::now();
+            let record = CodingThread {
+                id,
+                namespace: thread.namespace.clone(),
+                repository: thread.repository.clone(),
+                branch: thread.branch.clone(),
+                task_id: thread.task_id,
+                title: thread.title.clone(),
+                description: thread.description.clone(),
+                created_at: now,
+                updated_at: now,
+            };
+            self.coding_threads
+                .write()
+                .unwrap()
+                .insert((thread.namespace.clone(), id), record.clone());
+            Ok(record)
+        }
+
+        async fn get_thread(&self, namespace: &str, id: Uuid) -> Result<Option<CodingThread>> {
+            let r = self.coding_threads.read().unwrap();
+            Ok(r.get(&(namespace.to_string(), id)).cloned())
+        }
+
+        async fn list_threads(
+            &self,
+            namespace: &str,
+            repository: Option<&str>,
+            limit: usize,
+        ) -> Result<Vec<CodingThread>> {
+            let r = self.coding_threads.read().unwrap();
+            let mut list: Vec<_> = r
+                .values()
+                .filter(|t| {
+                    t.namespace == namespace && repository.is_none_or(|repo| t.repository == repo)
+                })
+                .cloned()
+                .collect();
+            list.sort_by_key(|a| std::cmp::Reverse(a.updated_at));
+            list.truncate(limit);
+            Ok(list)
+        }
+
+        async fn save_revision(
+            &self,
+            revision: &NewCodingRevision,
+            diff_hash: &str,
+        ) -> Result<CodingRevision> {
+            let id = revision.id.unwrap_or_else(Uuid::new_v4);
+            let now = chrono::Utc::now();
+            let record = CodingRevision {
+                id,
+                thread_id: revision.thread_id,
+                namespace: revision.namespace.clone(),
+                repository: revision.repository.clone(),
+                branch: revision.branch.clone(),
+                commit_sha: revision.commit_sha.clone(),
+                parent_sha: revision.parent_sha.clone(),
+                file_path: revision.file_path.clone(),
+                change_kind: revision.change_kind,
+                diff_content: revision.diff_content.clone(),
+                diff_hash: diff_hash.to_string(),
+                symbol_fingerprint: revision.symbol_fingerprint.clone(),
+                is_committed: revision.is_committed,
+                author: revision.author.clone(),
+                occurred_at: revision.occurred_at.unwrap_or(now),
+                created_at: now,
+                source_evidence_id: revision.source_evidence_id,
+                source_task_id: revision.source_task_id,
+            };
+            self.coding_revisions
+                .write()
+                .unwrap()
+                .insert((revision.namespace.clone(), id), record.clone());
+            Ok(record)
+        }
+
+        async fn get_revision(&self, namespace: &str, id: Uuid) -> Result<Option<CodingRevision>> {
+            let r = self.coding_revisions.read().unwrap();
+            Ok(r.get(&(namespace.to_string(), id)).cloned())
+        }
+
+        async fn get_revision_by_hash(
+            &self,
+            namespace: &str,
+            repository: &str,
+            diff_hash: &str,
+        ) -> Result<Option<CodingRevision>> {
+            let r = self.coding_revisions.read().unwrap();
+            Ok(r.values()
+                .find(|rev| {
+                    rev.namespace == namespace
+                        && rev.repository == repository
+                        && rev.diff_hash == diff_hash
+                })
+                .cloned())
+        }
+
+        async fn list_revisions_for_thread(
+            &self,
+            namespace: &str,
+            thread_id: Uuid,
+            limit: usize,
+        ) -> Result<Vec<CodingRevision>> {
+            let r = self.coding_revisions.read().unwrap();
+            let mut list: Vec<_> = r
+                .values()
+                .filter(|rev| rev.namespace == namespace && rev.thread_id == Some(thread_id))
+                .cloned()
+                .collect();
+            list.sort_by_key(|a| std::cmp::Reverse(a.occurred_at));
+            list.truncate(limit);
+            Ok(list)
+        }
+
+        async fn list_revisions_for_file(
+            &self,
+            namespace: &str,
+            repository: &str,
+            file_path: &str,
+            limit: usize,
+        ) -> Result<Vec<CodingRevision>> {
+            let r = self.coding_revisions.read().unwrap();
+            let mut list: Vec<_> = r
+                .values()
+                .filter(|rev| {
+                    rev.namespace == namespace
+                        && rev.repository == repository
+                        && rev.file_path == file_path
+                })
+                .cloned()
+                .collect();
+            list.sort_by_key(|a| std::cmp::Reverse(a.occurred_at));
+            list.truncate(limit);
+            Ok(list)
+        }
+
+        async fn all_threads_in_namespace(&self, namespace: &str) -> Result<Vec<CodingThread>> {
+            let r = self.coding_threads.read().unwrap();
+            let mut list: Vec<_> = r
+                .values()
+                .filter(|t| t.namespace == namespace)
+                .cloned()
+                .collect();
+            list.sort_by_key(|t| (t.created_at, t.id));
+            Ok(list)
+        }
+
+        async fn all_revisions_in_namespace(&self, namespace: &str) -> Result<Vec<CodingRevision>> {
+            let r = self.coding_revisions.read().unwrap();
+            let mut list: Vec<_> = r
+                .values()
+                .filter(|rev| rev.namespace == namespace)
+                .cloned()
+                .collect();
+            list.sort_by_key(|r| (r.created_at, r.id));
+            Ok(list)
         }
     }
 
