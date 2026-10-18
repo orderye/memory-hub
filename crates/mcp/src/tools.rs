@@ -1188,6 +1188,25 @@ mod tests {
             )
             .await;
         assert!(put_b2.is_error, "撤销后应不可写");
+
+        // 撤销后读与搜索同样必须被拒绝
+        let get_b = d
+            .dispatch(
+                &b,
+                "memory_get",
+                arg(json!({ "namespace": "shared", "key": "any" })),
+            )
+            .await;
+        assert!(get_b.is_error, "撤销后应不可读");
+
+        let search_b = d
+            .dispatch(
+                &b,
+                "memory_search",
+                arg(json!({ "namespace": "shared", "query_text": "笔记" })),
+            )
+            .await;
+        assert!(search_b.is_error, "撤销后应不可搜");
     }
 
     #[tokio::test]

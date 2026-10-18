@@ -840,6 +840,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_safety_backup_can_recover_pre_replace_state() {
+        let (svc, store) = setup();
+        let a = admin("agent-a");
+        store
+            .ensure_namespace(&scoped_ns("ns"), &"agent-a".to_string())
+            .await
+            .unwrap();
+        store
+            .grant(&NamespaceGrantRecord {
+                namespace: scoped_ns("ns"),
+                agent_id: "agent-a".to_string(),
+                can_read: true,
+                can_write: true,
+                granted_by: "agent-a".to_string(),
+                created_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        // 初始状态：版本 A
+        store.seed(&scoped_ns("ns"), "agent-a", "原始数据 A");
+        let backup_v1 = svc
+            .create(
+                &a,
+                BackupCreateRequest {
+                    namespace: "ns".to_string(),
+                    note: Some("v1".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+
+        // 后续改动为版本 B
+        let all = store.all_in_namespace(&scoped_ns("ns"), true).await.unwrap();
+        let mut cur = all[0].clone();
+        cur.content = "被修改后的数据 B".to_string();
+        store.save(&cur).await.unwrap();
+
+        // 执行 replace 恢复至 v1，系统必须自动创建安全备份 (保存了数据 B)
+        let replace_report = svc
+            .restore(
+                &a,
+                RestoreRequest {
+                    backup_id: backup_v1.id,
+                    mode: RestoreMode::Replace,
+                },
+            )
+            .await
+            .unwrap();
+        let safety_id = replace_report.safety_backup_id.expect("必须生成安全备份");
+
+        // 验证当前已被 v1 替换
+        let items_v1 = store.all_in_namespace(&scoped_ns("ns"), true).await.unwrap();
+        assert_eq!(items_v1[0].content, "原始数据 A");
+
+        // 验证：使用 safety_backup_id 恢复可成功找回数据 B
+        let rollback_report = svc
+            .restore(
+                &a,
+                RestoreRequest {
+                    backup_id: safety_id,
+                    mode: RestoreMode::Replace,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(rollback_report.total, 1);
+        let items_rollback = store.all_in_namespace(&scoped_ns("ns"), true).await.unwrap();
+        assert_eq!(items_rollback[0].content, "被修改后的数据 B");
+    }
+
+    #[tokio::test]
     async fn test_restore_detects_corrupted_checksum() {
         let (svc, store) = setup();
         let a = admin("agent-a");
