@@ -20,3 +20,4 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+store = { workspace = true }

@@ -67,15 +67,18 @@ impl HybridRetriever {
         if q.query_text.trim().is_empty() {
             return Vec::new();
         }
+        let mut statuses = vec![MemoryStatus::Active];
+        if q.include_archived || q.include_superseded {
+            statuses.push(MemoryStatus::Archived);
+        }
         let filter = MemoryFilter {
             namespace: Some(q.namespace.clone()),
             kinds: q.kinds.clone(),
-            statuses: Some(if q.include_archived {
-                vec![MemoryStatus::Active, MemoryStatus::Archived]
-            } else {
-                vec![MemoryStatus::Active]
-            }),
+            statuses: Some(statuses),
             text_contains: Some(q.query_text.clone()),
+            scene: q.scene,
+            layer: q.layer,
+            valid_at: q.valid_at,
             // 候选池必须容得下 top_k：此前固定取 fts_k(默认 20)，
             // 而工具契约允许 top_k 到 100，超出的请求会被静默截断。
             limit: Some(self.fts_k.max(q.top_k)),
@@ -107,12 +110,12 @@ impl HybridRetriever {
         let Some(qv) = qv else {
             return Vec::new();
         };
-        match self
+        let items = match self
             .store
             .similar(
                 &q.namespace,
                 qv,
-                self.vec_k.max(q.top_k),
+                self.vec_k.max(q.top_k * 2),
                 q.kinds.as_deref(),
             )
             .await
@@ -122,19 +125,50 @@ impl HybridRetriever {
                 tracing::warn!(error = %e, namespace = %q.namespace, "向量召回失败，该路结果为空");
                 Vec::new()
             }
-        }
+        };
+
+        // 认知过滤：scene、layer、valid_at 与状态约束
+        let now = chrono::Utc::now();
+        items
+            .into_iter()
+            .filter(|scored| {
+                if let Some(scene) = &q.scene {
+                    if scored.item.scene.as_ref() != Some(scene) {
+                        return false;
+                    }
+                }
+                if let Some(layer) = &q.layer {
+                    if scored.item.layer.as_ref() != Some(layer) {
+                        return false;
+                    }
+                }
+                if !q.include_superseded {
+                    if let Some(valid_at) = q.valid_at {
+                        if !scored.item.is_valid_at(valid_at) {
+                            return false;
+                        }
+                    } else if scored.item.is_superseded_or_expired(now) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .collect()
     }
 
     /// 兜底：纯列表召回（超时或查询为空时）
     async fn fallback_candidates(&self, q: &SearchQuery) -> Vec<Scored<MemoryEntry>> {
+        let mut statuses = vec![MemoryStatus::Active];
+        if q.include_archived || q.include_superseded {
+            statuses.push(MemoryStatus::Archived);
+        }
         let filter = MemoryFilter {
             namespace: Some(q.namespace.clone()),
             kinds: q.kinds.clone(),
-            statuses: Some(if q.include_archived {
-                vec![MemoryStatus::Active, MemoryStatus::Archived]
-            } else {
-                vec![MemoryStatus::Active]
-            }),
+            statuses: Some(statuses),
+            scene: q.scene,
+            layer: q.layer,
+            valid_at: q.valid_at,
             limit: Some(q.top_k.max(1)),
             ..Default::default()
         };
@@ -178,6 +212,28 @@ impl HybridRetriever {
         let now = chrono::Utc::now();
         let mut scored: Vec<Scored<MemoryEntry>> = candidates
             .into_iter()
+            .filter(|(item, _)| {
+                if !q.include_superseded {
+                    if let Some(valid_at) = q.valid_at {
+                        if !item.is_valid_at(valid_at) {
+                            return false;
+                        }
+                    } else if item.is_superseded_or_expired(now) {
+                        return false;
+                    }
+                }
+                if let Some(scene) = &q.scene {
+                    if item.scene.as_ref() != Some(scene) {
+                        return false;
+                    }
+                }
+                if let Some(layer) = &q.layer {
+                    if item.layer.as_ref() != Some(layer) {
+                        return false;
+                    }
+                }
+                true
+            })
             .map(|(item, sim)| {
                 // 关键词路命中此前一律记 sim=0，而 sim 权重高达 0.50 —— 于是
                 // "全文精确命中"最高只能得 0.5 分，被任何中等向量命中压过，
@@ -191,7 +247,7 @@ impl HybridRetriever {
                 let kw = keyword_score(&item.content, &q.query_text, &item.tags);
                 let rec = recency_score(now, item.updated_at, self.recency_tau_days);
                 let fresh = if item.version > 1 { 1.0 } else { 0.5 };
-                let score = calculate_item_score(
+                let mut score = calculate_item_score(
                     &ItemScoreParams {
                         sim: sim.unwrap_or(0.0),
                         kw,
@@ -201,6 +257,16 @@ impl HybridRetriever {
                     },
                     &self.score_weights,
                 );
+                // 场景自适应加成：显式命中指定场景提升 +0.05
+                if let Some(scene) = &q.scene {
+                    if item.scene.as_ref() == Some(scene) {
+                        score = (score + 0.05).min(1.0);
+                    }
+                }
+                // 演化回溯时，已失效的事实打折（* 0.5），使现行有效事实自然胜出
+                if item.is_superseded_or_expired(now) {
+                    score *= 0.5;
+                }
                 Scored { item, score }
             })
             .collect();
@@ -250,11 +316,11 @@ impl Retriever for HybridRetriever {
                 .into_iter()
                 .map(|s| (s.item, None))
                 .collect::<Vec<_>>();
-            return Ok(self
-                .score_items(candidates, q, None)
-                .into_iter()
-                .take(top_k)
-                .collect());
+            let mut scored = self.score_items(candidates, q, None);
+            if let Some(min_s) = q.min_score {
+                scored.retain(|s| s.score >= min_s);
+            }
+            return Ok(scored.into_iter().take(top_k).collect());
         }
 
         // 查询向量只算一次，双路召回与打分共用
@@ -314,7 +380,12 @@ impl Retriever for HybridRetriever {
         let qv_clone = query_vec;
         let reranked = tokio::task::spawn_blocking(move || {
             let scored = this.score_items(merged, &q_clone, qv_clone.as_deref());
-            this.mmr_rerank(scored, top_k)
+            let reranked = this.mmr_rerank(scored, top_k);
+            if let Some(min_s) = q_clone.min_score {
+                reranked.into_iter().filter(|s| s.score >= min_s).collect()
+            } else {
+                reranked
+            }
         })
         .await
         .map_err(|e| common::HubError::Internal(anyhow::anyhow!("检索重排任务调度失败: {}", e)))?;
@@ -390,6 +461,30 @@ mod tests {
                         .text_contains
                         .as_ref()
                         .is_none_or(|t| e.content.to_lowercase().contains(&t.to_lowercase()))
+                })
+                .filter(|e| {
+                    filter
+                        .statuses
+                        .as_ref()
+                        .is_none_or(|statuses| statuses.contains(&e.status))
+                })
+                .filter(|e| {
+                    filter
+                        .scene
+                        .as_ref()
+                        .is_none_or(|scene| e.scene.as_ref() == Some(scene))
+                })
+                .filter(|e| {
+                    filter
+                        .layer
+                        .as_ref()
+                        .is_none_or(|layer| e.layer.as_ref() == Some(layer))
+                })
+                .filter(|e| {
+                    filter
+                        .valid_at
+                        .as_ref()
+                        .is_none_or(|valid_at| e.is_valid_at(*valid_at))
                 })
                 .cloned()
                 .collect();
@@ -498,6 +593,7 @@ mod tests {
             tags: None,
             top_k: 5,
             include_archived: false,
+            ..Default::default()
         }
     }
 
@@ -637,5 +733,126 @@ mod tests {
                 term
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_scene_aware_filtering_and_boost() {
+        let store = Arc::new(TestStore::default());
+        let mut chat_item = entry("ns", "对话中记录的偏好");
+        chat_item.scene = Some(mem_core::MemoryScene::Chat);
+        let mut coding_item = entry("ns", "对话中讨论的代码重构方案");
+        coding_item.scene = Some(mem_core::MemoryScene::Coding);
+
+        store.add(chat_item, None);
+        store.add(coding_item, None);
+
+        let r = retriever(store);
+
+        // 1. 指定 scene 为 Chat 时，仅返回 Chat 条目
+        let mut q_chat = query("ns", "对话");
+        q_chat.scene = Some(mem_core::MemoryScene::Chat);
+        let res_chat = r.search(&auth(), &q_chat).await.unwrap();
+        assert_eq!(res_chat.len(), 1);
+        assert_eq!(res_chat[0].item.scene, Some(mem_core::MemoryScene::Chat));
+
+        // 2. 指定 scene 为 Coding 时，仅返回 Coding 条目
+        let mut q_coding = query("ns", "对话");
+        q_coding.scene = Some(mem_core::MemoryScene::Coding);
+        let res_coding = r.search(&auth(), &q_coding).await.unwrap();
+        assert_eq!(res_coding.len(), 1);
+        assert_eq!(
+            res_coding[0].item.scene,
+            Some(mem_core::MemoryScene::Coding)
+        );
+
+        // 3. 不指定 scene 时向后兼容，返回所有 scene
+        let q_any = query("ns", "对话");
+        let res_any = r.search(&auth(), &q_any).await.unwrap();
+        assert_eq!(res_any.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_temporal_validity_filtering() {
+        use chrono::{TimeZone, Utc};
+        let store = Arc::new(TestStore::default());
+
+        let t1 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let t2 = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+        let t3 = Utc.with_ymd_and_hms(2026, 12, 31, 23, 59, 59).unwrap();
+
+        // 事实 A：2026上半年有效
+        let mut fact_a = entry("ns", "公司默认使用 Python 3.10 运行时");
+        fact_a.valid_from = Some(t1);
+        fact_a.valid_until = Some(t2);
+
+        // 事实 B：2026下半年有效
+        let mut fact_b = entry("ns", "公司默认使用 Python 3.12 运行时");
+        fact_b.valid_from = Some(t2);
+        fact_b.valid_until = Some(t3);
+
+        store.add(fact_a, None);
+        store.add(fact_b, None);
+
+        let r = retriever(store);
+
+        // 查询 2026-03-15 的有效事实
+        let mut q_early = query("ns", "Python");
+        q_early.valid_at = Some(Utc.with_ymd_and_hms(2026, 3, 15, 0, 0, 0).unwrap());
+        let res_early = r.search(&auth(), &q_early).await.unwrap();
+        assert_eq!(res_early.len(), 1);
+        assert!(res_early[0].item.content.contains("3.10"));
+
+        // 查询 2026-08-15 的有效事实
+        let mut q_late = query("ns", "Python");
+        q_late.valid_at = Some(Utc.with_ymd_and_hms(2026, 8, 15, 0, 0, 0).unwrap());
+        let res_late = r.search(&auth(), &q_late).await.unwrap();
+        assert_eq!(res_late.len(), 1);
+        assert!(res_late[0].item.content.contains("3.12"));
+    }
+
+    #[tokio::test]
+    async fn test_superseded_fact_exclusion_and_inclusion() {
+        let store = Arc::new(TestStore::default());
+
+        let mut active_fact = entry("ns", "数据库主库部署在上海可用区A");
+        active_fact.valid_until = None;
+
+        let mut superseded_fact = entry("ns", "数据库主库部署在杭州可用区B");
+        superseded_fact.valid_until = Some(chrono::Utc::now() - chrono::Duration::days(1));
+
+        store.add(active_fact, None);
+        store.add(superseded_fact, None);
+
+        let r = retriever(store);
+
+        // 1. 默认情况下，已失效的事实必须被过滤，不返回
+        let q_default = query("ns", "数据库主库部署");
+        let res_default = r.search(&auth(), &q_default).await.unwrap();
+        assert_eq!(res_default.len(), 1);
+        assert!(res_default[0].item.content.contains("上海可用区A"));
+
+        // 2. 当显式请求 include_superseded 时，允许返回已失效的事实用于演化回溯
+        let mut q_hist = query("ns", "数据库主库部署");
+        q_hist.include_superseded = true;
+        let res_hist = r.search(&auth(), &q_hist).await.unwrap();
+        assert_eq!(res_hist.len(), 2);
+        // Active 事实排在第一，Superseded 受到 0.5 惩罚分排在后
+        assert!(res_hist[0].item.valid_until.is_none());
+        assert!(res_hist[1].item.valid_until.is_some());
+        assert!(res_hist[0].score > res_hist[1].score);
+    }
+
+    #[tokio::test]
+    async fn test_min_score_filter() {
+        let store = Arc::new(TestStore::default());
+        store.add(entry("ns", "完全精确匹配目标查询"), None);
+        store.add(entry("ns", "毫无关系的无关文档"), None);
+
+        let r = retriever(store);
+        let mut q = query("ns", "目标查询");
+        q.min_score = Some(0.01);
+        let res = r.search(&auth(), &q).await.unwrap();
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].item.content, "完全精确匹配目标查询");
     }
 }

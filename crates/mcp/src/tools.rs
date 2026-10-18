@@ -283,6 +283,16 @@ impl ToolDispatcher {
             top_k: usize,
             #[serde(default)]
             include_archived: bool,
+            #[serde(default)]
+            min_score: Option<f32>,
+            #[serde(default)]
+            scene: Option<mem_core::domain::MemoryScene>,
+            #[serde(default)]
+            layer: Option<mem_core::domain::CognitiveLayer>,
+            #[serde(default)]
+            valid_at: Option<chrono::DateTime<chrono::Utc>>,
+            #[serde(default)]
+            include_superseded: bool,
         }
         fn default_top_k() -> usize {
             10
@@ -296,6 +306,11 @@ impl ToolDispatcher {
                     tags: req.tags,
                     top_k: req.top_k,
                     include_archived: req.include_archived,
+                    min_score: req.min_score,
+                    scene: req.scene,
+                    layer: req.layer,
+                    valid_at: req.valid_at,
+                    include_superseded: req.include_superseded,
                 };
                 match self.memory.search(auth, q).await {
                     Ok(results) => {

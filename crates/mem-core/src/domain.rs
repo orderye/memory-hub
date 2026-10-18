@@ -1005,6 +1005,33 @@ pub struct MemoryEntry {
     pub occurred_at: Option<DateTime<Utc>>,
 }
 
+impl MemoryEntry {
+    /// 判定在特定时刻是否处于有效时间区间（valid_from <= t < valid_until）
+    pub fn is_valid_at(&self, t: DateTime<Utc>) -> bool {
+        if let Some(from) = self.valid_from {
+            if t < from {
+                return false;
+            }
+        }
+        if let Some(until) = self.valid_until {
+            if t >= until {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// 判定在特定时刻是否已被取代或已失效（valid_until <= now）
+    pub fn is_superseded_or_expired(&self, now: DateTime<Utc>) -> bool {
+        if let Some(until) = self.valid_until {
+            if until <= now {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 /// 新记忆写入请求
 #[derive(Debug, Clone)]
 pub struct NewMemory {

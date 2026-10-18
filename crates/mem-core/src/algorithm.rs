@@ -164,6 +164,21 @@ pub struct SearchQuery {
     /// 是否包含已归档条目
     #[serde(default)]
     pub include_archived: bool,
+    /// 最小综合分阈值（[0.0, 1.0]，低于此分的条目被过滤）
+    #[serde(default)]
+    pub min_score: Option<f32>,
+    /// 认知场景过滤（Chat / Working / Coding）
+    #[serde(default)]
+    pub scene: Option<crate::domain::MemoryScene>,
+    /// 认知层级过滤
+    #[serde(default)]
+    pub layer: Option<crate::domain::CognitiveLayer>,
+    /// 时间有效性断言：查询在特定时刻有效的事实（valid_from <= t < valid_until）
+    #[serde(default)]
+    pub valid_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// 是否返回已失效（superseded）的旧事实以供演化回溯
+    #[serde(default)]
+    pub include_superseded: bool,
 }
 
 #[cfg(test)]

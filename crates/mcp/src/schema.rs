@@ -205,6 +205,31 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                         "type": "boolean",
                         "default": false,
                         "description": "是否把已归档条目纳入候选"
+                    },
+                    "min_score": {
+                        "type": "number",
+                        "minimum": 0.0,
+                        "maximum": 1.0,
+                        "description": "最小综合相关性分阈值（可选）"
+                    },
+                    "scene": {
+                        "type": "string",
+                        "enum": ["chat", "working", "coding"],
+                        "description": "认知场景过滤（chat / working / coding，可选）"
+                    },
+                    "layer": {
+                        "type": "string",
+                        "description": "认知层级过滤（可选）"
+                    },
+                    "valid_at": {
+                        "type": "string",
+                        "format": "date-time",
+                        "description": "时间有效性断言：查询在特定时刻有效的事实（可选）"
+                    },
+                    "include_superseded": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "是否包含已失效（superseded）的旧事实"
                     }
                 }
             }),

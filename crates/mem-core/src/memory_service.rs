@@ -501,13 +501,35 @@ impl MemoryService for DefaultMemoryService {
         let now = self.clock.now();
         let store = self.scoped(auth);
         let mut scored: Vec<Scored<MemoryEntry>> = store
-            .similar(&q.namespace, &qv, q.top_k.max(1), q.kinds.as_deref())
+            .similar(&q.namespace, &qv, q.top_k.max(1) * 3, q.kinds.as_deref())
             .await?
             .into_iter()
+            .filter(|s| {
+                if let Some(scene) = &q.scene {
+                    if s.item.scene.as_ref() != Some(scene) {
+                        return false;
+                    }
+                }
+                if let Some(layer) = &q.layer {
+                    if s.item.layer.as_ref() != Some(layer) {
+                        return false;
+                    }
+                }
+                if !q.include_superseded {
+                    if let Some(valid_at) = q.valid_at {
+                        if !s.item.is_valid_at(valid_at) {
+                            return false;
+                        }
+                    } else if s.item.is_superseded_or_expired(now) {
+                        return false;
+                    }
+                }
+                true
+            })
             .map(|s| {
                 let kw = keyword_score(&s.item.content, &q.query_text, &s.item.tags);
                 let rec = recency_score(now, s.item.updated_at, DEFAULT_RECENCY_TAU_DAYS);
-                let score = calculate_item_score(
+                let mut score = calculate_item_score(
                     &ItemScoreParams {
                         sim: s.score.max(0.0),
                         kw,
@@ -517,9 +539,24 @@ impl MemoryService for DefaultMemoryService {
                     },
                     &self.score_weights,
                 );
+                if let Some(scene) = &q.scene {
+                    if s.item.scene.as_ref() == Some(scene) {
+                        score = (score + 0.05).min(1.0);
+                    }
+                }
+                if s.item.is_superseded_or_expired(now) {
+                    score *= 0.5;
+                }
                 Scored {
                     item: s.item,
                     score,
+                }
+            })
+            .filter(|s| {
+                if let Some(min_s) = q.min_score {
+                    s.score >= min_s
+                } else {
+                    true
                 }
             })
             .collect();
@@ -1305,6 +1342,7 @@ mod tests {
                     tags: None,
                     top_k: 2,
                     include_archived: false,
+                    ..Default::default()
                 },
             )
             .await

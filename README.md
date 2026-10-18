@@ -97,7 +97,10 @@ BACKUP=$(curl -s -X POST http://localhost:3000 -H "Authorization: Bearer $TOKEN"
 ### 1. 快速混合检索（Hybrid Retrieval）
 - **双路并发召回**：全文倒排索引（FTS）与向量相似度（pgvector HNSW Cosine）并发检索，弥补单一关键词或纯语义的边界短板；
 - **五维打分融合**：综合向量相似度、关键词命中率、基于遗忘曲线的时间衰减（Recency）、显式记忆权重（Weight）以及访问频次；
-- **MMR 多样性重排**：通过 Maximal Marginal Relevance 算法降低冗余度，避免上下文窗口被高度相似的重复条目侵占。
+- **MMR 多样性重排**：通过 Maximal Marginal Relevance 算法降低冗余度，避免上下文窗口被高度相似的重复条目侵占；
+- **认知场景感知**：支持 Chat / Working / Coding 场景自适应检索与提权加成（+0.05）；
+- **时间有效性与演化**：基于 `valid_from <= t < valid_until` 进行时间断言过滤，自动屏蔽过期旧事实，并支持历史演化回溯；
+- **强健容灾降级**：向量服务故障自动降级为关键词 FTS，软超时（soft timeout）降级为列表兜底，保证检索永不挂起。
 
 ### 2. 整合中枢（Consolidation Engine）
 - **多维冲突与冗余检测**：精确识别相同 Key 的事实分歧（Conflict）、语义高相似的重复碎片（Duplicate，向量阈值可配）以及超期过期数据；
@@ -106,6 +109,12 @@ BACKUP=$(curl -s -X POST http://localhost:3000 -H "Authorization: Bearer $TOKEN"
   - `Manual`：仅生成审查提案，绝不静默合并，严格人工/Agent 裁决；
   - `SemiAuto`：超高置信度（>= 阈值）且轻量条目自动融合，复杂冲突生成提案；
   - `FullAuto`：全自动收敛并归档重复历史。
+
+### 3. 认知记忆分层（Cognitive Architecture）
+- **证据存根与关系网**：不可变证据溯源（`memory_evidence`）与因果/演化关系网（`memory_relations`，支持 supersedes / contradicts / supports / derived_from）；
+- **Chat 对话认知流**：结构化事实抽取候选、防幻觉校验、自动封堵被取代旧事实的时间有效期；
+- **Working 经验记忆**：任务上下文隔离与可复用经验沉淀，具备运行环境边界（boundary envs）与前置条件校验；
+- **Coding 代码演进链**：代码演进线程（thread）与不可变修订（revision），记录统一 diff、SHA-256 哈希校验与敏感凭证防护。
 
 ---
 
