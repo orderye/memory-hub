@@ -129,6 +129,24 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use uuid::Uuid;
 
+/// 测试用固定时钟：让时间相关断言不随墙上时钟漂移（消除评测时间炸弹）
+#[derive(Debug, Clone)]
+pub struct FixedClock {
+    now: DateTime<Utc>,
+}
+
+impl FixedClock {
+    pub fn new(now: DateTime<Utc>) -> Self {
+        Self { now }
+    }
+}
+
+impl Clock for FixedClock {
+    fn now(&self) -> DateTime<Utc> {
+        self.now
+    }
+}
+
 /// 测试用全功能内存存储（实现 MemoryHubStore 全套 trait）
 #[derive(Default)]
 pub struct TestHubStore {

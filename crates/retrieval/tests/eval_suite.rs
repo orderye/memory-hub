@@ -1,18 +1,29 @@
 //! 认知记忆检索评测套件 (Retrieval Evaluation Suite)
 //!
 //! 评测集与覆盖矩阵：
-//! 1. 精确事实、语义改写、中文关键词、英文关键词、中英混合检索精度与排位
+//! 1. 精确事实、中文关键词、英文关键词、中英混合检索精度与排位
 //! 2. 事实版本演化与时间有效性（valid_at 约束与 superseded 失效事实回溯）
 //! 3. 认知场景感知检索（Chat / Working / Coding 场景过滤与场景自适应加成）
 //! 4. 多租户跨账户严格隔离验证（同名 namespace 零泄漏保证，Cross-Account Leakage = 0）
 //! 5. 故障降级与软超时自愈（嵌入服务崩溃降级 FTS、数据库超时降级 Fallback 列表）
 //! 6. 量化指标核算（Recall@1, Recall@3, Recall@5, MRR, 降级成功率）
+//!
+//! 局限说明（不得据本套件结论推断检索质量）：
+//! - 规模极小（个位数查询、每命名空间个位数条目），Recall@5 在 top_k=5 下结构性为 100%；
+//! - 每个场景的数据放在独立命名空间，跨场景干扰与场景过滤/加成的价值未被测量；
+//! - 使用 `TestEmbedder` 伪向量（与语义无关），向量路只起"把候选全量带回"的作用；
+//! - 查询与目标文本高度字面重叠，"语义改写"类目在样本中并不存在；
+//! - 内存存储的子串匹配与 PostgreSQL 分词 AND 语义不同，FTS 行为不代表生产；
+//! - 故障降级成功率在断言之后计数，任何失败会 panic，因此 100% 是结构性的而非测得的。
+//!
+//! 时间基准：全部用例使用固定时钟（`eval_fixed_now`），不随墙上时钟漂移，
+//! 避免"现行有效事实"在 valid_until 到期后变成无结果的时间炸弹。
 
 use chrono::{TimeZone, Utc};
 use common::{AccountId, AuthCtx, Scope};
 use mem_core::{
     domain::{CognitiveLayer, MemoryEntry, MemoryKind, MemoryScene, MemoryStatus},
-    testing::TestEmbedder,
+    testing::{FixedClock, TestEmbedder},
     AccountScopedStore, Embedder, MemoryHubStore, MemoryStore, Retriever, SearchQuery,
 };
 use retrieval::HybridRetriever;
@@ -20,6 +31,11 @@ use serde_json::json;
 use std::sync::Arc;
 use store::InMemoryHubStore;
 use uuid::Uuid;
+
+/// 评测固定时钟（所有时间断言以此为基准，保证任何日期运行结果一致）
+fn eval_fixed_now() -> chrono::DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 10, 19, 0, 0, 0).unwrap()
+}
 
 /// 评测样本定义
 struct EvalSample {
@@ -95,7 +111,7 @@ fn create_entry(
     valid_from: Option<chrono::DateTime<Utc>>,
     valid_until: Option<chrono::DateTime<Utc>>,
 ) -> MemoryEntry {
-    let now = Utc::now();
+    let now = eval_fixed_now();
     MemoryEntry {
         id: Uuid::new_v4(),
         namespace: ns.to_string(),
@@ -305,7 +321,8 @@ async fn test_full_retrieval_eval_suite() {
         [0.5, 0.2, 0.1, 0.1, 0.1],
         0.7,
         1000,
-    );
+    )
+    .with_clock(Arc::new(FixedClock::new(eval_fixed_now())));
 
     // ==========================================
     // 2. 执行精度与排位评测样本集
@@ -464,7 +481,8 @@ async fn test_full_retrieval_eval_suite() {
         [0.5, 0.2, 0.1, 0.1, 0.1],
         0.7,
         1000,
-    );
+    )
+    .with_clock(Arc::new(FixedClock::new(eval_fixed_now())));
 
     // 3.1 Prod 租户在 "infra-facts" 下搜索关键词 "SecretPassword" 或 "租户 B"
     let cross_check_query = SearchQuery {
@@ -554,7 +572,8 @@ async fn test_full_retrieval_eval_suite() {
         [0.5, 0.2, 0.1, 0.1, 0.1],
         0.7,
         1000,
-    );
+    )
+    .with_clock(Arc::new(FixedClock::new(eval_fixed_now())));
     let fts_degrade_query = SearchQuery {
         namespace: "infra-facts".into(),
         query_text: "PostgreSQL".into(),
@@ -589,7 +608,8 @@ async fn test_full_retrieval_eval_suite() {
         [0.5, 0.2, 0.1, 0.1, 0.1],
         0.7,
         1, // 1ms 极限超时触发降级
-    );
+    )
+    .with_clock(Arc::new(FixedClock::new(eval_fixed_now())));
     tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
     let timeout_query = SearchQuery {
         namespace: "infra-facts".into(),
@@ -697,7 +717,8 @@ async fn test_postgres_retrieval_eval_suite() {
         [0.5, 0.2, 0.1, 0.1, 0.1],
         0.7,
         1000,
-    );
+    )
+    .with_clock(Arc::new(FixedClock::new(eval_fixed_now())));
 
     // 灌入测试数据
     let mut entry = create_entry(

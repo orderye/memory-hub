@@ -9,8 +9,9 @@
 use crate::access::{validate_key, validate_namespace};
 use crate::account_scope::{scope_name, unscope_name, AccountScopedStore};
 use crate::algorithm::{
-    calculate_item_score, cosine_similarity, keyword_score, recency_score, ItemScoreParams,
-    SearchQuery,
+    calculate_item_score_with_availability, cosine_similarity, is_superseded_at, keyword_score,
+    matches_tag_filter, passes_validity_filter, recency_score, retrieval_reference_time,
+    ItemScoreParams, SearchQuery,
 };
 use crate::domain::{
     CognitiveLayer, MemoryEntry, MemoryFilter, MemoryKind, MemoryScene, MemoryStats, MemoryStatus,
@@ -499,52 +500,45 @@ impl MemoryService for DefaultMemoryService {
         let mut qv = query_vec;
         crate::algorithm::l2_normalize(&mut qv);
         let now = self.clock.now();
+        // 过滤与惩罚共用同一参考时点（与 HybridRetriever 语义一致）
+        let reference_time = retrieval_reference_time(q.valid_at, now);
         let store = self.scoped(auth);
         let mut scored: Vec<Scored<MemoryEntry>> = store
             .similar(&q.namespace, &qv, q.top_k.max(1) * 3, q.kinds.as_deref())
             .await?
             .into_iter()
             .filter(|s| {
-                if let Some(scene) = &q.scene {
-                    if s.item.scene.as_ref() != Some(scene) {
-                        return false;
-                    }
-                }
-                if let Some(layer) = &q.layer {
-                    if s.item.layer.as_ref() != Some(layer) {
-                        return false;
-                    }
-                }
-                if !q.include_superseded {
-                    if let Some(valid_at) = q.valid_at {
-                        if !s.item.is_valid_at(valid_at) {
-                            return false;
-                        }
-                    } else if s.item.is_superseded_or_expired(now) {
-                        return false;
-                    }
-                }
-                true
+                passes_validity_filter(&s.item, q.valid_at, q.include_superseded, now)
+                    && matches_tag_filter(&s.item, &q.tags)
+                    && (q.scene.is_none() || s.item.scene == q.scene)
+                    && (q.layer.is_none() || s.item.layer == q.layer)
             })
             .map(|s| {
-                let kw = keyword_score(&s.item.content, &q.query_text, &s.item.tags);
+                let kw = keyword_score(&s.item.content, &q.query_text);
                 let rec = recency_score(now, s.item.updated_at, DEFAULT_RECENCY_TAU_DAYS);
-                let mut score = calculate_item_score(
+                // 跨模型向量不可比：模型不匹配时按"嵌入缺失"处理
+                let sim_available = s.item.embedding.is_some()
+                    && s.item
+                        .embedding_model
+                        .as_deref()
+                        .is_none_or(|m| m == self.embedder.model_id());
+                let mut score = calculate_item_score_with_availability(
                     &ItemScoreParams {
-                        sim: s.score.max(0.0),
+                        sim: if sim_available { s.score.max(0.0) } else { 0.0 },
                         kw,
                         conf: s.item.confidence,
                         rec,
                         fresh: if s.item.version > 1 { 1.0 } else { 0.5 },
                     },
                     &self.score_weights,
+                    [sim_available, true, true, true, true],
                 );
                 if let Some(scene) = &q.scene {
                     if s.item.scene.as_ref() == Some(scene) {
                         score = (score + 0.05).min(1.0);
                     }
                 }
-                if s.item.is_superseded_or_expired(now) {
+                if is_superseded_at(&s.item, reference_time) {
                     score *= 0.5;
                 }
                 Scored {
@@ -655,6 +649,7 @@ pub struct SimpleRetriever {
     store: Arc<dyn MemoryStore>,
     embedder: Arc<dyn Embedder>,
     score_weights: [f32; 5],
+    clock: Arc<dyn Clock>,
 }
 
 impl SimpleRetriever {
@@ -667,7 +662,14 @@ impl SimpleRetriever {
             store,
             embedder,
             score_weights,
+            clock: Arc::new(SystemClock),
         }
+    }
+
+    /// 注入时钟（builder）：评测使用固定时钟，生产使用系统时钟
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 }
 
@@ -694,14 +696,18 @@ impl Retriever for SimpleRetriever {
                 .map(|s| s.item)
                 .collect(),
             None => {
+                let mut statuses = vec![MemoryStatus::Active];
+                if q.include_archived || q.include_superseded {
+                    statuses.push(MemoryStatus::Archived);
+                }
                 let filter = MemoryFilter {
                     namespace: Some(q.namespace.clone()),
                     kinds: q.kinds.clone(),
-                    statuses: Some(if q.include_archived {
-                        vec![MemoryStatus::Active, MemoryStatus::Archived]
-                    } else {
-                        vec![MemoryStatus::Active]
-                    }),
+                    statuses: Some(statuses),
+                    tags: q.tags.clone(),
+                    scene: q.scene,
+                    layer: q.layer,
+                    valid_at: q.valid_at,
                     limit: Some(q.top_k.max(1)),
                     ..Default::default()
                 };
@@ -709,18 +715,36 @@ impl Retriever for SimpleRetriever {
             }
         };
 
-        let now = chrono::Utc::now();
+        let now = self.clock.now();
+        // 过滤与惩罚共用同一参考时点（与 HybridRetriever 语义一致）
+        let reference_time = retrieval_reference_time(q.valid_at, now);
         let mut scored: Vec<Scored<MemoryEntry>> = candidates
             .into_iter()
+            .filter(|item| {
+                passes_validity_filter(item, q.valid_at, q.include_superseded, now)
+                    && matches_tag_filter(item, &q.tags)
+                    && (q.scene.is_none() || item.scene == q.scene)
+                    && (q.layer.is_none() || item.layer == q.layer)
+            })
             .map(|item| {
-                let sim = query_vec
-                    .as_ref()
-                    .and_then(|qv| item.embedding.as_ref().map(|iv| cosine_similarity(qv, iv)))
-                    .unwrap_or(0.0);
-                let kw = keyword_score(&item.content, &q.query_text, &item.tags);
+                let sim_available = query_vec.is_some()
+                    && item.embedding.is_some()
+                    && item
+                        .embedding_model
+                        .as_deref()
+                        .is_none_or(|m| m == self.embedder.model_id());
+                let sim = if sim_available {
+                    query_vec
+                        .as_ref()
+                        .and_then(|qv| item.embedding.as_ref().map(|iv| cosine_similarity(qv, iv)))
+                        .unwrap_or(0.0)
+                } else {
+                    0.0
+                };
+                let kw = keyword_score(&item.content, &q.query_text);
                 let rec = recency_score(now, item.updated_at, DEFAULT_RECENCY_TAU_DAYS);
                 let fresh = if item.version > 1 { 1.0 } else { 0.5 };
-                let score = calculate_item_score(
+                let mut score = calculate_item_score_with_availability(
                     &ItemScoreParams {
                         sim: sim.max(0.0),
                         kw,
@@ -729,11 +753,23 @@ impl Retriever for SimpleRetriever {
                         fresh,
                     },
                     &self.score_weights,
+                    [sim_available, true, true, true, true],
                 );
+                if let Some(scene) = &q.scene {
+                    if item.scene.as_ref() == Some(scene) {
+                        score = (score + 0.05).min(1.0);
+                    }
+                }
+                if is_superseded_at(&item, reference_time) {
+                    score *= 0.5;
+                }
                 Scored { item, score }
             })
             .collect();
 
+        if let Some(min_s) = q.min_score {
+            scored.retain(|s| s.score >= min_s);
+        }
         scored.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)

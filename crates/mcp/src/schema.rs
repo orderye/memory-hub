@@ -193,7 +193,8 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                     "tags": {
                         "type": "array",
                         "maxItems": 32,
-                        "items": { "type": "string", "maxLength": 64 }
+                        "items": { "type": "string", "maxLength": 64 },
+                        "description": "标签筛选：条目必须包含全部给定标签（不参与相关性打分）"
                     },
                     "top_k": {
                         "type": "integer",

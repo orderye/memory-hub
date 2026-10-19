@@ -62,8 +62,11 @@ pub fn extract_terms(query: &str) -> Vec<String> {
     terms
 }
 
-/// 关键词命中度（0.0 ~ 1.0）：查询词与标签在内容中的覆盖比例
-pub fn keyword_score(content: &str, query: &str, tags: &[String]) -> f32 {
+/// 关键词命中度（0.0 ~ 1.0）：查询词在内容中的覆盖比例
+///
+/// 条目自身的 tags 不参与分母：标签是独立信号，标签多寡不应稀释正文命中。
+/// 查询侧的标签筛选由 [`matches_tag_filter`] 负责。
+pub fn keyword_score(content: &str, query: &str) -> f32 {
     let haystack = content.to_lowercase();
     let mut hits = 0usize;
     let mut total = 0usize;
@@ -74,19 +77,54 @@ pub fn keyword_score(content: &str, query: &str, tags: &[String]) -> f32 {
             hits += 1;
         }
     }
-    for tag in tags {
-        total += 1;
-        if haystack.contains(&tag.to_lowercase()) {
-            hits += 1;
-        }
-    }
     if total == 0 {
         return 0.0;
     }
     hits as f32 / total as f32
 }
 
-/// 近期性打分：半衰期 `tau_days` 天，返回 0.0 ~ 1.0
+/// 检索参考时点：显式 `valid_at` 优先，否则取当前时刻。
+///
+/// 时间有效性过滤与失效惩罚必须使用同一参考时点，避免"按历史时点过滤、
+/// 却按墙上时钟惩罚"导致历史版本查询排序倒挂。
+pub fn retrieval_reference_time(
+    valid_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> DateTime<Utc> {
+    valid_at.unwrap_or(now)
+}
+
+/// 时间有效性过滤（三套检索路径共用的统一语义）
+///
+/// - 显式给出 `valid_at` 时一律按 `valid_from <= t < valid_until` 过滤，
+///   `include_superseded` 不绕过该约束（它只放宽"当前已失效"的排除）；
+/// - 未显式给出时，仅在 `include_superseded` 为假时排除已失效条目。
+pub fn passes_validity_filter(
+    item: &crate::domain::MemoryEntry,
+    valid_at: Option<DateTime<Utc>>,
+    include_superseded: bool,
+    now: DateTime<Utc>,
+) -> bool {
+    match valid_at {
+        Some(t) => item.is_valid_at(t),
+        None => include_superseded || !item.is_superseded_or_expired(now),
+    }
+}
+
+/// 失效惩罚判定：以检索参考时点为基准（而非墙上时钟）
+pub fn is_superseded_at(item: &crate::domain::MemoryEntry, reference_time: DateTime<Utc>) -> bool {
+    item.is_superseded_or_expired(reference_time)
+}
+
+/// 查询侧标签筛选：请求中给出的标签必须全部命中条目标签
+pub fn matches_tag_filter(item: &crate::domain::MemoryEntry, tags: &Option<Vec<String>>) -> bool {
+    match tags {
+        Some(tags) if !tags.is_empty() => tags.iter().all(|t| item.tags.contains(t)),
+        _ => true,
+    }
+}
+
+/// 近期性打分：时间常数 `tau_days` 天（指数衰减，`tau` 非半衰期），返回 0.0 ~ 1.0
 pub fn recency_score(now: DateTime<Utc>, updated_at: DateTime<Utc>, tau_days: f32) -> f32 {
     let days = (now - updated_at).num_seconds().max(0) as f32 / 86_400.0;
     (-days / tau_days.max(1.0)).exp().clamp(0.0, 1.0)
@@ -104,14 +142,44 @@ pub struct ItemScoreParams {
 
 /// 加权综合分 = Σ wᵢ·sᵢ
 pub fn calculate_item_score(p: &ItemScoreParams, w: &[f32; SCORE_WEIGHT_LEN]) -> f32 {
-    let raw = [
+    let raw = clamped_signals(p);
+    raw.iter().zip(w.iter()).map(|(s, w)| s * w).sum()
+}
+
+/// 加权综合分（缺失维度按可用信号重新归一化）
+///
+/// 当某维度不可用（如嵌入服务故障、条目缺失向量、嵌入模型不匹配）时，
+/// 其权重不应简单按 0 计——否则所有分数被整体压低，`min_score` 阈值失真、
+/// 无向量条目被系统性压制。此处按可用维度的权重之和归一化。
+pub fn calculate_item_score_with_availability(
+    p: &ItemScoreParams,
+    w: &[f32; SCORE_WEIGHT_LEN],
+    available: [bool; SCORE_WEIGHT_LEN],
+) -> f32 {
+    let raw = clamped_signals(p);
+    let mut numerator = 0.0f32;
+    let mut weight_sum = 0.0f32;
+    for i in 0..SCORE_WEIGHT_LEN {
+        if available[i] {
+            numerator += raw[i] * w[i];
+            weight_sum += w[i];
+        }
+    }
+    if weight_sum <= f32::EPSILON {
+        0.0
+    } else {
+        numerator / weight_sum
+    }
+}
+
+fn clamped_signals(p: &ItemScoreParams) -> [f32; SCORE_WEIGHT_LEN] {
+    [
         p.sim.clamp(0.0, 1.0),
         p.kw.clamp(0.0, 1.0),
         p.conf.clamp(0.0, 1.0),
         p.rec.clamp(0.0, 1.0),
         p.fresh.clamp(0.0, 1.0),
-    ];
-    raw.iter().zip(w.iter()).map(|(s, w)| s * w).sum()
+    ]
 }
 
 /// MMR（最大边际相关性）重排
@@ -209,20 +277,51 @@ mod tests {
     #[test]
     fn test_keyword_score() {
         let content = "用户偏好简短直接的中文回复";
-        let tags = vec!["沟通".to_string()];
-        let s = keyword_score(content, "简短", &tags);
+        let s = keyword_score(content, "简短");
         assert!(s > 0.4 && s <= 1.0);
 
-        // 空查询且无标签：0
-        assert_eq!(keyword_score(content, "", &[]), 0.0);
+        // 空查询：0
+        assert_eq!(keyword_score(content, ""), 0.0);
+    }
+
+    #[test]
+    fn test_keyword_score_ignores_entry_tags() {
+        // 标签是独立信号，不再计入正文覆盖分母（此前标签越多 kw 越低）
+        let content = "服务部署在东京区域";
+        assert_eq!(keyword_score(content, "东京"), 1.0);
+        assert_eq!(keyword_score(content, "东京 架构"), 0.5);
     }
 
     #[test]
     fn test_cjk_keyword_matching() {
         let content = "用户偏好简短直接的中文回复";
         // 未分词的长中文查询通过 2-gram 依然能精确召回命中子串
-        let s = keyword_score(content, "偏好直接", &[]);
+        let s = keyword_score(content, "偏好直接");
         assert!(s > 0.0, "CJK 2-gram 应成功命中 '偏好' 与 '直接'");
+    }
+
+    #[test]
+    fn test_score_renormalizes_when_sim_unavailable() {
+        let w = [0.5, 0.2, 0.1, 0.1, 0.1];
+        let p = ItemScoreParams {
+            sim: 0.0,
+            kw: 1.0,
+            conf: 1.0,
+            rec: 1.0,
+            fresh: 1.0,
+        };
+        // sim 不可用时不应整体缩水（旧口径上限 0.5），而应按剩余信号归一化
+        let renormalized =
+            calculate_item_score_with_availability(&p, &w, [false, true, true, true, true]);
+        assert!(
+            (renormalized - 1.0).abs() < 1e-6,
+            "其余信号全满时应得 1.0：{renormalized}"
+        );
+
+        // sim 可用时与旧口径一致
+        let full = calculate_item_score_with_availability(&p, &w, [true; 5]);
+        let legacy = calculate_item_score(&p, &w);
+        assert!((full - legacy).abs() < 1e-6);
     }
 
     #[test]

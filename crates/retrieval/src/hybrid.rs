@@ -11,14 +11,15 @@
 use async_trait::async_trait;
 use common::{AuthCtx, Result};
 use mem_core::{
-    algorithm::ItemScoreParams, calculate_item_score, cosine_similarity, keyword_score,
-    l2_normalize, recency_score, Embedder, MemoryEntry, MemoryFilter, MemoryStatus, MemoryStore,
-    Retriever, Scored, SearchQuery,
+    algorithm::ItemScoreParams, calculate_item_score_with_availability, cosine_similarity,
+    is_superseded_at, keyword_score, l2_normalize, matches_tag_filter, passes_validity_filter,
+    recency_score, retrieval_reference_time, Clock, Embedder, MemoryEntry, MemoryFilter,
+    MemoryStatus, MemoryStore, Retriever, Scored, SearchQuery, SystemClock,
 };
 use std::sync::Arc;
 use std::time::Duration;
 
-/// 近期性半衰期（天）
+/// 近期性时间常数（天）。衰减为 `exp(-d/tau)`，实际半衰期约 `tau·ln2` 天。
 pub const DEFAULT_RECENCY_TAU_DAYS: f32 = 30.0;
 
 /// 混合检索器
@@ -26,6 +27,7 @@ pub const DEFAULT_RECENCY_TAU_DAYS: f32 = 30.0;
 pub struct HybridRetriever {
     store: Arc<dyn MemoryStore>,
     embedder: Arc<dyn Embedder>,
+    clock: Arc<dyn Clock>,
     fts_k: usize,
     vec_k: usize,
     score_weights: [f32; 5],
@@ -47,6 +49,7 @@ impl HybridRetriever {
         Self {
             store,
             embedder,
+            clock: Arc::new(SystemClock),
             fts_k: fts_k.max(1),
             vec_k: vec_k.max(1),
             score_weights,
@@ -62,6 +65,22 @@ impl HybridRetriever {
         self
     }
 
+    /// 注入时钟（builder）：评测使用固定时钟，生产使用系统时钟
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// 条目向量是否可用于比较：存在向量，且嵌入模型与当前查询嵌入器一致
+    /// （跨模型向量不可比，按"嵌入缺失"处理）
+    fn embedding_usable(&self, item: &MemoryEntry) -> bool {
+        item.embedding.is_some()
+            && item
+                .embedding_model
+                .as_deref()
+                .is_none_or(|m| m == self.embedder.model_id())
+    }
+
     /// 关键词路召回
     async fn fts_candidates(&self, q: &SearchQuery) -> Vec<Scored<MemoryEntry>> {
         if q.query_text.trim().is_empty() {
@@ -75,6 +94,7 @@ impl HybridRetriever {
             namespace: Some(q.namespace.clone()),
             kinds: q.kinds.clone(),
             statuses: Some(statuses),
+            tags: q.tags.clone(),
             text_contains: Some(q.query_text.clone()),
             scene: q.scene,
             layer: q.layer,
@@ -127,8 +147,8 @@ impl HybridRetriever {
             }
         };
 
-        // 认知过滤：scene、layer、valid_at 与状态约束
-        let now = chrono::Utc::now();
+        // 认知过滤：scene、layer、tags 与时间有效性约束（与打分路径同一语义）
+        let now = self.clock.now();
         items
             .into_iter()
             .filter(|scored| {
@@ -142,16 +162,10 @@ impl HybridRetriever {
                         return false;
                     }
                 }
-                if !q.include_superseded {
-                    if let Some(valid_at) = q.valid_at {
-                        if !scored.item.is_valid_at(valid_at) {
-                            return false;
-                        }
-                    } else if scored.item.is_superseded_or_expired(now) {
-                        return false;
-                    }
+                if !matches_tag_filter(&scored.item, &q.tags) {
+                    return false;
                 }
-                true
+                passes_validity_filter(&scored.item, q.valid_at, q.include_superseded, now)
             })
             .collect()
     }
@@ -166,6 +180,7 @@ impl HybridRetriever {
             namespace: Some(q.namespace.clone()),
             kinds: q.kinds.clone(),
             statuses: Some(statuses),
+            tags: q.tags.clone(),
             scene: q.scene,
             layer: q.layer,
             valid_at: q.valid_at,
@@ -209,45 +224,38 @@ impl HybridRetriever {
         q: &SearchQuery,
         query_vec: Option<&[f32]>,
     ) -> Vec<Scored<MemoryEntry>> {
-        let now = chrono::Utc::now();
+        let now = self.clock.now();
+        // 过滤与惩罚共用同一参考时点：显式 valid_at 优先，否则墙上时钟
+        let reference_time = retrieval_reference_time(q.valid_at, now);
         let mut scored: Vec<Scored<MemoryEntry>> = candidates
             .into_iter()
             .filter(|(item, _)| {
-                if !q.include_superseded {
-                    if let Some(valid_at) = q.valid_at {
-                        if !item.is_valid_at(valid_at) {
-                            return false;
-                        }
-                    } else if item.is_superseded_or_expired(now) {
-                        return false;
-                    }
-                }
-                if let Some(scene) = &q.scene {
-                    if item.scene.as_ref() != Some(scene) {
-                        return false;
-                    }
-                }
-                if let Some(layer) = &q.layer {
-                    if item.layer.as_ref() != Some(layer) {
-                        return false;
-                    }
-                }
-                true
+                passes_validity_filter(item, q.valid_at, q.include_superseded, now)
+                    && matches_tag_filter(item, &q.tags)
+                    && (q.scene.is_none() || item.scene == q.scene)
+                    && (q.layer.is_none() || item.layer == q.layer)
             })
-            .map(|(item, sim)| {
+            .map(|(item, vec_sim)| {
                 // 关键词路命中此前一律记 sim=0，而 sim 权重高达 0.50 —— 于是
                 // "全文精确命中"最高只能得 0.5 分，被任何中等向量命中压过，
                 // 双路融合名不副实。这里用条目自带向量与查询向量现算相似度。
-                let sim = sim.or_else(|| {
-                    let qv = query_vec?;
-                    item.embedding
-                        .as_deref()
-                        .map(|e| cosine_similarity(qv, e).clamp(0.0, 1.0))
-                });
-                let kw = keyword_score(&item.content, &q.query_text, &item.tags);
+                let embedding_usable = self.embedding_usable(&item);
+                let sim = if embedding_usable {
+                    vec_sim.or_else(|| {
+                        let qv = query_vec?;
+                        let e = item.embedding.as_deref()?;
+                        Some(cosine_similarity(qv, e).clamp(0.0, 1.0))
+                    })
+                } else {
+                    None
+                };
+                let kw = keyword_score(&item.content, &q.query_text);
                 let rec = recency_score(now, item.updated_at, self.recency_tau_days);
                 let fresh = if item.version > 1 { 1.0 } else { 0.5 };
-                let mut score = calculate_item_score(
+                // 嵌入不可用（服务故障 / 缺失向量 / 模型不匹配）时按剩余
+                // 信号归一化，而不是让该维度按 0 计使分数整体缩水
+                let sim_available = sim.is_some();
+                let mut score = calculate_item_score_with_availability(
                     &ItemScoreParams {
                         sim: sim.unwrap_or(0.0),
                         kw,
@@ -256,6 +264,7 @@ impl HybridRetriever {
                         fresh,
                     },
                     &self.score_weights,
+                    [sim_available, true, true, true, true],
                 );
                 // 场景自适应加成：显式命中指定场景提升 +0.05
                 if let Some(scene) = &q.scene {
@@ -263,8 +272,9 @@ impl HybridRetriever {
                         score = (score + 0.05).min(1.0);
                     }
                 }
-                // 演化回溯时，已失效的事实打折（* 0.5），使现行有效事实自然胜出
-                if item.is_superseded_or_expired(now) {
+                // 演化回溯时，参考时点上已失效的事实打折（* 0.5），
+                // 使参考时点内有效的事实自然胜出
+                if is_superseded_at(&item, reference_time) {
                     score *= 0.5;
                 }
                 Scored { item, score }
@@ -279,7 +289,7 @@ impl HybridRetriever {
         scored
     }
 
-    /// MMR 重排（嵌入缺失项的相互相似度按 0 处理）
+    /// MMR 重排（嵌入缺失或模型不匹配的项相互相似度按 0 处理）
     fn mmr_rerank(&self, scored: Vec<Scored<MemoryEntry>>, k: usize) -> Vec<Scored<MemoryEntry>> {
         let n = scored.len();
         if n <= 1 {
@@ -290,9 +300,15 @@ impl HybridRetriever {
             .map(|a| {
                 scored
                     .iter()
-                    .map(|b| match (&a.item.embedding, &b.item.embedding) {
-                        (Some(x), Some(y)) => cosine_similarity(x, y).max(0.0),
-                        _ => 0.0,
+                    .map(|b| {
+                        if self.embedding_usable(&a.item) && self.embedding_usable(&b.item) {
+                            match (&a.item.embedding, &b.item.embedding) {
+                                (Some(x), Some(y)) => cosine_similarity(x, y).max(0.0),
+                                _ => 0.0,
+                            }
+                        } else {
+                            0.0
+                        }
                     })
                     .collect()
             })
@@ -323,13 +339,18 @@ impl Retriever for HybridRetriever {
             return Ok(scored.into_iter().take(top_k).collect());
         }
 
+        // 软超时预算统一起算：查询嵌入与双路召回共享同一 deadline，
+        // 避免嵌入服务故障把整体耗时拖到 HTTP 客户端超时（10s）
+        let deadline = tokio::time::Instant::now() + self.soft_timeout;
+
         // 查询向量只算一次，双路召回与打分共用
-        let query_vec: Option<Vec<f32>> = match self
-            .embedder
-            .embed(std::slice::from_ref(&q.query_text))
-            .await
+        let query_vec: Option<Vec<f32>> = match tokio::time::timeout_at(
+            deadline,
+            self.embedder.embed(std::slice::from_ref(&q.query_text)),
+        )
+        .await
         {
-            Ok(mut vectors) => vectors
+            Ok(Ok(mut vectors)) => vectors
                 .pop()
                 .map(|mut v| {
                     l2_normalize(&mut v);
@@ -339,7 +360,7 @@ impl Retriever for HybridRetriever {
                     tracing::warn!(namespace = %q.namespace, "嵌入服务返回空向量列表");
                     None
                 }),
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::warn!(
                     error = %e,
                     namespace = %q.namespace,
@@ -347,28 +368,38 @@ impl Retriever for HybridRetriever {
                 );
                 None
             }
-        };
-
-        // 双路并行 + 软超时
-        let fts = self.fts_candidates(q);
-        let vec_c = self.vec_candidates(q, query_vec.as_deref());
-        let joined =
-            tokio::time::timeout(self.soft_timeout, async { tokio::join!(fts, vec_c) }).await;
-
-        let merged = match joined {
-            Ok((fts_res, vec_res)) => Self::merge_candidates(fts_res, vec_res),
             Err(_) => {
                 tracing::warn!(
                     timeout_ms = self.soft_timeout.as_millis(),
                     namespace = %q.namespace,
-                    "检索软超时，降级为列表召回"
+                    "查询嵌入超出软超时预算：向量路不可用，仅关键词召回"
                 );
-                self.fallback_candidates(q)
-                    .await
-                    .into_iter()
-                    .map(|s| (s.item, None))
-                    .collect::<Vec<_>>()
+                None
             }
+        };
+
+        // 双路并行且各自受剩余预算约束：超时只丢弃超时的一路，已完成的一路保留
+        let (fts_res, vec_res) = tokio::join!(
+            tokio::time::timeout_at(deadline, self.fts_candidates(q)),
+            tokio::time::timeout_at(deadline, self.vec_candidates(q, query_vec.as_deref())),
+        );
+        let path_timed_out = fts_res.is_err() || vec_res.is_err();
+        let merged =
+            Self::merge_candidates(fts_res.unwrap_or_default(), vec_res.unwrap_or_default());
+
+        let merged = if merged.is_empty() && path_timed_out {
+            tracing::warn!(
+                timeout_ms = self.soft_timeout.as_millis(),
+                namespace = %q.namespace,
+                "检索软超时且无已完成结果，降级为列表召回"
+            );
+            self.fallback_candidates(q)
+                .await
+                .into_iter()
+                .map(|s| (s.item, None))
+                .collect::<Vec<_>>()
+        } else {
+            merged
         };
 
         if merged.is_empty() {
@@ -379,13 +410,13 @@ impl Retriever for HybridRetriever {
         let q_clone = q.clone();
         let qv_clone = query_vec;
         let reranked = tokio::task::spawn_blocking(move || {
-            let scored = this.score_items(merged, &q_clone, qv_clone.as_deref());
-            let reranked = this.mmr_rerank(scored, top_k);
+            let mut scored = this.score_items(merged, &q_clone, qv_clone.as_deref());
+            // min_score 必须在 MMR 之前应用：否则 MMR 先按 top_k 选满、
+            // 再被阈值删掉低分项，结果数会少于高阈值下本可返回的数量
             if let Some(min_s) = q_clone.min_score {
-                reranked.into_iter().filter(|s| s.score >= min_s).collect()
-            } else {
-                reranked
+                scored.retain(|s| s.score >= min_s);
             }
+            this.mmr_rerank(scored, top_k)
         })
         .await
         .map_err(|e| common::HubError::Internal(anyhow::anyhow!("检索重排任务调度失败: {}", e)))?;
@@ -409,6 +440,10 @@ mod tests {
     #[derive(Default)]
     struct TestStore {
         items: RwLock<BTreeMap<(String, Uuid), MemoryEntry>>,
+        /// FTS 路的模拟耗时（用于软超时测试）
+        list_delay: Option<Duration>,
+        /// 记录每次 list 调用的 text_contains 过滤条件（None 即兜底列表召回）
+        list_filters: std::sync::Mutex<Vec<Option<String>>>,
     }
 
     impl TestStore {
@@ -418,6 +453,10 @@ mod tests {
                 .write()
                 .unwrap()
                 .insert((e.namespace.clone(), e.id), e);
+        }
+
+        fn list_filter_log(&self) -> Vec<Option<String>> {
+            self.list_filters.lock().unwrap().clone()
         }
     }
 
@@ -445,6 +484,13 @@ mod tests {
             Ok(())
         }
         async fn list(&self, filter: &MemoryFilter) -> Result<Vec<MemoryEntry>> {
+            self.list_filters
+                .lock()
+                .unwrap()
+                .push(filter.text_contains.clone());
+            if let Some(delay) = self.list_delay {
+                tokio::time::sleep(delay).await;
+            }
             let mut out: Vec<MemoryEntry> = self
                 .items
                 .read()
@@ -467,6 +513,12 @@ mod tests {
                         .statuses
                         .as_ref()
                         .is_none_or(|statuses| statuses.contains(&e.status))
+                })
+                .filter(|e| {
+                    filter
+                        .tags
+                        .as_ref()
+                        .is_none_or(|tags| tags.iter().all(|t| e.tags.contains(t)))
                 })
                 .filter(|e| {
                     filter
@@ -616,8 +668,9 @@ mod tests {
 
         let mut item = entry("ns", text);
         item.embedding = Some(qv.clone());
+        item.embedding_model = Some("test-embedder".to_string());
 
-        // 没有查询向量时（如嵌入服务故障），关键词命中只能拿 sim=0 的那部分分
+        // 没有查询向量时（如嵌入服务故障），sim 维度不可用，按剩余信号归一化
         let without = r.score_items(vec![(item.clone(), None)], &query("ns", "东京"), None);
         // 带查询向量时同一命中应现算出 sim≈1.0，而不是被当作零相似度判死
         let with = r.score_items(vec![(item, None)], &query("ns", "东京"), Some(&qv));
@@ -628,11 +681,11 @@ mod tests {
             with[0].score,
             without[0].score
         );
-        // sim 维度权重为 0.5，补回后总分应抬升接近 0.5
+        // 缺嵌入时不应整体缩水到 0.5 上限：其余信号归一化后仍应保持高分
         assert!(
-            with[0].score - without[0].score > 0.45,
-            "应补回 sim 权重的几乎全部：{:#?}",
-            with[0].score - without[0].score
+            without[0].score >= 0.85,
+            "缺嵌入时按可用信号归一化，不应被 sim 权重整体压低：{:#?}",
+            without[0].score
         );
     }
 
@@ -854,5 +907,270 @@ mod tests {
         let res = r.search(&auth(), &q).await.unwrap();
         assert_eq!(res.len(), 1);
         assert_eq!(res[0].item.content, "完全精确匹配目标查询");
+    }
+
+    /// 模拟崩溃的嵌入器（下游 503 / 网络故障）
+    #[derive(Debug, Clone, Default)]
+    struct FailingEmbedder;
+
+    #[async_trait]
+    impl Embedder for FailingEmbedder {
+        fn model_id(&self) -> &str {
+            "failing-embedder"
+        }
+
+        fn dim(&self) -> usize {
+            64
+        }
+
+        async fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            Err(HubError::Internal(anyhow::anyhow!("模拟嵌入服务 503")))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_historical_query_include_superseded_respects_valid_at() {
+        // 回归：include_superseded=true 曾整段跳过 valid_at 约束，
+        // 且失效惩罚按墙上时钟计算 —— 历史时点查询会选错版本
+        let store = Arc::new(TestStore::default());
+        let now = chrono::Utc::now();
+
+        // v1：[-200d, -100d) 有效；v2：[-100d, +100d) 有效
+        // 两条都带向量：故障出在向量路与打分路径不应用 valid_at 约束
+        let mut v1 = entry("ns", "主节点是 redis-master-1（当时有效）");
+        v1.valid_from = Some(now - chrono::Duration::days(200));
+        v1.valid_until = Some(now - chrono::Duration::days(100));
+        let mut v2 = entry("ns", "主节点是 redis-master-2（现行有效）");
+        v2.valid_from = Some(now - chrono::Duration::days(100));
+        v2.valid_until = Some(now + chrono::Duration::days(100));
+        store.add(v1, Some(vec![1.0, 0.0]));
+        store.add(v2, Some(vec![0.0, 1.0]));
+
+        let r = retriever(store);
+        let mut q = query("ns", "主节点");
+        q.valid_at = Some(now - chrono::Duration::days(150)); // 查询 150 天前的事实
+        q.include_superseded = true;
+        let res = r.search(&auth(), &q).await.unwrap();
+
+        assert_eq!(
+            res.len(),
+            1,
+            "显式 valid_at 下必须按时间区间过滤（include_superseded 不绕过）：{:#?}",
+            res.iter().map(|s| &s.item.content).collect::<Vec<_>>()
+        );
+        assert!(
+            res[0].item.content.contains("redis-master-1"),
+            "历史时点查询必须命中当时有效的事实"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_injected_clock_drives_penalty_reference_time() {
+        use chrono::TimeZone;
+        let store = Arc::new(TestStore::default());
+        let fixed_now = chrono::Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap();
+
+        // 在注入时钟的参考时点上：E1 仍未失效，E2 已失效
+        let mut e1 = entry("ns", "旧事实仍在有效期内");
+        e1.valid_until = Some(fixed_now + chrono::Duration::days(30));
+        let mut e2 = entry("ns", "已过期事实");
+        e2.valid_until = Some(fixed_now - chrono::Duration::days(30));
+        store.add(e1, None);
+        store.add(e2, None);
+
+        let r =
+            retriever(store).with_clock(Arc::new(mem_core::testing::FixedClock::new(fixed_now)));
+        let mut q = query("ns", "事实");
+        q.include_superseded = true;
+        let res = r.search(&auth(), &q).await.unwrap();
+
+        assert_eq!(res.len(), 2);
+        assert!(
+            res[0].item.content.contains("仍在有效期"),
+            "惩罚必须按注入时钟的参考时点计算：{:#?}",
+            res.iter()
+                .map(|s| (&s.item.content, s.score))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_entry_tags_do_not_dilute_keyword_score() {
+        // 回归：条目标签曾计入 kw 分母，标签越多命中分越低
+        let store = Arc::new(TestStore::default());
+        let mut tagged = entry("ns", "服务部署在东京区域");
+        tagged.tags = vec![
+            "运维".to_string(),
+            "基础设施".to_string(),
+            "东京".to_string(),
+            "部署".to_string(),
+        ];
+        let untagged = entry("ns", "服务部署在东京区域");
+        store.add(tagged, None);
+        store.add(untagged, None);
+
+        let r = retriever(store);
+        let res = r.search(&auth(), &query("ns", "东京")).await.unwrap();
+        assert_eq!(res.len(), 2);
+        assert!(
+            (res[0].score - res[1].score).abs() < 1e-6,
+            "标签不应参与正文覆盖分母，两条同内容条目得分应一致：{:#?}",
+            res.iter()
+                .map(|s| (s.item.tags.len(), s.score))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_tags_filter_narrows_candidates() {
+        // 回归：memory_search 的 tags 参数曾被解析后静默丢弃
+        let store = Arc::new(TestStore::default());
+        let mut db_item = entry("ns", "数据库主从切换流程");
+        db_item.tags = vec!["db".to_string()];
+        let mut other_item = entry("ns", "数据库慢查询排查");
+        other_item.tags = vec!["ops".to_string()];
+        store.add(db_item, None);
+        store.add(other_item, None);
+
+        let r = retriever(store);
+        let mut q = query("ns", "数据库");
+        q.tags = Some(vec!["db".to_string()]);
+        let res = r.search(&auth(), &q).await.unwrap();
+
+        assert_eq!(res.len(), 1, "tags 过滤必须生效");
+        assert_eq!(res[0].item.tags, vec!["db".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_min_score_is_applied_before_mmr() {
+        // 回归：min_score 曾在 MMR 之后过滤，结果数可能少于高阈值下本可返回的数量。
+        // 构造：Z/Y 高相关且互相冗余，X 中等相关且与其余低相似。
+        let store = Arc::new(TestStore::default());
+        let mut z = entry("ns", "东京架构部署缓存网关方案");
+        z.embedding = Some(vec![1.0, 0.0]);
+        let mut y = entry("ns", "东京架构部署缓存网关方案");
+        y.embedding = Some(vec![1.0, 0.0]);
+        let mut x = entry("ns", "东京架构部署");
+        x.embedding = Some(vec![0.0, 1.0]);
+        store.add(z, Some(vec![1.0, 0.0]));
+        store.add(y, Some(vec![1.0, 0.0]));
+        store.add(x, Some(vec![0.0, 1.0]));
+
+        // 仅以 kw 为信号：Z/Y=1.0，X=0.6
+        let r = HybridRetriever::new(
+            store,
+            Arc::new(TestEmbedder::default()),
+            20,
+            20,
+            [0.0, 1.0, 0.0, 0.0, 0.0],
+            0.7,
+            500,
+        );
+        let mut q = query("ns", "东京 架构 部署 缓存 网关");
+        q.top_k = 2;
+        q.min_score = Some(0.7);
+        let res = r.search(&auth(), &q).await.unwrap();
+
+        assert_eq!(
+            res.len(),
+            2,
+            "阈值之上的候选数 ≥ top_k 时必须返回 top_k 条：{:#?}",
+            res.iter()
+                .map(|s| (&s.item.content, s.score))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_embed_failure_renormalizes_instead_of_shrinking_scores() {
+        // 回归：查询嵌入失败后所有分数被 sim 权重整体压低，min_score 直接清空结果
+        let store = Arc::new(TestStore::default());
+        store.add(entry("ns", "东京部署方案"), None);
+
+        let r = HybridRetriever::new(
+            store,
+            Arc::new(FailingEmbedder),
+            20,
+            20,
+            [0.5, 0.2, 0.1, 0.1, 0.1],
+            0.7,
+            500,
+        );
+        let mut q = query("ns", "东京");
+        q.min_score = Some(0.6);
+        let res = r.search(&auth(), &q).await.unwrap();
+
+        assert_eq!(
+            res.len(),
+            1,
+            "嵌入故障时按可用信号归一化，高分命中不应被阈值误杀"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_model_mismatched_embedding_not_used_for_similarity() {
+        // 回归：embedding_model 从不参与检索 —— 换模型后新旧向量被直接比较
+        let r = retriever(Arc::new(TestStore::default()));
+        let embedder = TestEmbedder::default();
+        let mut qv = embedder
+            .embed(&["东京".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        l2_normalize(&mut qv);
+
+        let mut matching = entry("ns", "东京");
+        matching.embedding = Some(qv.clone());
+        matching.embedding_model = Some("test-embedder".to_string());
+        matching.confidence = 0.5;
+
+        let mut mismatched = entry("ns", "东京");
+        mismatched.embedding = Some(qv.clone());
+        mismatched.embedding_model = Some("other-embedder".to_string());
+        mismatched.confidence = 0.5;
+
+        let q = query("ns", "东京");
+        let with_matching = r.score_items(vec![(matching, None)], &q, Some(&qv));
+        let with_mismatched = r.score_items(vec![(mismatched, None)], &q, Some(&qv));
+
+        assert!(
+            with_matching[0].score > with_mismatched[0].score + 0.05,
+            "跨模型向量不可比，模型不匹配时不得计入 sim 维度：{:#?} vs {:#?}",
+            with_matching[0].score,
+            with_mismatched[0].score
+        );
+    }
+
+    #[tokio::test]
+    async fn test_soft_timeout_keeps_completed_path_results() {
+        // 回归：软超时曾整体丢弃双路结果并退回无查询的列表召回
+        let slow_store = Arc::new(TestStore {
+            list_delay: Some(Duration::from_millis(200)),
+            ..TestStore::default()
+        });
+        let mut matched = entry("ns", "东京部署方案");
+        matched.embedding = Some(vec![1.0, 0.0]);
+        slow_store.add(matched, Some(vec![1.0, 0.0]));
+        slow_store.add(entry("ns", "完全无关的另一条内容"), None);
+
+        let r = HybridRetriever::new(
+            slow_store.clone(),
+            Arc::new(TestEmbedder::default()),
+            20,
+            20,
+            [0.5, 0.2, 0.1, 0.1, 0.1],
+            0.7,
+            30, // 30ms 软超时 < 200ms 的 FTS 耗时
+        );
+        let res = r.search(&auth(), &query("ns", "东京")).await.unwrap();
+
+        assert_eq!(res.len(), 1, "向量路已完成的结果必须保留：{:#?}", res);
+        assert!(res[0].item.content.contains("东京"));
+        let filters = slow_store.list_filter_log();
+        assert!(
+            !filters.is_empty() && filters.iter().all(|f| f.is_some()),
+            "有已完成结果时不应退回无查询条件的列表召回：{:#?}",
+            filters
+        );
     }
 }
