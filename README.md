@@ -84,7 +84,7 @@
 
 ```mermaid
 flowchart TD
-    subgraph Clients["多智能体客户端 (Multi-Agent Clients)"]
+    subgraph ClientGroup["多智能体客户端 (Multi-Agent Clients)"]
         AgentA["Agent A (代码助手)"]
         AgentB["Agent B (排障运维)"]
         AgentC["Agent C (对话助手)"]
@@ -93,18 +93,19 @@ flowchart TD
     subgraph AuthPlane["认证与授权控制平面 (auth-server :8080)"]
         Console["Web 控制台 (账户注册 / 登录)"]
         DCR["动态客户端注册 (DCR RFC 7591)"]
-        OAuth["OAuth 2.1 (PKCE / client_credentials / Token Family)"]
-        AuthDB[("账户与客户端信息")]
-        Console --> DCR --> OAuth --> AuthDB
+        OAuth["OAuth 2.1 (PKCE / Token Family)"]
+        AuthDB[("账户与客户端信息库")]
+        Console --> DCR
+        DCR --> OAuth
+        OAuth --> AuthDB
     end
 
     subgraph MCPPlane["记忆中枢交互平面 (mcp-server :3000)"]
-        AuthzFilter["OAuth 2.1 鉴权与 RFC 8707 aud 校验"]
-        SandboxGuard["账户沙箱隔离器 (AccountScopedStore)"]
-        ToolRouter["18 个 MCP 工具路由"]
+        AuthzFilter["OAuth 2.1 鉴权与 aud 校验"]
+        ToolRouter["18 个 MCP 工具分发路由"]
         
         subgraph CognitiveEngines["认知与检索引擎"]
-            HybridRetriever["混合检索引擎<br/>(FTS + pgvector + 五维打分 + MMR)"]
+            HybridRetriever["混合检索引擎 (FTS + 向量 + MMR)"]
             ChatPipeline["Chat 认知流 (四层模型 / 证据链)"]
             WorkingPipeline["Working 经验流 (环境边界感知)"]
             CodingPipeline["Coding 代码演进链 (真实 Diff / SHA-256)"]
@@ -116,9 +117,22 @@ flowchart TD
             ProposalMgr["待审提案管理器"]
         end
         
-        AuthzFilter --> SandboxGuard --> ToolRouter
-        ToolRouter --> CognitiveEngines
-        ToolRouter --> ConsolidationEngine
+        SandboxGuard["账户沙箱隔离器 (AccountScopedStore)"]
+        
+        AuthzFilter --> ToolRouter
+        ToolRouter --> HybridRetriever
+        ToolRouter --> ChatPipeline
+        ToolRouter --> WorkingPipeline
+        ToolRouter --> CodingPipeline
+        ToolRouter --> ConflictScanner
+        
+        HybridRetriever --> SandboxGuard
+        ChatPipeline --> SandboxGuard
+        WorkingPipeline --> SandboxGuard
+        CodingPipeline --> SandboxGuard
+        ConflictScanner --> TieredMerger
+        TieredMerger --> ProposalMgr
+        ProposalMgr --> SandboxGuard
     end
 
     subgraph WorkerPlane["异步治理平面 (backup-worker)"]
@@ -126,25 +140,35 @@ flowchart TD
         BackupJob["不可变快照作业 (SHA-256)"]
         ArchiveJob["过期记忆自动归档"]
         ScanJob["整合中枢离线扫描"]
-        CronSched --> BackupJob & ArchiveJob & ScanJob
+        CronSched --> BackupJob
+        CronSched --> ArchiveJob
+        CronSched --> ScanJob
     end
 
     subgraph DataPlane["持久化数据平面 (PostgreSQL 15 + pgvector / In-Memory)"]
-        T_Mem["memories (记忆条目表)"]
-        T_Ver["memory_versions (版本追溯表)"]
-        T_Evi["memory_evidence (不可变证据存根)"]
-        T_Rel["memory_relations (因果/演化关系网)"]
-        T_Bak["memory_backups (不可变快照表)"]
-        T_Prop["integration_proposals (待审提案表)"]
-        T_Work["working_tasks / experiences (经验表)"]
-        T_Code["coding_threads / revisions (代码演进表)"]
+        StorageEngine[("统一存储引擎 (HubStore)")]
+        T_Mem["memories / memory_versions"]
+        T_Evi["memory_evidence / relations"]
+        T_Bak["memory_backups (不可变快照)"]
+        T_Prop["integration_proposals (待审提案)"]
+        StorageEngine --- T_Mem
+        StorageEngine --- T_Evi
+        StorageEngine --- T_Bak
+        StorageEngine --- T_Prop
     end
 
-    Clients -->|1. 换取访问令牌| OAuth
-    Clients -->|2. MCP JSON-RPC 调用 (Bearer Token)| AuthzFilter
-    CognitiveEngines & ConsolidationEngine <--> SandboxGuard
-    SandboxGuard <--> DataPlane
-    WorkerPlane <--> SandboxGuard
+    AgentA -->|1. 换取 Token| OAuth
+    AgentB -->|1. 换取 Token| OAuth
+    AgentC -->|1. 换取 Token| OAuth
+
+    AgentA -->|2. MCP 请求| AuthzFilter
+    AgentB -->|2. MCP 请求| AuthzFilter
+    AgentC -->|2. MCP 请求| AuthzFilter
+
+    SandboxGuard <--> StorageEngine
+    BackupJob --> SandboxGuard
+    ArchiveJob --> SandboxGuard
+    ScanJob --> SandboxGuard
 ```
 
 ---
@@ -186,17 +210,15 @@ flowchart TD
 记忆中枢结合了倒排索引与高维向量语义，构建了工业级混合召回管道：
 
 ```mermaid
-graph LR
-    Query["用户检索请求<br/>(query_text + filters)"] --> ParallelRecall
+flowchart LR
+    Query["用户检索请求 (query_text + filters)"] --> FTS["CJK Bigram 全文倒排检索 (FTS)"]
+    Query --> Vector["pgvector HNSW 余弦相似度检索"]
     
-    subgraph ParallelRecall["并发双路召回"]
-        FTS["CJK Bigram 全文倒排检索 (FTS)<br/>精确命中关键词与代码符号"]
-        Vector["pgvector HNSW 余弦相似度<br/>捕捉自然语言深层语义"]
-    end
+    FTS --> FiveDimScoring["五维综合打分融合 (Vector + FTS + Recency + Weight + Scene)"]
+    Vector --> FiveDimScoring
     
-    ParallelRecall --> FiveDimScoring["五维综合打分融合<br/>VectorSim + FTS + Recency + Weight + SceneBoost"]
-    FiveDimScoring --> TemporalFilter["时间有效性断言过滤<br/>valid_from <= t < valid_until"]
-    TemporalFilter --> MMR["MMR 多样性重排<br/>降低上下文冗余度"]
+    FiveDimScoring --> TemporalFilter["时间有效性断言过滤 (valid_at)"]
+    TemporalFilter --> MMR["MMR 多样性重排 (消除冗余)"]
     MMR --> FinalResults["Top-K 精选条目输出"]
 ```
 
