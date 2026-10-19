@@ -54,7 +54,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let access: Arc<dyn mem_core::AccessChecker> = Arc::new(GrantChecker::new(store.clone()));
 
     // ===== 检索与服务 =====
-    let retriever = Arc::new(retrieval::HybridRetriever::new(
+    let mut retriever = retrieval::HybridRetriever::new(
         store.clone(),
         embedder.clone(),
         cfg.retrieval_fts_k,
@@ -62,15 +62,14 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.score_weights,
         cfg.mmr_lambda,
         cfg.soft_timeout_ms,
-    ));
+    );
+    if let Some(tau) = cfg.retrieval_recency_tau_days {
+        retriever = retriever.with_recency_tau(tau);
+    }
+    let retriever = Arc::new(retriever);
     let memory_service = Arc::new(
-        DefaultMemoryService::new(
-            store.clone(),
-            embedder.clone(),
-            access.clone(),
-            cfg.score_weights,
-        )
-        .with_retriever(retriever),
+        DefaultMemoryService::new(store.clone(), embedder.clone(), access.clone())
+            .with_retriever(retriever),
     );
     let backup_service = Arc::new(DefaultBackupService::new(store.clone(), access.clone()));
     let integration_service = Arc::new(DefaultIntegrationService::new(

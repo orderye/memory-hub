@@ -5,22 +5,21 @@
 //!   走 pgvector HNSW）并行执行，任一路失败不影响另一路；
 //! - **软超时**：整体受 `soft_timeout_ms` 约束，超时时降级为纯列表召回，
 //!   保证检索永不无限期挂起；
-//! - **融合打分**：sim / kw / conf / rec / fresh 五维加权（权重见配置）；
+//! - **融合打分**：sim / kw / conf / rec / prior 五维加权（权重见配置）；
 //! - **MMR 重排**：在相关性与多样性间取平衡，避免 top-k 全是近重复内容。
 
 use async_trait::async_trait;
 use common::{AuthCtx, Result};
 use mem_core::{
     algorithm::ItemScoreParams, calculate_item_score_with_availability, cosine_similarity,
-    is_superseded_at, keyword_score, l2_normalize, matches_tag_filter, passes_validity_filter,
-    recency_score, retrieval_reference_time, Clock, Embedder, MemoryEntry, MemoryFilter,
-    MemoryStatus, MemoryStore, Retriever, Scored, SearchQuery, SystemClock,
+    document_tokens, extract_terms, inverse_document_frequency, is_superseded_at,
+    keyword_score_weighted, l2_normalize, layer_prior, matches_tag_filter, passes_validity_filter,
+    recency_score, recency_tau_days_for, retrieval_reference_time, validity_filter_time, Clock,
+    Embedder, MemoryEntry, MemoryFilter, MemoryStatus, MemoryStore, Retriever, Scored, SearchQuery,
+    SystemClock,
 };
 use std::sync::Arc;
 use std::time::Duration;
-
-/// 近期性时间常数（天）。衰减为 `exp(-d/tau)`，实际半衰期约 `tau·ln2` 天。
-pub const DEFAULT_RECENCY_TAU_DAYS: f32 = 30.0;
 
 /// 混合检索器
 #[derive(Clone)]
@@ -33,7 +32,7 @@ pub struct HybridRetriever {
     score_weights: [f32; 5],
     mmr_lambda: f32,
     soft_timeout: Duration,
-    recency_tau_days: f32,
+    recency_tau_override: Option<f32>,
 }
 
 impl HybridRetriever {
@@ -55,13 +54,13 @@ impl HybridRetriever {
             score_weights,
             mmr_lambda: mmr_lambda.clamp(0.0, 1.0),
             soft_timeout: Duration::from_millis(soft_timeout_ms.max(1)),
-            recency_tau_days: DEFAULT_RECENCY_TAU_DAYS,
+            recency_tau_override: None,
         }
     }
 
-    /// 自定义近期性半衰期（builder）
+    /// 覆盖近期性时间常数（builder）：默认按记忆类型区分（见 [`recency_tau_days_for`]）
     pub fn with_recency_tau(mut self, tau_days: f32) -> Self {
-        self.recency_tau_days = tau_days.max(1.0);
+        self.recency_tau_override = Some(tau_days.max(1.0));
         self
     }
 
@@ -86,19 +85,16 @@ impl HybridRetriever {
         if q.query_text.trim().is_empty() {
             return Vec::new();
         }
-        let mut statuses = vec![MemoryStatus::Active];
-        if q.include_archived || q.include_superseded {
-            statuses.push(MemoryStatus::Archived);
-        }
         let filter = MemoryFilter {
             namespace: Some(q.namespace.clone()),
             kinds: q.kinds.clone(),
-            statuses: Some(statuses),
+            statuses: Some(self.statuses_for(q)),
             tags: q.tags.clone(),
             text_contains: Some(q.query_text.clone()),
             scene: q.scene,
             layer: q.layer,
-            valid_at: q.valid_at,
+            // 时间有效性过滤下推到存储层（与打分路径同一语义）
+            valid_at: validity_filter_time(q.valid_at, q.include_superseded, self.clock.now()),
             // 候选池必须容得下 top_k：此前固定取 fts_k(默认 20)，
             // 而工具契约允许 top_k 到 100，超出的请求会被静默截断。
             limit: Some(self.fts_k.max(q.top_k)),
@@ -130,14 +126,21 @@ impl HybridRetriever {
         let Some(qv) = qv else {
             return Vec::new();
         };
+        // 过滤条件下推到 SQL/存储层：此前 scene/valid_at 只在 Rust 侧事后过滤，
+        // 其它场景或已失效条目会先占满 top-k，导致目标场景候选严重缺失
+        let filter = MemoryFilter {
+            namespace: Some(q.namespace.clone()),
+            kinds: q.kinds.clone(),
+            statuses: Some(self.statuses_for(q)),
+            tags: q.tags.clone(),
+            scene: q.scene,
+            layer: q.layer,
+            valid_at: validity_filter_time(q.valid_at, q.include_superseded, self.clock.now()),
+            ..Default::default()
+        };
         let items = match self
             .store
-            .similar(
-                &q.namespace,
-                qv,
-                self.vec_k.max(q.top_k * 2),
-                q.kinds.as_deref(),
-            )
+            .similar(&filter, qv, self.vec_k.max(q.top_k * 2))
             .await
         {
             Ok(v) => v,
@@ -147,43 +150,38 @@ impl HybridRetriever {
             }
         };
 
-        // 认知过滤：scene、layer、tags 与时间有效性约束（与打分路径同一语义）
+        // 存储层过滤是同一套条件，这里只做防御性复核（存储实现差异兜底）
         let now = self.clock.now();
         items
             .into_iter()
             .filter(|scored| {
-                if let Some(scene) = &q.scene {
-                    if scored.item.scene.as_ref() != Some(scene) {
-                        return false;
-                    }
-                }
-                if let Some(layer) = &q.layer {
-                    if scored.item.layer.as_ref() != Some(layer) {
-                        return false;
-                    }
-                }
-                if !matches_tag_filter(&scored.item, &q.tags) {
-                    return false;
-                }
                 passes_validity_filter(&scored.item, q.valid_at, q.include_superseded, now)
+                    && matches_tag_filter(&scored.item, &q.tags)
+                    && (q.scene.is_none() || scored.item.scene == q.scene)
+                    && (q.layer.is_none() || scored.item.layer == q.layer)
             })
             .collect()
     }
 
-    /// 兜底：纯列表召回（超时或查询为空时）
-    async fn fallback_candidates(&self, q: &SearchQuery) -> Vec<Scored<MemoryEntry>> {
+    /// 状态集合：默认只召回 active，显式请求归档/回溯时纳入 archived
+    fn statuses_for(&self, q: &SearchQuery) -> Vec<MemoryStatus> {
         let mut statuses = vec![MemoryStatus::Active];
         if q.include_archived || q.include_superseded {
             statuses.push(MemoryStatus::Archived);
         }
+        statuses
+    }
+
+    /// 兜底：纯列表召回（超时或查询为空时）
+    async fn fallback_candidates(&self, q: &SearchQuery) -> Vec<Scored<MemoryEntry>> {
         let filter = MemoryFilter {
             namespace: Some(q.namespace.clone()),
             kinds: q.kinds.clone(),
-            statuses: Some(statuses),
+            statuses: Some(self.statuses_for(q)),
             tags: q.tags.clone(),
             scene: q.scene,
             layer: q.layer,
-            valid_at: q.valid_at,
+            valid_at: validity_filter_time(q.valid_at, q.include_superseded, self.clock.now()),
             limit: Some(q.top_k.max(1)),
             ..Default::default()
         };
@@ -227,15 +225,43 @@ impl HybridRetriever {
         let now = self.clock.now();
         // 过滤与惩罚共用同一参考时点：显式 valid_at 优先，否则墙上时钟
         let reference_time = retrieval_reference_time(q.valid_at, now);
+
+        // 关键词命中度按池内 IDF 加权：稀有词元主导命中度，常见 bigram
+        // （"的数""们的"）权重自然衰减；词元与 FTS 索引同源（词元集合匹配，
+        // 不再用裸子串，避免 api 命中 rapid）
+        let terms = extract_terms(&q.query_text);
+        let candidate_tokens: Vec<std::collections::HashSet<String>> = candidates
+            .iter()
+            .map(|(item, _)| document_tokens(&item.content))
+            .collect();
+        let pool_size = candidate_tokens.len();
+        let doc_freq: Vec<usize> = terms
+            .iter()
+            .map(|t| {
+                candidate_tokens
+                    .iter()
+                    .filter(|set| set.contains(t))
+                    .count()
+            })
+            .collect();
+        let idf = |term: &str| -> f32 {
+            terms
+                .iter()
+                .position(|t| t == term)
+                .map(|i| inverse_document_frequency(pool_size, doc_freq[i]))
+                .unwrap_or(1.0)
+        };
+
         let mut scored: Vec<Scored<MemoryEntry>> = candidates
             .into_iter()
-            .filter(|(item, _)| {
+            .zip(candidate_tokens)
+            .filter(|((item, _), _)| {
                 passes_validity_filter(item, q.valid_at, q.include_superseded, now)
                     && matches_tag_filter(item, &q.tags)
                     && (q.scene.is_none() || item.scene == q.scene)
                     && (q.layer.is_none() || item.layer == q.layer)
             })
-            .map(|(item, vec_sim)| {
+            .map(|((item, vec_sim), tokens)| {
                 // 关键词路命中此前一律记 sim=0，而 sim 权重高达 0.50 —— 于是
                 // "全文精确命中"最高只能得 0.5 分，被任何中等向量命中压过，
                 // 双路融合名不副实。这里用条目自带向量与查询向量现算相似度。
@@ -249,9 +275,13 @@ impl HybridRetriever {
                 } else {
                     None
                 };
-                let kw = keyword_score(&item.content, &q.query_text);
-                let rec = recency_score(now, item.updated_at, self.recency_tau_days);
-                let fresh = if item.version > 1 { 1.0 } else { 0.5 };
+                let kw = keyword_score_weighted(&tokens, &terms, &idf);
+                // 近期性以事件时间为准（缺失回落写入时间），衰减常数按记忆类型区分
+                let tau = self
+                    .recency_tau_override
+                    .unwrap_or_else(|| recency_tau_days_for(item.kind));
+                let rec = recency_score(now, item.occurred_at.unwrap_or(item.updated_at), tau);
+                let prior = layer_prior(item.layer);
                 // 嵌入不可用（服务故障 / 缺失向量 / 模型不匹配）时按剩余
                 // 信号归一化，而不是让该维度按 0 计使分数整体缩水
                 let sim_available = sim.is_some();
@@ -261,7 +291,7 @@ impl HybridRetriever {
                         kw,
                         conf: item.confidence,
                         rec,
-                        fresh,
+                        prior,
                     },
                     &self.score_weights,
                     [sim_available, true, true, true, true],
@@ -503,10 +533,11 @@ mod tests {
                         .is_none_or(|ns| e.namespace == ns)
                 })
                 .filter(|e| {
+                    // 与生产存储层同一套词法（分词部分匹配），避免测试桩与生产漂移
                     filter
                         .text_contains
                         .as_ref()
-                        .is_none_or(|t| e.content.to_lowercase().contains(&t.to_lowercase()))
+                        .is_none_or(|t| mem_core::fts_query_hits(&e.content, t) > 0)
                 })
                 .filter(|e| {
                     filter
@@ -551,17 +582,22 @@ mod tests {
         }
         async fn similar(
             &self,
-            ns: &str,
+            filter: &MemoryFilter,
             qv: &[f32],
             k: usize,
-            _kinds: Option<&[MemoryKind]>,
         ) -> Result<Vec<Scored<MemoryEntry>>> {
             let mut out: Vec<Scored<MemoryEntry>> = self
                 .items
                 .read()
                 .unwrap()
                 .values()
-                .filter(|e| e.namespace == ns && e.status == MemoryStatus::Active)
+                .filter(|e| {
+                    filter
+                        .namespace
+                        .as_deref()
+                        .is_none_or(|ns| e.namespace == ns)
+                        && e.status == MemoryStatus::Active
+                })
                 .filter_map(|e| {
                     let iv = e.embedding.as_ref()?;
                     Some(Scored {
@@ -1138,6 +1174,184 @@ mod tests {
             "跨模型向量不可比，模型不匹配时不得计入 sim 维度：{:#?} vs {:#?}",
             with_matching[0].score,
             with_mismatched[0].score
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rare_term_outweighs_common_term_by_pool_idf() {
+        // 回归：kw 曾是无差别覆盖率 —— 稀有词元与常见 bigram 等权。
+        // 池内有 1 条命中"东京"、6 条命中"缓存"时，命中稀有词元者分更高。
+        let store = Arc::new(TestStore::default());
+        let mut rare = entry("ns", "东京节点上线");
+        rare.embedding = Some(vec![1.0, 0.0]);
+        store.add(rare, Some(vec![1.0, 0.0]));
+        for i in 0..6 {
+            let mut common = entry("ns", &format!("缓存策略说明 {}", i));
+            common.embedding = Some(vec![0.0, 1.0]);
+            store.add(common, Some(vec![0.0, 1.0]));
+        }
+
+        let r = HybridRetriever::new(
+            store,
+            Arc::new(TestEmbedder::default()),
+            20,
+            20,
+            [0.0, 1.0, 0.0, 0.0, 0.0],
+            0.7,
+            500,
+        );
+        let res = r.search(&auth(), &query("ns", "东京 缓存")).await.unwrap();
+        let rare_score = res
+            .iter()
+            .find(|s| s.item.content.contains("东京"))
+            .map(|s| s.score)
+            .expect("命中稀有词元的条目必须被召回");
+        let common_score = res
+            .iter()
+            .find(|s| s.item.content.contains("缓存"))
+            .map(|s| s.score)
+            .expect("命中常见词元的条目必须被召回");
+        assert!(
+            rare_score > common_score,
+            "稀有词元命中应比常见词元命中得分更高（IDF 加权）：{rare_score} vs {common_score}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recency_uses_event_time_and_kind_specific_tau() {
+        let store = Arc::new(TestStore::default());
+        let now = chrono::Utc::now();
+
+        // 同一天写入：一条事件发生在 60 天前，一条发生在今天
+        let mut stale_event = entry("ns", "东京节点上线");
+        stale_event.occurred_at = Some(now - chrono::Duration::days(60));
+        let mut fresh_event = entry("ns", "缓存策略说明");
+        fresh_event.occurred_at = Some(now);
+
+        // 同为今天写入、事件时间一致：一条稳定偏好，一条临时笔记
+        let mut preference = entry("ns", "节点扩容流程");
+        preference.kind = MemoryKind::Preference;
+        let mut note = entry("ns", "扩容脚本备注");
+        note.kind = MemoryKind::Note;
+
+        store.add(stale_event, None);
+        store.add(fresh_event, None);
+        store.add(preference, None);
+        store.add(note, None);
+
+        // 仅 recency 维度有权重
+        let r = HybridRetriever::new(
+            store,
+            Arc::new(TestEmbedder::default()),
+            20,
+            20,
+            [0.0, 0.0, 0.0, 1.0, 0.0],
+            0.7,
+            500,
+        );
+
+        let by_event = r.score_items(
+            vec![
+                {
+                    let mut e = entry("ns", "事件时间久远");
+                    e.occurred_at = Some(now - chrono::Duration::days(60));
+                    (e, None)
+                },
+                {
+                    let mut e = entry("ns", "事件时间新鲜");
+                    e.occurred_at = Some(now);
+                    (e, None)
+                },
+            ],
+            &query("ns", "事件"),
+            None,
+        );
+        assert!(
+            by_event[0].item.content.contains("新鲜"),
+            "近期性必须以事件时间（occurred_at）为准，而不是写入时间"
+        );
+
+        let by_kind = r.score_items(
+            vec![
+                {
+                    let mut e = entry("ns", "稳定偏好条目");
+                    e.kind = MemoryKind::Preference;
+                    (e, None)
+                },
+                {
+                    let mut e = entry("ns", "临时笔记条目");
+                    e.kind = MemoryKind::Note;
+                    (e, None)
+                },
+            ],
+            &query("ns", "条目"),
+            None,
+        );
+        assert!(
+            by_kind[0].item.content.contains("稳定偏好"),
+            "稳定型记忆（偏好的 τ=180 天）衰减应慢于短期型（笔记 τ=7 天）"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_layer_prior_replaces_version_freshness() {
+        let store = Arc::new(TestStore::default());
+        // 仅 prior 维度有权重
+        let r = HybridRetriever::new(
+            store,
+            Arc::new(TestEmbedder::default()),
+            20,
+            20,
+            [0.0, 0.0, 0.0, 0.0, 1.0],
+            0.7,
+            500,
+        );
+
+        let by_layer = r.score_items(
+            vec![
+                {
+                    let mut e = entry("ns", "实体画像条目");
+                    e.layer = Some(mem_core::CognitiveLayer::Identity);
+                    (e, None)
+                },
+                {
+                    let mut e = entry("ns", "原始输入条目");
+                    e.layer = Some(mem_core::CognitiveLayer::Raw);
+                    (e, None)
+                },
+            ],
+            &query("ns", "条目"),
+            None,
+        );
+        assert!(
+            by_layer[0].item.content.contains("实体画像"),
+            "结构化知识应优先于原始观测（层级先验）"
+        );
+
+        // 回归：编辑次数多（version > 1）不再构成评分优势
+        let by_version = r.score_items(
+            vec![
+                {
+                    let mut e = entry("ns", "多次修订的条目");
+                    e.version = 5;
+                    (e, None)
+                },
+                {
+                    let mut e = entry("ns", "一次写入的条目");
+                    e.version = 1;
+                    (e, None)
+                },
+            ],
+            &query("ns", "条目"),
+            None,
+        );
+        assert!(
+            (by_version[0].score - by_version[1].score).abs() < 1e-6,
+            "版本次数不应参与打分（旧的 fresh 信号已移除）：{:#?}",
+            by_version
+                .iter()
+                .map(|s| (&s.item.content, s.score))
+                .collect::<Vec<_>>()
         );
     }
 

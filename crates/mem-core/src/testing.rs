@@ -323,10 +323,9 @@ impl MemoryStore for TestHubStore {
 
     async fn similar(
         &self,
-        _ns: &str,
+        _filter: &MemoryFilter,
         _qv: &[f32],
         _k: usize,
-        _kinds: Option<&[MemoryKind]>,
     ) -> Result<Vec<Scored<MemoryEntry>>> {
         Ok(vec![])
     }

@@ -47,8 +47,9 @@
   - **Working 经验记忆**：任务事实与通用经验严格解耦，环境边界感知（`boundary_envs`，不匹配显式告警并降权），正负反馈闭环衰减；
   - **Coding 代码演进链**：真实 Git Diff 捕获、SHA-256 幂等重放、敏感凭证（Token/密钥）自动截断与过滤。
 - **高性能混合检索（Hybrid Retrieval）**：
-  - **双路并发召回**：CJK Bigram 零依赖中文全文倒排索引（FTS）与 pgvector HNSW 余弦向量相似度并发召回；
-  - **五维打分融合**：综合向量相似度、FTS 匹配度、遗忘曲线时间衰减（Recency）、记忆显式权重（Weight）以及场景自适应加成；
+  - **双路并发召回**：CJK Bigram 零依赖中文全文倒排索引（FTS）与 pgvector HNSW 余弦向量相似度并发召回；过滤条件（场景/层级/时间有效性/状态/标签）下推到存储层，向量路在 pgvector ≥ 0.8 上自动启用 `hnsw.iterative_scan`；
+  - **词法语义统一**：文档 / 查询 / 打分三处共用同一套分词（剔除"的数""们的"等低信息量功能 bigram），FTS 采用部分匹配（OR）并由 `ts_rank_cd` 排序，避免多词查询整条遗漏与"按更新时间截断候选池"；
+  - **五维打分融合**：向量相似度、关键词命中（词元集合匹配 + 池内 IDF 稀有度加权，`api` 不再误命中 `rapid`）、条目置信度、近期性（**事件时间**优先，按记忆类型区分衰减常数）、认知层级先验；
   - **MMR 多样性重排**：通过 Maximal Marginal Relevance 算法降低信息冗余，防止相似条目占满上下文窗口；
   - **高可用容灾降级**：向量服务故障自动降级为 FTS 关键词检索，软超时（Soft Timeout）降级为列表兜底，保证检索永不挂起。
 - **整合中枢引擎（Consolidation Engine）**：
@@ -214,19 +215,24 @@ flowchart LR
     Query["用户检索请求 (query_text + filters)"] --> FTS["CJK Bigram 全文倒排检索 (FTS)"]
     Query --> Vector["pgvector HNSW 余弦相似度检索"]
     
-    FTS --> FiveDimScoring["五维综合打分融合 (Vector + FTS + Recency + Weight + Scene)"]
+    FTS --> FiveDimScoring["五维综合打分融合 (Vector + Keyword(IDF) + Confidence + Recency + LayerPrior)"]
     Vector --> FiveDimScoring
     
-    FiveDimScoring --> TemporalFilter["时间有效性断言过滤 (valid_at)"]
+    FiveDimScoring --> TemporalFilter["时间有效性/场景/标签过滤（存储层下推，打分前完成）"]
     TemporalFilter --> MMR["MMR 多样性重排 (消除冗余)"]
     MMR --> FinalResults["Top-K 精选条目输出"]
 ```
 
-### 打分模型与场景自适应
-$$\text{Score} = w_v \cdot \text{VectorSim} + w_f \cdot \text{FtsScore} + w_r \cdot \text{Recency} + w_w \cdot \text{Weight} + w_c \cdot \text{SceneBoost}$$
-- **场景加成（Scene Boost）**：当指定 `scene`（`chat` / `working` / `coding`）且条目属于对应场景时，自动享受 **+0.05** 的权重优先召回；
-- **MMR (Maximal Marginal Relevance) 重排**：在相关性与多样性之间取得平衡，避免向量聚类产生重复冗余条目；
-- **全链路容灾**：向量服务不可用时无缝降级为纯文本 FTS；检索出现软超时（Soft Timeout）时自动降级为游标列表兜底，检索接口永不悬挂。
+### 打分模型与场景过滤
+$$\text{Score} = w_{sim} \cdot \text{VectorSim} + w_{kw} \cdot \text{KeywordHit} + w_{conf} \cdot \text{Confidence} + w_{rec} \cdot \text{Recency} + w_{prior} \cdot \text{LayerPrior}$$
+
+- **候选池**：FTS 路按 `ts_rank_cd` 相关度排序取前 `HUB_RETRIEVAL_FTS_K`（默认 100）条，向量路按余弦距离取前 `HUB_RETRIEVAL_VEC_K`（默认 100）条后再融合——不再按 `updated_at` 截断，避免"更相关但更旧"的文档在打分前被丢弃；
+- **关键词命中**：与 FTS 同源的分词词元集合匹配（非裸子串），并按候选池内 IDF 加权，稀有词元主导命中度；
+- **近期性（Recency）**：以 `occurred_at`（事件时间）优先、`updated_at` 兜底，衰减时间常数按记忆类型区分（偏好 180 天 / 技能流程 90 天 / 事实 60 天 / 事件 14 天 / 笔记 7 天），`HUB_RECENCY_TAU` 可整体覆盖；
+- **层级先验（LayerPrior）**：结构化知识优先于原始观测（Identity/Schema 1.0 > Knowledge/Fact 0.8 > Summary 0.6 > Raw 0.5）；
+- **场景（Scene）**：指定 `scene` 时在存储层硬过滤（跨场景噪声不进入候选），命中条目另享 **+0.05** 加成；
+- **MMR (Maximal Marginal Relevance) 重排**：`min_score` 阈值先于 MMR 应用，在相关性与多样性之间取得平衡；
+- **全链路容灾**：向量服务不可用时降级为纯文本 FTS；查询嵌入与双路召回共享软超时预算，双路各自超时且已完成的一路结果保留；两路都无结果时才回退游标列表，检索接口永不悬挂。
 
 ---
 

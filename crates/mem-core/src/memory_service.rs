@@ -8,11 +8,7 @@
 
 use crate::access::{validate_key, validate_namespace};
 use crate::account_scope::{scope_name, unscope_name, AccountScopedStore};
-use crate::algorithm::{
-    calculate_item_score_with_availability, cosine_similarity, is_superseded_at, keyword_score,
-    matches_tag_filter, passes_validity_filter, recency_score, retrieval_reference_time,
-    ItemScoreParams, SearchQuery,
-};
+use crate::algorithm::SearchQuery;
 use crate::domain::{
     CognitiveLayer, MemoryEntry, MemoryFilter, MemoryKind, MemoryScene, MemoryStats, MemoryStatus,
     MemoryVersion, Page, Scored, VersionChange,
@@ -35,9 +31,6 @@ pub const MAX_TAG_CHARS: usize = 64;
 pub const MAX_METADATA_BYTES: usize = 16_384;
 /// 游标编码分隔符（内容不会包含该控制字符）
 const CURSOR_SEP: char = '\u{1}';
-
-/// 默认近期性半衰期（天）
-pub const DEFAULT_RECENCY_TAU_DAYS: f32 = 30.0;
 
 /// put 请求
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,7 +136,6 @@ pub struct DefaultMemoryService {
     access: Arc<dyn AccessChecker>,
     clock: Arc<dyn Clock>,
     retriever: Option<Arc<dyn Retriever>>,
-    score_weights: [f32; 5],
 }
 
 impl DefaultMemoryService {
@@ -151,7 +143,6 @@ impl DefaultMemoryService {
         store: Arc<dyn MemoryStore>,
         embedder: Arc<dyn Embedder>,
         access: Arc<dyn AccessChecker>,
-        score_weights: [f32; 5],
     ) -> Self {
         Self {
             store,
@@ -159,11 +150,13 @@ impl DefaultMemoryService {
             access,
             clock: Arc::new(SystemClock),
             retriever: None,
-            score_weights,
         }
     }
 
-    /// 注入混合检索器（不注入时退化为内置的纯向量检索）
+    /// 注入检索器（生产环境应注入 `retrieval::HybridRetriever`）
+    ///
+    /// 不注入时 `search` 会返回显式错误：历史上此处内置过一套与生产不一致的
+    /// 退化打分实现，导致测试跑的从来不是生产路径，已删除。
     pub fn with_retriever(mut self, retriever: Arc<dyn Retriever>) -> Self {
         self.retriever = Some(retriever);
         self
@@ -474,94 +467,19 @@ impl MemoryService for DefaultMemoryService {
 
     async fn search(&self, auth: &AuthCtx, mut q: SearchQuery) -> Result<Vec<Scored<MemoryEntry>>> {
         self.require_read(auth, &q.namespace).await?;
-        if let Some(retriever) = &self.retriever {
-            // 检索器直接在存储上按命名空间键工作：查询前作用域化、返回后剥离
-            q.namespace = scope_name(&auth.account_id, &q.namespace);
-            let mut rows = retriever.search(auth, &q).await?;
-            for s in &mut rows {
-                s.item.namespace = unscope_name(&auth.account_id, &s.item.namespace);
-            }
-            return Ok(rows);
-        }
-        // 退化路径：纯向量近邻 + 本地加权重排
-        let mut out = Vec::new();
-        if q.query_text.trim().is_empty() {
-            return Ok(out);
-        }
-        let query_vec = self
-            .embedder
-            .embed(std::slice::from_ref(&q.query_text))
-            .await?
-            .into_iter()
-            .next();
-        let Some(query_vec) = query_vec else {
-            return Ok(out);
+        let Some(retriever) = &self.retriever else {
+            // 检索器必须显式注入：不再容忍"看似能跑、实则是另一套打分"的退化实现
+            return Err(HubError::Internal(anyhow::anyhow!(
+                "检索器未注入：请通过 DefaultMemoryService::with_retriever 注入 retrieval::HybridRetriever"
+            )));
         };
-        let mut qv = query_vec;
-        crate::algorithm::l2_normalize(&mut qv);
-        let now = self.clock.now();
-        // 过滤与惩罚共用同一参考时点（与 HybridRetriever 语义一致）
-        let reference_time = retrieval_reference_time(q.valid_at, now);
-        let store = self.scoped(auth);
-        let mut scored: Vec<Scored<MemoryEntry>> = store
-            .similar(&q.namespace, &qv, q.top_k.max(1) * 3, q.kinds.as_deref())
-            .await?
-            .into_iter()
-            .filter(|s| {
-                passes_validity_filter(&s.item, q.valid_at, q.include_superseded, now)
-                    && matches_tag_filter(&s.item, &q.tags)
-                    && (q.scene.is_none() || s.item.scene == q.scene)
-                    && (q.layer.is_none() || s.item.layer == q.layer)
-            })
-            .map(|s| {
-                let kw = keyword_score(&s.item.content, &q.query_text);
-                let rec = recency_score(now, s.item.updated_at, DEFAULT_RECENCY_TAU_DAYS);
-                // 跨模型向量不可比：模型不匹配时按"嵌入缺失"处理
-                let sim_available = s.item.embedding.is_some()
-                    && s.item
-                        .embedding_model
-                        .as_deref()
-                        .is_none_or(|m| m == self.embedder.model_id());
-                let mut score = calculate_item_score_with_availability(
-                    &ItemScoreParams {
-                        sim: if sim_available { s.score.max(0.0) } else { 0.0 },
-                        kw,
-                        conf: s.item.confidence,
-                        rec,
-                        fresh: if s.item.version > 1 { 1.0 } else { 0.5 },
-                    },
-                    &self.score_weights,
-                    [sim_available, true, true, true, true],
-                );
-                if let Some(scene) = &q.scene {
-                    if s.item.scene.as_ref() == Some(scene) {
-                        score = (score + 0.05).min(1.0);
-                    }
-                }
-                if is_superseded_at(&s.item, reference_time) {
-                    score *= 0.5;
-                }
-                Scored {
-                    item: s.item,
-                    score,
-                }
-            })
-            .filter(|s| {
-                if let Some(min_s) = q.min_score {
-                    s.score >= min_s
-                } else {
-                    true
-                }
-            })
-            .collect();
-        scored.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        scored.truncate(q.top_k.max(1));
-        out.extend(scored);
-        Ok(out)
+        // 检索器直接在存储上按命名空间键工作：查询前作用域化、返回后剥离
+        q.namespace = scope_name(&auth.account_id, &q.namespace);
+        let mut rows = retriever.search(auth, &q).await?;
+        for s in &mut rows {
+            s.item.namespace = unscope_name(&auth.account_id, &s.item.namespace);
+        }
+        Ok(rows)
     }
 
     async fn list(&self, auth: &AuthCtx, req: ListRequest) -> Result<Page<MemoryEntry>> {
@@ -641,142 +559,6 @@ impl MemoryService for DefaultMemoryService {
         let store = self.scoped(auth);
         store.get(namespace, id).await?;
         store.versions(id).await
-    }
-}
-
-/// 内置纯向量简易检索器（未注入混合检索器时的退化实现）
-pub struct SimpleRetriever {
-    store: Arc<dyn MemoryStore>,
-    embedder: Arc<dyn Embedder>,
-    score_weights: [f32; 5],
-    clock: Arc<dyn Clock>,
-}
-
-impl SimpleRetriever {
-    pub fn new(
-        store: Arc<dyn MemoryStore>,
-        embedder: Arc<dyn Embedder>,
-        score_weights: [f32; 5],
-    ) -> Self {
-        Self {
-            store,
-            embedder,
-            score_weights,
-            clock: Arc::new(SystemClock),
-        }
-    }
-
-    /// 注入时钟（builder）：评测使用固定时钟，生产使用系统时钟
-    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
-        self.clock = clock;
-        self
-    }
-}
-
-#[async_trait]
-impl Retriever for SimpleRetriever {
-    async fn search(&self, _auth: &AuthCtx, q: &SearchQuery) -> Result<Vec<Scored<MemoryEntry>>> {
-        // 命名空间访问权由 MemoryService 统一把关，检索器内部不再重复校验
-        let query_vec = if q.query_text.trim().is_empty() {
-            None
-        } else {
-            self.embedder
-                .embed(std::slice::from_ref(&q.query_text))
-                .await?
-                .into_iter()
-                .next()
-        };
-
-        let candidates: Vec<MemoryEntry> = match &query_vec {
-            Some(qv) => self
-                .store
-                .similar(&q.namespace, qv, q.top_k.max(1) * 2, q.kinds.as_deref())
-                .await?
-                .into_iter()
-                .map(|s| s.item)
-                .collect(),
-            None => {
-                let mut statuses = vec![MemoryStatus::Active];
-                if q.include_archived || q.include_superseded {
-                    statuses.push(MemoryStatus::Archived);
-                }
-                let filter = MemoryFilter {
-                    namespace: Some(q.namespace.clone()),
-                    kinds: q.kinds.clone(),
-                    statuses: Some(statuses),
-                    tags: q.tags.clone(),
-                    scene: q.scene,
-                    layer: q.layer,
-                    valid_at: q.valid_at,
-                    limit: Some(q.top_k.max(1)),
-                    ..Default::default()
-                };
-                self.store.list(&filter).await?
-            }
-        };
-
-        let now = self.clock.now();
-        // 过滤与惩罚共用同一参考时点（与 HybridRetriever 语义一致）
-        let reference_time = retrieval_reference_time(q.valid_at, now);
-        let mut scored: Vec<Scored<MemoryEntry>> = candidates
-            .into_iter()
-            .filter(|item| {
-                passes_validity_filter(item, q.valid_at, q.include_superseded, now)
-                    && matches_tag_filter(item, &q.tags)
-                    && (q.scene.is_none() || item.scene == q.scene)
-                    && (q.layer.is_none() || item.layer == q.layer)
-            })
-            .map(|item| {
-                let sim_available = query_vec.is_some()
-                    && item.embedding.is_some()
-                    && item
-                        .embedding_model
-                        .as_deref()
-                        .is_none_or(|m| m == self.embedder.model_id());
-                let sim = if sim_available {
-                    query_vec
-                        .as_ref()
-                        .and_then(|qv| item.embedding.as_ref().map(|iv| cosine_similarity(qv, iv)))
-                        .unwrap_or(0.0)
-                } else {
-                    0.0
-                };
-                let kw = keyword_score(&item.content, &q.query_text);
-                let rec = recency_score(now, item.updated_at, DEFAULT_RECENCY_TAU_DAYS);
-                let fresh = if item.version > 1 { 1.0 } else { 0.5 };
-                let mut score = calculate_item_score_with_availability(
-                    &ItemScoreParams {
-                        sim: sim.max(0.0),
-                        kw,
-                        conf: item.confidence,
-                        rec,
-                        fresh,
-                    },
-                    &self.score_weights,
-                    [sim_available, true, true, true, true],
-                );
-                if let Some(scene) = &q.scene {
-                    if item.scene.as_ref() == Some(scene) {
-                        score = (score + 0.05).min(1.0);
-                    }
-                }
-                if is_superseded_at(&item, reference_time) {
-                    score *= 0.5;
-                }
-                Scored { item, score }
-            })
-            .collect();
-
-        if let Some(min_s) = q.min_score {
-            scored.retain(|s| s.score >= min_s);
-        }
-        scored.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        scored.truncate(q.top_k.max(1));
-        Ok(scored)
     }
 }
 
@@ -985,21 +767,26 @@ mod tests {
         }
         async fn similar(
             &self,
-            ns: &str,
+            filter: &MemoryFilter,
             qv: &[f32],
             k: usize,
-            _kinds: Option<&[MemoryKind]>,
         ) -> Result<Vec<Scored<MemoryEntry>>> {
             let mut out: Vec<Scored<MemoryEntry>> = self
                 .items
                 .read()
                 .unwrap()
                 .values()
-                .filter(|e| e.namespace == ns && e.status == MemoryStatus::Active)
+                .filter(|e| {
+                    filter
+                        .namespace
+                        .as_deref()
+                        .is_none_or(|ns| e.namespace == ns)
+                        && e.status == MemoryStatus::Active
+                })
                 .filter_map(|e| {
                     e.embedding.as_ref().map(|iv| Scored {
                         item: e.clone(),
-                        score: cosine_similarity(qv, iv),
+                        score: crate::algorithm::cosine_similarity(qv, iv),
                     })
                 })
                 .collect();
@@ -1075,7 +862,6 @@ mod tests {
             mem.clone(),
             test_embedder(),
             Arc::new(GrantChecker::new(grants.clone())),
-            [0.5, 0.2, 0.1, 0.1, 0.1],
         );
         (svc, mem, grants)
     }
@@ -1345,46 +1131,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_simple_retriever_ranks_relevant_first() {
+    async fn test_search_requires_injected_retriever() {
+        // 回归：此前未注入检索器会静默退化为另一套内置打分实现，
+        // 使 MCP 层测试看起来通过、实际从未覆盖生产检索路径
         let grants = Arc::new(TestGrants::default());
         let mem = Arc::new(TestMemoryStore::default());
         let svc = DefaultMemoryService::new(
             mem.clone(),
             test_embedder(),
             Arc::new(GrantChecker::new(grants.clone())),
-            [0.9, 0.1, 0.0, 0.0, 0.0],
-        )
-        .with_retriever(Arc::new(SimpleRetriever::new(
-            mem,
-            test_embedder(),
-            [0.9, 0.1, 0.0, 0.0, 0.0],
-        )));
+        );
         let a = auth("agent-a", vec![Scope::Read, Scope::Write]);
+        svc.put(&a, put_req("ns", "任意内容")).await.unwrap();
 
-        svc.put(&a, put_req("ns", "用户喜欢喝美式咖啡"))
-            .await
-            .unwrap();
-        svc.put(&a, put_req("ns", "服务器部署在东京区域"))
-            .await
-            .unwrap();
-
-        let res = svc
+        let err = svc
             .search(
                 &a,
                 SearchQuery {
                     namespace: "ns".to_string(),
-                    query_text: "咖啡".to_string(),
-                    kinds: None,
-                    tags: None,
+                    query_text: "内容".to_string(),
                     top_k: 2,
-                    include_archived: false,
                     ..Default::default()
                 },
             )
             .await
-            .unwrap();
-        assert_eq!(res.len(), 2);
-        assert_eq!(res[0].item.content, "用户喜欢喝美式咖啡");
+            .expect_err("未注入检索器必须显式报错，而不是静默使用另一套实现");
+        assert!(
+            err.to_string().contains("检索器未注入"),
+            "错误信息应指明缺失检索器：{err}"
+        );
     }
 
     // 保证 MemoryHubStore 聚合 trait 可被满足（编译期检查）

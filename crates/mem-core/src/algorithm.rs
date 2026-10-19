@@ -1,7 +1,7 @@
 //! 检索打分与多样性重排算法
 //!
 //! 五维加权（sim 向量相似度, kw 关键词命中, conf 条目置信度,
-//! rec 近期性, fresh 版本新鲜度）后接 MMR 去冗余重排。
+//! rec 近期性（事件时间 + 按类型衰减）, prior 认知层级先验）后接 MMR 去冗余重排。
 
 use crate::domain::Namespace;
 use chrono::{DateTime, Utc};
@@ -29,32 +29,39 @@ pub fn l2_normalize(v: &mut [f32]) {
     }
 }
 
-fn is_cjk_char(c: char) -> bool {
-    matches!(c,
-        '\u{4e00}'..='\u{9fff}' |
-        '\u{3400}'..='\u{4dbf}' |
-        '\u{f900}'..='\u{faff}'
-    )
-}
-
-/// 提取检索词元（支持英文单词与 CJK 中文 2-gram 切分）
+/// 提取检索词元（英文单词 + CJK 整词与 2-gram），剔除低信息量功能词并按序去重
 pub fn extract_terms(query: &str) -> Vec<String> {
     let mut terms = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut push = |t: String| {
+        if seen.insert(t.clone()) {
+            terms.push(t);
+        }
+    };
+
     for word in query.split_whitespace() {
-        let has_cjk = word.chars().any(is_cjk_char);
+        let has_cjk = word.chars().any(crate::cjk::is_cjk_char);
         if !has_cjk {
             if word.chars().count() >= 2 {
-                terms.push(word.to_lowercase());
+                push(word.to_lowercase());
             }
         } else {
             let chars: Vec<char> = word.chars().collect();
             if chars.len() <= 4 {
-                terms.push(word.to_lowercase());
+                let whole = word.to_lowercase();
+                if !crate::cjk::is_low_signal_bigram(&whole)
+                    && !whole.chars().all(crate::cjk::is_function_char)
+                {
+                    push(whole);
+                }
             }
             if chars.len() > 2 {
                 for window in chars.windows(2) {
                     let gram: String = window.iter().collect();
-                    terms.push(gram.to_lowercase());
+                    if crate::cjk::is_low_signal_bigram(&gram) {
+                        continue;
+                    }
+                    push(gram.to_lowercase());
                 }
             }
         }
@@ -62,25 +69,53 @@ pub fn extract_terms(query: &str) -> Vec<String> {
     terms
 }
 
-/// 关键词命中度（0.0 ~ 1.0）：查询词在内容中的覆盖比例
-///
-/// 条目自身的 tags 不参与分母：标签是独立信号，标签多寡不应稀释正文命中。
-/// 查询侧的标签筛选由 [`matches_tag_filter`] 负责。
-pub fn keyword_score(content: &str, query: &str) -> f32 {
-    let haystack = content.to_lowercase();
-    let mut hits = 0usize;
-    let mut total = 0usize;
+/// 文档词元集合（与 FTS 索引使用同一套词法，保证三处语义一致）
+pub fn document_tokens(content: &str) -> std::collections::HashSet<String> {
+    crate::cjk::fts_doc_tokens(content).into_iter().collect()
+}
 
-    for term in extract_terms(query) {
-        total += 1;
-        if haystack.contains(&term) {
-            hits += 1;
+/// 池内平滑 IDF：`ln(1 + pool_size / (df + 1))`，恒大于 0。
+///
+/// 稀有词元权重高、常见词元（含高频 bigram）权重低；缺少全局语料统计时，
+/// 以候选池内的文档频次作为语料统计的局部近似。
+pub fn inverse_document_frequency(pool_size: usize, doc_freq: usize) -> f32 {
+    let pool = pool_size.max(1) as f32;
+    let df = doc_freq as f32;
+    (1.0 + pool / (df + 1.0)).ln()
+}
+
+/// 关键词命中度（0.0 ~ 1.0）：查询词元在内容中的命中比例。
+///
+/// - 命中判定基于**词元集合**（与 FTS 同源），不做裸子串匹配：
+///   英文 `api` 不再误命中 `rapid`；
+/// - 条目自身 tags 不参与分母（标签是独立信号，由 [`matches_tag_filter`] 负责）；
+/// - 平权版本（`idf` 恒为 1）用于无池上下文的对拍与测试。
+pub fn keyword_score(content: &str, query: &str) -> f32 {
+    let tokens = document_tokens(content);
+    let terms = extract_terms(query);
+    keyword_score_weighted(&tokens, &terms, &|_| 1.0)
+}
+
+/// 关键词命中度（IDF 加权版）：`Σ idf(命中词元) / Σ idf(全部查询词元)`
+pub fn keyword_score_weighted(
+    doc_tokens: &std::collections::HashSet<String>,
+    terms: &[String],
+    idf: &dyn Fn(&str) -> f32,
+) -> f32 {
+    let mut numerator = 0.0f32;
+    let mut denominator = 0.0f32;
+    for term in terms {
+        let weight = idf(term).max(0.0);
+        denominator += weight;
+        if doc_tokens.contains(term) {
+            numerator += weight;
         }
     }
-    if total == 0 {
-        return 0.0;
+    if denominator <= f32::EPSILON {
+        0.0
+    } else {
+        (numerator / denominator).clamp(0.0, 1.0)
     }
-    hits as f32 / total as f32
 }
 
 /// 检索参考时点：显式 `valid_at` 优先，否则取当前时刻。
@@ -105,9 +140,28 @@ pub fn passes_validity_filter(
     include_superseded: bool,
     now: DateTime<Utc>,
 ) -> bool {
-    match valid_at {
+    match validity_filter_time(valid_at, include_superseded, now) {
         Some(t) => item.is_valid_at(t),
-        None => include_superseded || !item.is_superseded_or_expired(now),
+        None => true,
+    }
+}
+
+/// 与 [`passes_validity_filter`] 配套的**过滤下推**：
+/// 把同一语义表达为存储层的 `MemoryFilter.valid_at` 约束。
+///
+/// - 显式 `valid_at` → 用该时刻；
+/// - 未给出且不要求包含失效条目 → 用当前时刻（"当前有效"= `valid_from <= now < valid_until`，
+///   同时排除尚未生效的未来事实）；
+/// - 要求包含失效条目 → 不做时间约束。
+pub fn validity_filter_time(
+    valid_at: Option<DateTime<Utc>>,
+    include_superseded: bool,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    match valid_at {
+        Some(t) => Some(t),
+        None if include_superseded => None,
+        None => Some(now),
     }
 }
 
@@ -124,10 +178,43 @@ pub fn matches_tag_filter(item: &crate::domain::MemoryEntry, tags: &Option<Vec<S
     }
 }
 
-/// 近期性打分：时间常数 `tau_days` 天（指数衰减，`tau` 非半衰期），返回 0.0 ~ 1.0
-pub fn recency_score(now: DateTime<Utc>, updated_at: DateTime<Utc>, tau_days: f32) -> f32 {
-    let days = (now - updated_at).num_seconds().max(0) as f32 / 86_400.0;
+/// 近期性打分：时间常数 `tau_days` 天（指数衰减，`tau` 非半衰期），返回 0.0 ~ 1.0。
+///
+/// 调用方应传入**事件时间**（`occurred_at`），缺失时才回落到写入时间
+/// （`updated_at`）：记忆的"近期性"取决于事件何时发生，而不是何时被记录。
+pub fn recency_score(now: DateTime<Utc>, at: DateTime<Utc>, tau_days: f32) -> f32 {
+    let days = (now - at).num_seconds().max(0) as f32 / 86_400.0;
     (-days / tau_days.max(1.0)).exp().clamp(0.0, 1.0)
+}
+
+/// 按记忆类型区分的时间常数（天）：稳定型记忆衰减慢，短期型衰减快。
+///
+/// 统一 `tau=30` 会把"长期偏好"和"一次性事件"同等衰减；这里按类型给出
+/// 不同时间尺度，半衰期 ≈ `tau·ln2` 天。
+pub fn recency_tau_days_for(kind: crate::domain::MemoryKind) -> f32 {
+    use crate::domain::MemoryKind;
+    match kind {
+        MemoryKind::Preference => 180.0,
+        MemoryKind::Skill | MemoryKind::Procedure => 90.0,
+        MemoryKind::Fact => 60.0,
+        MemoryKind::Episode => 14.0,
+        MemoryKind::Note => 7.0,
+    }
+}
+
+/// 认知层级先验（0.0 ~ 1.0）：同等相关性下，结构化知识优先于原始观测。
+///
+/// 取代原先的"版本新鲜度"二值信号（`version > 1 → 1.0 / 0.5`）——编辑次数多
+/// 并不代表记忆更新鲜，该信号与"新鲜"无关。
+pub fn layer_prior(layer: Option<crate::domain::CognitiveLayer>) -> f32 {
+    use crate::domain::CognitiveLayer;
+    match layer {
+        Some(CognitiveLayer::Identity) | Some(CognitiveLayer::Schema) => 1.0,
+        Some(CognitiveLayer::Knowledge) | Some(CognitiveLayer::Fact) => 0.8,
+        Some(CognitiveLayer::Intention) => 0.7,
+        Some(CognitiveLayer::Summary) => 0.6,
+        Some(CognitiveLayer::Raw) | None => 0.5,
+    }
 }
 
 /// 单条目五维打分参数
@@ -137,7 +224,8 @@ pub struct ItemScoreParams {
     pub kw: f32,
     pub conf: f32,
     pub rec: f32,
-    pub fresh: f32,
+    /// 认知层级先验（见 [`layer_prior`]），此前为无意义的版本新鲜度信号
+    pub prior: f32,
 }
 
 /// 加权综合分 = Σ wᵢ·sᵢ
@@ -178,7 +266,7 @@ fn clamped_signals(p: &ItemScoreParams) -> [f32; SCORE_WEIGHT_LEN] {
         p.kw.clamp(0.0, 1.0),
         p.conf.clamp(0.0, 1.0),
         p.rec.clamp(0.0, 1.0),
-        p.fresh.clamp(0.0, 1.0),
+        p.prior.clamp(0.0, 1.0),
     ]
 }
 
@@ -301,6 +389,68 @@ mod tests {
     }
 
     #[test]
+    fn test_ascii_terms_match_on_token_boundary() {
+        // 回归：裸子串匹配让 "api" 命中 "rapid"
+        assert_eq!(keyword_score("rapid prototyping", "api"), 0.0);
+        assert_eq!(keyword_score("api gateway", "api"), 1.0);
+    }
+
+    #[test]
+    fn test_idf_weighting_prefers_rare_terms() {
+        let rare_doc = document_tokens("东京节点上线");
+        let common_doc = document_tokens("缓存策略说明");
+        let terms = extract_terms("东京 缓存");
+        assert_eq!(terms.len(), 2);
+
+        // 池内：东京 1 篇、缓存 7 篇
+        let idf = |term: &str| match term {
+            "东京" => inverse_document_frequency(8, 1),
+            "缓存" => inverse_document_frequency(8, 7),
+            _ => 1.0,
+        };
+        let rare = keyword_score_weighted(&rare_doc, &terms, &idf);
+        let common = keyword_score_weighted(&common_doc, &terms, &idf);
+        assert!(
+            rare > common,
+            "稀有词元命中应高于常见词元命中：{rare} vs {common}"
+        );
+        assert!(inverse_document_frequency(8, 1) > inverse_document_frequency(8, 7));
+    }
+
+    #[test]
+    fn test_kind_specific_recency_tau_and_layer_prior() {
+        use crate::domain::{CognitiveLayer, MemoryKind};
+        assert!(
+            recency_tau_days_for(MemoryKind::Preference) > recency_tau_days_for(MemoryKind::Fact)
+        );
+        assert!(recency_tau_days_for(MemoryKind::Fact) > recency_tau_days_for(MemoryKind::Note));
+
+        // 层级先验：结构化知识 > 摘要 > 原始观测
+        assert!(
+            layer_prior(Some(CognitiveLayer::Identity))
+                > layer_prior(Some(CognitiveLayer::Summary))
+        );
+        assert!(
+            layer_prior(Some(CognitiveLayer::Summary)) > layer_prior(Some(CognitiveLayer::Raw))
+        );
+        assert_eq!(layer_prior(None), layer_prior(Some(CognitiveLayer::Raw)));
+    }
+
+    #[test]
+    fn test_validity_filter_time_matches_rust_side_semantics() {
+        use chrono::TimeZone;
+        let now = Utc.with_ymd_and_hms(2026, 10, 19, 0, 0, 0).unwrap();
+        let t = Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0).unwrap();
+        // 显式 valid_at 优先
+        assert_eq!(validity_filter_time(Some(t), false, now), Some(t));
+        assert_eq!(validity_filter_time(Some(t), true, now), Some(t));
+        // 未给出且不包含失效条目 → 以当前时刻过滤
+        assert_eq!(validity_filter_time(None, false, now), Some(now));
+        // 包含失效条目 → 不做时间约束
+        assert_eq!(validity_filter_time(None, true, now), None);
+    }
+
+    #[test]
     fn test_score_renormalizes_when_sim_unavailable() {
         let w = [0.5, 0.2, 0.1, 0.1, 0.1];
         let p = ItemScoreParams {
@@ -308,7 +458,7 @@ mod tests {
             kw: 1.0,
             conf: 1.0,
             rec: 1.0,
-            fresh: 1.0,
+            prior: 1.0,
         };
         // sim 不可用时不应整体缩水（旧口径上限 0.5），而应按剩余信号归一化
         let renormalized =
@@ -327,9 +477,9 @@ mod tests {
     #[test]
     fn test_recency_score_decays() {
         let now = Utc::now();
-        let fresh = recency_score(now, now, 30.0);
+        let recent = recency_score(now, now, 30.0);
         let old = recency_score(now, now - chrono::Duration::days(30), 30.0);
-        assert!(fresh > 0.99);
+        assert!(recent > 0.99);
         assert!(old < 0.4);
     }
 
@@ -341,7 +491,7 @@ mod tests {
             kw: 0.0,
             conf: 0.0,
             rec: 0.0,
-            fresh: 0.0,
+            prior: 0.0,
         };
         assert!((calculate_item_score(&p, &w) - 0.5).abs() < 1e-6);
     }

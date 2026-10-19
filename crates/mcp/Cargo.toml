@@ -28,3 +28,4 @@ adapter-cjs = []
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
 store = { workspace = true }
+retrieval = { workspace = true }

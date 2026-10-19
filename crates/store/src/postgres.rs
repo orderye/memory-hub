@@ -25,7 +25,7 @@ use mem_core::{
     TaskStatus, TaskStore, VersionChange,
 };
 use sqlx::postgres::{PgConnection, PgPool, PgPoolOptions, PgRow};
-use sqlx::Row;
+use sqlx::{Connection as _, Row};
 use uuid::Uuid;
 
 /// 行映射辅助
@@ -296,6 +296,42 @@ impl PostgresHubStore {
     /// `statement_timeout_ms` 为 0 时不设置服务器端语句超时。连接池另设
     /// `idle_timeout`/`max_lifetime`：没有它们，云端 LB 切断的空闲连接会长期
     /// 占据池配额，而一条被锁等待拖住的语句会一直占着坑位。
+    /// 比较 pgvector 版本号（形如 `0.8.0`）是否不低于给定版本
+    fn pgvector_version_at_least(version: &str, required: (u32, u32, u32)) -> bool {
+        let parse = |s: &str| s.trim().parse::<u32>().unwrap_or(0);
+        let mut parts = version.split('.').map(parse);
+        let actual = (
+            parts.next().unwrap_or(0),
+            parts.next().unwrap_or(0),
+            parts.next().unwrap_or(0),
+        );
+        actual >= required
+    }
+
+    /// 探测已安装的 pgvector 是否支持 HNSW 迭代索引扫描（>= 0.8.0）
+    ///
+    /// 带 WHERE 过滤的 ANN 查询在 HNSW 上默认"先扫描后过滤"，可能返回不足 k 条；
+    /// 0.8.0 起可用 `hnsw.iterative_scan` 让索引继续扫描直到凑满结果。
+    /// 探测使用独立连接，失败（如全新库尚未建扩展）按不支持处理。
+    async fn probe_hnsw_iterative_scan(database_url: &str) -> bool {
+        let mut conn = match PgConnection::connect(database_url).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(error = %e, "pgvector 版本探测建连失败，按不支持迭代索引扫描处理");
+                return false;
+            }
+        };
+        let version: Option<String> =
+            sqlx::query_scalar("select extversion from pg_extension where extname = 'vector'")
+                .fetch_optional(&mut conn)
+                .await
+                .unwrap_or(None);
+        match version {
+            Some(v) => Self::pgvector_version_at_least(&v, (0, 8, 0)),
+            None => false,
+        }
+    }
+
     pub async fn connect(
         database_url: &str,
         max_connections: u32,
@@ -308,13 +344,25 @@ impl PostgresHubStore {
             .idle_timeout(std::time::Duration::from_secs(120))
             .max_lifetime(std::time::Duration::from_secs(1800));
 
-        if statement_timeout_ms > 0 {
+        // 每连接会话设置：语句超时 +（pgvector >= 0.8）HNSW 迭代索引扫描
+        let hnsw_iterative = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            Self::probe_hnsw_iterative_scan(database_url).await,
+        ));
+        {
+            let flag = hnsw_iterative.clone();
             builder = builder.after_connect(move |conn, _| {
-                let ms = statement_timeout_ms.to_string();
+                let flag = flag.clone();
                 Box::pin(async move {
-                    sqlx::query(&format!("set statement_timeout = '{ms}'"))
-                        .execute(conn)
-                        .await?;
+                    if statement_timeout_ms > 0 {
+                        sqlx::query(&format!("set statement_timeout = '{statement_timeout_ms}'"))
+                            .execute(&mut *conn)
+                            .await?;
+                    }
+                    if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        sqlx::query("set hnsw.iterative_scan = 'relaxed_order'")
+                            .execute(&mut *conn)
+                            .await?;
+                    }
                     Ok(())
                 })
             });
@@ -324,6 +372,23 @@ impl PostgresHubStore {
 
         let store = Self { pool };
         store.run_migrations().await?;
+
+        // 迁移可能刚创建 vector 扩展：再探测一次并置位（对之后新建的连接生效）
+        if !hnsw_iterative.load(std::sync::atomic::Ordering::Relaxed)
+            && Self::probe_hnsw_iterative_scan(database_url).await
+        {
+            hnsw_iterative.store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!("pgvector 支持 HNSW 迭代索引扫描：已对新建连接启用（重启后全量生效）");
+        } else if hnsw_iterative.load(std::sync::atomic::Ordering::Relaxed) {
+            tracing::info!(
+                "已启用 pgvector HNSW 迭代索引扫描（hnsw.iterative_scan = relaxed_order）"
+            );
+        } else {
+            tracing::info!(
+                "未启用 pgvector HNSW 迭代索引扫描（需要 pgvector >= 0.8.0）：过滤型向量检索可能返回不足 k 条"
+            );
+        }
+
         Ok(store)
     }
 
@@ -389,6 +454,76 @@ impl PostgresHubStore {
     }
 
     // ===== 行映射 =====
+
+    /// 统一把 `MemoryFilter` 条件压入 SQL（list / count / similar 共用一份实现，
+    /// 避免三处过滤语义漂移；带查询词时按词元 OR 部分匹配，交由相关性排序与打分区分）
+    fn push_memory_filters(qb: &mut sqlx::QueryBuilder<'_, sqlx::Postgres>, filter: &MemoryFilter) {
+        if let Some(ns) = &filter.namespace {
+            qb.push(" and namespace = ").push_bind(ns.clone());
+        }
+        if let Some(kinds) = &filter.kinds {
+            qb.push(" and kind = any(")
+                .push_bind(
+                    kinds
+                        .iter()
+                        .map(|k| k.as_str().to_string())
+                        .collect::<Vec<_>>(),
+                )
+                .push(")");
+        }
+        if let Some(statuses) = &filter.statuses {
+            qb.push(" and status = any(")
+                .push_bind(
+                    statuses
+                        .iter()
+                        .map(|s| s.as_str().to_string())
+                        .collect::<Vec<_>>(),
+                )
+                .push(")");
+        }
+        if let Some(tags) = &filter.tags {
+            qb.push(" and tags @> ").push_bind(tags.clone());
+        }
+        if let Some(agent) = &filter.source_agent {
+            qb.push(" and source_agent = ").push_bind(agent.clone());
+        }
+        if let Some(key) = &filter.key {
+            qb.push(" and key = ").push_bind(key.clone());
+        }
+        if let Some(text) = &filter.text_contains {
+            match mem_core::cjk::fts_or_query(text) {
+                Some(or_query) => {
+                    qb.push(" and to_tsvector('simple', tsv_tokens) @@ to_tsquery('simple', ")
+                        .push_bind(or_query)
+                        .push(")");
+                }
+                // 查询词元全部是低信息量功能词：词法路不应命中任何文档
+                None => {
+                    qb.push(" and false");
+                }
+            }
+        }
+        if let Some(scene) = &filter.scene {
+            qb.push(" and scene = ").push_bind(scene.as_str());
+        }
+        if let Some(layer) = &filter.layer {
+            qb.push(" and layer = ").push_bind(layer.as_str());
+        }
+        if let Some(valid_at) = &filter.valid_at {
+            qb.push(" and (valid_from is null or valid_from <= ")
+                .push_bind(*valid_at)
+                .push(") and (valid_until is null or valid_until > ")
+                .push_bind(*valid_at)
+                .push(")");
+        }
+        if let Some((ts, id)) = &filter.before {
+            qb.push(" and (updated_at, id) < (")
+                .push_bind(*ts)
+                .push(", ")
+                .push_bind(*id)
+                .push(")");
+        }
+    }
 
     fn entry_from_row(r: &PgRow) -> Result<MemoryEntry> {
         let kind: String = r.try_get("kind").pg()?;
@@ -908,67 +1043,26 @@ impl mem_core::MemoryStore for PostgresHubStore {
             "select {} from memories where 1 = 1",
             Self::ENTRY_COLUMNS
         ));
+        Self::push_memory_filters(&mut qb, filter);
 
-        if let Some(ns) = &filter.namespace {
-            qb.push(" and namespace = ").push_bind(ns.clone());
-        }
-        if let Some(kinds) = &filter.kinds {
-            qb.push(" and kind = any(")
-                .push_bind(
-                    kinds
-                        .iter()
-                        .map(|k| k.as_str().to_string())
-                        .collect::<Vec<_>>(),
+        match filter
+            .text_contains
+            .as_deref()
+            .and_then(mem_core::cjk::fts_or_query)
+        {
+            // 带查询词时按词法相关度排序：候选池此前按 updated_at 截断，
+            // 更相关但更旧的文档会在打分前被系统性丢弃
+            Some(or_query) => {
+                qb.push(
+                    " order by ts_rank_cd(to_tsvector('simple', tsv_tokens), to_tsquery('simple', ",
                 )
-                .push(")");
+                .push_bind(or_query)
+                .push(")) desc, updated_at desc, id desc");
+            }
+            None => {
+                qb.push(" order by updated_at desc, id desc");
+            }
         }
-        if let Some(statuses) = &filter.statuses {
-            qb.push(" and status = any(")
-                .push_bind(
-                    statuses
-                        .iter()
-                        .map(|s| s.as_str().to_string())
-                        .collect::<Vec<_>>(),
-                )
-                .push(")");
-        }
-        if let Some(tags) = &filter.tags {
-            qb.push(" and tags @> ").push_bind(tags.clone());
-        }
-        if let Some(agent) = &filter.source_agent {
-            qb.push(" and source_agent = ").push_bind(agent.clone());
-        }
-        if let Some(key) = &filter.key {
-            qb.push(" and key = ").push_bind(key.clone());
-        }
-        if let Some(text) = &filter.text_contains {
-            let query_tokens = mem_core::tokenize_query_for_fts(text);
-            qb.push(" and to_tsvector('simple', tsv_tokens) @@ plainto_tsquery('simple', ")
-                .push_bind(query_tokens)
-                .push(")");
-        }
-        if let Some(scene) = &filter.scene {
-            qb.push(" and scene = ").push_bind(scene.as_str());
-        }
-        if let Some(layer) = &filter.layer {
-            qb.push(" and layer = ").push_bind(layer.as_str());
-        }
-        if let Some(valid_at) = &filter.valid_at {
-            qb.push(" and (valid_from is null or valid_from <= ")
-                .push_bind(*valid_at)
-                .push(") and (valid_until is null or valid_until > ")
-                .push_bind(*valid_at)
-                .push(")");
-        }
-        if let Some((ts, id)) = &filter.before {
-            qb.push(" and (updated_at, id) < (")
-                .push_bind(*ts)
-                .push(", ")
-                .push_bind(*id)
-                .push(")");
-        }
-
-        qb.push(" order by updated_at desc, id desc");
         if let Some(limit) = filter.limit {
             qb.push(" limit ").push_bind(limit as i64);
         }
@@ -980,97 +1074,42 @@ impl mem_core::MemoryStore for PostgresHubStore {
     async fn count(&self, filter: &MemoryFilter) -> Result<usize> {
         let mut qb =
             sqlx::QueryBuilder::<sqlx::Postgres>::new("select count(*) from memories where 1 = 1");
-        if let Some(ns) = &filter.namespace {
-            qb.push(" and namespace = ").push_bind(ns.clone());
-        }
-        if let Some(kinds) = &filter.kinds {
-            qb.push(" and kind = any(")
-                .push_bind(
-                    kinds
-                        .iter()
-                        .map(|k| k.as_str().to_string())
-                        .collect::<Vec<_>>(),
-                )
-                .push(")");
-        }
-        if let Some(statuses) = &filter.statuses {
-            qb.push(" and status = any(")
-                .push_bind(
-                    statuses
-                        .iter()
-                        .map(|s| s.as_str().to_string())
-                        .collect::<Vec<_>>(),
-                )
-                .push(")");
-        }
-        if let Some(tags) = &filter.tags {
-            qb.push(" and tags @> ").push_bind(tags.clone());
-        }
-        if let Some(agent) = &filter.source_agent {
-            qb.push(" and source_agent = ").push_bind(agent.clone());
-        }
-        if let Some(key) = &filter.key {
-            qb.push(" and key = ").push_bind(key.clone());
-        }
-        if let Some(text) = &filter.text_contains {
-            let query_tokens = mem_core::tokenize_query_for_fts(text);
-            qb.push(" and to_tsvector('simple', tsv_tokens) @@ plainto_tsquery('simple', ")
-                .push_bind(query_tokens)
-                .push(")");
-        }
-        if let Some(scene) = &filter.scene {
-            qb.push(" and scene = ").push_bind(scene.as_str());
-        }
-        if let Some(layer) = &filter.layer {
-            qb.push(" and layer = ").push_bind(layer.as_str());
-        }
-        if let Some(valid_at) = &filter.valid_at {
-            qb.push(" and (valid_from is null or valid_from <= ")
-                .push_bind(*valid_at)
-                .push(") and (valid_until is null or valid_until > ")
-                .push_bind(*valid_at)
-                .push(")");
-        }
+        Self::push_memory_filters(&mut qb, filter);
         let count: i64 = qb.build_query_scalar().fetch_one(&self.pool).await.pg()?;
         Ok(count.max(0) as usize)
     }
 
     async fn similar(
         &self,
-        namespace: &str,
+        filter: &MemoryFilter,
         embedding: &[f32],
         k: usize,
-        kinds: Option<&[MemoryKind]>,
     ) -> Result<Vec<Scored<MemoryEntry>>> {
         let literal = mapping::vector_literal(embedding);
-        let kinds_vec: Option<Vec<String>> =
-            kinds.map(|ks| ks.iter().map(|k| k.as_str().to_string()).collect());
+        // 状态缺省按 active 处理（与历史行为一致，避免默认召回已归档条目）
+        let mut effective = filter.clone();
+        if effective.statuses.is_none() {
+            effective.statuses = Some(vec![MemoryStatus::Active]);
+        }
 
-        let sql = format!(
-            "select {}, 1 - (embedding <=> $2::vector) as score \
-             from memories \
-             where namespace = $1 and status = 'active' \
-               and ($3::text[] is null or kind = any($3::text[])) \
-             order by embedding <=> $2::vector \
-             limit $4",
+        let mut qb = sqlx::QueryBuilder::<sqlx::Postgres>::new(format!(
+            "select {}, (embedding <=> ",
             Self::ENTRY_COLUMNS
-        );
-        let rows = sqlx::query(&sql)
-            .bind(namespace)
-            .bind(&literal)
-            .bind(&kinds_vec)
-            .bind(k as i64)
-            .fetch_all(&self.pool)
-            .await
-            .pg()?;
+        ));
+        qb.push_bind(literal)
+            .push("::vector) as dist from memories where embedding is not null");
+        // 过滤条件下推到 SQL：否则其它场景/已失效条目会占满 top-k，导致目标候选缺失
+        Self::push_memory_filters(&mut qb, &effective);
+        qb.push(" order by dist limit ").push_bind(k as i64);
 
+        let rows = qb.build().fetch_all(&self.pool).await.pg()?;
         let mut out = Vec::with_capacity(rows.len());
         for r in &rows {
             let item = Self::entry_from_row(r)?;
-            let score: f32 = r.try_get("score").unwrap_or(0.0);
+            let dist: f64 = r.try_get("dist").unwrap_or(1.0);
             out.push(Scored {
                 item,
-                score: score.clamp(0.0, 1.0),
+                score: (1.0 - dist as f32).clamp(0.0, 1.0),
             });
         }
         Ok(out)

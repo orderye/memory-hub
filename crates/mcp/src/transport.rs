@@ -692,12 +692,20 @@ mod tests {
         let access = Arc::new(GrantChecker::new(store.clone()));
         McpTransportState {
             dispatcher: Arc::new(ToolDispatcher::new(
-                Arc::new(mem_core::DefaultMemoryService::new(
-                    store.clone(),
-                    Arc::new(mem_core::TestEmbedder::default()),
-                    access.clone(),
-                    [0.5, 0.2, 0.1, 0.1, 0.1],
-                )),
+                Arc::new({
+                    let embedder = Arc::new(mem_core::TestEmbedder::default());
+                    let retriever = Arc::new(retrieval::HybridRetriever::new(
+                        store.clone() as Arc<dyn mem_core::MemoryStore>,
+                        embedder.clone(),
+                        100,
+                        100,
+                        [0.5, 0.2, 0.1, 0.1, 0.1],
+                        0.7,
+                        500,
+                    ));
+                    mem_core::DefaultMemoryService::new(store.clone(), embedder, access.clone())
+                        .with_retriever(retriever)
+                }),
                 Arc::new(DefaultBackupService::new(store.clone(), access.clone())),
                 Arc::new(DefaultIntegrationService::new(
                     store.clone(),

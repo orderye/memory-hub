@@ -10,11 +10,10 @@ use common::{AccountId, AgentId, HubError, Result};
 use mem_core::{
     AccountRecord, BackupRecord, CodingRevision, CodingStore, CodingThread, EvidenceSourceKind,
     ExperienceStatus, IntegrationProposal, MemoryEntry, MemoryEvidence, MemoryExperience,
-    MemoryFilter, MemoryKind, MemoryRelation, MemoryRelationKind, MemoryStats, MemoryStatus,
-    MemoryTask, MemoryTaskExperience, MemoryVersion, Namespace, NamespaceGrantRecord,
-    NamespaceInfo, NewCodingRevision, NewCodingThread, NewEvidence, NewMemoryExperience,
-    NewMemoryRelation, NewMemoryTask, ProposalStatus, Scored, SessionRecord, TaskStatus,
-    VersionChange,
+    MemoryFilter, MemoryRelation, MemoryRelationKind, MemoryStats, MemoryStatus, MemoryTask,
+    MemoryTaskExperience, MemoryVersion, Namespace, NamespaceGrantRecord, NamespaceInfo,
+    NewCodingRevision, NewCodingThread, NewEvidence, NewMemoryExperience, NewMemoryRelation,
+    NewMemoryTask, ProposalStatus, Scored, SessionRecord, TaskStatus, VersionChange,
 };
 use std::collections::BTreeMap;
 use std::sync::RwLock;
@@ -133,8 +132,9 @@ impl InMemoryHubStore {
             }
         }
         if let Some(text) = &f.text_contains {
-            let needle = text.to_lowercase();
-            if !e.content.to_lowercase().contains(&needle) {
+            // 与 PostgreSQL FTS 同源的分词部分匹配（OR 语义）：
+            // 此前用整段查询做裸子串匹配，内存路径与生产路径词法不同
+            if mem_core::fts_query_hits(&e.content, text) == 0 {
                 return false;
             }
         }
@@ -303,7 +303,20 @@ impl mem_core::MemoryStore for InMemoryHubStore {
             .filter(|e| Self::matches_filter(e, filter))
             .cloned()
             .collect();
-        out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(b.id.cmp(&a.id)));
+        match &filter.text_contains {
+            // 与 PostgreSQL 侧一致：带查询词时按词法相关度（词元命中数）排序，
+            // 不做"按更新时间截断"——否则更相关但更旧的文档会在打分前被丢弃
+            Some(text) => {
+                out.sort_by(|a, b| {
+                    let ha = mem_core::fts_query_hits(&a.content, text);
+                    let hb = mem_core::fts_query_hits(&b.content, text);
+                    hb.cmp(&ha)
+                        .then(b.updated_at.cmp(&a.updated_at))
+                        .then(b.id.cmp(&a.id))
+                });
+            }
+            None => out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(b.id.cmp(&a.id))),
+        }
         if let Some(limit) = filter.limit {
             out.truncate(limit);
         }
@@ -326,18 +339,22 @@ impl mem_core::MemoryStore for InMemoryHubStore {
 
     async fn similar(
         &self,
-        namespace: &str,
+        filter: &MemoryFilter,
         embedding: &[f32],
         k: usize,
-        kinds: Option<&[MemoryKind]>,
     ) -> Result<Vec<Scored<MemoryEntry>>> {
+        // 状态缺省时按 active 处理（与历史行为一致，避免默认召回已归档条目）
+        let mut effective = filter.clone();
+        if effective.statuses.is_none() {
+            effective.statuses = Some(vec![MemoryStatus::Active]);
+        }
         let mut scored: Vec<Scored<MemoryEntry>> = self
             .items
             .read()
             .unwrap()
             .values()
-            .filter(|e| e.namespace == namespace && e.status == MemoryStatus::Active)
-            .filter(|e| kinds.is_none_or(|ks| ks.contains(&e.kind)))
+            .filter(|e| Self::matches_filter(e, &effective))
+            .filter(|e| e.embedding.is_some())
             .filter_map(|e| {
                 let iv = e.embedding.as_ref()?;
                 if iv.len() != embedding.len() {
@@ -1564,7 +1581,7 @@ mod tests {
     use super::*;
     use mem_core::{
         AccountStore, BackupStore, EvidenceStore, GrantStore, IntegrationStore, MemoryHubStore,
-        MemoryStore, RelationStore,
+        MemoryKind, MemoryScene, MemoryStore, RelationStore,
     };
 
     fn entry(ns: &str, content: &str, key: Option<&str>) -> MemoryEntry {
@@ -1666,13 +1683,30 @@ mod tests {
         e.embedding = Some(vec![1.0, 0.0]);
         store.insert(&e).await.unwrap();
 
-        let hit = store.similar("ns", &[1.0, 0.0], 5, None).await.unwrap();
+        let hit = store
+            .similar(
+                &MemoryFilter {
+                    namespace: Some("ns".to_string()),
+                    ..Default::default()
+                },
+                &[1.0, 0.0],
+                5,
+            )
+            .await
+            .unwrap();
         assert_eq!(hit.len(), 1);
         assert!((hit[0].score - 1.0).abs() < 1e-6);
 
         // 维度不匹配 → 无结果
         let miss = store
-            .similar("ns", &[1.0, 0.0, 0.0], 5, None)
+            .similar(
+                &MemoryFilter {
+                    namespace: Some("ns".to_string()),
+                    ..Default::default()
+                },
+                &[1.0, 0.0, 0.0],
+                5,
+            )
             .await
             .unwrap();
         assert!(miss.is_empty());
@@ -1680,8 +1714,89 @@ mod tests {
         // 归档后不再召回
         e.status = MemoryStatus::Archived;
         store.save(&e).await.unwrap();
-        let empty = store.similar("ns", &[1.0, 0.0], 5, None).await.unwrap();
+        let empty = store
+            .similar(
+                &MemoryFilter {
+                    namespace: Some("ns".to_string()),
+                    ..Default::default()
+                },
+                &[1.0, 0.0],
+                5,
+            )
+            .await
+            .unwrap();
         assert!(empty.is_empty());
+    }
+
+    /// 回归：向量召回曾把 scene / valid_at 过滤留在 Rust 侧，
+    /// 过滤条件下推后，被过滤条目不得占据 top-k 名额
+    #[tokio::test]
+    async fn test_similar_pushes_down_scene_and_validity_filters() {
+        use chrono::TimeZone;
+        let store = InMemoryHubStore::new();
+
+        // 同主题、不同场景的三条：只有 Coding 场景那条符合查询
+        let mut chat = entry("ns", "代码重构方案 A", None);
+        chat.scene = Some(MemoryScene::Chat);
+        chat.embedding = Some(vec![1.0, 0.0]);
+        let mut coding = entry("ns", "代码重构方案 B", None);
+        coding.scene = Some(MemoryScene::Coding);
+        coding.embedding = Some(vec![1.0, 0.0]);
+        let mut expired = entry("ns", "代码重构方案 C", None);
+        expired.scene = Some(MemoryScene::Coding);
+        expired.embedding = Some(vec![1.0, 0.0]);
+        expired.valid_until = Some(chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap());
+
+        for e in [&chat, &coding, &expired] {
+            store.insert(e).await.unwrap();
+        }
+
+        let filter = MemoryFilter {
+            namespace: Some("ns".to_string()),
+            statuses: Some(vec![MemoryStatus::Active]),
+            scene: Some(MemoryScene::Coding),
+            valid_at: Some(chrono::Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap()),
+            ..Default::default()
+        };
+        let hits = store.similar(&filter, &[1.0, 0.0], 10).await.unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "下推过滤必须只返回满足 scene/valid_at 的条目"
+        );
+        assert_eq!(hits[0].item.content, "代码重构方案 B");
+    }
+
+    /// 回归：FTS 词法曾用整段查询做裸子串匹配，与 PostgreSQL 分词语义不同，
+    /// 且 AND 语义下多词查询会整条遗漏
+    #[tokio::test]
+    async fn test_list_fts_partial_match_and_relevance_order() {
+        let store = InMemoryHubStore::new();
+        // 精确命中两个词元的旧条目，与只命中一个词元的新条目
+        let mut both = entry("ns", "Redis 缓存集群主节点说明", None);
+        both.updated_at = chrono::Utc::now() - chrono::Duration::days(30);
+        let mut one = entry("ns", "缓存预热脚本", None);
+        one.updated_at = chrono::Utc::now();
+        store.insert(&both).await.unwrap();
+        store.insert(&one).await.unwrap();
+
+        let filter = MemoryFilter {
+            namespace: Some("ns".to_string()),
+            text_contains: Some("Redis 缓存集群".to_string()),
+            limit: Some(10),
+            ..Default::default()
+        };
+        let rows = store.list(&filter).await.unwrap();
+
+        assert_eq!(
+            rows.len(),
+            2,
+            "部分匹配（OR 语义）应召回只命中一个词元的文档"
+        );
+        assert_eq!(
+            rows[0].content, "Redis 缓存集群主节点说明",
+            "命中词元更多的文档必须排在前（相关度优先于更新时间）"
+        );
     }
 
     #[tokio::test]

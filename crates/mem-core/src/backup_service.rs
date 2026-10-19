@@ -993,10 +993,9 @@ mod tests {
         }
         async fn similar(
             &self,
-            _ns: &str,
+            _filter: &MemoryFilter,
             _qv: &[f32],
             _k: usize,
-            _kinds: Option<&[MemoryKind]>,
         ) -> Result<Vec<crate::domain::Scored<MemoryEntry>>> {
             Ok(vec![])
         }

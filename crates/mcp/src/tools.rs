@@ -1414,13 +1414,21 @@ mod tests {
     fn harness() -> (ToolDispatcher, AuthCtx) {
         let store = Arc::new(InMemoryHubStore::new());
         let access = Arc::new(GrantChecker::new(store.clone()));
+        let embedder = Arc::new(mem_core::TestEmbedder::default());
+        let retriever = Arc::new(retrieval::HybridRetriever::new(
+            store.clone() as Arc<dyn mem_core::MemoryStore>,
+            embedder.clone(),
+            100,
+            100,
+            [0.5, 0.2, 0.1, 0.1, 0.1],
+            0.7,
+            500,
+        ));
         let dispatcher = ToolDispatcher::new(
-            Arc::new(mem_core::DefaultMemoryService::new(
-                store.clone(),
-                Arc::new(mem_core::TestEmbedder::default()),
-                access.clone(),
-                [0.5, 0.2, 0.1, 0.1, 0.1],
-            )),
+            Arc::new(
+                mem_core::DefaultMemoryService::new(store.clone(), embedder, access.clone())
+                    .with_retriever(retriever),
+            ),
             Arc::new(DefaultBackupService::new(store.clone(), access.clone())),
             Arc::new(DefaultIntegrationService::new(
                 store.clone(),

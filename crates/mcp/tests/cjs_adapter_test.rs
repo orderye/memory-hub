@@ -35,12 +35,20 @@ impl mem_core::TokenIntrospector for StubIntrospector {
 fn create_test_state(config: CjsAdapterConfig) -> McpTransportState {
     let store = Arc::new(InMemoryHubStore::new());
     let access = Arc::new(GrantChecker::new(store.clone()));
-    let memory_svc = Arc::new(DefaultMemoryService::new(
-        store.clone(),
-        Arc::new(mem_core::TestEmbedder::default()),
-        access.clone(),
+    let embedder = Arc::new(mem_core::TestEmbedder::default());
+    let retriever = Arc::new(retrieval::HybridRetriever::new(
+        store.clone() as Arc<dyn mem_core::MemoryStore>,
+        embedder.clone(),
+        100,
+        100,
         [0.5, 0.2, 0.1, 0.1, 0.1],
+        0.7,
+        500,
     ));
+    let memory_svc = Arc::new(
+        DefaultMemoryService::new(store.clone(), embedder, access.clone())
+            .with_retriever(retriever),
+    );
     let backup_svc = Arc::new(DefaultBackupService::new(store.clone(), access.clone()));
     let integration_svc = Arc::new(DefaultIntegrationService::new(
         store.clone(),

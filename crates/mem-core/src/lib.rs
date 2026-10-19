@@ -29,14 +29,19 @@ pub mod memory_service;
 pub mod testing;
 pub mod working_memory_service;
 
-pub use cjk::{tokenize_for_fts, tokenize_query_for_fts};
+pub use cjk::{
+    fts_doc_tokens, fts_or_query, fts_query_hits, fts_query_tokens, tokenize_for_fts,
+    tokenize_query_for_fts,
+};
 
 pub use access::{validate_key, validate_namespace, GrantChecker};
 pub use account_scope::{scope_name, unscope_name, AccountScopedStore};
 pub use algorithm::{
     calculate_item_score, calculate_item_score_with_availability, cosine_similarity,
-    is_superseded_at, keyword_score, l2_normalize, matches_tag_filter, mmr_rerank,
-    passes_validity_filter, recency_score, retrieval_reference_time, SearchQuery,
+    document_tokens, extract_terms, inverse_document_frequency, is_superseded_at, keyword_score,
+    keyword_score_weighted, l2_normalize, layer_prior, matches_tag_filter, mmr_rerank,
+    passes_validity_filter, recency_score, recency_tau_days_for, retrieval_reference_time,
+    validity_filter_time, SearchQuery,
 };
 pub use backup_service::{
     grant_checker, BackupCreateRequest, BackupService, DefaultBackupService, PruneReport,
@@ -68,7 +73,7 @@ pub use integration_service::{
 };
 pub use memory_service::{
     decode_cursor, encode_cursor, DefaultMemoryService, GetRequest, ListRequest, MemoryService,
-    PutRequest, SimpleRetriever,
+    PutRequest,
 };
 pub use testing::{FixedClock, TestEmbedder, TestHubStore};
 pub use working_memory_service::{ExperienceSearchResult, WorkingMemoryService};

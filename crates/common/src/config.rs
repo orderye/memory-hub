@@ -61,6 +61,8 @@ pub struct AppConfig {
     // ===== 检索 =====
     pub retrieval_fts_k: usize,
     pub retrieval_vec_k: usize,
+    /// 近期性时间常数覆盖（天）：None 表示按记忆类型自动取值
+    pub retrieval_recency_tau_days: Option<f32>,
     pub score_weights: [f32; SCORE_WEIGHT_LEN],
     pub mmr_lambda: f32,
     /// 单次检索软超时（毫秒），超时返回已召回结果
@@ -174,8 +176,11 @@ impl Default for AppConfig {
             bootstrap_password: None,
             invite_code: None,
             auth_session_ttl_h: 720,
-            retrieval_fts_k: 20,
-            retrieval_vec_k: 20,
+            // 候选池取 100：融合打分前按相关度取较大候选集，
+            // 避免"匹配文档数超过候选池时更相关但更旧的文档被截断丢弃"
+            retrieval_fts_k: 100,
+            retrieval_vec_k: 100,
+            retrieval_recency_tau_days: None,
             score_weights: [0.50, 0.20, 0.10, 0.10, 0.10],
             mmr_lambda: 0.7,
             soft_timeout_ms: 500,
@@ -227,6 +232,13 @@ impl AppConfig {
 
         cfg.retrieval_fts_k = parse_usize("HUB_RETRIEVAL_FTS_K", cfg.retrieval_fts_k)?;
         cfg.retrieval_vec_k = parse_usize("HUB_RETRIEVAL_VEC_K", cfg.retrieval_vec_k)?;
+        cfg.retrieval_recency_tau_days = match var("HUB_RETRIEVAL_RECENCY_TAU_DAYS") {
+            Some(_) => Some(parse_f32(
+                "HUB_RETRIEVAL_RECENCY_TAU_DAYS",
+                cfg.retrieval_recency_tau_days.unwrap_or(30.0),
+            )?),
+            None => None,
+        };
         cfg.score_weights = parse_score_weights()?;
         cfg.mmr_lambda = parse_f32("HUB_MMR_LAMBDA", cfg.mmr_lambda)?;
         cfg.soft_timeout_ms = parse_u64("HUB_SOFT_TIMEOUT_MS", cfg.soft_timeout_ms)?;
@@ -314,6 +326,11 @@ impl AppConfig {
         }
         if self.mmr_lambda < 0.0 || self.mmr_lambda > 1.0 {
             anyhow::bail!("HUB_MMR_LAMBDA 必须落在 [0,1]");
+        }
+        if let Some(tau) = self.retrieval_recency_tau_days {
+            if tau <= 0.0 {
+                anyhow::bail!("HUB_RETRIEVAL_RECENCY_TAU_DAYS 必须大于 0");
+            }
         }
 
         let wsum: f32 = self.score_weights.iter().sum();
@@ -566,6 +583,32 @@ mod tests {
             ..Default::default()
         };
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_recency_tau_override_must_be_positive() {
+        // 基准配置需先满足其它启动校验（此处仅替换占位 token 密钥）
+        let base = AppConfig {
+            token_secret: "k".repeat(64),
+            ..Default::default()
+        };
+        assert!(base.validate().is_ok(), "{:?}", base.validate());
+
+        let invalid = AppConfig {
+            retrieval_recency_tau_days: Some(0.0),
+            ..base.clone()
+        };
+        let err = invalid.validate().expect_err("τ 为 0 必须被拒绝");
+        assert!(
+            err.to_string().contains("HUB_RETRIEVAL_RECENCY_TAU_DAYS"),
+            "错误信息应指明配置项：{err}"
+        );
+
+        let valid = AppConfig {
+            retrieval_recency_tau_days: Some(45.0),
+            ..base
+        };
+        assert!(valid.validate().is_ok());
     }
 
     #[test]

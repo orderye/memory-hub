@@ -14,7 +14,7 @@
 
 use crate::domain::{
     BackupRecord, CodingRevision, CodingThread, EvidenceSourceKind, ExperienceStatus,
-    IntegrationProposal, MemoryEntry, MemoryEvidence, MemoryExperience, MemoryFilter, MemoryKind,
+    IntegrationProposal, MemoryEntry, MemoryEvidence, MemoryExperience, MemoryFilter,
     MemoryRelation, MemoryRelationKind, MemoryTask, MemoryTaskExperience, MemoryVersion, Namespace,
     NamespaceGrantRecord, NamespaceInfo, NewCodingRevision, NewCodingThread, NewEvidence,
     NewMemoryExperience, NewMemoryRelation, NewMemoryTask, ProposalStatus, Scored, TaskStatus,
@@ -189,14 +189,13 @@ impl<S: MemoryStore + ?Sized> MemoryStore for AccountScopedStore<S> {
 
     async fn similar(
         &self,
-        namespace: &str,
+        filter: &MemoryFilter,
         embedding: &[f32],
         k: usize,
-        kinds: Option<&[MemoryKind]>,
     ) -> Result<Vec<Scored<MemoryEntry>>> {
         let rows = self
             .inner
-            .similar(&self.scoped(namespace), embedding, k, kinds)
+            .similar(&self.scoped_filter(filter), embedding, k)
             .await?;
         Ok(rows
             .into_iter()

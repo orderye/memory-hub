@@ -6,7 +6,7 @@
 use crate::domain::{
     BackupRecord, ChatCognitiveInput, CodingRevision, CodingThread, CognitiveCandidate,
     EvidenceSourceKind, ExperienceStatus, IntegrationProposal, MemoryEntry, MemoryEvidence,
-    MemoryExperience, MemoryFilter, MemoryKind, MemoryRelation, MemoryRelationKind, MemoryTask,
+    MemoryExperience, MemoryFilter, MemoryRelation, MemoryRelationKind, MemoryTask,
     MemoryTaskExperience, MemoryVersion, Namespace, NamespaceGrantRecord, NamespaceInfo,
     NewCodingRevision, NewCodingThread, NewEvidence, NewMemoryExperience, NewMemoryRelation,
     NewMemoryTask, ProposalStatus, Scored, TaskStatus,
@@ -112,19 +112,20 @@ pub trait MemoryStore: Send + Sync {
     /// 物理删除
     async fn delete(&self, namespace: &str, id: uuid::Uuid) -> Result<()>;
 
-    /// 条件列表（按 updated_at desc + id desc 排序）
+    /// 条件列表（默认按 updated_at desc + id desc 排序；
+    /// 带 `text_contains` 时按词法相关度排序，保证大候选池不漏掉旧而更相关的文档）
     async fn list(&self, filter: &MemoryFilter) -> Result<Vec<MemoryEntry>>;
 
     /// 条件计数（不含分页游标与 limit）
     async fn count(&self, filter: &MemoryFilter) -> Result<usize>;
 
-    /// 向量近邻（仅在 active 状态内召回）
+    /// 向量近邻召回：过滤条件（命名空间/状态/场景/层级/时间有效性/标签/类型）
+    /// 必须下推到存储层执行，只返回满足条件的最近邻；排序为相似度降序。
     async fn similar(
         &self,
-        namespace: &str,
+        filter: &MemoryFilter,
         embedding: &[f32],
         k: usize,
-        kinds: Option<&[MemoryKind]>,
     ) -> Result<Vec<Scored<MemoryEntry>>>;
 
     /// 命名空间下全部条目（备份与整合扫描用；merged 可排除）
