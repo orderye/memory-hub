@@ -157,12 +157,30 @@ mod pg_integration {
         s
     }
 
+    /// 幂等键表对 agent_id 有外键约束，被测 Agent 必须先在 agents 表登记。
+    /// 写法与 PostgresHubStore::ensure_namespace 的兜底一致：未知 Agent 归入引导账户。
+    async fn ensure_agent(s: &PostgresIdempotencyStore, agent_id: &str) {
+        sqlx::query(
+            r#"
+            insert into agents (agent_id, name, owner_account_id)
+            values ($1, $1, $2)
+            on conflict (agent_id) do nothing
+            "#,
+        )
+        .bind(agent_id)
+        .bind(common::BOOTSTRAP_ACCOUNT_ID)
+        .execute(&s.pool)
+        .await
+        .expect("登记 Agent 失败");
+    }
+
     #[tokio::test]
     #[ignore = "需要 DATABASE_URL"]
     async fn pg_response_hash_is_text_not_bytea() {
         // 回归：response_hash 初版为 bytea，写入 hex 字符串会类型不匹配；
         // 迁移 003 已改为 text，本测试确保该路径真实可写。
         let s = store().await;
+        ensure_agent(&s, "asst").await;
         let k = IdempotencyKey {
             agent_id: AgentId::from("asst"),
             namespace: "team-x".to_string(),
@@ -186,6 +204,7 @@ mod pg_integration {
     #[ignore = "需要 DATABASE_URL"]
     async fn pg_register_is_idempotent_and_prunes() {
         let s = store().await;
+        ensure_agent(&s, "asst").await;
         let k = IdempotencyKey {
             agent_id: AgentId::from("asst"),
             namespace: "team-x".to_string(),

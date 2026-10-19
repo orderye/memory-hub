@@ -1762,12 +1762,11 @@ mod tests {
         let s = state();
         let client_ip = extract_client_ip(&HeaderMap::new());
         for _ in 0..15 {
-            assert!(
-                s.rate_limiter
-                    .try_acquire_in_window(common::RateDimension::Ip, &client_ip, 15, 60)
-                    .await
-                    .unwrap()
-            );
+            assert!(s
+                .rate_limiter
+                .try_acquire_in_window(common::RateDimension::Ip, &client_ip, 15, 60)
+                .await
+                .unwrap());
         }
         let rate_limited = handle_login_submit(
             State(s.clone()),

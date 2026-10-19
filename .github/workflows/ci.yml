@@ -91,6 +91,14 @@ jobs:
   supply-chain:
     name: 依赖准入与安全审计
     runs-on: ubuntu-latest
+    # 本仓默认 GITHUB_TOKEN 权限为只读（default_workflow_permissions = read），
+    # 而 audit-check 会无条件创建 "Security audit" check run（需 checks: write），
+    # 命中新告警时还会自动开 issue（需 issues: write）。权限不足会以
+    # "Resource not accessible by integration" 失败——与是否存在漏洞无关。
+    permissions:
+      contents: read
+      checks: write
+      issues: write
     steps:
       - uses: actions/checkout@v4
 
@@ -110,6 +118,16 @@ jobs:
         uses: rustsec/audit-check@v1.4.1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # RUSTSEC-2023-0071（Marvin Attack）：rsa 0.9.10 私钥运算非恒定时间，
+          # 可经网络时序侧信道恢复私钥。上游暂无修复版本（advisory 的 patched 列表为空，
+          # 0.10.0-rc.x 同样受影响），故只能显式豁免。
+          #
+          # 风险敞口实际为零：rsa 仅由 sqlx 的可选 MySQL 驱动引入，本项目只启用 postgres，
+          # 该 crate 根本不参与编译（cargo tree -i rsa 输出为空），只作为可选依赖留在
+          # Cargo.lock 里被 cargo-audit 扫到。锁文件与特性无关（可选依赖恒被解析进锁文件），
+          # 关闭 migrate 等特性无法让它消失；升级同样无效——sqlx 0.9 的 MySQL 驱动仍依赖 rsa。
+          # 仓库只用 PostgreSQL，MySQL 认证路径不编译进任何产物。
+          ignore: RUSTSEC-2023-0071
 
   # ---------- 4. 产物构建（Release） ----------
   build:

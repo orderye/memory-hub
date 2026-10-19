@@ -3245,6 +3245,14 @@ mod pg_integration {
         let (_, created) = store.ensure_namespace(ns, &owner).await.unwrap();
         assert!(created, "首次注册应报告新建");
 
+        // 被授权方必须先在 agents 表登记：namespace_grants.agent_id 有外键约束，
+        // 未登记的 Agent 写不进授权行。生产路径上 memory_grant 工具同样先校验
+        // 目标 Agent 存在且同属本账户，再落授权行。
+        store
+            .register_agent(&core_agent_reg("it-guest", None))
+            .await
+            .unwrap();
+
         store
             .grant(&NamespaceGrantRecord {
                 namespace: ns.to_string(),
