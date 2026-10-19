@@ -1718,26 +1718,57 @@ mod tests {
 
     #[tokio::test]
     async fn test_login_rate_limiting_username_and_ip() {
+        // 限流是令牌桶，按 capacity/window 连续回补（此处用户维度为每 12 秒补 1 个令牌）。
+        // 因此不能用「连续 5 次真实错密码登录把桶打空、第 6 次必然限流」来构造用例：
+        // debug 构建下每次 Argon2 校验都很慢，5 次尝试的耗时可超过回补一个令牌所需的时间，
+        // 第 6 次就会被放行。改为直接打空对应维度的桶，再断言路由确实返回 429。
+
+        // 单次失败登录仍返回 200（保留原有的行为断言）
         let s = state();
-        let _ = s
-            .accounts
-            .register("bob", "password123", "Bob", None)
+        let failed = handle_login_submit(
+            State(s.clone()),
+            HeaderMap::new(),
+            Form(LoginForm {
+                username: "bob".to_string(),
+                password: "wrong".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(failed.status(), StatusCode::OK);
+
+        // 按用户名维度（容量 5/60s）：打空剩余令牌后，同用户名的登录应被限流
+        let mut drained = 0;
+        while s
+            .rate_limiter
+            .try_acquire_in_window(common::RateDimension::User, "bob", 5, 60)
             .await
-            .unwrap();
-
-        for _ in 0..5 {
-            let resp = handle_login_submit(
-                State(s.clone()),
-                HeaderMap::new(),
-                Form(LoginForm {
-                    username: "bob".to_string(),
-                    password: "wrong".to_string(),
-                }),
-            )
-            .await;
-            assert_eq!(resp.status(), StatusCode::OK);
+            .unwrap()
+        {
+            drained += 1;
+            assert!(drained <= 5, "按用户名的令牌桶未能在 5 次内打空");
         }
+        let rate_limited = handle_login_submit(
+            State(s.clone()),
+            HeaderMap::new(),
+            Form(LoginForm {
+                username: "bob".to_string(),
+                password: "wrong".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(rate_limited.status(), StatusCode::TOO_MANY_REQUESTS);
 
+        // 按客户端 IP 维度（容量 15/60s）：此时用户名桶仍有余额，被限流即说明 IP 维度生效
+        let s = state();
+        let client_ip = extract_client_ip(&HeaderMap::new());
+        for _ in 0..15 {
+            assert!(
+                s.rate_limiter
+                    .try_acquire_in_window(common::RateDimension::Ip, &client_ip, 15, 60)
+                    .await
+                    .unwrap()
+            );
+        }
         let rate_limited = handle_login_submit(
             State(s.clone()),
             HeaderMap::new(),

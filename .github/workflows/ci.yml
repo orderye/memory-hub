@@ -83,7 +83,9 @@ jobs:
       - name: PostgreSQL 集成测试（--ignored）
         env:
           DATABASE_URL: postgresql://hub_test:hub_test_password@127.0.0.1:5432/memory_hub_test?sslmode=disable
-        run: cargo test -p store --features pg-integration -- --ignored --nocapture
+        # 这些用例共用同一个数据库：首个连接会自动执行迁移，且各自有清理动作，
+        # 并行执行会互相触发 "Conflict"（并发迁移）与外键约束失败，必须串行。
+        run: cargo test -p store --features pg-integration -- --ignored --nocapture --test-threads=1
 
   # ---------- 3. 依赖准入与安全审计 ----------
   supply-chain:
