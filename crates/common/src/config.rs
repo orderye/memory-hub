@@ -63,6 +63,10 @@ pub struct AppConfig {
     pub retrieval_vec_k: usize,
     /// 近期性时间常数覆盖（天）：None 表示按记忆类型自动取值
     pub retrieval_recency_tau_days: Option<f32>,
+    /// 场景过滤模式：`strict`（默认，硬过滤）/ `prefer`（软偏好，需评测确认后开启）
+    pub retrieval_scene_mode: String,
+    /// 分场景权重 profile（`chat` / `working` / `coding`），空表示统一使用 `score_weights`
+    pub retrieval_scene_weight_profiles: std::collections::HashMap<String, [f32; SCORE_WEIGHT_LEN]>,
     pub score_weights: [f32; SCORE_WEIGHT_LEN],
     pub mmr_lambda: f32,
     /// 单次检索软超时（毫秒），超时返回已召回结果
@@ -181,6 +185,8 @@ impl Default for AppConfig {
             retrieval_fts_k: 100,
             retrieval_vec_k: 100,
             retrieval_recency_tau_days: None,
+            retrieval_scene_mode: "strict".to_string(),
+            retrieval_scene_weight_profiles: std::collections::HashMap::new(),
             score_weights: [0.50, 0.20, 0.10, 0.10, 0.10],
             mmr_lambda: 0.7,
             soft_timeout_ms: 500,
@@ -239,6 +245,9 @@ impl AppConfig {
             )?),
             None => None,
         };
+        cfg.retrieval_scene_mode =
+            var_or("HUB_RETRIEVAL_SCENE_MODE", &cfg.retrieval_scene_mode).to_lowercase();
+        cfg.retrieval_scene_weight_profiles = parse_scene_weight_profiles()?;
         cfg.score_weights = parse_score_weights()?;
         cfg.mmr_lambda = parse_f32("HUB_MMR_LAMBDA", cfg.mmr_lambda)?;
         cfg.soft_timeout_ms = parse_u64("HUB_SOFT_TIMEOUT_MS", cfg.soft_timeout_ms)?;
@@ -331,6 +340,9 @@ impl AppConfig {
             if tau <= 0.0 {
                 anyhow::bail!("HUB_RETRIEVAL_RECENCY_TAU_DAYS 必须大于 0");
             }
+        }
+        if self.retrieval_scene_mode != "strict" && self.retrieval_scene_mode != "prefer" {
+            anyhow::bail!("HUB_RETRIEVAL_SCENE_MODE 只能是 strict 或 prefer");
         }
 
         let wsum: f32 = self.score_weights.iter().sum();
@@ -426,6 +438,56 @@ impl AppConfig {
 }
 
 /// 解析 `HUB_SCORE_WEIGHTS=a,b,c,d,e`
+/// 解析分场景权重 profile：
+/// `HUB_SCENE_WEIGHT_PROFILES="chat=0.45,0.20,0.10,0.15,0.10;coding=0.45,0.25,0.10,0.05,0.15"`
+///
+/// 每个 profile 必须是 5 个 [0,1] 权重且之和为 1；场景名限定 chat / working / coding。
+/// 未配置时全部请求使用全局 `HUB_SCORE_WEIGHTS`（默认行为不变）。
+fn parse_scene_weight_profiles(
+) -> anyhow::Result<std::collections::HashMap<String, [f32; SCORE_WEIGHT_LEN]>> {
+    let Some(raw) = var("HUB_SCENE_WEIGHT_PROFILES") else {
+        return Ok(std::collections::HashMap::new());
+    };
+    let mut profiles = std::collections::HashMap::new();
+    for entry in raw.split(';').map(str::trim).filter(|e| !e.is_empty()) {
+        let (name, values) = entry
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("HUB_SCENE_WEIGHT_PROFILES 条目缺少 '='：{entry}"))?;
+        let name = name.trim().to_lowercase();
+        if !matches!(name.as_str(), "chat" | "working" | "coding") {
+            anyhow::bail!(
+                "HUB_SCENE_WEIGHT_PROFILES 不支持的场景：{name}（仅 chat/working/coding）"
+            );
+        }
+        let mut weights = [0f32; SCORE_WEIGHT_LEN];
+        let parts: Vec<&str> = values.split(',').map(str::trim).collect();
+        if parts.len() != SCORE_WEIGHT_LEN {
+            anyhow::bail!(
+                "HUB_SCENE_WEIGHT_PROFILES 的 {name} 需要 {SCORE_WEIGHT_LEN} 个权重，当前 {}",
+                parts.len()
+            );
+        }
+        for (i, part) in parts.iter().enumerate() {
+            let w: f32 = part.parse().map_err(|_| {
+                anyhow::anyhow!("HUB_SCENE_WEIGHT_PROFILES 权重不是合法数字：{part}")
+            })?;
+            if !(0.0..=1.0).contains(&w) {
+                anyhow::bail!(
+                    "HUB_SCENE_WEIGHT_PROFILES 的 {name} 第 {} 项必须落在 [0,1]",
+                    i + 1
+                );
+            }
+            weights[i] = w;
+        }
+        let sum: f32 = weights.iter().sum();
+        if (sum - 1.0).abs() > 1e-3 {
+            anyhow::bail!("HUB_SCENE_WEIGHT_PROFILES 的 {name} 权重之和必须为 1.0，当前为 {sum}");
+        }
+        profiles.insert(name, weights);
+    }
+    Ok(profiles)
+}
+
 fn parse_score_weights() -> anyhow::Result<[f32; SCORE_WEIGHT_LEN]> {
     let raw = match var("HUB_SCORE_WEIGHTS") {
         Some(v) => v,
@@ -583,6 +645,47 @@ mod tests {
             ..Default::default()
         };
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_scene_mode_and_weight_profiles_from_env() {
+        with_env(&[("HUB_RETRIEVAL_SCENE_MODE", Some("prefer"))], || {
+            let cfg = AppConfig::from_env().unwrap();
+            assert_eq!(cfg.retrieval_scene_mode, "prefer");
+        });
+        with_env(&[("HUB_RETRIEVAL_SCENE_MODE", Some("loose"))], || {
+            assert!(AppConfig::from_env().is_err(), "未支持的场景模式必须被拒绝");
+        });
+
+        with_env(
+            &[(
+                "HUB_SCENE_WEIGHT_PROFILES",
+                Some("chat=0.45,0.20,0.10,0.15,0.10;coding=1.0,0,0,0,0"),
+            )],
+            || {
+                let cfg = AppConfig::from_env().unwrap();
+                assert_eq!(cfg.retrieval_scene_weight_profiles.len(), 2);
+                assert!((cfg.retrieval_scene_weight_profiles["chat"][0] - 0.45).abs() < 1e-6);
+            },
+        );
+        with_env(
+            &[(
+                "HUB_SCENE_WEIGHT_PROFILES",
+                Some("chat=0.5,0.5,0.5,0.5,0.5"),
+            )],
+            || {
+                assert!(
+                    AppConfig::from_env().is_err(),
+                    "profile 权重之和不为 1 必须被拒绝"
+                );
+            },
+        );
+        with_env(
+            &[("HUB_SCENE_WEIGHT_PROFILES", Some("unknown=1.0,0,0,0,0"))],
+            || {
+                assert!(AppConfig::from_env().is_err(), "未知场景名必须被拒绝");
+            },
+        );
     }
 
     #[test]

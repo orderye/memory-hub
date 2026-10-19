@@ -5,7 +5,7 @@
 //!    - 任务事实记录“本次任务做了什么”，每个结束的任务均完整归档；
 //!    - 经验层通过严格的价值门槛（通用性、可验证性、环境边界、无凭证泄露）；
 //! 2. 幂等控制：同一任务多次 finish 保持幂等；
-//! 3. 反馈闭环：负反馈降低经验置信度与排序权重，绝不物理删除经验；
+//! 3. 反馈闭环：负反馈只降低反馈分（单一因子）与排序权重，绝不物理删除经验；
 //! 4. 环境边界感知：执行环境不匹配时显式警告，严禁伪称适用；
 //! 5. 跨命名空间强隔离：账户沙箱下任何跨 namespace 关联均被阻断。
 
@@ -184,7 +184,8 @@ impl WorkingMemoryService {
             .ok_or_else(|| HubError::InvalidArgument("源任务不存在或无权访问".into()))?;
 
         // 查重：若命名空间内已存在相同任务模式和解决方案的活跃经验，幂等返回
-        let existing = self.store.list_experiences(namespace, None, 100).await?;
+        // （分页扫描全量，避免"只看最近 N 条"导致重复经验被反复写入）
+        let existing = self.scan_experiences(namespace).await?;
         if let Some(found) = existing.into_iter().find(|e| {
             e.task.trim() == candidate.task_pattern.trim()
                 && e.solution.trim() == candidate.solution.trim()
@@ -249,16 +250,15 @@ impl WorkingMemoryService {
             .await?
             .ok_or(HubError::NotFound)?;
 
+        // 反馈只调整 feedback_score 一个因子：置信度反映"提炼时的可信度"，
+        // 此前两者同时被调整、又在打分区相乘，一次负反馈被放大成两次惩罚
         if is_success {
             exp.feedback_score = (exp.feedback_score + 0.1).clamp(0.0, 1.0);
-            exp.confidence = (exp.confidence + 0.05).clamp(0.0, 1.0);
             if exp.status == ExperienceStatus::Candidate {
                 exp.status = ExperienceStatus::Active;
             }
         } else {
-            // 负反馈：降低反馈分与置信度，不直接物理删除
             exp.feedback_score = (exp.feedback_score - 0.25).clamp(0.0, 1.0);
-            exp.confidence = (exp.confidence - 0.15).clamp(0.0, 1.0);
             if exp.feedback_score < 0.3 {
                 exp.status = ExperienceStatus::Deprecated;
             }
@@ -267,7 +267,50 @@ impl WorkingMemoryService {
         self.store.update_experience(&exp).await
     }
 
-    /// 检索可复用经验（感知环境边界）
+    /// 经验检索单页大小与单次扫描上限
+    const EXPERIENCE_PAGE: usize = 200;
+    const EXPERIENCE_SCAN_CAP: usize = 2_000;
+
+    /// 分页扫描命名空间内的经验（替代"只取最近 100 条"的硬上限）
+    async fn scan_experiences(&self, namespace: &str) -> Result<Vec<MemoryExperience>> {
+        let mut pool: Vec<MemoryExperience> = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let page = self
+                .store
+                .list_experiences(namespace, None, Self::EXPERIENCE_PAGE, offset)
+                .await?;
+            let fetched = page.len();
+            pool.extend(page);
+            if fetched < Self::EXPERIENCE_PAGE || pool.len() >= Self::EXPERIENCE_SCAN_CAP {
+                break;
+            }
+            offset += fetched;
+        }
+        pool.truncate(Self::EXPERIENCE_SCAN_CAP);
+        Ok(pool)
+    }
+
+    /// 经验的可检索文本：任务模式 + 方案 + 检索别名 + 已知失败模式
+    fn searchable_text(exp: &MemoryExperience) -> String {
+        let mut text = format!("{} {}", exp.task, exp.solution);
+        if !exp.search_keys.is_empty() {
+            text.push(' ');
+            text.push_str(&exp.search_keys.join(" "));
+        }
+        if !exp.failure_modes.is_empty() {
+            text.push(' ');
+            text.push_str(&exp.failure_modes.join(" "));
+        }
+        text
+    }
+
+    /// 检索可复用经验（与 memory_search 同源的词法打分 + 环境边界匹配）
+    ///
+    /// - 命中判定基于分词词元集合与池内 IDF 加权，不再用整段查询做裸子串匹配；
+    /// - `env` 给出且与经验 `boundary_envs` 不匹配时降权 ×0.5 并给出显式告警，
+    ///   但不吞没结果，交由 Agent 判别；
+    /// - 查询为空时退化为列表召回（按置信度 × 反馈分排序）。
     pub async fn search_experiences(
         &self,
         auth: &AuthCtx,
@@ -280,60 +323,62 @@ impl WorkingMemoryService {
             return Err(HubError::InsufficientScope);
         }
 
-        let all = self.store.list_experiences(namespace, None, 100).await?;
+        let pool = self.scan_experiences(namespace).await?;
 
-        let query_lower = query.to_lowercase();
+        let terms = crate::algorithm::extract_terms(query);
+        let docs: Vec<std::collections::HashSet<String>> = pool
+            .iter()
+            .map(|e| crate::algorithm::document_tokens(&Self::searchable_text(e)))
+            .collect();
+        let pool_size = docs.len();
+        let doc_freq: Vec<usize> = terms
+            .iter()
+            .map(|t| docs.iter().filter(|d| d.contains(t)).count())
+            .collect();
+        let idf = |term: &str| -> f32 {
+            terms
+                .iter()
+                .position(|t| t == term)
+                .map(|i| crate::algorithm::inverse_document_frequency(pool_size, doc_freq[i]))
+                .unwrap_or(1.0)
+        };
+
         let mut results = Vec::new();
-
-        for exp in all {
-            // 过滤已被归档的经验
+        for (exp, tokens) in pool.into_iter().zip(docs) {
+            // 归档经验不召回（弃用经验保留但由低反馈分自然降序）
             if exp.status == ExperienceStatus::Archived {
                 continue;
             }
 
-            // 文本/关键词召回打分
-            let mut score = 0.0f32;
-            let task_lower = exp.task.to_lowercase();
-            let solution_lower = exp.solution.to_lowercase();
-
-            if task_lower.contains(&query_lower) {
-                score += 0.5;
-            }
-            if solution_lower.contains(&query_lower) {
-                score += 0.3;
-            }
-            for k in &exp.search_keys {
-                if query_lower.contains(&k.to_lowercase()) {
-                    score += 0.2;
-                }
-            }
-
-            if score <= 0.0 && !query.trim().is_empty() {
+            let lexical = if terms.is_empty() {
+                1.0
+            } else {
+                crate::algorithm::keyword_score_weighted(&tokens, &terms, &idf)
+            };
+            if lexical <= 0.0 {
                 continue;
             }
 
-            // 结合置信度与反馈分加权
-            score *= exp.confidence * exp.feedback_score;
+            // 置信度 × 反馈分：反馈只调 feedback_score 一个因子，无双重计分
+            let mut score = lexical * exp.confidence * exp.feedback_score;
 
             // 环境边界校验
             let mut env_mismatch = false;
             let mut boundary_warning = None;
-
             if let Some(env) = current_env {
-                if !exp.boundary_envs.is_empty() {
-                    let env_matched = exp
+                if !exp.boundary_envs.is_empty()
+                    && !exp
                         .boundary_envs
                         .iter()
-                        .any(|be| be.eq_ignore_ascii_case(env));
-                    if !env_matched {
-                        env_mismatch = true;
-                        boundary_warning = Some(format!(
-                            "当前环境 [{}] 与经验适用环境边界 {:?} 不匹配，需谨慎参考",
-                            env, exp.boundary_envs
-                        ));
-                        // 环境不匹配时适度降权，但不直接吞没，标明边界供 Agent 判别
-                        score *= 0.5;
-                    }
+                        .any(|be| be.eq_ignore_ascii_case(env))
+                {
+                    env_mismatch = true;
+                    boundary_warning = Some(format!(
+                        "当前环境 [{}] 与经验适用环境边界 {:?} 不匹配，需谨慎参考",
+                        env, exp.boundary_envs
+                    ));
+                    // 环境不匹配时适度降权，但不直接吞没，标明边界供 Agent 判别
+                    score *= 0.5;
                 }
             }
 
@@ -571,9 +616,12 @@ mod tests {
             .await
             .unwrap();
 
-        // 验证：反馈分与置信度下降，但实体并未被删除
+        // 验证：反馈只降低反馈分（单一因子），提炼时的置信度不变；实体未被删除
         assert!(updated1.feedback_score < 1.0);
-        assert!(updated1.confidence < 0.85);
+        assert_eq!(
+            updated1.confidence, 0.85,
+            "反馈不得再同时下调置信度（会被打分区相乘放大成双重惩罚）"
+        );
         assert_eq!(updated1.status, ExperienceStatus::Active);
 
         // 再次多次负反馈触发降级 Deprecated
@@ -664,5 +712,139 @@ mod tests {
             .checkpoint_task(&auth, task_a.id, "ns-b", "越权探测", None)
             .await;
         assert!(matches!(fetch, Err(HubError::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn test_experience_search_is_tokenized_and_env_aware() {
+        let store = Arc::new(TestHubStore::default());
+        let service = WorkingMemoryService::new(store.clone());
+        let auth = make_auth("exp-search-agent");
+
+        let linux_task = service
+            .start_task(&auth, "exp-ns", "排查生产环境内存泄漏", None, None)
+            .await
+            .unwrap();
+        service
+            .distill_experience(
+                &auth,
+                "exp-ns",
+                ExperienceCandidate {
+                    task_pattern: "排查生产环境内存泄漏".into(),
+                    search_keys: vec!["heaptrack".into()],
+                    solution: "用 heaptrack 抓取堆栈定位泄漏点后修复".into(),
+                    preconditions: serde_json::json!({"os": "linux"}),
+                    boundary_envs: vec!["linux".into()],
+                    failure_modes: vec!["未安装调试符号导致堆栈缺失".into()],
+                    validation: serde_json::json!({"ok": true}),
+                    confidence: 1.0,
+                    source_task_id: linux_task.id,
+                },
+            )
+            .await
+            .unwrap();
+
+        let mac_task = service
+            .start_task(&auth, "exp-ns", "配置 jemalloc 内存分配器", None, None)
+            .await
+            .unwrap();
+        service
+            .distill_experience(
+                &auth,
+                "exp-ns",
+                ExperienceCandidate {
+                    task_pattern: "配置 jemalloc 内存分配器".into(),
+                    search_keys: vec!["jemalloc".into()],
+                    solution: "设置 #[global_allocator] 指向 tikv_jemallocator".into(),
+                    preconditions: serde_json::json!({"os": "macos"}),
+                    boundary_envs: vec!["macos".into()],
+                    failure_modes: vec![],
+                    validation: serde_json::json!({"ok": true}),
+                    confidence: 1.0,
+                    source_task_id: mac_task.id,
+                },
+            )
+            .await
+            .unwrap();
+
+        // 回归：查询不是正文的整段子串（"内存泄漏排查" ∉ "排查生产环境内存泄漏"），
+        // 旧的裸子串匹配会整条漏召回；分词部分匹配必须命中
+        let hits = service
+            .search_experiences(&auth, "exp-ns", "内存泄漏排查", Some("linux"), 10)
+            .await
+            .unwrap();
+        assert!(!hits.is_empty(), "分词部分匹配必须召回经验");
+        assert!(
+            hits[0].experience.task.contains("内存泄漏"),
+            "词元命中更多的经验应排在首位：{:#?}",
+            hits.iter()
+                .map(|h| (&h.experience.task, h.score))
+                .collect::<Vec<_>>()
+        );
+        assert!(!hits[0].env_mismatch, "环境匹配时不应标记不匹配");
+
+        // 环境不匹配：显式告警并降权，但不吞没结果
+        let mismatched = service
+            .search_experiences(&auth, "exp-ns", "内存泄漏排查", Some("windows"), 10)
+            .await
+            .unwrap();
+        let linux_hit = mismatched
+            .iter()
+            .find(|h| h.experience.task.contains("内存泄漏"))
+            .expect("不匹配时仍应保留条目");
+        assert!(linux_hit.env_mismatch);
+        assert!(linux_hit
+            .boundary_warning
+            .as_deref()
+            .unwrap_or_default()
+            .contains("windows"));
+        assert!(linux_hit.score < hits[0].score, "环境边界不匹配必须降权");
+
+        // 无关查询：无词元命中即不返回
+        let unrelated = service
+            .search_experiences(&auth, "exp-ns", "量子纠缠波长", None, 10)
+            .await
+            .unwrap();
+        assert!(
+            unrelated.is_empty(),
+            "无词元命中不应返回结果：{unrelated:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_experience_search_scans_all_pages_not_only_recent() {
+        // 回归：检索曾硬编码 list_experiences(..., 100)，只看最近 100 条
+        use crate::infra::ExperienceStore as _;
+        let store = Arc::new(TestHubStore::default());
+        let service = WorkingMemoryService::new(store.clone());
+        let auth = make_auth("exp-page-agent");
+
+        for i in 0..205 {
+            let exp = NewMemoryExperience {
+                id: None,
+                namespace: "page-ns".to_string(),
+                task: format!("历史经验 {}", i),
+                search_keys: vec![format!("key-{}", i)],
+                solution: format!("解决方案 {}", i),
+                preconditions: serde_json::json!({}),
+                boundary_envs: vec![],
+                failure_modes: vec![],
+                validation: serde_json::json!({}),
+                confidence: 1.0,
+                status: ExperienceStatus::Active,
+                feedback_score: 1.0,
+            };
+            store.save_experience(&exp).await.unwrap();
+        }
+
+        // 空查询 → 列表召回；分页扫描必须覆盖第一页之外的条目
+        let all = service
+            .search_experiences(&auth, "page-ns", "", None, 1_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            all.len(),
+            205,
+            "检索必须分页扫描全量经验，而不是只看最近 100 条"
+        );
     }
 }

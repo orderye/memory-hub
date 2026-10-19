@@ -110,8 +110,8 @@ mod tests {
         let list = tools["tools"].as_array().expect("tools 应为数组");
         assert_eq!(
             list.len(),
-            27,
-            "应暴露全部 27 个记忆工具（18 个核心基础工具 + 9 个认知增强工具）"
+            28,
+            "应暴露全部 28 个记忆工具（18 个核心基础工具 + 10 个认知增强工具）"
         );
         assert!(list.iter().any(|t| t["name"] == "memory_put"));
         assert!(list.iter().any(|t| t["name"] == "memory_search"));

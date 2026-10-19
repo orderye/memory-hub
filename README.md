@@ -44,7 +44,7 @@
   - **不可变证据链**（`memory_evidence`）：写入抽取前先持久化原始上下文，确保决策完全可审计溯源；
   - **时间有效性与事实演化**（`valid_from <= t < valid_until`）：新事实通过 `supersedes` 关联自动闭合旧事实有效期，杜绝过期知识产生伪冲突；
   - **Chat 对话认知流**：四层模型（Fact / Summary / Pattern / Intention），意图过期自动失效，防止模型幻觉；
-  - **Working 经验记忆**：任务事实与通用经验严格解耦，环境边界感知（`boundary_envs`，不匹配显式告警并降权），正负反馈闭环衰减；
+  - **Working 经验记忆**：任务事实与通用经验严格解耦；`working_experience_search` 提供分词检索评分（与 `memory_search` 同源词法 + 池内 IDF），环境边界感知（`boundary_envs` 不匹配显式告警并降权），正负反馈闭环（只调整反馈分，单一因子）；
   - **Coding 代码演进链**：真实 Git Diff 捕获、SHA-256 幂等重放、敏感凭证（Token/密钥）自动截断与过滤。
 - **高性能混合检索（Hybrid Retrieval）**：
   - **双路并发召回**：CJK Bigram 零依赖中文全文倒排索引（FTS）与 pgvector HNSW 余弦向量相似度并发召回；过滤条件（场景/层级/时间有效性/状态/标签）下推到存储层，向量路在 pgvector ≥ 0.8 上自动启用 `hnsw.iterative_scan`；
@@ -230,7 +230,8 @@ $$\text{Score} = w_{sim} \cdot \text{VectorSim} + w_{kw} \cdot \text{KeywordHit}
 - **关键词命中**：与 FTS 同源的分词词元集合匹配（非裸子串），并按候选池内 IDF 加权，稀有词元主导命中度；
 - **近期性（Recency）**：以 `occurred_at`（事件时间）优先、`updated_at` 兜底，衰减时间常数按记忆类型区分（偏好 180 天 / 技能流程 90 天 / 事实 60 天 / 事件 14 天 / 笔记 7 天），`HUB_RECENCY_TAU` 可整体覆盖；
 - **层级先验（LayerPrior）**：结构化知识优先于原始观测（Identity/Schema 1.0 > Knowledge/Fact 0.8 > Summary 0.6 > Raw 0.5）；
-- **场景（Scene）**：指定 `scene` 时在存储层硬过滤（跨场景噪声不进入候选），命中条目另享 **+0.05** 加成；
+- **场景（Scene）**：默认 `strict` 模式在存储层硬过滤（跨场景噪声不进入候选），命中条目另享 **+0.05** 加成；`HUB_RETRIEVAL_SCENE_MODE=prefer` 可切换为软偏好（同场景加成、其它场景降权、未标注场景中性，需评测确认后开启）；
+- **分场景权重**：`HUB_SCENE_WEIGHT_PROFILES="chat=0.45,0.20,0.10,0.15,0.10;coding=..."` 可为各场景单独配置五维权重（每套必须权重和为 1，缺省统一使用全局 `HUB_SCORE_WEIGHTS`）；
 - **MMR (Maximal Marginal Relevance) 重排**：`min_score` 阈值先于 MMR 应用，在相关性与多样性之间取得平衡；
 - **全链路容灾**：向量服务不可用时降级为纯文本 FTS；查询嵌入与双路召回共享软超时预算，双路各自超时且已完成的一路结果保留；两路都无结果时才回退游标列表，检索接口永不悬挂。
 

@@ -1463,6 +1463,7 @@ mod tests {
             namespace: &str,
             status: Option<ExperienceStatus>,
             limit: usize,
+            _offset: usize,
         ) -> Result<Vec<MemoryExperience>> {
             let r = self.experiences.read().unwrap();
             let mut list: Vec<_> = r

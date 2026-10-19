@@ -186,6 +186,7 @@ impl ToolDispatcher {
             "working_experience_feedback" => {
                 self.working_experience_feedback(auth, arguments).await
             }
+            "working_experience_search" => self.working_experience_search(auth, arguments).await,
             "coding_thread_create" => self.coding_thread_create(auth, arguments).await,
             "coding_revision_record" => self.coding_revision_record(auth, arguments).await,
             other => {
@@ -1281,6 +1282,62 @@ impl ToolDispatcher {
         }
     }
 
+    async fn working_experience_search(&self, auth: &AuthCtx, args: Value) -> ToolCallResult {
+        #[derive(Deserialize)]
+        struct Req {
+            namespace: String,
+            query: String,
+            #[serde(default)]
+            env: Option<String>,
+            #[serde(default = "default_experience_top_k")]
+            top_k: usize,
+        }
+        fn default_experience_top_k() -> usize {
+            10
+        }
+        match serde_json::from_value::<Req>(args) {
+            Ok(req) => {
+                let service = self
+                    .working_memory
+                    .clone()
+                    .unwrap_or_else(|| {
+                        Arc::new(mem_core::WorkingMemoryService::new(self.store.clone()))
+                    })
+                    .scoped(auth.account_id);
+                match service
+                    .search_experiences(
+                        auth,
+                        &req.namespace,
+                        &req.query,
+                        req.env.as_deref(),
+                        req.top_k.clamp(1, 50),
+                    )
+                    .await
+                {
+                    Ok(results) => {
+                        let items: Vec<Value> = results
+                            .into_iter()
+                            .map(|r| {
+                                json!({
+                                    "score": r.score,
+                                    "env_mismatch": r.env_mismatch,
+                                    "boundary_warning": r.boundary_warning,
+                                    "experience": r.experience,
+                                })
+                            })
+                            .collect();
+                        ToolCallResult::success(json!({ "results": items }))
+                    }
+                    Err(e) => ToolCallResult::error(&e),
+                }
+            }
+            Err(e) => ToolCallResult::error(&HubError::InvalidArgument(format!(
+                "参数不符合 working_experience_search schema: {}",
+                e
+            ))),
+        }
+    }
+
     async fn coding_thread_create(&self, auth: &AuthCtx, args: Value) -> ToolCallResult {
         #[derive(Deserialize)]
         struct Req {
@@ -2129,6 +2186,54 @@ mod tests {
             )
             .await;
         assert!(!fb_res.is_error, "反馈失败: {:?}", fb_res);
+
+        // 6. 经验检索：分词部分匹配 + 环境边界匹配
+        //    （查询不是正文的整段子串，旧实现会整条漏召回）
+        let search_res = d
+            .dispatch(
+                &auth,
+                "working_experience_search",
+                arg(json!({
+                    "namespace": "work-ns",
+                    "query": "内存泄漏排查",
+                    "env": "os:linux",
+                    "top_k": 5,
+                })),
+            )
+            .await;
+        assert!(!search_res.is_error, "经验检索失败: {:?}", search_res);
+        let results = search_res.structured_content.unwrap();
+        let results = results["results"].as_array().unwrap();
+        assert!(
+            results.iter().any(|r| r["experience"]["id"] == exp_id),
+            "经验检索必须能召回刚提炼的经验：{results:?}"
+        );
+        assert_eq!(results[0]["env_mismatch"], json!(false));
+
+        // 7. 环境不匹配：显式告警且降权保留
+        let mismatch_res = d
+            .dispatch(
+                &auth,
+                "working_experience_search",
+                arg(json!({
+                    "namespace": "work-ns",
+                    "query": "内存泄漏排查",
+                    "env": "os:windows",
+                })),
+            )
+            .await;
+        let mismatched = mismatch_res.structured_content.unwrap();
+        let item = mismatched["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["experience"]["id"] == exp_id)
+            .expect("环境不匹配时仍应保留经验");
+        assert_eq!(item["env_mismatch"], json!(true));
+        assert!(item["boundary_warning"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("os:windows"));
     }
 
     #[tokio::test]

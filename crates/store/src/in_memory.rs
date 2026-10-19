@@ -1234,6 +1234,7 @@ impl mem_core::infra::ExperienceStore for InMemoryHubStore {
         namespace: &str,
         status: Option<ExperienceStatus>,
         limit: usize,
+        offset: usize,
     ) -> Result<Vec<MemoryExperience>> {
         let r = self.experiences.read().unwrap();
         let mut list: Vec<MemoryExperience> = r
@@ -1249,8 +1250,7 @@ impl mem_core::infra::ExperienceStore for InMemoryHubStore {
             })
             .collect();
         list.sort_by_key(|e| std::cmp::Reverse(e.updated_at));
-        list.truncate(limit.max(1));
-        Ok(list)
+        Ok(list.into_iter().skip(offset).take(limit.max(1)).collect())
     }
 
     async fn link_task_experience(&self, link: &MemoryTaskExperience) -> Result<()> {

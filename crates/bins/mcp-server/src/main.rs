@@ -66,6 +66,31 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(tau) = cfg.retrieval_recency_tau_days {
         retriever = retriever.with_recency_tau(tau);
     }
+    let scene_mode = match cfg.retrieval_scene_mode.as_str() {
+        "prefer" => mem_core::SceneMode::Prefer,
+        _ => mem_core::SceneMode::Strict,
+    };
+    retriever = retriever.with_scene_mode(scene_mode);
+    if !cfg.retrieval_scene_weight_profiles.is_empty() {
+        let mut profiles = std::collections::HashMap::new();
+        for (name, weights) in &cfg.retrieval_scene_weight_profiles {
+            let scene = match name.as_str() {
+                "chat" => mem_core::MemoryScene::Chat,
+                "working" => mem_core::MemoryScene::Working,
+                "coding" => mem_core::MemoryScene::Coding,
+                other => {
+                    return Err(format!("未知的场景权重 profile：{other}").into());
+                }
+            };
+            profiles.insert(scene, *weights);
+        }
+        info!(
+            profiles = cfg.retrieval_scene_weight_profiles.len(),
+            "已启用分场景权重 profile"
+        );
+        retriever = retriever.with_scene_weight_profiles(profiles);
+    }
+    info!(scene_mode = %cfg.retrieval_scene_mode, "检索场景模式");
     let retriever = Arc::new(retriever);
     let memory_service = Arc::new(
         DefaultMemoryService::new(store.clone(), embedder.clone(), access.clone())

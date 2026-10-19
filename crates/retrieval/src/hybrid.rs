@@ -14,9 +14,9 @@ use mem_core::{
     algorithm::ItemScoreParams, calculate_item_score_with_availability, cosine_similarity,
     document_tokens, extract_terms, inverse_document_frequency, is_superseded_at,
     keyword_score_weighted, l2_normalize, layer_prior, matches_tag_filter, passes_validity_filter,
-    recency_score, recency_tau_days_for, retrieval_reference_time, validity_filter_time, Clock,
-    Embedder, MemoryEntry, MemoryFilter, MemoryStatus, MemoryStore, Retriever, Scored, SearchQuery,
-    SystemClock,
+    recency_score, recency_tau_days_for, retrieval_reference_time, scene_preference_score,
+    validity_filter_time, Clock, Embedder, MemoryEntry, MemoryFilter, MemoryScene, MemoryStatus,
+    MemoryStore, Retriever, SceneMode, Scored, SearchQuery, SystemClock, SCENE_PREFER_BONUS,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,6 +33,9 @@ pub struct HybridRetriever {
     mmr_lambda: f32,
     soft_timeout: Duration,
     recency_tau_override: Option<f32>,
+    scene_mode: SceneMode,
+    /// 分场景权重 profile（按请求 scene 选择；缺省回落到全局权重）
+    scene_weight_profiles: std::collections::HashMap<MemoryScene, [f32; 5]>,
 }
 
 impl HybridRetriever {
@@ -55,6 +58,8 @@ impl HybridRetriever {
             mmr_lambda: mmr_lambda.clamp(0.0, 1.0),
             soft_timeout: Duration::from_millis(soft_timeout_ms.max(1)),
             recency_tau_override: None,
+            scene_mode: SceneMode::Strict,
+            scene_weight_profiles: std::collections::HashMap::new(),
         }
     }
 
@@ -62,6 +67,41 @@ impl HybridRetriever {
     pub fn with_recency_tau(mut self, tau_days: f32) -> Self {
         self.recency_tau_override = Some(tau_days.max(1.0));
         self
+    }
+
+    /// 场景过滤模式（builder）：默认 `Strict` 硬过滤，`Prefer` 为软偏好
+    pub fn with_scene_mode(mut self, mode: SceneMode) -> Self {
+        self.scene_mode = mode;
+        self
+    }
+
+    /// 分场景权重 profile（builder）：请求指定 scene 时优先使用对应权重
+    pub fn with_scene_weight_profiles(
+        mut self,
+        profiles: std::collections::HashMap<MemoryScene, [f32; 5]>,
+    ) -> Self {
+        self.scene_weight_profiles = profiles;
+        self
+    }
+
+    /// 场景过滤下推：strict 模式硬过滤；prefer 模式不下推（由打分降权处理）
+    fn scene_pushdown(&self, q: &SearchQuery) -> Option<MemoryScene> {
+        match self.scene_mode {
+            SceneMode::Strict => q.scene,
+            SceneMode::Prefer => None,
+        }
+    }
+
+    /// 打分语义下的场景保留判定
+    fn scene_keeps(&self, q: &SearchQuery, item: &MemoryEntry) -> bool {
+        q.scene.is_none() || self.scene_mode == SceneMode::Prefer || item.scene == q.scene
+    }
+
+    /// 本次请求生效的五维权重：分场景 profile 优先
+    fn weights_for(&self, q: &SearchQuery) -> [f32; 5] {
+        q.scene
+            .and_then(|s| self.scene_weight_profiles.get(&s).copied())
+            .unwrap_or(self.score_weights)
     }
 
     /// 注入时钟（builder）：评测使用固定时钟，生产使用系统时钟
@@ -91,7 +131,7 @@ impl HybridRetriever {
             statuses: Some(self.statuses_for(q)),
             tags: q.tags.clone(),
             text_contains: Some(q.query_text.clone()),
-            scene: q.scene,
+            scene: self.scene_pushdown(q),
             layer: q.layer,
             // 时间有效性过滤下推到存储层（与打分路径同一语义）
             valid_at: validity_filter_time(q.valid_at, q.include_superseded, self.clock.now()),
@@ -133,7 +173,7 @@ impl HybridRetriever {
             kinds: q.kinds.clone(),
             statuses: Some(self.statuses_for(q)),
             tags: q.tags.clone(),
-            scene: q.scene,
+            scene: self.scene_pushdown(q),
             layer: q.layer,
             valid_at: validity_filter_time(q.valid_at, q.include_superseded, self.clock.now()),
             ..Default::default()
@@ -252,13 +292,15 @@ impl HybridRetriever {
                 .unwrap_or(1.0)
         };
 
+        // 分场景权重 profile：指定场景且配置了 profile 时优先使用
+        let weights = self.weights_for(q);
         let mut scored: Vec<Scored<MemoryEntry>> = candidates
             .into_iter()
             .zip(candidate_tokens)
             .filter(|((item, _), _)| {
                 passes_validity_filter(item, q.valid_at, q.include_superseded, now)
                     && matches_tag_filter(item, &q.tags)
-                    && (q.scene.is_none() || item.scene == q.scene)
+                    && self.scene_keeps(q, item)
                     && (q.layer.is_none() || item.layer == q.layer)
             })
             .map(|((item, vec_sim), tokens)| {
@@ -293,13 +335,21 @@ impl HybridRetriever {
                         rec,
                         prior,
                     },
-                    &self.score_weights,
+                    &weights,
                     [sim_available, true, true, true, true],
                 );
-                // 场景自适应加成：显式命中指定场景提升 +0.05
-                if let Some(scene) = &q.scene {
-                    if item.scene.as_ref() == Some(scene) {
-                        score = (score + 0.05).min(1.0);
+                // 场景处理：strict 模式命中即 +0.05（与既有行为一致）；
+                // prefer 模式按"同场景加成 / 其它场景降权 / 未标注中性"调整
+                match self.scene_mode {
+                    SceneMode::Strict => {
+                        if let Some(scene) = &q.scene {
+                            if item.scene.as_ref() == Some(scene) {
+                                score = (score + SCENE_PREFER_BONUS).min(1.0);
+                            }
+                        }
+                    }
+                    SceneMode::Prefer => {
+                        score = scene_preference_score(score, q.scene, item.scene);
                     }
                 }
                 // 演化回溯时，参考时点上已失效的事实打折（* 0.5），
@@ -1352,6 +1402,106 @@ mod tests {
                 .iter()
                 .map(|s| (&s.item.content, s.score))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scene_prefer_keeps_other_scenes_with_penalty() {
+        let store = Arc::new(TestStore::default());
+        let mut chat = entry("ns", "对话中记录的偏好");
+        chat.scene = Some(MemoryScene::Chat);
+        let mut coding = entry("ns", "对话中讨论的代码重构");
+        coding.scene = Some(MemoryScene::Coding);
+        let unscoped = entry("ns", "对话摘要未标注场景");
+        store.add(chat, None);
+        store.add(coding, None);
+        store.add(unscoped, None);
+
+        let mut q = query("ns", "对话");
+        q.scene = Some(MemoryScene::Chat);
+
+        // strict（默认）：硬过滤，只召回指定场景
+        let strict = retriever(store.clone()).search(&auth(), &q).await.unwrap();
+        assert_eq!(strict.len(), 1, "strict 模式保持既有硬过滤行为");
+        assert_eq!(strict[0].item.scene, Some(MemoryScene::Chat));
+
+        // prefer：其它场景降权保留、未标注场景中性
+        let prefer = retriever(store.clone())
+            .with_scene_mode(SceneMode::Prefer)
+            .search(&auth(), &q)
+            .await
+            .unwrap();
+        assert_eq!(
+            prefer.len(),
+            3,
+            "prefer 模式必须保留其它场景与未标注场景：{prefer:#?}"
+        );
+        assert_eq!(
+            prefer[0].item.scene,
+            Some(MemoryScene::Chat),
+            "同场景应排首位"
+        );
+        let coding_score = prefer
+            .iter()
+            .find(|s| s.item.scene == Some(MemoryScene::Coding))
+            .unwrap()
+            .score;
+        let unscoped_score = prefer
+            .iter()
+            .find(|s| s.item.scene.is_none())
+            .unwrap()
+            .score;
+        assert!(
+            coding_score < unscoped_score,
+            "其它场景应被降权到未标注（中性）场景之下：{coding_score} vs {unscoped_score}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scene_weight_profile_overrides_global_weights() {
+        let store = Arc::new(TestStore::default());
+        // E1：词法精确命中（层级 Raw）；E2：无语义/词法命中但层级 Identity
+        let mut lexical = entry("ns", "东京节点上线");
+        lexical.scene = Some(MemoryScene::Chat);
+        let mut prior = entry("ns", "缓存策略说明");
+        prior.scene = Some(MemoryScene::Chat);
+        prior.layer = Some(mem_core::CognitiveLayer::Identity);
+        store.add(lexical, Some(vec![1.0, 0.0]));
+        store.add(prior, Some(vec![0.0, 1.0]));
+
+        let mut q = query("ns", "东京");
+        q.scene = Some(MemoryScene::Chat);
+
+        let build = |profiles: Option<std::collections::HashMap<MemoryScene, [f32; 5]>>| {
+            let mut r = HybridRetriever::new(
+                store.clone(),
+                Arc::new(TestEmbedder::default()),
+                20,
+                20,
+                [0.0, 0.0, 0.0, 0.0, 1.0],
+                0.7,
+                500,
+            );
+            if let Some(p) = profiles {
+                r = r.with_scene_weight_profiles(p);
+            }
+            r
+        };
+
+        // 全局权重只奖励层级先验 → 先验条目在前
+        let global = build(None).search(&auth(), &q).await.unwrap();
+        assert!(
+            global[0].item.content.contains("缓存"),
+            "全局权重下层级先验应主导：{global:#?}"
+        );
+
+        // chat 场景 profile 只奖励关键词 → 词法命中条目在前
+        let mut profiles = std::collections::HashMap::new();
+        profiles.insert(MemoryScene::Chat, [0.0, 1.0, 0.0, 0.0, 0.0]);
+        let with_profile = build(Some(profiles)).search(&auth(), &q).await.unwrap();
+        assert!(
+            with_profile[0].item.content.contains("东京"),
+            "分场景权重 profile 应改由关键词主导：{with_profile:#?}"
         );
     }
 

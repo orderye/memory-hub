@@ -820,6 +820,39 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                 }
             }),
         },
+        ToolDefinition {
+            name: "working_experience_search",
+            description: "检索可复用的工作任务经验：分词词法命中 + 池内 IDF 加权，并按当前环境边界匹配（不匹配显式告警并降权）。",
+            read_only: true,
+            destructive: false,
+            idempotent: true,
+            required_scope: "memory:read",
+            input_schema: json!({
+                "type": "object",
+                "required": ["namespace", "query"],
+                "additionalProperties": false,
+                "properties": {
+                    "namespace": ns_prop(),
+                    "query": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 2048,
+                        "description": "任务/故障的自然语言描述；为空字符串时退化为列表召回"
+                    },
+                    "env": {
+                        "type": "string",
+                        "maxLength": 128,
+                        "description": "当前执行环境（如 linux / macos / postgres）；给出后与经验 boundary_envs 匹配，不匹配则降权并告警"
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "default": 10
+                    }
+                }
+            }),
+        },
         // ===== 认知增强：Coding 记忆（演进线程与修订记录） =====
         ToolDefinition {
             name: "coding_thread_create",
@@ -957,7 +990,7 @@ mod tests {
     #[test]
     fn test_tool_count_and_names() {
         let defs = get_tool_definitions();
-        assert_eq!(defs.len(), 27, "共应有 18 个基础工具 + 9 个认知增强工具");
+        assert_eq!(defs.len(), 28, "共应有 18 个基础工具 + 10 个认知增强工具");
         let names: Vec<&str> = defs.iter().map(|d| d.name).collect();
         // 原有 18 个基础工具 100% 保留
         for expected in [
@@ -982,7 +1015,7 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "基础工具缺少: {}", expected);
         }
-        // 新增 9 个认知增强工具
+        // 新增 10 个认知增强工具
         for expected in [
             "cognitive_chat_propose",
             "cognitive_proposal_resolve",
@@ -991,6 +1024,7 @@ mod tests {
             "working_task_finish",
             "working_experience_distill",
             "working_experience_feedback",
+            "working_experience_search",
             "coding_thread_create",
             "coding_revision_record",
         ] {

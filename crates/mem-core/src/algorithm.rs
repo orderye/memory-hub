@@ -305,6 +305,47 @@ pub fn mmr_rerank(scores: &[f32], sim_matrix: &[Vec<f32>], k: usize, lambda: f32
     selected
 }
 
+/// 场景过滤模式
+///
+/// - `Strict`（默认）：指定 `scene` 时硬过滤，其它场景与未标注场景的条目都不召回，
+///   保持既有行为不变；
+/// - `Prefer`：不排除其它场景，改为"同场景加成、其它场景降权、未标注场景中性"，
+///   让跨场景的强相关条目也能被 Agent 看到。开启前需经评测确认收益。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SceneMode {
+    #[default]
+    Strict,
+    Prefer,
+}
+
+/// 场景偏好加成（prefer 模式下同场景命中）
+pub const SCENE_PREFER_BONUS: f32 = 0.05;
+/// 场景偏好降权（prefer 模式下其它已标注场景命中）
+pub const SCENE_PREFER_PENALTY: f32 = 0.05;
+
+/// 应用场景偏好：返回调整后的综合分（`None` 场景视为中性，不做任何调整）
+fn apply_scene_preference(
+    score: f32,
+    requested: Option<crate::domain::MemoryScene>,
+    item_scene: Option<crate::domain::MemoryScene>,
+) -> f32 {
+    match (requested, item_scene) {
+        (Some(want), Some(got)) if want == got => (score + SCENE_PREFER_BONUS).min(1.0),
+        (Some(_), Some(_)) => (score - SCENE_PREFER_PENALTY).max(0.0),
+        _ => score,
+    }
+}
+
+/// 场景偏好打分（供检索器在 prefer 模式下使用）
+pub fn scene_preference_score(
+    score: f32,
+    requested: Option<crate::domain::MemoryScene>,
+    item_scene: Option<crate::domain::MemoryScene>,
+) -> f32 {
+    apply_scene_preference(score, requested, item_scene)
+}
+
 /// 检索查询（core 定义，retrieval crate 实现）
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SearchQuery {

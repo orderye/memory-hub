@@ -310,12 +310,15 @@ pub trait ExperienceStore: Send + Sync {
         id: uuid::Uuid,
     ) -> Result<Option<MemoryExperience>>;
 
-    /// 列表经验记忆
+    /// 分页列出经验记忆（`offset` 为跳过的条数，按 updated_at 降序）
+    ///
+    /// 检索路径依赖分页扫描全量候选，硬编码"只取最近 N 条"会系统性漏召回。
     async fn list_experiences(
         &self,
         namespace: &str,
         status: Option<ExperienceStatus>,
         limit: usize,
+        offset: usize,
     ) -> Result<Vec<MemoryExperience>>;
 
     /// 关联任务与经验

@@ -674,10 +674,11 @@ impl<S: ExperienceStore + ?Sized> ExperienceStore for AccountScopedStore<S> {
         namespace: &str,
         status: Option<ExperienceStatus>,
         limit: usize,
+        offset: usize,
     ) -> Result<Vec<MemoryExperience>> {
         let rows = self
             .inner
-            .list_experiences(&self.scoped(namespace), status, limit)
+            .list_experiences(&self.scoped(namespace), status, limit, offset)
             .await?;
         Ok(rows
             .into_iter()

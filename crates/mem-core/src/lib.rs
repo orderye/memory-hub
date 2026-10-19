@@ -41,7 +41,8 @@ pub use algorithm::{
     document_tokens, extract_terms, inverse_document_frequency, is_superseded_at, keyword_score,
     keyword_score_weighted, l2_normalize, layer_prior, matches_tag_filter, mmr_rerank,
     passes_validity_filter, recency_score, recency_tau_days_for, retrieval_reference_time,
-    validity_filter_time, SearchQuery,
+    scene_preference_score, validity_filter_time, SceneMode, SearchQuery, SCENE_PREFER_BONUS,
+    SCENE_PREFER_PENALTY,
 };
 pub use backup_service::{
     grant_checker, BackupCreateRequest, BackupService, DefaultBackupService, PruneReport,

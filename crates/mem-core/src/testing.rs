@@ -786,6 +786,7 @@ impl ExperienceStore for TestHubStore {
         namespace: &str,
         status: Option<ExperienceStatus>,
         limit: usize,
+        offset: usize,
     ) -> Result<Vec<MemoryExperience>> {
         let r = self.experiences.read().unwrap();
         let mut list: Vec<_> = r
@@ -794,8 +795,7 @@ impl ExperienceStore for TestHubStore {
             .cloned()
             .collect();
         list.sort_by_key(|a| std::cmp::Reverse(a.created_at));
-        list.truncate(limit);
-        Ok(list)
+        Ok(list.into_iter().skip(offset).take(limit.max(1)).collect())
     }
 
     async fn link_task_experience(&self, link: &MemoryTaskExperience) -> Result<()> {

@@ -2492,6 +2492,7 @@ impl ExperienceStore for PostgresHubStore {
         namespace: &str,
         status: Option<ExperienceStatus>,
         limit: usize,
+        offset: usize,
     ) -> Result<Vec<MemoryExperience>> {
         let mut builder: sqlx::QueryBuilder<'_, sqlx::Postgres> = sqlx::QueryBuilder::new(
             "select id, namespace, task, search_keys, solution, preconditions, boundary_envs, failure_modes, validation, confidence, status, feedback_score, created_at, updated_at from memory_experiences where namespace = ",
@@ -2503,8 +2504,10 @@ impl ExperienceStore for PostgresHubStore {
             builder.push_bind(s.as_str());
         }
 
-        builder.push(" order by updated_at desc limit ");
+        builder.push(" order by updated_at desc, id asc limit ");
         builder.push_bind(limit.max(1) as i64);
+        builder.push(" offset ");
+        builder.push_bind(offset as i64);
 
         let rows = builder.build().fetch_all(&self.pool).await.pg()?;
         rows.iter().map(Self::experience_from_row).collect()
