@@ -287,6 +287,7 @@ $$\text{Score} = w_{sim} \cdot \text{VectorSim} + w_{kw} \cdot \text{KeywordHit}
 
 ```bash
 # 1. 克隆仓库并复制环境变量模板
+git clone https://github.com/orderye/memory-hub.git && cd memory-hub
 cp .env.example .env
 
 # 2. 至少配置强密钥（必须 >= 32 字符）
@@ -505,4 +506,4 @@ cargo test -p store --features pg-integration -- --ignored
 
 ## 📄 License
 
-本项目采用 [MIT](LICENSE) OR [Apache-2.0](LICENSE) 双协议授权。
+本项目采用 [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE) 双协议授权。

@@ -1706,6 +1706,7 @@ dependencies = [
  "mem-core",
  "serde",
  "serde_json",
+ "sha2",
  "store",
  "tokio",
  "tracing",

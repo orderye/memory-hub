@@ -4,8 +4,9 @@
 # push 到 main 触发：云端构建生产镜像 → 推送 CNB 制品库 → ssh 部署到 tx-cloud
 # 制品镜像：docker.cnb.cool/toroyxxx/memory-hub:${CNB_COMMIT:0:8} 及 latest
 #
-# 部署依赖的 SSH 私钥来自密钥仓 toroyxxx/ci-secrets 的 deploy-key.yml
-# （文件内 allow_slugs/allow_events/allow_branches 限定仅本仓 main push 可引用）。
+# 部署依赖的 SSH 私钥与部署主机地址均来自密钥仓 toroyxxx/ci-secrets 的 deploy-key.yml
+# （文件内 allow_slugs/allow_events/allow_branches 限定仅本仓 main push 可引用；
+#  DEPLOY_HOST 即部署主机，不在流水线内硬编码）。
 # ==============================================================================
 main:
   push:
@@ -40,7 +41,7 @@ main:
             command -v ssh >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq openssh-client; }
             echo "$SSH_KEY_B64" | base64 -d > /tmp/deploy_key && chmod 600 /tmp/deploy_key
             source /tmp/release.env
-            ssh -i /tmp/deploy_key -o StrictHostKeyChecking=accept-new ubuntu@43.143.104.93 "
+            ssh -i /tmp/deploy_key -o StrictHostKeyChecking=accept-new ubuntu@${DEPLOY_HOST} "
               cd ~/memory-hub &&
               if [ -f current_release.env ]; then
                 cp current_release.env previous_release.env
