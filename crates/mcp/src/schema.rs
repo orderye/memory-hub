@@ -547,6 +547,405 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                 }
             }),
         },
+        // ===== 认知增强：对话提炼与提案审核 =====
+        ToolDefinition {
+            name: "cognitive_chat_propose",
+            description: "提交多轮对话内容进行认知提炼，提炼候选记忆事实、实体关联与整合提案。",
+            read_only: false,
+            destructive: false,
+            idempotent: false,
+            required_scope: "memory:write",
+            input_schema: json!({
+                "type": "object",
+                "required": ["namespace", "turns"],
+                "additionalProperties": false,
+                "properties": {
+                    "namespace": ns_prop(),
+                    "turns": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "required": ["role", "content"],
+                            "additionalProperties": false,
+                            "properties": {
+                                "role": { "type": "string", "minLength": 1, "maxLength": 32 },
+                                "content": { "type": "string", "minLength": 1, "maxLength": 16384 }
+                            }
+                        },
+                        "description": "对话轮次列表（包含角色与内容）"
+                    },
+                    "scene": {
+                        "enum": ["chat", "working", "coding"],
+                        "description": "对话所属场景（默认 chat）"
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "maxLength": 128,
+                        "description": "可选会话/线程标识"
+                    },
+                    "metadata": {
+                        "type": "object",
+                        "description": "可选提炼上下文元数据"
+                    }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "cognitive_proposal_resolve",
+            description: "审核并决策认知提炼生成的整合提案（接受采纳、驳回拒绝或自定义编辑合并）。",
+            read_only: false,
+            destructive: false,
+            idempotent: true,
+            required_scope: "memory:write",
+            input_schema: json!({
+                "type": "object",
+                "required": ["proposal_id", "decision"],
+                "additionalProperties": false,
+                "properties": {
+                    "proposal_id": {
+                        "type": "string",
+                        "format": "uuid",
+                        "description": "提案 UUID"
+                    },
+                    "decision": {
+                        "enum": ["accepted", "rejected", "modified"],
+                        "description": "决策操作"
+                    },
+                    "reason": {
+                        "type": "string",
+                        "maxLength": 1024,
+                        "description": "审核决策理由或备注"
+                    },
+                    "custom_content": {
+                        "type": "string",
+                        "maxLength": 8192,
+                        "description": "决策为 modified 时提供的最终修订正文"
+                    }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "cognitive_intentions_list",
+            description: "查询指定命名空间下的认知意图与候选提案列表。",
+            read_only: true,
+            destructive: false,
+            idempotent: true,
+            required_scope: "memory:read",
+            input_schema: json!({
+                "type": "object",
+                "required": ["namespace"],
+                "additionalProperties": false,
+                "properties": {
+                    "namespace": ns_prop(),
+                    "status": {
+                        "enum": ["open", "merged", "dismissed", "expired"],
+                        "description": "提案状态过滤"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "default": 20,
+                        "description": "最大返回条数"
+                    }
+                }
+            }),
+        },
+        // ===== 认知增强：Working 记忆（任务生命周期与经验提炼） =====
+        ToolDefinition {
+            name: "working_task_start",
+            description: "登记或开启一项工作流任务（Working Task），支持关联证据溯源。",
+            read_only: false,
+            destructive: false,
+            idempotent: false,
+            required_scope: "memory:write",
+            input_schema: json!({
+                "type": "object",
+                "required": ["namespace", "task"],
+                "additionalProperties": false,
+                "properties": {
+                    "namespace": ns_prop(),
+                    "task": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 2048,
+                        "description": "任务目标描述"
+                    },
+                    "scene": {
+                        "enum": ["chat", "working", "coding"],
+                        "description": "任务发生场景（默认 working）"
+                    },
+                    "source_evidence_id": {
+                        "type": "string",
+                        "format": "uuid",
+                        "description": "关联的前置证据 ID"
+                    },
+                    "metadata": {
+                        "type": "object",
+                        "description": "任务自定义上下文元数据"
+                    }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "working_task_finish",
+            description: "完成或终止工作流任务，记录执行结果摘要或失败原因。",
+            read_only: false,
+            destructive: false,
+            idempotent: true,
+            required_scope: "memory:write",
+            input_schema: json!({
+                "type": "object",
+                "required": ["namespace", "task_id", "status"],
+                "additionalProperties": false,
+                "properties": {
+                    "namespace": ns_prop(),
+                    "task_id": {
+                        "type": "string",
+                        "format": "uuid",
+                        "description": "任务 UUID"
+                    },
+                    "status": {
+                        "enum": ["completed", "failed", "cancelled"],
+                        "description": "任务终态"
+                    },
+                    "result_summary": {
+                        "type": "string",
+                        "maxLength": 4096,
+                        "description": "执行结果摘要"
+                    },
+                    "failure_reason": {
+                        "type": "string",
+                        "maxLength": 4096,
+                        "description": "失败原因（状态为 failed 时填写）"
+                    }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "working_experience_distill",
+            description: "将工作流任务或人工复盘提炼沉淀为经验记忆（包含问题模式、解决方案、前置条件与边界环境）。",
+            read_only: false,
+            destructive: false,
+            idempotent: false,
+            required_scope: "memory:write",
+            input_schema: json!({
+                "type": "object",
+                "required": ["namespace", "task", "solution"],
+                "additionalProperties": false,
+                "properties": {
+                    "namespace": ns_prop(),
+                    "task": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 2048,
+                        "description": "任务/问题模式描述"
+                    },
+                    "solution": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 8192,
+                        "description": "经过验证的解决方案"
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "format": "uuid",
+                        "description": "可选关联源任务 ID"
+                    },
+                    "search_keys": {
+                        "type": "array",
+                        "items": { "type": "string", "maxLength": 64 },
+                        "description": "经验检索索引关键词"
+                    },
+                    "preconditions": {
+                        "type": "array",
+                        "items": { "type": "string", "maxLength": 256 },
+                        "description": "方案适用的前置条件列表"
+                    },
+                    "boundary_envs": {
+                        "type": "array",
+                        "items": { "type": "string", "maxLength": 128 },
+                        "description": "适用环境与边界约束（如 os:linux, db:pg）"
+                    },
+                    "failure_modes": {
+                        "type": "array",
+                        "items": { "type": "string", "maxLength": 256 },
+                        "description": "已知失败模式或踩坑警示"
+                    },
+                    "validation": {
+                        "type": "string",
+                        "maxLength": 1024,
+                        "description": "验证方案或验证标准"
+                    },
+                    "confidence": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1,
+                        "default": 1.0,
+                        "description": "经验置信度"
+                    }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "working_experience_feedback",
+            description: "对沉淀的经验记忆提供效用反馈评分与状态演化（成功加分、踩坑减分）。",
+            read_only: false,
+            destructive: false,
+            idempotent: true,
+            required_scope: "memory:write",
+            input_schema: json!({
+                "type": "object",
+                "required": ["namespace", "experience_id", "score"],
+                "additionalProperties": false,
+                "properties": {
+                    "namespace": ns_prop(),
+                    "experience_id": {
+                        "type": "string",
+                        "format": "uuid",
+                        "description": "经验 UUID"
+                    },
+                    "score": {
+                        "type": "number",
+                        "minimum": -1,
+                        "maximum": 1,
+                        "description": "反馈评分（+1 验证有效，-1 产生故障，0 中立）"
+                    },
+                    "status": {
+                        "enum": ["candidate", "active", "deprecated", "archived"],
+                        "description": "可选更新经验生命周期状态"
+                    }
+                }
+            }),
+        },
+        // ===== 认知增强：Coding 记忆（演进线程与修订记录） =====
+        ToolDefinition {
+            name: "coding_thread_create",
+            description: "创建一条代码演进或重构逻辑线程（Coding Thread）。",
+            read_only: false,
+            destructive: false,
+            idempotent: false,
+            required_scope: "memory:write",
+            input_schema: json!({
+                "type": "object",
+                "required": ["namespace", "repository", "title"],
+                "additionalProperties": false,
+                "properties": {
+                    "namespace": ns_prop(),
+                    "repository": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 256,
+                        "description": "代码仓库标识（如 owner/repo）"
+                    },
+                    "branch": {
+                        "type": "string",
+                        "maxLength": 256,
+                        "description": "目标分支名称"
+                    },
+                    "title": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 512,
+                        "description": "线程主题或重构任务标题"
+                    },
+                    "description": {
+                        "type": "string",
+                        "maxLength": 4096,
+                        "description": "详细背景或设计说明"
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "format": "uuid",
+                        "description": "可选关联的 Working Task ID"
+                    }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "coding_revision_record",
+            description: "记录代码修订快照（Diff、变更类型、安全相对路径、符号指纹或关联任务/证据）。",
+            read_only: false,
+            destructive: false,
+            idempotent: true,
+            required_scope: "memory:write",
+            input_schema: json!({
+                "type": "object",
+                "required": ["namespace", "repository", "file_path", "diff_content", "change_kind"],
+                "additionalProperties": false,
+                "properties": {
+                    "namespace": ns_prop(),
+                    "repository": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 256,
+                        "description": "代码仓库标识"
+                    },
+                    "file_path": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 512,
+                        "description": "安全相对文件路径（禁止路径穿越、绝对路径与敏感凭证文件）"
+                    },
+                    "diff_content": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 32768,
+                        "description": "代码变更 Unified Diff 文本（自动检测并禁止泄漏 Token/私钥）"
+                    },
+                    "change_kind": {
+                        "enum": ["add", "modify", "delete", "rename"],
+                        "description": "变更类型"
+                    },
+                    "thread_id": {
+                        "type": "string",
+                        "format": "uuid",
+                        "description": "所属代码线程 ID"
+                    },
+                    "branch": {
+                        "type": "string",
+                        "maxLength": 256,
+                        "description": "所属分支"
+                    },
+                    "commit_sha": {
+                        "type": "string",
+                        "maxLength": 64,
+                        "description": "Git Commit SHA"
+                    },
+                    "parent_sha": {
+                        "type": "string",
+                        "maxLength": 64,
+                        "description": "父 Commit SHA"
+                    },
+                    "symbol_fingerprint": {
+                        "type": "string",
+                        "maxLength": 512,
+                        "description": "变更符号指纹或函数签名摘要"
+                    },
+                    "is_committed": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "是否已正式提交 Git"
+                    },
+                    "author": {
+                        "type": "string",
+                        "maxLength": 128,
+                        "description": "提交作者"
+                    },
+                    "source_evidence_id": {
+                        "type": "string",
+                        "format": "uuid",
+                        "description": "溯源证据 ID"
+                    },
+                    "source_task_id": {
+                        "type": "string",
+                        "format": "uuid",
+                        "description": "关联 Working Task ID"
+                    }
+                }
+            }),
+        },
     ]
 }
 
@@ -557,8 +956,9 @@ mod tests {
     #[test]
     fn test_tool_count_and_names() {
         let defs = get_tool_definitions();
-        assert_eq!(defs.len(), 18);
+        assert_eq!(defs.len(), 27, "共应有 18 个基础工具 + 9 个认知增强工具");
         let names: Vec<&str> = defs.iter().map(|d| d.name).collect();
+        // 原有 18 个基础工具 100% 保留
         for expected in [
             "memory_put",
             "memory_get",
@@ -579,7 +979,21 @@ mod tests {
             "memory_grant",
             "memory_revoke",
         ] {
-            assert!(names.contains(&expected), "缺少工具: {}", expected);
+            assert!(names.contains(&expected), "基础工具缺少: {}", expected);
+        }
+        // 新增 9 个认知增强工具
+        for expected in [
+            "cognitive_chat_propose",
+            "cognitive_proposal_resolve",
+            "cognitive_intentions_list",
+            "working_task_start",
+            "working_task_finish",
+            "working_experience_distill",
+            "working_experience_feedback",
+            "coding_thread_create",
+            "coding_revision_record",
+        ] {
+            assert!(names.contains(&expected), "认知增强工具缺少: {}", expected);
         }
     }
 

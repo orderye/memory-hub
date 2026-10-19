@@ -56,6 +56,20 @@ impl WorkingMemoryService {
         scene: Option<MemoryScene>,
         metadata: Option<serde_json::Value>,
     ) -> Result<MemoryTask> {
+        self.start_task_with_evidence(auth, namespace, task, scene, None, metadata)
+            .await
+    }
+
+    /// 启动新任务并关联前置证据溯源
+    pub async fn start_task_with_evidence(
+        &self,
+        auth: &AuthCtx,
+        namespace: &str,
+        task: &str,
+        scene: Option<MemoryScene>,
+        source_evidence_id: Option<Uuid>,
+        metadata: Option<serde_json::Value>,
+    ) -> Result<MemoryTask> {
         if !auth.has_scope(&Scope::Write) {
             return Err(HubError::InsufficientScope);
         }
@@ -74,7 +88,7 @@ impl WorkingMemoryService {
             finished_at: None,
             result_summary: None,
             failure_reason: None,
-            source_evidence_id: None,
+            source_evidence_id,
             metadata: metadata.unwrap_or_else(|| serde_json::json!({})),
         };
 
@@ -177,6 +191,7 @@ impl WorkingMemoryService {
         }) {
             // 补充关联当前源任务
             let link = MemoryTaskExperience {
+                namespace: Some(namespace.to_string()),
                 task_id: source_task.id,
                 experience_id: found.id,
                 relation_kind: "reused".to_string(),
@@ -205,6 +220,7 @@ impl WorkingMemoryService {
 
         // 建立任务与经验的双向关联映射
         let link = MemoryTaskExperience {
+            namespace: Some(namespace.to_string()),
             task_id: source_task.id,
             experience_id: saved.id,
             relation_kind: "derived".to_string(),

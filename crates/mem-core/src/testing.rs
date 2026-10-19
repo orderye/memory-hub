@@ -581,8 +581,9 @@ impl EvidenceStore for TestHubStore {
 
 #[async_trait]
 impl RelationStore for TestHubStore {
-    async fn add_relation(&self, _ns: &str, rel: &NewMemoryRelation) -> Result<MemoryRelation> {
+    async fn add_relation(&self, ns: &str, rel: &NewMemoryRelation) -> Result<MemoryRelation> {
         let record = MemoryRelation {
+            namespace: Some(ns.to_string()),
             from_memory_id: rel.from_memory_id,
             to_memory_id: rel.to_memory_id,
             relation_kind: rel.relation_kind,
@@ -705,6 +706,17 @@ impl TaskStore for TestHubStore {
             .cloned()
             .collect())
     }
+
+    async fn delete_task(&self, namespace: &str, id: Uuid) -> Result<()> {
+        let mut r = self.tasks.write().unwrap();
+        if r.remove(&(namespace.to_string(), id)).is_some() {
+            let mut te = self.task_experiences.write().unwrap();
+            te.retain(|l| l.task_id != id);
+            Ok(())
+        } else {
+            Err(HubError::NotFound)
+        }
+    }
 }
 
 #[async_trait]
@@ -807,6 +819,17 @@ impl ExperienceStore for TestHubStore {
             .filter(|te| exp_ids.contains(&te.experience_id))
             .cloned()
             .collect())
+    }
+
+    async fn delete_experience(&self, namespace: &str, id: Uuid) -> Result<()> {
+        let mut r = self.experiences.write().unwrap();
+        if r.remove(&(namespace.to_string(), id)).is_some() {
+            let mut te = self.task_experiences.write().unwrap();
+            te.retain(|l| l.experience_id != id);
+            Ok(())
+        } else {
+            Err(HubError::NotFound)
+        }
     }
 }
 
@@ -971,6 +994,27 @@ impl CodingStore for TestHubStore {
             .collect();
         list.sort_by_key(|r| (r.created_at, r.id));
         Ok(list)
+    }
+
+    async fn delete_thread(&self, namespace: &str, id: Uuid) -> Result<()> {
+        let mut r = self.coding_threads.write().unwrap();
+        if r.remove(&(namespace.to_string(), id)).is_some() {
+            // Also clean up revisions referencing this thread
+            let mut revs = self.coding_revisions.write().unwrap();
+            revs.retain(|_, v| v.thread_id != Some(id));
+            Ok(())
+        } else {
+            Err(HubError::NotFound)
+        }
+    }
+
+    async fn delete_revision(&self, namespace: &str, id: Uuid) -> Result<()> {
+        let mut r = self.coding_revisions.write().unwrap();
+        if r.remove(&(namespace.to_string(), id)).is_some() {
+            Ok(())
+        } else {
+            Err(HubError::NotFound)
+        }
     }
 }
 

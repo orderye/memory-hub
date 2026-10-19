@@ -218,6 +218,8 @@ pub struct NewEvidence {
 /// 记忆实体关系（P1 引入）
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryRelation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<Namespace>,
     pub from_memory_id: Uuid,
     pub to_memory_id: Uuid,
     pub relation_kind: MemoryRelationKind,
@@ -374,6 +376,12 @@ pub fn validate_cognitive_candidate(candidate: &CognitiveCandidate) -> common::R
     if candidate.tags.len() > 32 {
         return Err(common::HubError::InvalidArgument(
             "标签数不能超过 32".into(),
+        ));
+    }
+
+    if contains_sensitive_credentials(trimmed) {
+        return Err(common::HubError::InvalidArgument(
+            "候选记忆包含敏感凭证或密钥，严禁持久化".into(),
         ));
     }
 
@@ -575,6 +583,8 @@ pub struct NewMemoryExperience {
 /// 任务与经验关联映射
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryTaskExperience {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<Namespace>,
     pub task_id: Uuid,
     pub experience_id: Uuid,
     pub relation_kind: String,
@@ -599,21 +609,130 @@ pub struct ExperienceCandidate {
 pub fn contains_sensitive_credentials(text: &str) -> bool {
     let lower = text.to_lowercase();
     let sensitive_patterns = [
+        // Authorization & Bearer
         "bearer ",
+        // OpenAI & LLM Providers
         "sk-",
+        "sk_live_",
+        "sk_test_",
+        // GitHub Tokens (all variations)
         "ghp_",
         "gho_",
+        "ghu_",
+        "ghs_",
+        "ghr_",
+        "github_pat_",
+        // GitLab Tokens
+        "glpat-",
+        // Slack Tokens (all variations)
         "xoxb-",
         "xoxp-",
+        "xoxa-",
+        "xoxr-",
+        "xoxe-",
+        "xoxs-",
+        // AWS Access Keys & Secrets
         "akia",
+        "asia",
+        "aws_secret_access_key",
+        "aws_access_key_id",
+        // Private Keys (all formats)
         "-----begin private key-----",
         "-----begin rsa private key-----",
         "-----begin openssh private key-----",
+        "-----begin dsa private key-----",
+        "-----begin ec private key-----",
+        "-----begin encrypted private key-----",
+        "-----begin pgp private key-----",
+        // Generic Password / Secret Key assignments
         "password=",
+        "password:",
+        "passwd=",
+        "passwd:",
         "secret_key",
         "client_secret",
+        "api_key=",
+        "apikey=",
+        "access_token=",
     ];
     sensitive_patterns.iter().any(|p| lower.contains(p))
+}
+
+/// 校验文件相对路径安全性：
+/// 1. 不得为空；
+/// 2. 拒绝空字符 '\0'；
+/// 3. 拒绝路径穿越 ("..")；
+/// 4. 拒绝绝对路径（'/' 或 '\\' 开头）；
+/// 5. 拒绝 Windows UNC 共享路径 ("\\\\", "//", "\\?\", etc.)；
+/// 6. 拒绝 Windows 盘符路径（如 "C:", "D:\"）；
+/// 7. 拒绝包含敏感配置文件或密钥路径。
+pub fn validate_safe_relative_path(path: &str) -> common::Result<()> {
+    let p = path.trim();
+    if p.is_empty() {
+        return Err(common::HubError::InvalidArgument("文件路径不能为空".into()));
+    }
+
+    if p.as_bytes().contains(&0) {
+        return Err(common::HubError::InvalidArgument(
+            "文件路径包含非法空字符".into(),
+        ));
+    }
+
+    if p.contains("..") {
+        return Err(common::HubError::InvalidArgument(
+            "文件路径存在路径穿越 (..) 风险".into(),
+        ));
+    }
+
+    if p.starts_with('/') || p.starts_with('\\') {
+        return Err(common::HubError::InvalidArgument(
+            "文件路径不得为绝对路径或 UNC 路径".into(),
+        ));
+    }
+
+    if p.contains("//") || p.contains(r"\\") {
+        return Err(common::HubError::InvalidArgument(
+            "文件路径包含非法连续分隔符或 UNC 模式".into(),
+        ));
+    }
+
+    // Windows 盘符如 C: / C:\ / c:/
+    let bytes = p.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return Err(common::HubError::InvalidArgument(
+            "文件路径包含 Windows 驱动器盘符".into(),
+        ));
+    }
+
+    let p_lower = p.to_lowercase();
+    let forbidden_patterns = [
+        ".env",
+        ".git/",
+        ".git\\",
+        "id_rsa",
+        "id_ed25519",
+        "id_ecdsa",
+        "id_dsa",
+        ".pem",
+        ".key",
+        "credentials.json",
+        "service-account",
+        "service_account",
+        "authorized_keys",
+        "known_hosts",
+    ];
+
+    if forbidden_patterns
+        .iter()
+        .any(|pattern| p_lower.contains(pattern))
+    {
+        return Err(common::HubError::InvalidArgument(format!(
+            "禁止将敏感配置文件或私钥路径纳入代码演进记忆: {}",
+            p
+        )));
+    }
+
+    Ok(())
 }
 
 /// 验证经验候选质量门槛
@@ -796,38 +915,7 @@ pub fn validate_coding_revision(revision: &NewCodingRevision) -> common::Result<
         return Err(common::HubError::InvalidArgument("仓库标识不能为空".into()));
     }
 
-    let path = revision.file_path.trim();
-    if path.is_empty() {
-        return Err(common::HubError::InvalidArgument("文件路径不能为空".into()));
-    }
-
-    // 路径安全检查：防止路径穿越和非法的绝对路径
-    if path.contains("..") || path.starts_with('/') || path.starts_with('\\') {
-        return Err(common::HubError::InvalidArgument(
-            "文件路径存在路径穿越或非法的绝对路径".into(),
-        ));
-    }
-
-    let path_lower = path.to_lowercase();
-    let forbidden_path_patterns = [
-        ".env",
-        ".git/",
-        "id_rsa",
-        "id_ed25519",
-        ".pem",
-        ".key",
-        "credentials.json",
-        "service-account",
-    ];
-    if forbidden_path_patterns
-        .iter()
-        .any(|p| path_lower.contains(p))
-    {
-        return Err(common::HubError::InvalidArgument(format!(
-            "禁止将敏感配置文件或私钥路径纳入代码演进记忆: {}",
-            path
-        )));
-    }
+    validate_safe_relative_path(&revision.file_path)?;
 
     // Diff 大小限制
     if revision.diff_content.len() > MAX_DIFF_SIZE_BYTES {
@@ -1327,4 +1415,158 @@ pub struct MemoryStats {
     pub by_kind: HashMap<String, usize>,
     pub by_agent: HashMap<String, usize>,
     pub expiring_24h: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_safe_relative_path_blocks_traversal_and_sensitive_patterns() {
+        // 合法安全相对路径
+        assert!(validate_safe_relative_path("src/main.rs").is_ok());
+        assert!(validate_safe_relative_path("crates/mem-core/src/domain.rs").is_ok());
+        assert!(validate_safe_relative_path("README.md").is_ok());
+        assert!(validate_safe_relative_path("docs/architecture/flow.png").is_ok());
+
+        // 空路径
+        assert!(validate_safe_relative_path("").is_err());
+        assert!(validate_safe_relative_path("   ").is_err());
+
+        // 空字符注入
+        assert!(validate_safe_relative_path("src/foo\0bar.rs").is_err());
+
+        // 路径穿越 (..)
+        assert!(validate_safe_relative_path("../secret.txt").is_err());
+        assert!(validate_safe_relative_path("src/../../etc/passwd").is_err());
+        assert!(validate_safe_relative_path("foo/../bar").is_err());
+        assert!(validate_safe_relative_path(r"foo\..\bar").is_err());
+
+        // 绝对路径
+        assert!(validate_safe_relative_path("/etc/passwd").is_err());
+        assert!(validate_safe_relative_path(r"\Windows\System32\cmd.exe").is_err());
+
+        // Windows UNC 共享路径
+        assert!(validate_safe_relative_path(r"\\server\share\file.txt").is_err());
+        assert!(validate_safe_relative_path("//server/share/file.txt").is_err());
+        assert!(validate_safe_relative_path(r"\\?\C:\foo").is_err());
+
+        // Windows 盘符路径
+        assert!(validate_safe_relative_path(r"C:\Windows\System32").is_err());
+        assert!(validate_safe_relative_path("c:/users/admin").is_err());
+        assert!(validate_safe_relative_path("D:file.txt").is_err());
+
+        // 敏感配置文件与私钥路径
+        assert!(validate_safe_relative_path(".env").is_err());
+        assert!(validate_safe_relative_path("config/.env.local").is_err());
+        assert!(validate_safe_relative_path(".git/config").is_err());
+        assert!(validate_safe_relative_path(r".git\HEAD").is_err());
+        assert!(validate_safe_relative_path("keys/id_rsa").is_err());
+        assert!(validate_safe_relative_path("keys/id_ed25519").is_err());
+        assert!(validate_safe_relative_path("certs/server.pem").is_err());
+        assert!(validate_safe_relative_path("certs/private.key").is_err());
+        assert!(validate_safe_relative_path("credentials.json").is_err());
+        assert!(validate_safe_relative_path("auth/service-account.json").is_err());
+    }
+
+    #[test]
+    fn test_contains_sensitive_credentials_detects_all_token_variants() {
+        // 安全正常内容
+        assert!(!contains_sensitive_credentials(
+            "Normal code and documentation"
+        ));
+        assert!(!contains_sensitive_credentials(
+            "fn process_data(input: &str) -> Result<()>"
+        ));
+
+        // Bearer 令牌
+        assert!(contains_sensitive_credentials(
+            "Authorization: Bearer eyJhbGciOiJIUzI1NiIs..."
+        ));
+
+        // OpenAI / LLM API keys
+        assert!(contains_sensitive_credentials("sk-1234567890abcdef"));
+        assert!(contains_sensitive_credentials("sk_live_1234567890"));
+        assert!(contains_sensitive_credentials("sk_test_1234567890"));
+
+        // GitHub 令牌变体
+        assert!(contains_sensitive_credentials("ghp_1234567890abcdef"));
+        assert!(contains_sensitive_credentials("gho_1234567890abcdef"));
+        assert!(contains_sensitive_credentials("ghu_1234567890abcdef"));
+        assert!(contains_sensitive_credentials("ghs_1234567890abcdef"));
+        assert!(contains_sensitive_credentials("ghr_1234567890abcdef"));
+        assert!(contains_sensitive_credentials(
+            "github_pat_1234567890abcdef"
+        ));
+
+        // GitLab 令牌
+        assert!(contains_sensitive_credentials("glpat-abcdef1234567890"));
+
+        // Slack 令牌变体
+        assert!(contains_sensitive_credentials("xoxb-1234567890"));
+        assert!(contains_sensitive_credentials("xoxp-1234567890"));
+        assert!(contains_sensitive_credentials("xoxa-1234567890"));
+        assert!(contains_sensitive_credentials("xoxe-1234567890"));
+
+        // AWS 访问密钥
+        assert!(contains_sensitive_credentials("AKIAIOSFODNN7EXAMPLE"));
+        assert!(contains_sensitive_credentials("ASIAIOSFODNN7EXAMPLE"));
+        assert!(contains_sensitive_credentials(
+            "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+        ));
+
+        // 各格式私钥
+        assert!(contains_sensitive_credentials(
+            "-----BEGIN PRIVATE KEY-----"
+        ));
+        assert!(contains_sensitive_credentials(
+            "-----BEGIN RSA PRIVATE KEY-----"
+        ));
+        assert!(contains_sensitive_credentials(
+            "-----BEGIN OPENSSH PRIVATE KEY-----"
+        ));
+        assert!(contains_sensitive_credentials(
+            "-----BEGIN EC PRIVATE KEY-----"
+        ));
+
+        // 通用密码 / 敏感键分配
+        assert!(contains_sensitive_credentials("db_password=supersecret"));
+        assert!(contains_sensitive_credentials("password: 'mypassword'"));
+        assert!(contains_sensitive_credentials("api_key=abcdef123456"));
+        assert!(contains_sensitive_credentials("client_secret = 'secret'"));
+    }
+
+    #[test]
+    fn test_validate_coding_revision_enforces_safety_and_diff_limits() {
+        let mut rev = NewCodingRevision {
+            id: None,
+            thread_id: None,
+            namespace: "coding-ns".to_string(),
+            repository: "memory-hub".to_string(),
+            branch: Some("main".to_string()),
+            commit_sha: Some("abc1234".to_string()),
+            parent_sha: None,
+            file_path: "crates/mem-core/src/domain.rs".to_string(),
+            change_kind: CodeChangeKind::Modify,
+            diff_content: "+ pub fn test() {}".to_string(),
+            symbol_fingerprint: None,
+            is_committed: true,
+            author: Some("developer".to_string()),
+            occurred_at: None,
+            source_evidence_id: None,
+            source_task_id: None,
+        };
+
+        // 合法 revision
+        assert!(validate_coding_revision(&rev).is_ok());
+
+        // 包含敏感凭证
+        rev.diff_content = "+ let api_key = \"ghp_1234567890abcdef\";".to_string();
+        assert!(validate_coding_revision(&rev).is_err());
+
+        // 包含危险路径
+        rev.diff_content = "+ pub fn clean() {}".to_string();
+        rev.file_path = "../../etc/shadow".to_string();
+        assert!(validate_coding_revision(&rev).is_err());
+    }
 }

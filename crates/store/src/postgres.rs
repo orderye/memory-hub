@@ -200,6 +200,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "20261018000008_coding_memory_revisions",
         include_str!("../migrations/20261018000008_coding_memory_revisions.sql"),
     ),
+    (
+        "20261019000009_composite_namespace_fk_hardening",
+        include_str!("../migrations/20261019000009_composite_namespace_fk_hardening.sql"),
+    ),
 ];
 
 /// PostgreSQL 四合一存储
@@ -479,6 +483,7 @@ impl PostgresHubStore {
         let kind_str: String = r.try_get("relation_kind").pg()?;
         let relation_kind = mapping::parse_relation_kind(&kind_str)?;
         Ok(MemoryRelation {
+            namespace: r.try_get("namespace").ok(),
             from_memory_id: r.try_get("from_memory_id").pg()?,
             to_memory_id: r.try_get("to_memory_id").pg()?,
             relation_kind,
@@ -531,6 +536,7 @@ impl PostgresHubStore {
 
     fn task_experience_from_row(r: &PgRow) -> Result<MemoryTaskExperience> {
         Ok(MemoryTaskExperience {
+            namespace: r.try_get("namespace").ok(),
             task_id: r.try_get("task_id").pg()?,
             experience_id: r.try_get("experience_id").pg()?,
             relation_kind: r.try_get("relation_kind").pg()?,
@@ -2076,14 +2082,16 @@ impl RelationStore for PostgresHubStore {
 
         let row = sqlx::query(
             r#"
-            insert into memory_relations (from_memory_id, to_memory_id, relation_kind, confidence, source_evidence_id, created_at)
-            values ($1, $2, $3, $4, $5, now())
+            insert into memory_relations (namespace, from_memory_id, to_memory_id, relation_kind, confidence, source_evidence_id, created_at)
+            values ($1, $2, $3, $4, $5, $6, now())
             on conflict (from_memory_id, to_memory_id, relation_kind) do update set
+                namespace = excluded.namespace,
                 confidence = excluded.confidence,
                 source_evidence_id = coalesce(excluded.source_evidence_id, memory_relations.source_evidence_id)
-            returning from_memory_id, to_memory_id, relation_kind, confidence, source_evidence_id, created_at
+            returning namespace, from_memory_id, to_memory_id, relation_kind, confidence, source_evidence_id, created_at
             "#,
         )
+        .bind(namespace)
         .bind(relation.from_memory_id)
         .bind(relation.to_memory_id)
         .bind(relation.relation_kind.as_str())
@@ -2103,7 +2111,7 @@ impl RelationStore for PostgresHubStore {
     ) -> Result<Vec<MemoryRelation>> {
         let rows = sqlx::query(
             r#"
-            select r.from_memory_id, r.to_memory_id, r.relation_kind, r.confidence, r.source_evidence_id, r.created_at
+            select r.namespace, r.from_memory_id, r.to_memory_id, r.relation_kind, r.confidence, r.source_evidence_id, r.created_at
             from memory_relations r
             join memories m on r.from_memory_id = m.id
             where m.namespace = $1 and r.from_memory_id = $2
@@ -2126,7 +2134,7 @@ impl RelationStore for PostgresHubStore {
     ) -> Result<Vec<MemoryRelation>> {
         let rows = sqlx::query(
             r#"
-            select r.from_memory_id, r.to_memory_id, r.relation_kind, r.confidence, r.source_evidence_id, r.created_at
+            select r.namespace, r.from_memory_id, r.to_memory_id, r.relation_kind, r.confidence, r.source_evidence_id, r.created_at
             from memory_relations r
             join memories m on r.to_memory_id = m.id
             where m.namespace = $1 and r.to_memory_id = $2
@@ -2151,13 +2159,11 @@ impl RelationStore for PostgresHubStore {
     ) -> Result<()> {
         let res = sqlx::query(
             r#"
-            delete from memory_relations r
-            using memories m
-            where r.from_memory_id = m.id
-              and m.namespace = $1
-              and r.from_memory_id = $2
-              and r.to_memory_id = $3
-              and r.relation_kind = $4
+            delete from memory_relations
+            where namespace = $1
+              and from_memory_id = $2
+              and to_memory_id = $3
+              and relation_kind = $4
             "#,
         )
         .bind(namespace)
@@ -2178,11 +2184,10 @@ impl RelationStore for PostgresHubStore {
     async fn all_relations_in_namespace(&self, namespace: &str) -> Result<Vec<MemoryRelation>> {
         let rows = sqlx::query(
             r#"
-            select r.from_memory_id, r.to_memory_id, r.relation_kind, r.confidence, r.source_evidence_id, r.created_at
-            from memory_relations r
-            join memories m on r.from_memory_id = m.id
-            where m.namespace = $1
-            order by r.created_at desc
+            select namespace, from_memory_id, to_memory_id, relation_kind, confidence, source_evidence_id, created_at
+            from memory_relations
+            where namespace = $1
+            order by created_at desc
             "#,
         )
         .bind(namespace)
@@ -2326,6 +2331,21 @@ impl TaskStore for PostgresHubStore {
 
         rows.iter().map(Self::task_from_row).collect()
     }
+
+    async fn delete_task(&self, namespace: &str, id: Uuid) -> Result<()> {
+        let res = sqlx::query("delete from memory_tasks where namespace = $1 and id = $2")
+            .bind(namespace)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .pg()?;
+
+        if res.rows_affected() == 0 {
+            Err(HubError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 // ===== ExperienceStore =====
@@ -2452,13 +2472,48 @@ impl ExperienceStore for PostgresHubStore {
     }
 
     async fn link_task_experience(&self, link: &MemoryTaskExperience) -> Result<()> {
+        let (task_ns, exp_ns): (Option<String>, Option<String>) = sqlx::query_as(
+            r#"
+            select 
+                (select namespace from memory_tasks where id = $1) as task_ns,
+                (select namespace from memory_experiences where id = $2) as exp_ns
+            "#,
+        )
+        .bind(link.task_id)
+        .bind(link.experience_id)
+        .fetch_one(&self.pool)
+        .await
+        .pg()?;
+
+        let (t_ns, e_ns) = match (task_ns, exp_ns) {
+            (Some(t), Some(e)) => (t, e),
+            _ => {
+                return Err(HubError::NotFound);
+            }
+        };
+
+        if t_ns != e_ns {
+            return Err(HubError::InvalidArgument(
+                "任务与经验不属于同一命名空间".into(),
+            ));
+        }
+
+        if let Some(ref link_ns) = link.namespace {
+            if *link_ns != t_ns {
+                return Err(HubError::InvalidArgument(
+                    "指定命名空间与任务所属命名空间不一致".into(),
+                ));
+            }
+        }
+
         sqlx::query(
             r#"
-            insert into memory_task_experiences (task_id, experience_id, relation_kind, created_at)
-            values ($1, $2, $3, $4)
+            insert into memory_task_experiences (namespace, task_id, experience_id, relation_kind, created_at)
+            values ($1, $2, $3, $4, $5)
             on conflict (task_id, experience_id, relation_kind) do nothing
             "#,
         )
+        .bind(&t_ns)
         .bind(link.task_id)
         .bind(link.experience_id)
         .bind(&link.relation_kind)
@@ -2473,7 +2528,7 @@ impl ExperienceStore for PostgresHubStore {
     async fn list_experiences_for_task(&self, task_id: Uuid) -> Result<Vec<MemoryTaskExperience>> {
         let rows = sqlx::query(
             r#"
-            select task_id, experience_id, relation_kind, created_at
+            select namespace, task_id, experience_id, relation_kind, created_at
             from memory_task_experiences
             where task_id = $1
             order by created_at desc
@@ -2491,8 +2546,8 @@ impl ExperienceStore for PostgresHubStore {
         let rows = sqlx::query(
             r#"
             select id, namespace, task, search_keys, solution, preconditions,
-                   boundary_envs, failure_modes, validation, confidence, status,
-                   feedback_score, created_at, updated_at
+                    boundary_envs, failure_modes, validation, confidence, status,
+                    feedback_score, created_at, updated_at
             from memory_experiences
             where namespace = $1
             order by created_at asc, id asc
@@ -2512,11 +2567,10 @@ impl ExperienceStore for PostgresHubStore {
     ) -> Result<Vec<MemoryTaskExperience>> {
         let rows = sqlx::query(
             r#"
-            select mte.task_id, mte.experience_id, mte.relation_kind, mte.created_at
-            from memory_task_experiences mte
-            join memory_tasks mt on mt.id = mte.task_id
-            where mt.namespace = $1
-            order by mte.created_at asc, mte.task_id asc
+            select namespace, task_id, experience_id, relation_kind, created_at
+            from memory_task_experiences
+            where namespace = $1
+            order by created_at asc, task_id asc
             "#,
         )
         .bind(namespace)
@@ -2526,11 +2580,43 @@ impl ExperienceStore for PostgresHubStore {
 
         rows.iter().map(Self::task_experience_from_row).collect()
     }
+
+    async fn delete_experience(&self, namespace: &str, id: Uuid) -> Result<()> {
+        let res = sqlx::query("delete from memory_experiences where namespace = $1 and id = $2")
+            .bind(namespace)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .pg()?;
+
+        if res.rows_affected() == 0 {
+            Err(HubError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[async_trait]
 impl CodingStore for PostgresHubStore {
     async fn create_thread(&self, thread: &NewCodingThread) -> Result<CodingThread> {
+        if let Some(task_id) = thread.task_id {
+            let task_exists: bool = sqlx::query_scalar(
+                "select exists(select 1 from memory_tasks where namespace = $1 and id = $2)",
+            )
+            .bind(&thread.namespace)
+            .bind(task_id)
+            .fetch_one(&self.pool)
+            .await
+            .pg()?;
+
+            if !task_exists {
+                return Err(HubError::InvalidArgument(
+                    "关联任务不存在于该命名空间".into(),
+                ));
+            }
+        }
+
         let id = thread.id.unwrap_or_else(Uuid::new_v4);
         let now = Utc::now();
         let row = sqlx::query(
@@ -2604,6 +2690,54 @@ impl CodingStore for PostgresHubStore {
         revision: &NewCodingRevision,
         diff_hash: &str,
     ) -> Result<CodingRevision> {
+        if let Some(tid) = revision.thread_id {
+            let thread_exists: bool = sqlx::query_scalar(
+                "select exists(select 1 from coding_threads where namespace = $1 and id = $2)",
+            )
+            .bind(&revision.namespace)
+            .bind(tid)
+            .fetch_one(&self.pool)
+            .await
+            .pg()?;
+
+            if !thread_exists {
+                return Err(HubError::InvalidArgument(
+                    "关联线程不存在于该命名空间".into(),
+                ));
+            }
+        }
+        if let Some(task_id) = revision.source_task_id {
+            let task_exists: bool = sqlx::query_scalar(
+                "select exists(select 1 from memory_tasks where namespace = $1 and id = $2)",
+            )
+            .bind(&revision.namespace)
+            .bind(task_id)
+            .fetch_one(&self.pool)
+            .await
+            .pg()?;
+
+            if !task_exists {
+                return Err(HubError::InvalidArgument(
+                    "关联任务不存在于该命名空间".into(),
+                ));
+            }
+        }
+        if let Some(ev_id) = revision.source_evidence_id {
+            let ev_exists: bool = sqlx::query_scalar(
+                "select exists(select 1 from memory_evidence where namespace = $1 and id = $2)",
+            )
+            .bind(&revision.namespace)
+            .bind(ev_id)
+            .fetch_one(&self.pool)
+            .await
+            .pg()?;
+
+            if !ev_exists {
+                return Err(HubError::InvalidArgument(
+                    "关联证据不存在于该命名空间".into(),
+                ));
+            }
+        }
         let id = revision.id.unwrap_or_else(Uuid::new_v4);
         let now = Utc::now();
         let occurred_at = revision.occurred_at.unwrap_or(now);
@@ -2781,6 +2915,36 @@ impl CodingStore for PostgresHubStore {
 
         rows.iter().map(Self::revision_from_row).collect()
     }
+
+    async fn delete_thread(&self, namespace: &str, id: Uuid) -> Result<()> {
+        let res = sqlx::query("delete from coding_threads where namespace = $1 and id = $2")
+            .bind(namespace)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .pg()?;
+
+        if res.rows_affected() == 0 {
+            Err(HubError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn delete_revision(&self, namespace: &str, id: Uuid) -> Result<()> {
+        let res = sqlx::query("delete from coding_revisions where namespace = $1 and id = $2")
+            .bind(namespace)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .pg()?;
+
+        if res.rows_affected() == 0 {
+            Err(HubError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// accounts 行 → AccountRecord
@@ -2801,7 +2965,7 @@ mod tests {
 
     #[test]
     fn test_migrations_registered() {
-        assert_eq!(MIGRATIONS.len(), 8);
+        assert_eq!(MIGRATIONS.len(), 9);
         assert!(MIGRATIONS[0].0.starts_with("20261011"));
         // 迁移清单必须按版本号字典序排列（执行顺序依赖于此）
         for w in MIGRATIONS.windows(2) {

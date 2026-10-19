@@ -8,6 +8,7 @@
 //! 错误一律以 `isError = true` + 标准错误码对象返回（MCP 规定工具错误仍在 200 内表达）。
 
 use common::{AgentId, AuthCtx, HubError, Scope};
+use mem_core::infra::ExperienceStore;
 use mem_core::{
     BackupService, GrantStore, IntegrationService, MemoryService, NamespaceGrantRecord,
 };
@@ -96,6 +97,12 @@ pub struct ToolDispatcher {
     pub consolidation: ConsolidationParams,
     /// 嵌入器：整合合并后重算幸存者向量（未注入时合并会清空旧向量）
     pub embedder: Option<Arc<dyn mem_core::Embedder>>,
+    /// 认知提炼服务（Chat 场景会话提炼与事实演化）
+    pub chat_cognitive: Option<Arc<mem_core::ChatCognitiveService>>,
+    /// Working 经验记忆服务（任务事实生命周期与经验提炼）
+    pub working_memory: Option<Arc<mem_core::WorkingMemoryService>>,
+    /// Coding 代码演进记忆服务（主题线程与修订记录）
+    pub coding_memory: Option<Arc<mem_core::CodingMemoryService>>,
 }
 
 impl ToolDispatcher {
@@ -112,6 +119,9 @@ impl ToolDispatcher {
             store,
             consolidation: ConsolidationParams::default(),
             embedder: None,
+            chat_cognitive: None,
+            working_memory: None,
+            coding_memory: None,
         }
     }
 
@@ -124,6 +134,24 @@ impl ToolDispatcher {
     /// 注入嵌入器（合并后重算向量）
     pub fn with_embedder(mut self, embedder: Arc<dyn mem_core::Embedder>) -> Self {
         self.embedder = Some(embedder);
+        self
+    }
+
+    /// 注入 Chat 认知提炼服务
+    pub fn with_chat_cognitive(mut self, service: Arc<mem_core::ChatCognitiveService>) -> Self {
+        self.chat_cognitive = Some(service);
+        self
+    }
+
+    /// 注入 Working 经验记忆服务
+    pub fn with_working_memory(mut self, service: Arc<mem_core::WorkingMemoryService>) -> Self {
+        self.working_memory = Some(service);
+        self
+    }
+
+    /// 注入 Coding 代码演进记忆服务
+    pub fn with_coding_memory(mut self, service: Arc<mem_core::CodingMemoryService>) -> Self {
+        self.coding_memory = Some(service);
         self
     }
 
@@ -148,6 +176,18 @@ impl ToolDispatcher {
             "memory_consolidation_stats" => self.consolidation_stats(auth, arguments).await,
             "memory_grant" => self.grant(auth, arguments).await,
             "memory_revoke" => self.revoke(auth, arguments).await,
+            // ===== 认知增强工具 (P2 / P3 / P4) =====
+            "cognitive_chat_propose" => self.cognitive_chat_propose(auth, arguments).await,
+            "cognitive_proposal_resolve" => self.cognitive_proposal_resolve(auth, arguments).await,
+            "cognitive_intentions_list" => self.cognitive_intentions_list(auth, arguments).await,
+            "working_task_start" => self.working_task_start(auth, arguments).await,
+            "working_task_finish" => self.working_task_finish(auth, arguments).await,
+            "working_experience_distill" => self.working_experience_distill(auth, arguments).await,
+            "working_experience_feedback" => {
+                self.working_experience_feedback(auth, arguments).await
+            }
+            "coding_thread_create" => self.coding_thread_create(auth, arguments).await,
+            "coding_revision_record" => self.coding_revision_record(auth, arguments).await,
             other => {
                 ToolCallResult::error(&HubError::MethodNotFound(format!("未知工具: {}", other)))
             }
@@ -740,6 +780,625 @@ impl ToolDispatcher {
                 "agent_id": req.agent_id,
             })),
             Err(e) => ToolCallResult::error(&e),
+        }
+    }
+
+    // ===== 认知增强：Chat / Working / Coding =====
+
+    async fn cognitive_chat_propose(&self, auth: &AuthCtx, args: Value) -> ToolCallResult {
+        if !auth.has_scope(&Scope::Write) {
+            return ToolCallResult::error(&HubError::InsufficientScope);
+        }
+        #[derive(Deserialize)]
+        struct Turn {
+            role: String,
+            content: String,
+        }
+        #[derive(Deserialize)]
+        struct Req {
+            namespace: String,
+            turns: Vec<Turn>,
+            #[serde(default)]
+            #[allow(dead_code)]
+            scene: Option<String>,
+            #[serde(default)]
+            session_id: Option<String>,
+            #[serde(default)]
+            #[allow(dead_code)]
+            metadata: Option<Value>,
+        }
+        match serde_json::from_value::<Req>(args) {
+            Ok(req) => {
+                let service = match &self.chat_cognitive {
+                    Some(s) => s.clone(),
+                    None => {
+                        return ToolCallResult::error(&HubError::MethodNotFound(
+                            "Chat 认知提炼服务未配置模型抽取器".into(),
+                        ));
+                    }
+                };
+                let messages = req
+                    .turns
+                    .into_iter()
+                    .map(|t| mem_core::ChatMessage {
+                        role: match t.role.to_lowercase().as_str() {
+                            "user" => mem_core::ChatRole::User,
+                            "assistant" => mem_core::ChatRole::Assistant,
+                            "system" => mem_core::ChatRole::System,
+                            _ => mem_core::ChatRole::User,
+                        },
+                        content: t.content,
+                        timestamp: Some(chrono::Utc::now()),
+                    })
+                    .collect();
+                let session_id = req
+                    .session_id
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                let input = mem_core::ChatCognitiveInput {
+                    namespace: req.namespace,
+                    session_id,
+                    messages,
+                    occurred_at: Some(chrono::Utc::now()),
+                };
+                let scoped_svc = service.scoped(auth.account_id);
+                match scoped_svc.process_chat_session(auth, input).await {
+                    Ok(result) => {
+                        let committed: Vec<_> = result
+                            .committed_entries
+                            .into_iter()
+                            .map(|e| {
+                                strip_embedding(serde_json::to_value(&e).unwrap_or(Value::Null))
+                            })
+                            .collect();
+                        ToolCallResult::success(json!({
+                            "evidence_id": result.evidence_id,
+                            "committed_entries": committed,
+                            "proposals": result.proposals,
+                        }))
+                    }
+                    Err(e) => ToolCallResult::error(&e),
+                }
+            }
+            Err(e) => ToolCallResult::error(&HubError::InvalidArgument(format!(
+                "参数不符合 cognitive_chat_propose schema: {}",
+                e
+            ))),
+        }
+    }
+
+    async fn cognitive_proposal_resolve(&self, auth: &AuthCtx, args: Value) -> ToolCallResult {
+        if !auth.has_scope(&Scope::Write) {
+            return ToolCallResult::error(&HubError::InsufficientScope);
+        }
+        #[derive(Deserialize)]
+        struct Req {
+            proposal_id: uuid::Uuid,
+            decision: String,
+            #[serde(default)]
+            reason: Option<String>,
+            #[serde(default)]
+            custom_content: Option<String>,
+        }
+        match serde_json::from_value::<Req>(args) {
+            Ok(req) => {
+                let action = match req.decision.to_lowercase().as_str() {
+                    "rejected" => mem_core::ResolveAction::Dismiss,
+                    "accepted" | "modified" => mem_core::ResolveAction::Merge,
+                    other => {
+                        return ToolCallResult::error(&HubError::InvalidArgument(format!(
+                            "不支持的提案决策: {}",
+                            other
+                        )));
+                    }
+                };
+                match self
+                    .integration
+                    .resolve(
+                        auth,
+                        mem_core::ResolveRequest {
+                            proposal_id: req.proposal_id,
+                            action,
+                            survivor_id: None,
+                            note: req.reason.clone(),
+                        },
+                    )
+                    .await
+                {
+                    Ok(mut entry) => {
+                        if req.decision == "modified" {
+                            if let Some(custom) = req.custom_content {
+                                let patch = mem_core::MemoryPatch {
+                                    content: Some(custom),
+                                    kind: None,
+                                    tags: None,
+                                    metadata: None,
+                                    confidence: None,
+                                    expires_in_seconds: None,
+                                    scene: None,
+                                    layer: None,
+                                    valid_from: None,
+                                    valid_until: None,
+                                    occurred_at: None,
+                                };
+                                match self
+                                    .memory
+                                    .update(auth, &entry.namespace, entry.id, patch)
+                                    .await
+                                {
+                                    Ok(updated) => {
+                                        entry = updated;
+                                    }
+                                    Err(e) => return ToolCallResult::error(&e),
+                                }
+                            }
+                        }
+                        ToolCallResult::success(json!({
+                            "status": req.decision,
+                            "resulting_memory": strip_embedding(serde_json::to_value(&entry).unwrap_or(Value::Null)),
+                        }))
+                    }
+                    Err(e) => ToolCallResult::error(&e),
+                }
+            }
+            Err(e) => ToolCallResult::error(&HubError::InvalidArgument(format!(
+                "参数不符合 cognitive_proposal_resolve schema: {}",
+                e
+            ))),
+        }
+    }
+
+    async fn cognitive_intentions_list(&self, auth: &AuthCtx, args: Value) -> ToolCallResult {
+        if !auth.has_scope(&Scope::Read) {
+            return ToolCallResult::error(&HubError::InsufficientScope);
+        }
+        #[derive(Deserialize)]
+        struct Req {
+            namespace: String,
+            #[serde(default)]
+            status: Option<String>,
+            #[serde(default)]
+            limit: Option<usize>,
+        }
+        match serde_json::from_value::<Req>(args) {
+            Ok(req) => {
+                let limit = req.limit.unwrap_or(20).clamp(1, 100);
+                let intentions = if let Some(ref chat_svc) = self.chat_cognitive {
+                    let scoped = chat_svc.scoped(auth.account_id);
+                    scoped
+                        .list_active_intentions(auth, &req.namespace)
+                        .await
+                        .unwrap_or_default()
+                } else {
+                    let list_req = mem_core::ListRequest {
+                        namespace: req.namespace.clone(),
+                        kinds: None,
+                        statuses: Some(vec![mem_core::MemoryStatus::Active]),
+                        tags: None,
+                        source_agent: None,
+                        text_contains: None,
+                        scene: Some(mem_core::MemoryScene::Chat),
+                        layer: Some(mem_core::CognitiveLayer::Intention),
+                        valid_at: Some(chrono::Utc::now()),
+                        cursor: None,
+                        limit,
+                    };
+                    match self.memory.list(auth, list_req).await {
+                        Ok(page) => page.items,
+                        Err(e) => return ToolCallResult::error(&e),
+                    }
+                };
+                let intentions_val: Vec<_> = intentions
+                    .into_iter()
+                    .take(limit)
+                    .map(|e| strip_embedding(serde_json::to_value(&e).unwrap_or(Value::Null)))
+                    .collect();
+
+                let proposals = match self.integration.list(auth, &req.namespace).await {
+                    Ok(list) => {
+                        let filtered: Vec<_> = list
+                            .into_iter()
+                            .filter(|p| {
+                                if let Some(ref st) = req.status {
+                                    match st.to_lowercase().as_str() {
+                                        "open" => p.status == mem_core::ProposalStatus::Open,
+                                        "merged" => p.status == mem_core::ProposalStatus::Merged,
+                                        "dismissed" => {
+                                            p.status == mem_core::ProposalStatus::Dismissed
+                                        }
+                                        _ => true,
+                                    }
+                                } else {
+                                    true
+                                }
+                            })
+                            .take(limit)
+                            .collect();
+                        filtered
+                    }
+                    Err(_) => vec![],
+                };
+
+                ToolCallResult::success(json!({
+                    "intentions": intentions_val,
+                    "proposals": proposals,
+                }))
+            }
+            Err(e) => ToolCallResult::error(&HubError::InvalidArgument(format!(
+                "参数不符合 cognitive_intentions_list schema: {}",
+                e
+            ))),
+        }
+    }
+
+    async fn working_task_start(&self, auth: &AuthCtx, args: Value) -> ToolCallResult {
+        #[derive(Deserialize)]
+        struct Req {
+            namespace: String,
+            task: String,
+            #[serde(default)]
+            scene: Option<String>,
+            #[serde(default)]
+            source_evidence_id: Option<uuid::Uuid>,
+            #[serde(default)]
+            metadata: Option<Value>,
+        }
+        match serde_json::from_value::<Req>(args) {
+            Ok(req) => {
+                let service = self
+                    .working_memory
+                    .clone()
+                    .unwrap_or_else(|| {
+                        Arc::new(mem_core::WorkingMemoryService::new(self.store.clone()))
+                    })
+                    .scoped(auth.account_id);
+                let scene = match req.scene.as_deref() {
+                    Some("chat") => Some(mem_core::MemoryScene::Chat),
+                    Some("coding") => Some(mem_core::MemoryScene::Coding),
+                    _ => Some(mem_core::MemoryScene::Working),
+                };
+                match service
+                    .start_task_with_evidence(
+                        auth,
+                        &req.namespace,
+                        &req.task,
+                        scene,
+                        req.source_evidence_id,
+                        req.metadata,
+                    )
+                    .await
+                {
+                    Ok(task) => ToolCallResult::success(json!({ "task": task })),
+                    Err(e) => ToolCallResult::error(&e),
+                }
+            }
+            Err(e) => ToolCallResult::error(&HubError::InvalidArgument(format!(
+                "参数不符合 working_task_start schema: {}",
+                e
+            ))),
+        }
+    }
+
+    async fn working_task_finish(&self, auth: &AuthCtx, args: Value) -> ToolCallResult {
+        #[derive(Deserialize)]
+        struct Req {
+            namespace: String,
+            task_id: uuid::Uuid,
+            status: String,
+            #[serde(default)]
+            result_summary: Option<String>,
+            #[serde(default)]
+            failure_reason: Option<String>,
+        }
+        match serde_json::from_value::<Req>(args) {
+            Ok(req) => {
+                let status = match req.status.to_lowercase().as_str() {
+                    "completed" => mem_core::TaskStatus::Completed,
+                    "failed" => mem_core::TaskStatus::Failed,
+                    "cancelled" => mem_core::TaskStatus::Cancelled,
+                    other => {
+                        return ToolCallResult::error(&HubError::InvalidArgument(format!(
+                            "不支持的任务终态: {}",
+                            other
+                        )));
+                    }
+                };
+                let service = self
+                    .working_memory
+                    .clone()
+                    .unwrap_or_else(|| {
+                        Arc::new(mem_core::WorkingMemoryService::new(self.store.clone()))
+                    })
+                    .scoped(auth.account_id);
+                match service
+                    .finish_task(
+                        auth,
+                        req.task_id,
+                        &req.namespace,
+                        status,
+                        req.result_summary,
+                        req.failure_reason,
+                        None,
+                    )
+                    .await
+                {
+                    Ok(task) => ToolCallResult::success(json!({ "task": task })),
+                    Err(e) => ToolCallResult::error(&e),
+                }
+            }
+            Err(e) => ToolCallResult::error(&HubError::InvalidArgument(format!(
+                "参数不符合 working_task_finish schema: {}",
+                e
+            ))),
+        }
+    }
+
+    async fn working_experience_distill(&self, auth: &AuthCtx, args: Value) -> ToolCallResult {
+        #[derive(Deserialize)]
+        struct Req {
+            namespace: String,
+            task: String,
+            solution: String,
+            #[serde(default)]
+            task_id: Option<uuid::Uuid>,
+            #[serde(default)]
+            search_keys: Option<Vec<String>>,
+            #[serde(default)]
+            preconditions: Option<Vec<String>>,
+            #[serde(default)]
+            boundary_envs: Option<Vec<String>>,
+            #[serde(default)]
+            failure_modes: Option<Vec<String>>,
+            #[serde(default)]
+            validation: Option<String>,
+            #[serde(default)]
+            confidence: Option<f32>,
+        }
+        match serde_json::from_value::<Req>(args) {
+            Ok(req) => {
+                let service = self
+                    .working_memory
+                    .clone()
+                    .unwrap_or_else(|| {
+                        Arc::new(mem_core::WorkingMemoryService::new(self.store.clone()))
+                    })
+                    .scoped(auth.account_id);
+                // 若未指定关联任务，则自动生成一个已完成的工作事实任务
+                let source_task_id = match req.task_id {
+                    Some(tid) => tid,
+                    None => {
+                        match service
+                            .start_task(
+                                auth,
+                                &req.namespace,
+                                &req.task,
+                                Some(mem_core::MemoryScene::Working),
+                                None,
+                            )
+                            .await
+                        {
+                            Ok(t) => {
+                                let _ = service
+                                    .finish_task(
+                                        auth,
+                                        t.id,
+                                        &req.namespace,
+                                        mem_core::TaskStatus::Completed,
+                                        Some("由工作经验提炼工具自动创建的关联任务事实".into()),
+                                        None,
+                                        None,
+                                    )
+                                    .await;
+                                t.id
+                            }
+                            Err(e) => return ToolCallResult::error(&e),
+                        }
+                    }
+                };
+                let candidate = mem_core::ExperienceCandidate {
+                    source_task_id,
+                    task_pattern: req.task,
+                    search_keys: req.search_keys.unwrap_or_default(),
+                    solution: req.solution,
+                    preconditions: serde_json::to_value(req.preconditions.unwrap_or_default())
+                        .unwrap_or_else(|_| json!([])),
+                    boundary_envs: req.boundary_envs.unwrap_or_default(),
+                    failure_modes: req.failure_modes.unwrap_or_default(),
+                    validation: match req.validation {
+                        Some(ref v) if !v.trim().is_empty() => json!(v),
+                        _ => json!("通过自动化测试与回归验证"),
+                    },
+                    confidence: req.confidence.unwrap_or(1.0),
+                };
+                match service
+                    .distill_experience(auth, &req.namespace, candidate)
+                    .await
+                {
+                    Ok(exp) => ToolCallResult::success(json!({ "experience": exp })),
+                    Err(e) => ToolCallResult::error(&e),
+                }
+            }
+            Err(e) => ToolCallResult::error(&HubError::InvalidArgument(format!(
+                "参数不符合 working_experience_distill schema: {}",
+                e
+            ))),
+        }
+    }
+
+    async fn working_experience_feedback(&self, auth: &AuthCtx, args: Value) -> ToolCallResult {
+        #[derive(Deserialize)]
+        struct Req {
+            namespace: String,
+            experience_id: uuid::Uuid,
+            score: f32,
+            #[serde(default)]
+            status: Option<String>,
+        }
+        match serde_json::from_value::<Req>(args) {
+            Ok(req) => {
+                let service = self
+                    .working_memory
+                    .clone()
+                    .unwrap_or_else(|| {
+                        Arc::new(mem_core::WorkingMemoryService::new(self.store.clone()))
+                    })
+                    .scoped(auth.account_id);
+                let is_success = req.score > 0.0;
+                match service
+                    .record_feedback(auth, &req.namespace, req.experience_id, is_success, None)
+                    .await
+                {
+                    Ok(mut exp) => {
+                        if let Some(st) = req.status {
+                            let parsed = match st.to_lowercase().as_str() {
+                                "candidate" => mem_core::ExperienceStatus::Candidate,
+                                "active" => mem_core::ExperienceStatus::Active,
+                                "deprecated" => mem_core::ExperienceStatus::Deprecated,
+                                "archived" => mem_core::ExperienceStatus::Archived,
+                                other => {
+                                    return ToolCallResult::error(&HubError::InvalidArgument(
+                                        format!("不支持的经验状态: {}", other),
+                                    ));
+                                }
+                            };
+                            exp.status = parsed;
+                            let scoped_store = mem_core::AccountScopedStore::new(
+                                self.store.clone(),
+                                auth.account_id,
+                            );
+                            if let Err(e) = scoped_store.update_experience(&exp).await {
+                                return ToolCallResult::error(&e);
+                            }
+                        }
+                        ToolCallResult::success(json!({ "experience": exp }))
+                    }
+                    Err(e) => ToolCallResult::error(&e),
+                }
+            }
+            Err(e) => ToolCallResult::error(&HubError::InvalidArgument(format!(
+                "参数不符合 working_experience_feedback schema: {}",
+                e
+            ))),
+        }
+    }
+
+    async fn coding_thread_create(&self, auth: &AuthCtx, args: Value) -> ToolCallResult {
+        #[derive(Deserialize)]
+        struct Req {
+            namespace: String,
+            repository: String,
+            #[serde(default)]
+            branch: Option<String>,
+            title: String,
+            #[serde(default)]
+            description: Option<String>,
+            #[serde(default)]
+            task_id: Option<uuid::Uuid>,
+        }
+        match serde_json::from_value::<Req>(args) {
+            Ok(req) => {
+                let service = self
+                    .coding_memory
+                    .clone()
+                    .unwrap_or_else(|| {
+                        Arc::new(mem_core::CodingMemoryService::new(self.store.clone()))
+                    })
+                    .scoped(auth.account_id);
+                let thread = mem_core::NewCodingThread {
+                    id: None,
+                    namespace: req.namespace,
+                    repository: req.repository,
+                    branch: req.branch,
+                    title: req.title,
+                    description: req.description,
+                    task_id: req.task_id,
+                };
+                match service.start_thread(auth, thread).await {
+                    Ok(t) => ToolCallResult::success(json!({ "thread": t })),
+                    Err(e) => ToolCallResult::error(&e),
+                }
+            }
+            Err(e) => ToolCallResult::error(&HubError::InvalidArgument(format!(
+                "参数不符合 coding_thread_create schema: {}",
+                e
+            ))),
+        }
+    }
+
+    async fn coding_revision_record(&self, auth: &AuthCtx, args: Value) -> ToolCallResult {
+        #[derive(Deserialize)]
+        struct Req {
+            namespace: String,
+            repository: String,
+            file_path: String,
+            diff_content: String,
+            change_kind: String,
+            #[serde(default)]
+            thread_id: Option<uuid::Uuid>,
+            #[serde(default)]
+            branch: Option<String>,
+            #[serde(default)]
+            commit_sha: Option<String>,
+            #[serde(default)]
+            parent_sha: Option<String>,
+            #[serde(default)]
+            symbol_fingerprint: Option<String>,
+            #[serde(default)]
+            is_committed: Option<bool>,
+            #[serde(default)]
+            author: Option<String>,
+            #[serde(default)]
+            source_evidence_id: Option<uuid::Uuid>,
+            #[serde(default)]
+            source_task_id: Option<uuid::Uuid>,
+        }
+        match serde_json::from_value::<Req>(args) {
+            Ok(req) => {
+                let kind = match req.change_kind.to_lowercase().as_str() {
+                    "add" => mem_core::CodeChangeKind::Add,
+                    "modify" => mem_core::CodeChangeKind::Modify,
+                    "delete" => mem_core::CodeChangeKind::Delete,
+                    "rename" => mem_core::CodeChangeKind::Rename,
+                    other => {
+                        return ToolCallResult::error(&HubError::InvalidArgument(format!(
+                            "不支持的代码变更类型: {}",
+                            other
+                        )));
+                    }
+                };
+                let service = self
+                    .coding_memory
+                    .clone()
+                    .unwrap_or_else(|| {
+                        Arc::new(mem_core::CodingMemoryService::new(self.store.clone()))
+                    })
+                    .scoped(auth.account_id);
+                let revision = mem_core::NewCodingRevision {
+                    id: None,
+                    namespace: req.namespace,
+                    repository: req.repository,
+                    thread_id: req.thread_id,
+                    branch: req.branch,
+                    commit_sha: req.commit_sha,
+                    parent_sha: req.parent_sha,
+                    change_kind: kind,
+                    file_path: req.file_path,
+                    diff_content: req.diff_content,
+                    symbol_fingerprint: req.symbol_fingerprint,
+                    is_committed: req.is_committed.unwrap_or(false),
+                    author: req.author,
+                    occurred_at: Some(chrono::Utc::now()),
+                    source_evidence_id: req.source_evidence_id,
+                    source_task_id: req.source_task_id,
+                };
+                match service.record_revision(auth, revision).await {
+                    Ok(rev) => ToolCallResult::success(json!({ "revision": rev })),
+                    Err(e) => ToolCallResult::error(&e),
+                }
+            }
+            Err(e) => ToolCallResult::error(&HubError::InvalidArgument(format!(
+                "参数不符合 coding_revision_record schema: {}",
+                e
+            ))),
         }
     }
 }
@@ -1367,6 +2026,239 @@ mod tests {
             .unwrap()
             .clone();
         assert_eq!(versions.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_working_memory_tools_lifecycle_and_scope() {
+        let (d, auth) = harness();
+
+        // 1. 无写权限时 working_task_start 应失败
+        let read_only_auth = AuthCtx {
+            agent_id: "agent-ro".to_string(),
+            account_id: common::BOOTSTRAP_ACCOUNT_ID,
+            scopes: vec![Scope::Read],
+            acl: Default::default(),
+        };
+        let denied = d
+            .dispatch(
+                &read_only_auth,
+                "working_task_start",
+                arg(json!({
+                    "namespace": "work-ns",
+                    "task": "排查内存泄漏",
+                })),
+            )
+            .await;
+        assert!(denied.is_error, "缺少 write scope 应拒绝");
+
+        // 2. 正常启动任务
+        let start_res = d
+            .dispatch(
+                &auth,
+                "working_task_start",
+                arg(json!({
+                    "namespace": "work-ns",
+                    "task": "排查内存泄漏",
+                })),
+            )
+            .await;
+        assert!(!start_res.is_error, "任务启动失败: {:?}", start_res);
+        let task_id = start_res.structured_content.unwrap()["task"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // 3. 正常结束任务
+        let finish_res = d
+            .dispatch(
+                &auth,
+                "working_task_finish",
+                arg(json!({
+                    "namespace": "work-ns",
+                    "task_id": task_id,
+                    "status": "completed",
+                    "result_summary": "定位并修复循环引用",
+                })),
+            )
+            .await;
+        assert!(!finish_res.is_error, "任务结束失败: {:?}", finish_res);
+
+        // 4. 经验提炼
+        let distill_res = d
+            .dispatch(
+                &auth,
+                "working_experience_distill",
+                arg(json!({
+                    "namespace": "work-ns",
+                    "task": "排查内存泄漏",
+                    "solution": "使用 valgrind 或 heaptrack 抓取堆栈分析泄漏点",
+                    "task_id": task_id,
+                    "search_keys": ["memory_leak", "heaptrack"],
+                    "preconditions": ["linux环境"],
+                    "boundary_envs": ["os:linux"],
+                    "failure_modes": ["未安装调试符号"],
+                    "confidence": 0.95,
+                })),
+            )
+            .await;
+        assert!(!distill_res.is_error, "经验提炼失败: {:?}", distill_res);
+        let exp_id = distill_res.structured_content.unwrap()["experience"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // 5. 经验效用反馈
+        let fb_res = d
+            .dispatch(
+                &auth,
+                "working_experience_feedback",
+                arg(json!({
+                    "namespace": "work-ns",
+                    "experience_id": exp_id,
+                    "score": 1.0,
+                    "status": "active",
+                })),
+            )
+            .await;
+        assert!(!fb_res.is_error, "反馈失败: {:?}", fb_res);
+    }
+
+    #[tokio::test]
+    async fn test_coding_memory_tools_and_security_checks() {
+        let (d, auth) = harness();
+
+        // 1. 创建 coding thread
+        let thread_res = d
+            .dispatch(
+                &auth,
+                "coding_thread_create",
+                arg(json!({
+                    "namespace": "code-ns",
+                    "repository": "company/backend",
+                    "branch": "feature/cognitive-v2",
+                    "title": "重构 MCP 认知调度器",
+                })),
+            )
+            .await;
+        assert!(!thread_res.is_error, "线程创建失败: {:?}", thread_res);
+        let thread_id = thread_res.structured_content.unwrap()["thread"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // 2. 尝试记录含路径穿越与敏感凭证的代码变更 -> 必须被拒绝
+        let bad_path = d
+            .dispatch(
+                &auth,
+                "coding_revision_record",
+                arg(json!({
+                    "namespace": "code-ns",
+                    "repository": "company/backend",
+                    "thread_id": thread_id,
+                    "file_path": "../../../etc/passwd",
+                    "diff_content": "+root:x:0:0:root:/root:/bin/bash",
+                    "change_kind": "modify",
+                })),
+            )
+            .await;
+        assert!(bad_path.is_error, "路径穿越必须被拒绝");
+
+        let leak = d
+            .dispatch(
+                &auth,
+                "coding_revision_record",
+                arg(json!({
+                    "namespace": "code-ns",
+                    "repository": "company/backend",
+                    "thread_id": thread_id,
+                    "file_path": "config/key.rs",
+                    "diff_content": "+const KEY: &str = \"sk-proj-1234567890abcdef1234567890abcdef\";",
+                    "change_kind": "add",
+                })),
+            )
+            .await;
+        assert!(leak.is_error, "敏感凭证泄漏必须被拒绝");
+
+        // 3. 正常记录代码变更
+        let ok_rev = d
+            .dispatch(
+                &auth,
+                "coding_revision_record",
+                arg(json!({
+                    "namespace": "code-ns",
+                    "repository": "company/backend",
+                    "thread_id": thread_id,
+                    "file_path": "src/tools.rs",
+                    "diff_content": "--- a/src/tools.rs\n+++ b/src/tools.rs\n@@ -1,1 +1,2 @@\n+// cognitive tool\n",
+                    "change_kind": "modify",
+                })),
+            )
+            .await;
+        assert!(!ok_rev.is_error, "正常代码修订应成功: {:?}", ok_rev);
+    }
+
+    #[tokio::test]
+    async fn test_chat_cognitive_tools_propose_resolve_and_intentions() {
+        let (mut d, auth) = harness();
+        let mock_extractor = Arc::new(
+            mem_core::testing::MockChatCognitiveExtractor::new().with_candidates(vec![
+                mem_core::CognitiveCandidate {
+                    content: "用户偏好使用 Rust 编写后端服务".into(),
+                    layer: mem_core::CognitiveLayer::Intention,
+                    scene: mem_core::MemoryScene::Chat,
+                    confidence: 0.95,
+                    occurred_at: Some(chrono::Utc::now()),
+                    valid_from: None,
+                    valid_until: Some(chrono::Utc::now() + chrono::Duration::days(30)),
+                    tags: vec!["preference".into(), "rust".into()],
+                    target_memory_id: None,
+                    relation_kind: None,
+                    metadata: serde_json::json!({}),
+                },
+            ]),
+        );
+        let chat_svc = Arc::new(mem_core::ChatCognitiveService::new(
+            d.store.clone(),
+            mock_extractor,
+            mem_core::CognitivePolicy {
+                mode: mem_core::CognitiveGovernanceMode::Manual,
+                ..Default::default()
+            },
+        ));
+        d = d.with_chat_cognitive(chat_svc);
+
+        // 1. 提交对话提炼
+        let prop_res = d
+            .dispatch(
+                &auth,
+                "cognitive_chat_propose",
+                arg(json!({
+                    "namespace": "chat-ns",
+                    "turns": [
+                        { "role": "user", "content": "以后项目后端全部使用 Rust" },
+                        { "role": "assistant", "content": "好的，已记录偏好" }
+                    ],
+                })),
+            )
+            .await;
+        assert!(!prop_res.is_error, "对话提炼应成功: {:?}", prop_res);
+        let proposals = prop_res.structured_content.unwrap()["proposals"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert!(!proposals.is_empty(), "在 Manual 模式下应生成候选提案");
+
+        // 2. 列出意图与提案
+        let list_res = d
+            .dispatch(
+                &auth,
+                "cognitive_intentions_list",
+                arg(json!({
+                    "namespace": "chat-ns",
+                })),
+            )
+            .await;
+        assert!(!list_res.is_error, "列出意图应成功: {:?}", list_res);
     }
 
     // 编译期检查：内存实现满足聚合契约

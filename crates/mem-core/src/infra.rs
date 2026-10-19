@@ -288,6 +288,9 @@ pub trait TaskStore: Send + Sync {
 
     /// 命名空间下全部任务（备份/恢复用）
     async fn all_tasks_in_namespace(&self, namespace: &str) -> Result<Vec<MemoryTask>>;
+
+    /// 物理删除单条任务事实
+    async fn delete_task(&self, namespace: &str, id: uuid::Uuid) -> Result<()>;
 }
 
 /// 经验记忆存储（Working 场景，P3 引入）
@@ -331,6 +334,9 @@ pub trait ExperienceStore: Send + Sync {
         &self,
         namespace: &str,
     ) -> Result<Vec<MemoryTaskExperience>>;
+
+    /// 物理删除单条经验记忆
+    async fn delete_experience(&self, namespace: &str, id: uuid::Uuid) -> Result<()>;
 }
 
 /// 代码演进存储（Coding 场景，P4 引入）
@@ -391,6 +397,12 @@ pub trait CodingStore: Send + Sync {
 
     /// 命名空间下全部代码修订记录（备份/恢复用）
     async fn all_revisions_in_namespace(&self, namespace: &str) -> Result<Vec<CodingRevision>>;
+
+    /// 物理删除单条代码演进线程
+    async fn delete_thread(&self, namespace: &str, id: uuid::Uuid) -> Result<()>;
+
+    /// 物理删除单条代码修订记录
+    async fn delete_revision(&self, namespace: &str, id: uuid::Uuid) -> Result<()>;
 }
 
 /// 存储聚合：一套实现同时满足全部核心与认知存储需求

@@ -13,8 +13,9 @@ use consolidation::DefaultIntegrationService;
 use mcp::transport::{mcp_router, run_stdio, McpTransportState};
 use mcp::ToolDispatcher;
 use mem_core::{
+    ChatCognitiveService, CodingMemoryService, CognitiveGovernanceMode, CognitivePolicy,
     DefaultBackupService, DefaultMemoryService, Embedder, GrantChecker, MemoryHubStore,
-    TokenIntrospector,
+    TokenIntrospector, WorkingMemoryService,
 };
 use std::sync::Arc;
 use store::{InMemoryHubStore, PostgresHubStore};
@@ -79,6 +80,18 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.integrate_max_proposals,
     ));
 
+    let working_memory = Arc::new(WorkingMemoryService::new(store.clone()));
+    let coding_memory = Arc::new(CodingMemoryService::new(store.clone()));
+    let chat_extractor = Arc::new(mem_core::testing::MockChatCognitiveExtractor::new());
+    let chat_cognitive = Arc::new(ChatCognitiveService::new(
+        store.clone(),
+        chat_extractor,
+        CognitivePolicy {
+            mode: CognitiveGovernanceMode::Manual,
+            ..Default::default()
+        },
+    ));
+
     let dispatcher = Arc::new(
         ToolDispatcher::new(
             memory_service,
@@ -90,7 +103,10 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             sim_threshold: cfg.integrate_sim_threshold,
             max_proposals: cfg.integrate_max_proposals,
         })
-        .with_embedder(embedder.clone()),
+        .with_embedder(embedder.clone())
+        .with_working_memory(working_memory)
+        .with_coding_memory(coding_memory)
+        .with_chat_cognitive(chat_cognitive),
     );
 
     // ===== 鉴权 =====

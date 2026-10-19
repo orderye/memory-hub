@@ -224,10 +224,42 @@ async fn test_full_retrieval_eval_suite() {
             None,
             None,
         ),
+        create_entry(
+            "ops-tasks",
+            "排查生产环境 Redis 连接池泄漏需通过 netstat 结合 redis-cli client list 统计空闲连接",
+            Some(MemoryScene::Working),
+            Some(CognitiveLayer::Knowledge),
+            None,
+            None,
+        ),
+        create_entry(
+            "ops-tasks",
+            "PostgreSQL 慢查询日志分析使用 pg_stat_statements 扩展定位高耗时 SQL",
+            Some(MemoryScene::Working),
+            Some(CognitiveLayer::Knowledge),
+            None,
+            None,
+        ),
         // Coding 代码修订记忆
         create_entry(
             "repo-code",
             "重构 HybridRetriever 双路融合并引入 MMR 多样性重排",
+            Some(MemoryScene::Coding),
+            Some(CognitiveLayer::Fact),
+            None,
+            None,
+        ),
+        create_entry(
+            "repo-code",
+            "实现 Composite Foreign Key 迁移以强化跨租户命名空间外键约束",
+            Some(MemoryScene::Coding),
+            Some(CognitiveLayer::Fact),
+            None,
+            None,
+        ),
+        create_entry(
+            "repo-code",
+            "扩展 MCP ToolDispatcher 支持 9 个专用认知增强工具分发",
             Some(MemoryScene::Coding),
             Some(CognitiveLayer::Fact),
             None,
@@ -330,6 +362,38 @@ async fn test_full_retrieval_eval_suite() {
         EvalSample {
             query: "HybridRetriever MMR 重排".into(),
             target_content_substr: "MMR 多样性重排".into(),
+            scene: Some(MemoryScene::Coding),
+            layer: None,
+            valid_at: None,
+            include_superseded: false,
+        },
+        EvalSample {
+            query: "Redis 连接池泄漏排查 netstat".into(),
+            target_content_substr: "通过 netstat 结合 redis-cli".into(),
+            scene: Some(MemoryScene::Working),
+            layer: Some(CognitiveLayer::Knowledge),
+            valid_at: None,
+            include_superseded: false,
+        },
+        EvalSample {
+            query: "PostgreSQL 慢查询定位 pg_stat_statements".into(),
+            target_content_substr: "pg_stat_statements 扩展定位高耗时".into(),
+            scene: Some(MemoryScene::Working),
+            layer: Some(CognitiveLayer::Knowledge),
+            valid_at: None,
+            include_superseded: false,
+        },
+        EvalSample {
+            query: "Composite Foreign Key 跨租户命名空间".into(),
+            target_content_substr: "强化跨租户命名空间外键约束".into(),
+            scene: Some(MemoryScene::Coding),
+            layer: None,
+            valid_at: None,
+            include_superseded: false,
+        },
+        EvalSample {
+            query: "MCP ToolDispatcher 认知增强工具".into(),
+            target_content_substr: "9 个专用认知增强工具分发".into(),
             scene: Some(MemoryScene::Coding),
             layer: None,
             valid_at: None,
@@ -594,4 +658,85 @@ async fn test_full_retrieval_eval_suite() {
         metrics.degradation_success_count, metrics.degradation_total_count,
         "故障降级成功率必须达到 100%"
     );
+}
+
+/// 真实 PostgreSQL + pgvector 独立基准评测（显式配置数据库后通过 `--ignored` 执行）
+#[ignore]
+#[tokio::test]
+async fn test_postgres_retrieval_eval_suite() {
+    let db_url = match std::env::var("DATABASE_URL") {
+        Ok(url) if !url.trim().is_empty() => url,
+        _ => {
+            println!(
+                "\n[SKIPPED] 未配置 DATABASE_URL 环境变量，跳过真实 PostgreSQL 集成/性能评测。\n"
+            );
+            return;
+        }
+    };
+    println!("\n========================================================");
+    println!("    POSTGRESQL + PGVECTOR RETRIEVAL BENCHMARK           ");
+    println!("========================================================");
+    let store = match store::PostgresHubStore::connect(&db_url, 5, 10).await {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            panic!("连接 PostgreSQL 数据库失败: {}", e);
+        }
+    };
+    let embedder = Arc::new(TestEmbedder::new(64));
+    let account_id = Uuid::new_v4();
+    let auth = make_auth(account_id, "pg-eval-agent");
+    let scoped_store = Arc::new(AccountScopedStore::new(
+        store.clone() as Arc<dyn MemoryHubStore>,
+        account_id,
+    ));
+    let retriever = HybridRetriever::new(
+        scoped_store.clone() as Arc<dyn MemoryStore>,
+        embedder.clone(),
+        20,
+        20,
+        [0.5, 0.2, 0.1, 0.1, 0.1],
+        0.7,
+        1000,
+    );
+
+    // 灌入测试数据
+    let mut entry = create_entry(
+        "pg-eval-ns",
+        "PostgreSQL 真实数据库与 pgvector 语义检索基准测试条目",
+        Some(MemoryScene::Chat),
+        Some(CognitiveLayer::Fact),
+        None,
+        None,
+    );
+    let v = embedder
+        .embed(&[entry.content.clone()])
+        .await
+        .unwrap()
+        .remove(0);
+    entry.embedding = Some(v);
+    scoped_store.insert(&entry).await.unwrap();
+
+    let query = SearchQuery {
+        namespace: "pg-eval-ns".into(),
+        query_text: "pgvector 语义检索基准测试".into(),
+        kinds: None,
+        tags: None,
+        top_k: 5,
+        include_archived: false,
+        min_score: None,
+        scene: None,
+        layer: None,
+        valid_at: None,
+        include_superseded: false,
+    };
+    let start = std::time::Instant::now();
+    let hits = retriever.search(&auth, &query).await.unwrap();
+    let duration = start.elapsed();
+
+    assert!(!hits.is_empty(), "真实 PG 检索应召回命中条目");
+    assert!(hits[0].item.content.contains("pgvector"));
+    println!("PostgreSQL Query Latency : {:?}", duration);
+    println!("Hits Count               : {}", hits.len());
+    println!("Top Result Content       : {}", hits[0].item.content);
+    println!("========================================================\n");
 }

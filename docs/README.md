@@ -27,30 +27,32 @@
 ```mermaid
 flowchart TD
     subgraph V1["历史版本 (v1.0 - 已彻底废弃)"]
-        V1_Old["内嵌行为规范 / 六技能框架 / 量表校准<br/>（过度耦合大模型提示词与生成式推理）"]
+        V1_Old["内嵌行为规范 / 六技能框架 / 量表校准 (过度耦合大模型 Prompt)"]
     end
 
     subgraph V2["基础设施重构 (v2.0 - v2.1)"]
-        V2_Core["定位为纯粹的基础设施服务<br/>专注于：存储 (Store) + 备份 (Backup) + 整合 (Consolidation)"]
-        V2_Sandbox["多账户沙箱 (Account Sandbox)<br/>每个终端用户独立命名空间，账户间绝对隔离<br/>基于 OAuth 2.1 零信任授权机制"]
+        V2_Core["定位为纯粹的基础设施服务 (存储 + 备份 + 整合)"]
+        V2_Sandbox["多账户沙箱 (Account Sandbox & OAuth 2.1 隔离)"]
         V2_Core --> V2_Sandbox
     end
 
     subgraph Cognitive["认知升级演进 (P0 - P5)"]
-        P1["P1: 证据存根 (Evidence) 与时间有效性 (valid_from/until)"]
-        P2["P2: Chat 对话认知流 (Fact / Summary / Pattern / Intention)"]
-        P3["P3: Working 经验记忆 (任务事实 vs 经验解耦 / 环境边界)"]
-        P4["P4: Coding 代码演进链 (真实 Diff / Thread / 凭证防御)"]
-        P5["P5: 场景自适应混合检索 (Chat/Working/Coding 提权 / MMR 重排)"]
+        P1["P1: 证据存根 (Evidence) 与时间有效性"]
+        P2["P2: Chat 对话认知流 (四层模型)"]
+        P3["P3: Working 经验记忆 (环境边界)"]
+        P4["P4: Coding 代码演进链 (真实 Diff)"]
+        P5["P5: 场景自适应混合检索 (MMR 重排)"]
         
         P1 --> P2
         P1 --> P3
         P1 --> P4
-        P2 & P3 & P4 --> P5
+        P2 --> P5
+        P3 --> P5
+        P4 --> P5
     end
 
-    V1 -.->|彻底重写| V2
-    V2 --> Cognitive
+    V1_Old -.->|彻底重写| V2_Core
+    V2_Sandbox --> P1
 ```
 
 ### 核心定位声明

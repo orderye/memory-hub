@@ -629,6 +629,10 @@ impl<S: TaskStore + ?Sized> TaskStore for AccountScopedStore<S> {
             })
             .collect())
     }
+
+    async fn delete_task(&self, namespace: &str, id: Uuid) -> Result<()> {
+        self.inner.delete_task(&self.scoped(namespace), id).await
+    }
 }
 
 // ===== ExperienceStore =====
@@ -687,11 +691,28 @@ impl<S: ExperienceStore + ?Sized> ExperienceStore for AccountScopedStore<S> {
     }
 
     async fn link_task_experience(&self, link: &MemoryTaskExperience) -> Result<()> {
-        self.inner.link_task_experience(link).await
+        let mut scoped_link = link.clone();
+        if let Some(ref ns) = link.namespace {
+            scoped_link.namespace = Some(self.scoped(ns));
+        }
+        self.inner.link_task_experience(&scoped_link).await
     }
 
     async fn list_experiences_for_task(&self, task_id: Uuid) -> Result<Vec<MemoryTaskExperience>> {
-        self.inner.list_experiences_for_task(task_id).await
+        let rows = self.inner.list_experiences_for_task(task_id).await?;
+        Ok(rows
+            .into_iter()
+            .filter(|l| match &l.namespace {
+                Some(ns) => in_scope(&self.account, ns),
+                None => true,
+            })
+            .map(|mut l| {
+                if let Some(ref ns) = l.namespace {
+                    l.namespace = Some(self.unscoped(ns));
+                }
+                l
+            })
+            .collect())
     }
 
     async fn all_experiences_in_namespace(&self, namespace: &str) -> Result<Vec<MemoryExperience>> {
@@ -713,8 +734,28 @@ impl<S: ExperienceStore + ?Sized> ExperienceStore for AccountScopedStore<S> {
         &self,
         namespace: &str,
     ) -> Result<Vec<MemoryTaskExperience>> {
-        self.inner
+        let rows = self
+            .inner
             .all_task_experiences_in_namespace(&self.scoped(namespace))
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter(|l| match &l.namespace {
+                Some(ns) => in_scope(&self.account, ns),
+                None => true,
+            })
+            .map(|mut l| {
+                if let Some(ref ns) = l.namespace {
+                    l.namespace = Some(self.unscoped(ns));
+                }
+                l
+            })
+            .collect())
+    }
+
+    async fn delete_experience(&self, namespace: &str, id: Uuid) -> Result<()> {
+        self.inner
+            .delete_experience(&self.scoped(namespace), id)
             .await
     }
 }
@@ -868,6 +909,16 @@ impl<S: CodingStore + ?Sized> CodingStore for AccountScopedStore<S> {
                 r
             })
             .collect())
+    }
+
+    async fn delete_thread(&self, namespace: &str, id: Uuid) -> Result<()> {
+        self.inner.delete_thread(&self.scoped(namespace), id).await
+    }
+
+    async fn delete_revision(&self, namespace: &str, id: Uuid) -> Result<()> {
+        self.inner
+            .delete_revision(&self.scoped(namespace), id)
+            .await
     }
 }
 

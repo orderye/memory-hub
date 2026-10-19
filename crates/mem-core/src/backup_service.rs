@@ -570,8 +570,19 @@ impl BackupService for DefaultBackupService {
             return Ok(report);
         }
 
-        // 目标命名空间集合（全量备份可能含多个命名空间）
-        let mut namespaces: Vec<String> = entries.iter().map(|e| e.namespace.clone()).collect();
+        // 目标命名空间集合（全量备份可能含多个命名空间，且涵盖认知各实体）
+        let mut namespaces: Vec<String> = entries
+            .iter()
+            .map(|e| e.namespace.clone())
+            .chain(evidences.iter().map(|e| e.namespace.clone()))
+            .chain(tasks.iter().map(|t| t.namespace.clone()))
+            .chain(experiences.iter().map(|e| e.namespace.clone()))
+            .chain(coding_threads.iter().map(|t| t.namespace.clone()))
+            .chain(coding_revisions.iter().map(|r| r.namespace.clone()))
+            .collect();
+        if backup.namespace != ALL_NAMESPACES && !backup.namespace.trim().is_empty() {
+            namespaces.push(backup.namespace.clone());
+        }
         namespaces.sort();
         namespaces.dedup();
 
@@ -583,13 +594,58 @@ impl BackupService for DefaultBackupService {
                     report.safety_backup_id = Some(safety.id);
                 }
             }
-            // 再清空当前状态（merged 一并清除，保证与快照一致）
+            // 清空当前状态：按外键依赖逆序由子表到父表深度清空，保证无脏数据且无外键阻塞
             for ns in &namespaces {
-                for cur in store.all_in_namespace(ns, true).await? {
-                    store.delete(&cur.namespace, cur.id).await?;
+                // 1. 删除代码修订
+                for cur in store
+                    .all_revisions_in_namespace(ns)
+                    .await
+                    .unwrap_or_default()
+                {
+                    let _ = store.delete_revision(ns, cur.id).await;
                 }
-                for cur in store.all_evidence_in_namespace(ns).await? {
-                    store.delete_evidence(&cur.namespace, cur.id).await?;
+                // 2. 删除代码线程
+                for cur in store.all_threads_in_namespace(ns).await.unwrap_or_default() {
+                    let _ = store.delete_thread(ns, cur.id).await;
+                }
+                // 3. 删除经验（附带任务-经验关联清理）
+                for cur in store
+                    .all_experiences_in_namespace(ns)
+                    .await
+                    .unwrap_or_default()
+                {
+                    let _ = store.delete_experience(ns, cur.id).await;
+                }
+                // 4. 删除任务事实
+                for cur in store.all_tasks_in_namespace(ns).await.unwrap_or_default() {
+                    let _ = store.delete_task(ns, cur.id).await;
+                }
+                // 5. 删除实体关联
+                for cur in store
+                    .all_relations_in_namespace(ns)
+                    .await
+                    .unwrap_or_default()
+                {
+                    let _ = store
+                        .delete_relation(
+                            ns,
+                            cur.from_memory_id,
+                            cur.to_memory_id,
+                            cur.relation_kind,
+                        )
+                        .await;
+                }
+                // 6. 删除证据
+                for cur in store
+                    .all_evidence_in_namespace(ns)
+                    .await
+                    .unwrap_or_default()
+                {
+                    let _ = store.delete_evidence(&cur.namespace, cur.id).await;
+                }
+                // 7. 删除核心记忆条目（包括历史版本）
+                for cur in store.all_in_namespace(ns, true).await.unwrap_or_default() {
+                    let _ = store.delete(&cur.namespace, cur.id).await;
                 }
             }
         } else {
@@ -641,7 +697,9 @@ impl BackupService for DefaultBackupService {
 
         // 恢复实体关系网
         for rel in &relations {
-            let rel_ns = if backup.namespace != ALL_NAMESPACES {
+            let rel_ns = if let Some(ref ns) = rel.namespace {
+                ns.clone()
+            } else if backup.namespace != ALL_NAMESPACES {
                 backup.namespace.clone()
             } else {
                 entries
@@ -704,8 +762,18 @@ impl BackupService for DefaultBackupService {
         }
 
         // 恢复任务-经验关联映射
-        for te in &task_experiences {
-            let _ = store.link_task_experience(te).await;
+        for mut te in task_experiences {
+            if te.namespace.is_none() {
+                let inferred = tasks
+                    .iter()
+                    .find(|t| t.id == te.task_id)
+                    .map(|t| t.namespace.clone())
+                    .or_else(|| {
+                        (backup.namespace != ALL_NAMESPACES).then(|| backup.namespace.clone())
+                    });
+                te.namespace = inferred;
+            }
+            let _ = store.link_task_experience(&te).await;
         }
 
         // 恢复代码演进线程
@@ -1198,8 +1266,9 @@ mod tests {
 
     #[async_trait]
     impl RelationStore for TestHubStore {
-        async fn add_relation(&self, _ns: &str, rel: &NewMemoryRelation) -> Result<MemoryRelation> {
+        async fn add_relation(&self, ns: &str, rel: &NewMemoryRelation) -> Result<MemoryRelation> {
             let record = MemoryRelation {
+                namespace: Some(ns.to_string()),
                 from_memory_id: rel.from_memory_id,
                 to_memory_id: rel.to_memory_id,
                 relation_kind: rel.relation_kind,
@@ -1322,6 +1391,17 @@ mod tests {
                 .cloned()
                 .collect())
         }
+
+        async fn delete_task(&self, namespace: &str, id: Uuid) -> Result<()> {
+            let mut r = self.tasks.write().unwrap();
+            if r.remove(&(namespace.to_string(), id)).is_some() {
+                let mut te = self.task_experiences.write().unwrap();
+                te.retain(|l| l.task_id != id);
+                Ok(())
+            } else {
+                Err(HubError::NotFound)
+            }
+        }
     }
 
     #[async_trait]
@@ -1440,6 +1520,17 @@ mod tests {
                 .filter(|te| exp_ids.contains(&te.experience_id))
                 .cloned()
                 .collect())
+        }
+
+        async fn delete_experience(&self, namespace: &str, id: Uuid) -> Result<()> {
+            let mut r = self.experiences.write().unwrap();
+            if r.remove(&(namespace.to_string(), id)).is_some() {
+                let mut te = self.task_experiences.write().unwrap();
+                te.retain(|l| l.experience_id != id);
+                Ok(())
+            } else {
+                Err(HubError::NotFound)
+            }
         }
     }
 
@@ -1604,6 +1695,26 @@ mod tests {
                 .collect();
             list.sort_by_key(|r| (r.created_at, r.id));
             Ok(list)
+        }
+
+        async fn delete_thread(&self, namespace: &str, id: Uuid) -> Result<()> {
+            let mut r = self.coding_threads.write().unwrap();
+            if r.remove(&(namespace.to_string(), id)).is_some() {
+                let mut revs = self.coding_revisions.write().unwrap();
+                revs.retain(|_, v| v.thread_id != Some(id));
+                Ok(())
+            } else {
+                Err(HubError::NotFound)
+            }
+        }
+
+        async fn delete_revision(&self, namespace: &str, id: Uuid) -> Result<()> {
+            let mut r = self.coding_revisions.write().unwrap();
+            if r.remove(&(namespace.to_string(), id)).is_some() {
+                Ok(())
+            } else {
+                Err(HubError::NotFound)
+            }
         }
     }
 
@@ -2063,6 +2174,391 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, HubError::InsufficientScope));
+    }
+
+    #[tokio::test]
+    async fn test_v1_to_v4_historical_sample_restore_and_checksum_verification() {
+        let (svc, store) = setup();
+        let a = admin("admin-agent");
+        let ns = "hist-ns";
+
+        store
+            .ensure_namespace(&scoped_ns(ns), &"admin-agent".to_string())
+            .await
+            .unwrap();
+        store
+            .grant(&NamespaceGrantRecord {
+                namespace: scoped_ns(ns),
+                agent_id: "admin-agent".to_string(),
+                can_read: true,
+                can_write: true,
+                granted_by: "admin-agent".to_string(),
+                created_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        // 1. 构造历史 v1 备份样本 (只有 entries)
+        let mut entry_v1 = store.seed(&scoped_ns(ns), "admin-agent", "历史 v1 记忆事实");
+        entry_v1.namespace = ns.to_string();
+        let v1_checksum = DefaultBackupService::checksum_v1(&[entry_v1.clone()]);
+        let v1_payload = serde_json::json!({
+            "version": 1,
+            "entries": [entry_v1.clone()]
+        });
+        let backup_v1 = BackupRecord {
+            id: Uuid::new_v4(),
+            namespace: scoped_ns(ns),
+            created_by: "admin-agent".to_string(),
+            note: Some("v1-legacy".to_string()),
+            entry_count: 1,
+            checksum: v1_checksum,
+            payload: v1_payload,
+            retain_until: None,
+            created_at: chrono::Utc::now(),
+        };
+        store.save_backup(&backup_v1).await.unwrap();
+
+        // DryRun 验证
+        let rep_v1_dry = svc
+            .restore(
+                &a,
+                RestoreRequest {
+                    backup_id: backup_v1.id,
+                    mode: RestoreMode::DryRun,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(rep_v1_dry.mode, RestoreMode::DryRun);
+        assert_eq!(rep_v1_dry.total, 1);
+
+        // 2. 构造历史 v2 备份样本 (entries + evidences + relations)
+        let ev_v2 = MemoryEvidence {
+            id: Uuid::new_v4(),
+            namespace: ns.to_string(),
+            source_kind: EvidenceSourceKind::Session,
+            source_ref: Some("msg-001".to_string()),
+            content_hash: "hash001".to_string(),
+            excerpt: Some("用户询问架构配置".to_string()),
+            occurred_at: Some(chrono::Utc::now()),
+            created_at: chrono::Utc::now(),
+        };
+        let rel_v2 = MemoryRelation {
+            namespace: Some(ns.to_string()),
+            from_memory_id: entry_v1.id,
+            to_memory_id: entry_v1.id,
+            relation_kind: MemoryRelationKind::DerivedFrom,
+            confidence: 0.95,
+            source_evidence_id: Some(ev_v2.id),
+            created_at: chrono::Utc::now(),
+        };
+        let v2_checksum = DefaultBackupService::checksum_v2(
+            std::slice::from_ref(&entry_v1),
+            std::slice::from_ref(&ev_v2),
+            std::slice::from_ref(&rel_v2),
+        );
+        let v2_payload = serde_json::json!({
+            "version": 2,
+            "entries": [entry_v1],
+            "evidences": [ev_v2],
+            "relations": [rel_v2],
+        });
+        let backup_v2 = BackupRecord {
+            id: Uuid::new_v4(),
+            namespace: scoped_ns(ns),
+            created_by: "admin-agent".to_string(),
+            note: Some("v2-legacy".to_string()),
+            entry_count: 1,
+            checksum: v2_checksum,
+            payload: v2_payload,
+            retain_until: None,
+            created_at: chrono::Utc::now(),
+        };
+        store.save_backup(&backup_v2).await.unwrap();
+
+        // 3. 构造历史 v3 备份样本 (v2 + tasks + experiences + task_experiences)
+        let task_v3 = MemoryTask {
+            id: Uuid::new_v4(),
+            namespace: ns.to_string(),
+            scene: crate::domain::MemoryScene::Working,
+            task: "审计历史备份恢复".to_string(),
+            status: TaskStatus::Completed,
+            started_at: chrono::Utc::now(),
+            finished_at: Some(chrono::Utc::now()),
+            result_summary: Some("审计通过".to_string()),
+            failure_reason: None,
+            source_evidence_id: None,
+            metadata: serde_json::json!({}),
+        };
+        let exp_v3 = MemoryExperience {
+            id: Uuid::new_v4(),
+            namespace: ns.to_string(),
+            task: "备份校验".to_string(),
+            search_keys: vec!["backup".to_string()],
+            solution: "按版本计算校验和".to_string(),
+            preconditions: serde_json::json!([]),
+            boundary_envs: vec![],
+            failure_modes: vec![],
+            validation: serde_json::json!("成功"),
+            confidence: 1.0,
+            status: ExperienceStatus::Active,
+            feedback_score: 1.0,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let te_v3 = MemoryTaskExperience {
+            task_id: task_v3.id,
+            experience_id: exp_v3.id,
+            namespace: Some(ns.to_string()),
+            relation_kind: "derived_from".to_string(),
+            created_at: chrono::Utc::now(),
+        };
+        let v3_checksum = DefaultBackupService::checksum_v3(
+            &[],
+            &[],
+            &[],
+            std::slice::from_ref(&task_v3),
+            std::slice::from_ref(&exp_v3),
+            std::slice::from_ref(&te_v3),
+        );
+        let v3_payload = serde_json::json!({
+            "version": 3,
+            "entries": [],
+            "tasks": [task_v3],
+            "experiences": [exp_v3],
+            "task_experiences": [te_v3],
+        });
+        let backup_v3 = BackupRecord {
+            id: Uuid::new_v4(),
+            namespace: scoped_ns(ns),
+            created_by: "admin-agent".to_string(),
+            note: Some("v3-legacy".to_string()),
+            entry_count: 0,
+            checksum: v3_checksum,
+            payload: v3_payload,
+            retain_until: None,
+            created_at: chrono::Utc::now(),
+        };
+        store.save_backup(&backup_v3).await.unwrap();
+
+        // 4. 恢复 v3 备份（Merge 模式）
+        let rep_v3 = svc
+            .restore(
+                &a,
+                RestoreRequest {
+                    backup_id: backup_v3.id,
+                    mode: RestoreMode::Merge,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(rep_v3.mode, RestoreMode::Merge);
+
+        // 验证 task 和 experience 成功恢复
+        let recovered_task = store.get_task(&scoped_ns(ns), task_v3.id).await.unwrap();
+        assert!(recovered_task.is_some());
+        assert_eq!(recovered_task.unwrap().task, "审计历史备份恢复");
+
+        let recovered_exp = store
+            .get_experience(&scoped_ns(ns), exp_v3.id)
+            .await
+            .unwrap();
+        assert!(recovered_exp.is_some());
+        assert_eq!(recovered_exp.unwrap().solution, "按版本计算校验和");
+    }
+
+    #[tokio::test]
+    async fn test_backup_replace_purge_safety_backup_and_rollback() {
+        let (svc, store) = setup();
+        let a = admin("admin-agent");
+        let ns = "replace-ns";
+
+        store
+            .ensure_namespace(&scoped_ns(ns), &"admin-agent".to_string())
+            .await
+            .unwrap();
+        store
+            .grant(&NamespaceGrantRecord {
+                namespace: scoped_ns(ns),
+                agent_id: "admin-agent".to_string(),
+                can_read: true,
+                can_write: true,
+                granted_by: "admin-agent".to_string(),
+                created_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        // 阶段 1：初始状态，写入一条记忆与任务
+        let initial_entry = store.seed(&scoped_ns(ns), "admin-agent", "初始重要数据");
+        let initial_task = store
+            .create_task(&NewMemoryTask {
+                id: None,
+                namespace: scoped_ns(ns),
+                scene: crate::domain::MemoryScene::Working,
+                task: "初始任务".to_string(),
+                status: TaskStatus::Running,
+                started_at: chrono::Utc::now(),
+                finished_at: None,
+                result_summary: None,
+                failure_reason: None,
+                source_evidence_id: None,
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+
+        // 阶段 2：准备一份快照（仅包含新条目）
+        let new_entry_id = Uuid::new_v4();
+        let new_entry = MemoryEntry {
+            id: new_entry_id,
+            namespace: ns.to_string(),
+            key: None,
+            kind: MemoryKind::Fact,
+            content: "全新的快照数据".to_string(),
+            tags: vec![],
+            metadata: serde_json::json!({}),
+            embedding: None,
+            embedding_model: None,
+            source_agent: "admin-agent".to_string(),
+            confidence: 1.0,
+            status: MemoryStatus::Active,
+            version: 1,
+            expires_at: None,
+            merged_into: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            scene: None,
+            layer: None,
+            valid_from: None,
+            valid_until: None,
+            occurred_at: None,
+        };
+        let checksum = DefaultBackupService::checksum_v1(std::slice::from_ref(&new_entry));
+        let snapshot_backup = BackupRecord {
+            id: Uuid::new_v4(),
+            namespace: scoped_ns(ns),
+            created_by: "admin-agent".to_string(),
+            note: Some("snapshot-to-replace".to_string()),
+            entry_count: 1,
+            checksum,
+            payload: serde_json::json!({
+                "version": 1,
+                "entries": [new_entry]
+            }),
+            retain_until: None,
+            created_at: chrono::Utc::now(),
+        };
+        store.save_backup(&snapshot_backup).await.unwrap();
+
+        // 阶段 3：执行 Replace 恢复
+        let rep = svc
+            .restore(
+                &a,
+                RestoreRequest {
+                    backup_id: snapshot_backup.id,
+                    mode: RestoreMode::Replace,
+                },
+            )
+            .await
+            .unwrap();
+
+        // 验证生成了 safety backup
+        assert!(rep.safety_backup_id.is_some());
+        let safety_id = rep.safety_backup_id.unwrap();
+
+        // 验证旧数据已被彻底清除
+        assert!(store.get(&scoped_ns(ns), initial_entry.id).await.is_err());
+        assert!(store
+            .get_task(&scoped_ns(ns), initial_task.id)
+            .await
+            .unwrap()
+            .is_none());
+
+        // 验证新数据已生效
+        let cur = store.get(&scoped_ns(ns), new_entry_id).await.unwrap();
+        assert_eq!(cur.content, "全新的快照数据");
+
+        // 阶段 4：模拟故障回滚，通过 safety backup 再次执行 Replace 恢复！
+        let rollback_rep = svc
+            .restore(
+                &a,
+                RestoreRequest {
+                    backup_id: safety_id,
+                    mode: RestoreMode::Replace,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(rollback_rep.mode, RestoreMode::Replace);
+
+        // 验证回滚后，初始数据完全复原！
+        let restored_initial = store.get(&scoped_ns(ns), initial_entry.id).await.unwrap();
+        assert_eq!(restored_initial.content, "初始重要数据");
+        let restored_task = store
+            .get_task(&scoped_ns(ns), initial_task.id)
+            .await
+            .unwrap();
+        assert!(restored_task.is_some());
+        assert_eq!(restored_task.unwrap().task, "初始任务");
+
+        // 验证被替换的新数据已不存在
+        assert!(store.get(&scoped_ns(ns), new_entry_id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_corrupted_checksum_fails_restore() {
+        let (svc, store) = setup();
+        let a = admin("admin-agent");
+        let ns = "corrupt-ns";
+
+        store
+            .ensure_namespace(&scoped_ns(ns), &"admin-agent".to_string())
+            .await
+            .unwrap();
+        store
+            .grant(&NamespaceGrantRecord {
+                namespace: scoped_ns(ns),
+                agent_id: "admin-agent".to_string(),
+                can_read: true,
+                can_write: true,
+                granted_by: "admin-agent".to_string(),
+                created_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        let corrupted_backup = BackupRecord {
+            id: Uuid::new_v4(),
+            namespace: scoped_ns(ns),
+            created_by: "admin-agent".to_string(),
+            note: Some("corrupted".to_string()),
+            entry_count: 1,
+            checksum: "invalid_tampered_checksum".to_string(),
+            payload: serde_json::json!({
+                "version": 1,
+                "entries": []
+            }),
+            retain_until: None,
+            created_at: chrono::Utc::now(),
+        };
+        store.save_backup(&corrupted_backup).await.unwrap();
+
+        let err = svc
+            .restore(
+                &a,
+                RestoreRequest {
+                    backup_id: corrupted_backup.id,
+                    mode: RestoreMode::Merge,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HubError::Internal(_)),
+            "校验和篡改必须直接拒绝"
+        );
     }
 
     // 编译期检查：Embedder trait 对象可用

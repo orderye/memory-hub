@@ -1005,6 +1005,7 @@ impl mem_core::infra::RelationStore for InMemoryHubStore {
         }
         let created_at = Utc::now();
         let rel = MemoryRelation {
+            namespace: Some(namespace.to_string()),
             from_memory_id: relation.from_memory_id,
             to_memory_id: relation.to_memory_id,
             relation_kind: relation.relation_kind,
@@ -1155,6 +1156,17 @@ impl mem_core::infra::TaskStore for InMemoryHubStore {
         list.sort_by_key(|t| (t.started_at, t.id));
         Ok(list)
     }
+
+    async fn delete_task(&self, namespace: &str, id: Uuid) -> Result<()> {
+        let mut w = self.tasks.write().unwrap();
+        if w.remove(&(namespace.to_string(), id)).is_some() {
+            let mut te = self.task_experiences.write().unwrap();
+            te.retain(|(_, l)| l.task_id != id);
+            Ok(())
+        } else {
+            Err(HubError::NotFound)
+        }
+    }
 }
 
 #[async_trait]
@@ -1225,19 +1237,44 @@ impl mem_core::infra::ExperienceStore for InMemoryHubStore {
     }
 
     async fn link_task_experience(&self, link: &MemoryTaskExperience) -> Result<()> {
+        let tasks = self.tasks.read().unwrap();
+        let experiences = self.experiences.read().unwrap();
+
+        let task_ns = tasks
+            .iter()
+            .find(|((_, tid), _)| *tid == link.task_id)
+            .map(|((ns, _), _)| ns.clone())
+            .ok_or(HubError::NotFound)?;
+
+        let exp_ns = experiences
+            .iter()
+            .find(|((_, eid), _)| *eid == link.experience_id)
+            .map(|((ns, _), _)| ns.clone())
+            .ok_or(HubError::NotFound)?;
+
+        if task_ns != exp_ns {
+            return Err(HubError::InvalidArgument(
+                "任务与经验不属于同一命名空间".into(),
+            ));
+        }
+
+        if let Some(ref link_ns) = link.namespace {
+            if *link_ns != task_ns {
+                return Err(HubError::InvalidArgument(
+                    "指定命名空间与任务所属命名空间不一致".into(),
+                ));
+            }
+        }
+
         let mut w = self.task_experiences.write().unwrap();
         if !w.iter().any(|(_, l)| {
             l.task_id == link.task_id
                 && l.experience_id == link.experience_id
                 && l.relation_kind == link.relation_kind
         }) {
-            let tasks = self.tasks.read().unwrap();
-            let ns = tasks
-                .iter()
-                .find(|((_, tid), _)| *tid == link.task_id)
-                .map(|((ns, _), _)| ns.clone())
-                .unwrap_or_default();
-            w.push((ns, link.clone()));
+            let mut stored = link.clone();
+            stored.namespace = Some(task_ns.clone());
+            w.push((task_ns, stored));
         }
         Ok(())
     }
@@ -1275,11 +1312,31 @@ impl mem_core::infra::ExperienceStore for InMemoryHubStore {
             .collect();
         Ok(list)
     }
+
+    async fn delete_experience(&self, namespace: &str, id: Uuid) -> Result<()> {
+        let mut w = self.experiences.write().unwrap();
+        if w.remove(&(namespace.to_string(), id)).is_some() {
+            let mut te = self.task_experiences.write().unwrap();
+            te.retain(|(_, l)| l.experience_id != id);
+            Ok(())
+        } else {
+            Err(HubError::NotFound)
+        }
+    }
 }
 
 #[async_trait]
 impl CodingStore for InMemoryHubStore {
     async fn create_thread(&self, thread: &NewCodingThread) -> Result<CodingThread> {
+        if let Some(task_id) = thread.task_id {
+            let tasks = self.tasks.read().unwrap();
+            if !tasks.contains_key(&(thread.namespace.clone(), task_id)) {
+                return Err(HubError::InvalidArgument(
+                    "关联任务不存在于该命名空间".into(),
+                ));
+            }
+        }
+
         let id = thread.id.unwrap_or_else(Uuid::new_v4);
         let now = Utc::now();
         let record = CodingThread {
@@ -1329,6 +1386,31 @@ impl CodingStore for InMemoryHubStore {
         revision: &NewCodingRevision,
         diff_hash: &str,
     ) -> Result<CodingRevision> {
+        if let Some(tid) = revision.thread_id {
+            let threads = self.coding_threads.read().unwrap();
+            if !threads.contains_key(&(revision.namespace.clone(), tid)) {
+                return Err(HubError::InvalidArgument(
+                    "关联线程不存在于该命名空间".into(),
+                ));
+            }
+        }
+        if let Some(task_id) = revision.source_task_id {
+            let tasks = self.tasks.read().unwrap();
+            if !tasks.contains_key(&(revision.namespace.clone(), task_id)) {
+                return Err(HubError::InvalidArgument(
+                    "关联任务不存在于该命名空间".into(),
+                ));
+            }
+        }
+        if let Some(ev_id) = revision.source_evidence_id {
+            let evs = self.evidences.read().unwrap();
+            if !evs.contains_key(&(revision.namespace.clone(), ev_id)) {
+                return Err(HubError::InvalidArgument(
+                    "关联证据不存在于该命名空间".into(),
+                ));
+            }
+        }
+
         let id = revision.id.unwrap_or_else(Uuid::new_v4);
         let now = Utc::now();
         let record = CodingRevision {
@@ -1432,6 +1514,26 @@ impl CodingStore for InMemoryHubStore {
             .filter(|rev| rev.namespace == namespace)
             .cloned()
             .collect())
+    }
+
+    async fn delete_thread(&self, namespace: &str, id: Uuid) -> Result<()> {
+        let mut w = self.coding_threads.write().unwrap();
+        if w.remove(&(namespace.to_string(), id)).is_some() {
+            let mut revs = self.coding_revisions.write().unwrap();
+            revs.retain(|_, r| r.thread_id != Some(id));
+            Ok(())
+        } else {
+            Err(HubError::NotFound)
+        }
+    }
+
+    async fn delete_revision(&self, namespace: &str, id: Uuid) -> Result<()> {
+        let mut w = self.coding_revisions.write().unwrap();
+        if w.remove(&(namespace.to_string(), id)).is_some() {
+            Ok(())
+        } else {
+            Err(HubError::NotFound)
+        }
     }
 }
 

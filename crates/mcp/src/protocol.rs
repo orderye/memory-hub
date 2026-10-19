@@ -108,11 +108,18 @@ mod tests {
 
         let tools = handle_tools_list();
         let list = tools["tools"].as_array().expect("tools 应为数组");
-        assert_eq!(list.len(), 18, "应暴露全部 18 个记忆工具");
+        assert_eq!(
+            list.len(),
+            27,
+            "应暴露全部 27 个记忆工具（18 个核心基础工具 + 9 个认知增强工具）"
+        );
         assert!(list.iter().any(|t| t["name"] == "memory_put"));
         assert!(list.iter().any(|t| t["name"] == "memory_search"));
         assert!(list.iter().any(|t| t["name"] == "memory_backup_create"));
         assert!(list.iter().any(|t| t["name"] == "memory_integrate_scan"));
+        assert!(list.iter().any(|t| t["name"] == "cognitive_chat_propose"));
+        assert!(list.iter().any(|t| t["name"] == "working_task_start"));
+        assert!(list.iter().any(|t| t["name"] == "coding_thread_create"));
     }
 
     #[test]
