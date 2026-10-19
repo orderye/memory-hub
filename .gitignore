@@ -6,5 +6,11 @@ Cargo.lock.bk
 .env.*
 !.env.example
 .DS_Store
+**/.DS_Store
 Thumbs.db
 .zcode/
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
