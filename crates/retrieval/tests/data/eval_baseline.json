@@ -1,122 +1,122 @@
 {
-  "dataset_fingerprint": "19c00cb20aa691d1",
-  "dataset_docs": 212,
-  "dataset_queries": 199,
+  "dataset_fingerprint": "9f5b3b075a558371",
+  "dataset_docs": 480,
+  "dataset_queries": 600,
   "embedder": "test-embedder",
   "config": "default(strict, w=0.5/0.2/0.1/0.1/0.1, λ=0.7)",
   "overall": {
-    "queries": 199,
-    "recall_at_1": 0.5867346938775511,
-    "recall_at_5": 0.9132653061224489,
-    "recall_at_10": 0.9795918367346939,
-    "mrr_at_10": 0.7087625526401035,
-    "ndcg_at_10": 0.5726072463825397,
-    "forbidden_rate": 0.17857142857142858,
-    "negative_hit_rate": 0.0,
-    "p50_ms": 29.276083,
-    "p95_ms": 68.77808300000001
+    "queries": 600,
+    "recall_at_1": 0.4888888888888889,
+    "recall_at_5": 0.7333333333333333,
+    "recall_at_10": 0.8277777777777777,
+    "mrr_at_10": 0.5888315696649032,
+    "ndcg_at_10": 0.49707916945541125,
+    "forbidden_rate": 0.08333333333333333,
+    "negative_hit_rate": 1.0,
+    "p50_ms": 25.650833000000002,
+    "p95_ms": 34.889917
   },
   "by_scene": {
     "chat": {
-      "queries": 76,
-      "recall_at_1": 0.6973684210526315,
-      "recall_at_5": 0.9473684210526315,
-      "recall_at_10": 0.9736842105263158,
-      "mrr_at_10": 0.7876461988304095,
-      "ndcg_at_10": 0.6222523876848222,
-      "forbidden_rate": 0.2631578947368421,
+      "queries": 165,
+      "recall_at_1": 0.7393939393939394,
+      "recall_at_5": 0.8727272727272727,
+      "recall_at_10": 0.9454545454545454,
+      "mrr_at_10": 0.7870346320346323,
+      "ndcg_at_10": 0.6930827124831679,
+      "forbidden_rate": 0.12121212121212122,
       "negative_hit_rate": 0.0,
-      "p50_ms": 34.525917,
-      "p95_ms": 48.350708
+      "p50_ms": 13.165,
+      "p95_ms": 27.676790999999998
     },
     "coding": {
-      "queries": 56,
-      "recall_at_1": 0.7678571428571429,
-      "recall_at_5": 1.0,
-      "recall_at_10": 1.0,
-      "mrr_at_10": 0.8389880952380955,
-      "ndcg_at_10": 0.6270718198233763,
-      "forbidden_rate": 0.10714285714285714,
+      "queries": 105,
+      "recall_at_1": 0.6571428571428571,
+      "recall_at_5": 0.8571428571428571,
+      "recall_at_10": 0.9619047619047619,
+      "mrr_at_10": 0.7512244897959184,
+      "ndcg_at_10": 0.5629195155135663,
+      "forbidden_rate": 0.08571428571428572,
       "negative_hit_rate": 0.0,
-      "p50_ms": 27.343042,
-      "p95_ms": 37.800625
+      "p50_ms": 23.770667,
+      "p95_ms": 25.55825
     },
     "working": {
-      "queries": 64,
-      "recall_at_1": 0.296875,
-      "recall_at_5": 0.796875,
-      "recall_at_10": 0.96875,
-      "mrr_at_10": 0.5011408730158728,
-      "ndcg_at_10": 0.46599713932535125,
-      "forbidden_rate": 0.140625,
+      "queries": 270,
+      "recall_at_1": 0.27037037037037037,
+      "recall_at_5": 0.6,
+      "recall_at_10": 0.7037037037037037,
+      "mrr_at_10": 0.40455467372134024,
+      "ndcg_at_10": 0.3516946474713875,
+      "forbidden_rate": 0.05925925925925926,
       "negative_hit_rate": 0.0,
-      "p50_ms": 49.399167,
-      "p95_ms": 82.93675
+      "p50_ms": 32.178334,
+      "p95_ms": 35.196334
     }
   },
   "by_category": {
     "env": {
-      "queries": 8,
-      "recall_at_1": 0.125,
-      "recall_at_5": 0.75,
-      "recall_at_10": 1.0,
-      "mrr_at_10": 0.41369047619047616,
-      "ndcg_at_10": 0.5554603621628142,
-      "forbidden_rate": 0.25,
+      "queries": 60,
+      "recall_at_1": 0.15,
+      "recall_at_5": 0.31666666666666665,
+      "recall_at_10": 0.48333333333333334,
+      "mrr_at_10": 0.22144841269841262,
+      "ndcg_at_10": 0.2816067513033929,
+      "forbidden_rate": 0.03333333333333333,
       "negative_hit_rate": 0.0,
-      "p50_ms": 79.844292,
-      "p95_ms": 89.41679099999999
+      "p50_ms": 34.78075,
+      "p95_ms": 36.153625000000005
     },
     "evolution": {
-      "queries": 26,
-      "recall_at_1": 0.6538461538461539,
-      "recall_at_5": 0.9615384615384616,
-      "recall_at_10": 1.0,
-      "mrr_at_10": 0.7685897435897435,
-      "ndcg_at_10": 0.5059261106312009,
-      "forbidden_rate": 0.3076923076923077,
+      "queries": 60,
+      "recall_at_1": 0.48333333333333334,
+      "recall_at_5": 0.8166666666666667,
+      "recall_at_10": 0.9333333333333333,
+      "mrr_at_10": 0.6204166666666666,
+      "ndcg_at_10": 0.4263988699960911,
+      "forbidden_rate": 0.16666666666666666,
       "negative_hit_rate": 0.0,
-      "p50_ms": 48.350708,
-      "p95_ms": 67.06554100000001
+      "p50_ms": 32.606708,
+      "p95_ms": 34.310125
     },
     "exact": {
-      "queries": 26,
-      "recall_at_1": 0.6923076923076923,
-      "recall_at_5": 0.9615384615384616,
-      "recall_at_10": 1.0,
-      "mrr_at_10": 0.7878205128205127,
-      "ndcg_at_10": 0.5146297408439284,
-      "forbidden_rate": 0.34615384615384615,
+      "queries": 60,
+      "recall_at_1": 0.5833333333333334,
+      "recall_at_5": 0.8833333333333333,
+      "recall_at_10": 0.9666666666666667,
+      "mrr_at_10": 0.6921296296296297,
+      "ndcg_at_10": 0.4645991056175071,
+      "forbidden_rate": 0.18333333333333332,
       "negative_hit_rate": 0.0,
-      "p50_ms": 35.605,
-      "p95_ms": 55.929375
+      "p50_ms": 31.560249999999996,
+      "p95_ms": 33.032084000000005
     },
     "layer": {
-      "queries": 26,
-      "recall_at_1": 0.6923076923076923,
-      "recall_at_5": 0.9615384615384616,
-      "recall_at_10": 1.0,
-      "mrr_at_10": 0.7878205128205127,
-      "ndcg_at_10": 0.5146297408439284,
-      "forbidden_rate": 0.34615384615384615,
+      "queries": 60,
+      "recall_at_1": 0.6,
+      "recall_at_5": 0.8833333333333333,
+      "recall_at_10": 0.9666666666666667,
+      "mrr_at_10": 0.705462962962963,
+      "ndcg_at_10": 0.47086493028410986,
+      "forbidden_rate": 0.21666666666666667,
       "negative_hit_rate": 0.0,
-      "p50_ms": 11.790833000000001,
-      "p95_ms": 27.847165999999998
+      "p50_ms": 30.384292,
+      "p95_ms": 31.726499999999998
     },
     "negative": {
-      "queries": 3,
+      "queries": 60,
       "recall_at_1": 0.0,
       "recall_at_5": 0.0,
       "recall_at_10": 0.0,
       "mrr_at_10": 0.0,
       "ndcg_at_10": 0.0,
       "forbidden_rate": 0.0,
-      "negative_hit_rate": 0.0,
-      "p50_ms": 48.299083,
-      "p95_ms": 60.874042
+      "negative_hit_rate": 1.0,
+      "p50_ms": 27.809708,
+      "p95_ms": 34.938125
     },
     "no_embedding": {
-      "queries": 6,
+      "queries": 60,
       "recall_at_1": 1.0,
       "recall_at_5": 1.0,
       "recall_at_10": 1.0,
@@ -124,56 +124,5458 @@
       "ndcg_at_10": 1.0,
       "forbidden_rate": 0.0,
       "negative_hit_rate": 0.0,
-      "p50_ms": 34.525917,
-      "p95_ms": 34.943000000000005
+      "p50_ms": 12.537042,
+      "p95_ms": 13.222959
     },
     "paraphrase": {
-      "queries": 26,
-      "recall_at_1": 0.23076923076923078,
-      "recall_at_5": 0.6923076923076923,
-      "recall_at_10": 0.8461538461538461,
-      "mrr_at_10": 0.3976953601953602,
-      "ndcg_at_10": 0.3088430795475045,
-      "forbidden_rate": 0.2692307692307692,
+      "queries": 60,
+      "recall_at_1": 0.2,
+      "recall_at_5": 0.43333333333333335,
+      "recall_at_10": 0.55,
+      "mrr_at_10": 0.2913095238095238,
+      "ndcg_at_10": 0.2159905143799719,
+      "forbidden_rate": 0.15,
       "negative_hit_rate": 0.0,
-      "p50_ms": 35.838375,
-      "p95_ms": 50.826417
+      "p50_ms": 31.157291999999998,
+      "p95_ms": 32.4625
     },
     "scene": {
-      "queries": 26,
-      "recall_at_1": 0.6538461538461539,
-      "recall_at_5": 0.9615384615384616,
-      "recall_at_10": 1.0,
-      "mrr_at_10": 0.7685897435897435,
-      "ndcg_at_10": 0.8251299469371105,
+      "queries": 60,
+      "recall_at_1": 0.48333333333333334,
+      "recall_at_5": 0.8166666666666667,
+      "recall_at_10": 0.9333333333333333,
+      "mrr_at_10": 0.620648148148148,
+      "ndcg_at_10": 0.6956671853179017,
       "forbidden_rate": 0.0,
       "negative_hit_rate": 0.0,
-      "p50_ms": 35.287375000000004,
-      "p95_ms": 50.607583
+      "p50_ms": 31.224167,
+      "p95_ms": 32.9295
     },
     "tags": {
-      "queries": 26,
-      "recall_at_1": 0.8076923076923077,
+      "queries": 60,
+      "recall_at_1": 0.7166666666666667,
       "recall_at_5": 1.0,
       "recall_at_10": 1.0,
-      "mrr_at_10": 0.8910256410256411,
-      "ndcg_at_10": 0.5634537177901426,
+      "mrr_at_10": 0.8472222222222222,
+      "ndcg_at_10": 0.5436785028082448,
       "forbidden_rate": 0.0,
       "negative_hit_rate": 0.0,
-      "p50_ms": 0.5756669999999999,
-      "p95_ms": 1.4827919999999999
+      "p50_ms": 0.661708,
+      "p95_ms": 0.875375
     },
     "temporal": {
-      "queries": 26,
-      "recall_at_1": 0.4230769230769231,
-      "recall_at_5": 0.8846153846153846,
-      "recall_at_10": 1.0,
-      "mrr_at_10": 0.5833791208791208,
-      "ndcg_at_10": 0.6822852554706261,
+      "queries": 60,
+      "recall_at_1": 0.18333333333333332,
+      "recall_at_5": 0.45,
+      "recall_at_10": 0.6166666666666667,
+      "mrr_at_10": 0.3008465608465608,
+      "ndcg_at_10": 0.3749066653914758,
       "forbidden_rate": 0.0,
       "negative_hit_rate": 0.0,
-      "p50_ms": 4.772583,
-      "p95_ms": 5.622707999999999
+      "p50_ms": 11.83775,
+      "p95_ms": 12.426
     }
-  }
+  },
+  "per_query": [
+    {
+      "id": "chat-db-conn-exact",
+      "category": "exact",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "chat-db-conn-paraphrase",
+      "category": "paraphrase",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "chat-db-conn-temporal",
+      "category": "temporal",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-db-conn-evolution",
+      "category": "evolution",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "chat-db-conn-scene",
+      "category": "scene",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-db-conn-tags",
+      "category": "tags",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 2
+    },
+    {
+      "id": "chat-db-conn-layer",
+      "category": "layer",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "chat-gateway-timeout-exact",
+      "category": "exact",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-gateway-timeout-paraphrase",
+      "category": "paraphrase",
+      "scene": "chat",
+      "rank_first_relevant": 7,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-gateway-timeout-temporal",
+      "category": "temporal",
+      "scene": "chat",
+      "rank_first_relevant": 9,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-gateway-timeout-evolution",
+      "category": "evolution",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-gateway-timeout-scene",
+      "category": "scene",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-gateway-timeout-tags",
+      "category": "tags",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 2
+    },
+    {
+      "id": "chat-gateway-timeout-layer",
+      "category": "layer",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-jwt-rotation-exact",
+      "category": "exact",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "chat-jwt-rotation-paraphrase",
+      "category": "paraphrase",
+      "scene": "chat",
+      "rank_first_relevant": 6,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-jwt-rotation-temporal",
+      "category": "temporal",
+      "scene": "chat",
+      "rank_first_relevant": 9,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-jwt-rotation-evolution",
+      "category": "evolution",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "chat-jwt-rotation-scene",
+      "category": "scene",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-jwt-rotation-tags",
+      "category": "tags",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 2
+    },
+    {
+      "id": "chat-jwt-rotation-layer",
+      "category": "layer",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-lang-preference-exact",
+      "category": "exact",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-lang-preference-paraphrase",
+      "category": "paraphrase",
+      "scene": "chat",
+      "rank_first_relevant": 5,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-lang-preference-temporal",
+      "category": "temporal",
+      "scene": "chat",
+      "rank_first_relevant": 8,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-lang-preference-evolution",
+      "category": "evolution",
+      "scene": "chat",
+      "rank_first_relevant": 2,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-lang-preference-scene",
+      "category": "scene",
+      "scene": "chat",
+      "rank_first_relevant": 2,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-lang-preference-tags",
+      "category": "tags",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 2
+    },
+    {
+      "id": "chat-lang-preference-layer",
+      "category": "layer",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 3
+    },
+    {
+      "id": "chat-budget-exact",
+      "category": "exact",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "chat-budget-paraphrase",
+      "category": "paraphrase",
+      "scene": "chat",
+      "rank_first_relevant": null,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-budget-temporal",
+      "category": "temporal",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-budget-evolution",
+      "category": "evolution",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "chat-budget-scene",
+      "category": "scene",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-budget-tags",
+      "category": "tags",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 2
+    },
+    {
+      "id": "chat-budget-layer",
+      "category": "layer",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "chat-oncall-exact",
+      "category": "exact",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-oncall-paraphrase",
+      "category": "paraphrase",
+      "scene": "chat",
+      "rank_first_relevant": null,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-oncall-temporal",
+      "category": "temporal",
+      "scene": "chat",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-oncall-evolution",
+      "category": "evolution",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-oncall-scene",
+      "category": "scene",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-oncall-tags",
+      "category": "tags",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 2
+    },
+    {
+      "id": "chat-oncall-layer",
+      "category": "layer",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 9
+    },
+    {
+      "id": "chat-retention-exact",
+      "category": "exact",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-retention-paraphrase",
+      "category": "paraphrase",
+      "scene": "chat",
+      "rank_first_relevant": null,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "chat-retention-temporal",
+      "category": "temporal",
+      "scene": "chat",
+      "rank_first_relevant": 4,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-retention-evolution",
+      "category": "evolution",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-retention-scene",
+      "category": "scene",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-retention-tags",
+      "category": "tags",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 2
+    },
+    {
+      "id": "chat-retention-layer",
+      "category": "layer",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-region-exact",
+      "category": "exact",
+      "scene": "chat",
+      "rank_first_relevant": 5,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "chat-region-paraphrase",
+      "category": "paraphrase",
+      "scene": "chat",
+      "rank_first_relevant": 4,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "chat-region-temporal",
+      "category": "temporal",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-region-evolution",
+      "category": "evolution",
+      "scene": "chat",
+      "rank_first_relevant": 5,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "chat-region-scene",
+      "category": "scene",
+      "scene": "chat",
+      "rank_first_relevant": 5,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-region-tags",
+      "category": "tags",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 2
+    },
+    {
+      "id": "chat-region-layer",
+      "category": "layer",
+      "scene": "chat",
+      "rank_first_relevant": 5,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "chat-cache-exact",
+      "category": "exact",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "chat-cache-paraphrase",
+      "category": "paraphrase",
+      "scene": "chat",
+      "rank_first_relevant": 5,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-cache-temporal",
+      "category": "temporal",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-cache-evolution",
+      "category": "evolution",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "chat-cache-scene",
+      "category": "scene",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-cache-tags",
+      "category": "tags",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 2
+    },
+    {
+      "id": "chat-cache-layer",
+      "category": "layer",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "chat-api-version-exact",
+      "category": "exact",
+      "scene": "chat",
+      "rank_first_relevant": 5,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-api-version-paraphrase",
+      "category": "paraphrase",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-api-version-temporal",
+      "category": "temporal",
+      "scene": "chat",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-api-version-evolution",
+      "category": "evolution",
+      "scene": "chat",
+      "rank_first_relevant": 5,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-api-version-scene",
+      "category": "scene",
+      "scene": "chat",
+      "rank_first_relevant": 5,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-api-version-tags",
+      "category": "tags",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 2
+    },
+    {
+      "id": "chat-api-version-layer",
+      "category": "layer",
+      "scene": "chat",
+      "rank_first_relevant": 5,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-session-ttl-exact",
+      "category": "exact",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-session-ttl-paraphrase",
+      "category": "paraphrase",
+      "scene": "chat",
+      "rank_first_relevant": 3,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-session-ttl-temporal",
+      "category": "temporal",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-session-ttl-evolution",
+      "category": "evolution",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-session-ttl-scene",
+      "category": "scene",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-session-ttl-tags",
+      "category": "tags",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 2
+    },
+    {
+      "id": "chat-session-ttl-layer",
+      "category": "layer",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-invite-exact",
+      "category": "exact",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-invite-paraphrase",
+      "category": "paraphrase",
+      "scene": "chat",
+      "rank_first_relevant": 7,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-invite-temporal",
+      "category": "temporal",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-invite-evolution",
+      "category": "evolution",
+      "scene": "chat",
+      "rank_first_relevant": 3,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-invite-scene",
+      "category": "scene",
+      "scene": "chat",
+      "rank_first_relevant": 3,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-invite-tags",
+      "category": "tags",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 2
+    },
+    {
+      "id": "chat-invite-layer",
+      "category": "layer",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 9
+    },
+    {
+      "id": "chat-rate-limit-exact",
+      "category": "exact",
+      "scene": "chat",
+      "rank_first_relevant": null,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-rate-limit-paraphrase",
+      "category": "paraphrase",
+      "scene": "chat",
+      "rank_first_relevant": 3,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-rate-limit-temporal",
+      "category": "temporal",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-rate-limit-evolution",
+      "category": "evolution",
+      "scene": "chat",
+      "rank_first_relevant": null,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-rate-limit-scene",
+      "category": "scene",
+      "scene": "chat",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-rate-limit-tags",
+      "category": "tags",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 2
+    },
+    {
+      "id": "chat-rate-limit-layer",
+      "category": "layer",
+      "scene": "chat",
+      "rank_first_relevant": null,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-backup-cron-exact",
+      "category": "exact",
+      "scene": "chat",
+      "rank_first_relevant": 9,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-backup-cron-paraphrase",
+      "category": "paraphrase",
+      "scene": "chat",
+      "rank_first_relevant": 4,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-backup-cron-temporal",
+      "category": "temporal",
+      "scene": "chat",
+      "rank_first_relevant": 2,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-backup-cron-evolution",
+      "category": "evolution",
+      "scene": "chat",
+      "rank_first_relevant": 9,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-backup-cron-scene",
+      "category": "scene",
+      "scene": "chat",
+      "rank_first_relevant": 9,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-backup-cron-tags",
+      "category": "tags",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 2
+    },
+    {
+      "id": "chat-backup-cron-layer",
+      "category": "layer",
+      "scene": "chat",
+      "rank_first_relevant": 9,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-cjk-exact",
+      "category": "exact",
+      "scene": "chat",
+      "rank_first_relevant": 5,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-cjk-paraphrase",
+      "category": "paraphrase",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-cjk-temporal",
+      "category": "temporal",
+      "scene": "chat",
+      "rank_first_relevant": 2,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-cjk-evolution",
+      "category": "evolution",
+      "scene": "chat",
+      "rank_first_relevant": 6,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-cjk-scene",
+      "category": "scene",
+      "scene": "chat",
+      "rank_first_relevant": 6,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "chat-cjk-tags",
+      "category": "tags",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 2
+    },
+    {
+      "id": "chat-cjk-layer",
+      "category": "layer",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 9
+    },
+    {
+      "id": "code-idempotency-exact",
+      "category": "exact",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-idempotency-paraphrase",
+      "category": "paraphrase",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-idempotency-temporal",
+      "category": "temporal",
+      "scene": "coding",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-idempotency-evolution",
+      "category": "evolution",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-idempotency-scene",
+      "category": "scene",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-idempotency-tags",
+      "category": "tags",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 2
+    },
+    {
+      "id": "code-idempotency-layer",
+      "category": "layer",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-scoped-ns-exact",
+      "category": "exact",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-scoped-ns-paraphrase",
+      "category": "paraphrase",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-scoped-ns-temporal",
+      "category": "temporal",
+      "scene": "coding",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-scoped-ns-evolution",
+      "category": "evolution",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-scoped-ns-scene",
+      "category": "scene",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-scoped-ns-tags",
+      "category": "tags",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 2
+    },
+    {
+      "id": "code-scoped-ns-layer",
+      "category": "layer",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-jemalloc-exact",
+      "category": "exact",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-jemalloc-paraphrase",
+      "category": "paraphrase",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-jemalloc-temporal",
+      "category": "temporal",
+      "scene": "coding",
+      "rank_first_relevant": 2,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-jemalloc-evolution",
+      "category": "evolution",
+      "scene": "coding",
+      "rank_first_relevant": 2,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-jemalloc-scene",
+      "category": "scene",
+      "scene": "coding",
+      "rank_first_relevant": 2,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-jemalloc-tags",
+      "category": "tags",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 2
+    },
+    {
+      "id": "code-jemalloc-layer",
+      "category": "layer",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-stmt-timeout-exact",
+      "category": "exact",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-stmt-timeout-paraphrase",
+      "category": "paraphrase",
+      "scene": "coding",
+      "rank_first_relevant": null,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-stmt-timeout-temporal",
+      "category": "temporal",
+      "scene": "coding",
+      "rank_first_relevant": 2,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-stmt-timeout-evolution",
+      "category": "evolution",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-stmt-timeout-scene",
+      "category": "scene",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-stmt-timeout-tags",
+      "category": "tags",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 2
+    },
+    {
+      "id": "code-stmt-timeout-layer",
+      "category": "layer",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-redaction-exact",
+      "category": "exact",
+      "scene": "coding",
+      "rank_first_relevant": 3,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "code-redaction-paraphrase",
+      "category": "paraphrase",
+      "scene": "coding",
+      "rank_first_relevant": 2,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-redaction-temporal",
+      "category": "temporal",
+      "scene": "coding",
+      "rank_first_relevant": 7,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-redaction-evolution",
+      "category": "evolution",
+      "scene": "coding",
+      "rank_first_relevant": 3,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "code-redaction-scene",
+      "category": "scene",
+      "scene": "coding",
+      "rank_first_relevant": 3,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-redaction-tags",
+      "category": "tags",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 2
+    },
+    {
+      "id": "code-redaction-layer",
+      "category": "layer",
+      "scene": "coding",
+      "rank_first_relevant": 3,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "code-cursor-exact",
+      "category": "exact",
+      "scene": "coding",
+      "rank_first_relevant": 4,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-cursor-paraphrase",
+      "category": "paraphrase",
+      "scene": "coding",
+      "rank_first_relevant": 2,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "code-cursor-temporal",
+      "category": "temporal",
+      "scene": "coding",
+      "rank_first_relevant": 2,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-cursor-evolution",
+      "category": "evolution",
+      "scene": "coding",
+      "rank_first_relevant": 4,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-cursor-scene",
+      "category": "scene",
+      "scene": "coding",
+      "rank_first_relevant": 4,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-cursor-tags",
+      "category": "tags",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 2
+    },
+    {
+      "id": "code-cursor-layer",
+      "category": "layer",
+      "scene": "coding",
+      "rank_first_relevant": 4,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-sql-validate-exact",
+      "category": "exact",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-sql-validate-paraphrase",
+      "category": "paraphrase",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-sql-validate-temporal",
+      "category": "temporal",
+      "scene": "coding",
+      "rank_first_relevant": 8,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-sql-validate-evolution",
+      "category": "evolution",
+      "scene": "coding",
+      "rank_first_relevant": 2,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-sql-validate-scene",
+      "category": "scene",
+      "scene": "coding",
+      "rank_first_relevant": 2,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-sql-validate-tags",
+      "category": "tags",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 2
+    },
+    {
+      "id": "code-sql-validate-layer",
+      "category": "layer",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-kafka-lag-exact",
+      "category": "exact",
+      "scene": "working",
+      "rank_first_relevant": 4,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-kafka-lag-paraphrase",
+      "category": "paraphrase",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "work-kafka-lag-temporal",
+      "category": "temporal",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-kafka-lag-evolution",
+      "category": "evolution",
+      "scene": "working",
+      "rank_first_relevant": 4,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-kafka-lag-scene",
+      "category": "scene",
+      "scene": "working",
+      "rank_first_relevant": 4,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-kafka-lag-tags",
+      "category": "tags",
+      "scene": "working",
+      "rank_first_relevant": 2,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 4
+    },
+    {
+      "id": "work-kafka-lag-layer",
+      "category": "layer",
+      "scene": "working",
+      "rank_first_relevant": 4,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-kafka-lag-env",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-kafka-lag-env-alt",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": 3,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-es-shard-exact",
+      "category": "exact",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-es-shard-paraphrase",
+      "category": "paraphrase",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "work-es-shard-temporal",
+      "category": "temporal",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-es-shard-evolution",
+      "category": "evolution",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-es-shard-scene",
+      "category": "scene",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-es-shard-tags",
+      "category": "tags",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 4
+    },
+    {
+      "id": "work-es-shard-layer",
+      "category": "layer",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-es-shard-env",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-es-shard-env-alt",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-nginx-502-exact",
+      "category": "exact",
+      "scene": "working",
+      "rank_first_relevant": 2,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-nginx-502-paraphrase",
+      "category": "paraphrase",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-nginx-502-temporal",
+      "category": "temporal",
+      "scene": "working",
+      "rank_first_relevant": 5,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-nginx-502-evolution",
+      "category": "evolution",
+      "scene": "working",
+      "rank_first_relevant": 2,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-nginx-502-scene",
+      "category": "scene",
+      "scene": "working",
+      "rank_first_relevant": 2,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-nginx-502-tags",
+      "category": "tags",
+      "scene": "working",
+      "rank_first_relevant": 2,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 4
+    },
+    {
+      "id": "work-nginx-502-layer",
+      "category": "layer",
+      "scene": "working",
+      "rank_first_relevant": 2,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-nginx-502-env",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-nginx-502-env-alt",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": 6,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-mysql-lock-exact",
+      "category": "exact",
+      "scene": "working",
+      "rank_first_relevant": 6,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-mysql-lock-paraphrase",
+      "category": "paraphrase",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-mysql-lock-temporal",
+      "category": "temporal",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-mysql-lock-evolution",
+      "category": "evolution",
+      "scene": "working",
+      "rank_first_relevant": 6,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-mysql-lock-scene",
+      "category": "scene",
+      "scene": "working",
+      "rank_first_relevant": 6,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-mysql-lock-tags",
+      "category": "tags",
+      "scene": "working",
+      "rank_first_relevant": 3,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 4
+    },
+    {
+      "id": "work-mysql-lock-layer",
+      "category": "layer",
+      "scene": "working",
+      "rank_first_relevant": 6,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-mysql-lock-env",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": 4,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-mysql-lock-env-alt",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": 10,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-tls-handshake-exact",
+      "category": "exact",
+      "scene": "working",
+      "rank_first_relevant": 2,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-tls-handshake-paraphrase",
+      "category": "paraphrase",
+      "scene": "working",
+      "rank_first_relevant": 5,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-tls-handshake-temporal",
+      "category": "temporal",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-tls-handshake-evolution",
+      "category": "evolution",
+      "scene": "working",
+      "rank_first_relevant": 2,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-tls-handshake-scene",
+      "category": "scene",
+      "scene": "working",
+      "rank_first_relevant": 2,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-tls-handshake-tags",
+      "category": "tags",
+      "scene": "working",
+      "rank_first_relevant": 2,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 4
+    },
+    {
+      "id": "work-tls-handshake-layer",
+      "category": "layer",
+      "scene": "working",
+      "rank_first_relevant": 2,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-tls-handshake-env",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": 5,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-tls-handshake-env-alt",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-jvm-oom-exact",
+      "category": "exact",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-jvm-oom-paraphrase",
+      "category": "paraphrase",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-jvm-oom-temporal",
+      "category": "temporal",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-jvm-oom-evolution",
+      "category": "evolution",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-jvm-oom-scene",
+      "category": "scene",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-jvm-oom-tags",
+      "category": "tags",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 4
+    },
+    {
+      "id": "work-jvm-oom-layer",
+      "category": "layer",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-jvm-oom-env",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-jvm-oom-env-alt",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-inode-exact",
+      "category": "exact",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-inode-paraphrase",
+      "category": "paraphrase",
+      "scene": "working",
+      "rank_first_relevant": 4,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-inode-temporal",
+      "category": "temporal",
+      "scene": "working",
+      "rank_first_relevant": 4,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-inode-evolution",
+      "category": "evolution",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-inode-scene",
+      "category": "scene",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-inode-tags",
+      "category": "tags",
+      "scene": "working",
+      "rank_first_relevant": 2,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 4
+    },
+    {
+      "id": "work-inode-layer",
+      "category": "layer",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-inode-env",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-inode-env-alt",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-dns-dig-exact",
+      "category": "exact",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-dns-dig-paraphrase",
+      "category": "paraphrase",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-dns-dig-temporal",
+      "category": "temporal",
+      "scene": "working",
+      "rank_first_relevant": 8,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-dns-dig-evolution",
+      "category": "evolution",
+      "scene": "working",
+      "rank_first_relevant": 9,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-dns-dig-scene",
+      "category": "scene",
+      "scene": "working",
+      "rank_first_relevant": 9,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-dns-dig-tags",
+      "category": "tags",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 4
+    },
+    {
+      "id": "work-dns-dig-layer",
+      "category": "layer",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-dns-dig-env",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": 5,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-dns-dig-env-alt",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-pg-bloat-exact",
+      "category": "exact",
+      "scene": "working",
+      "rank_first_relevant": 5,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-pg-bloat-paraphrase",
+      "category": "paraphrase",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-pg-bloat-temporal",
+      "category": "temporal",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-pg-bloat-evolution",
+      "category": "evolution",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-pg-bloat-scene",
+      "category": "scene",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-pg-bloat-tags",
+      "category": "tags",
+      "scene": "working",
+      "rank_first_relevant": 2,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 4
+    },
+    {
+      "id": "work-pg-bloat-layer",
+      "category": "layer",
+      "scene": "working",
+      "rank_first_relevant": 5,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-pg-bloat-env",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-pg-bloat-env-alt",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-redis-maxmemory-exact",
+      "category": "exact",
+      "scene": "working",
+      "rank_first_relevant": 3,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-redis-maxmemory-paraphrase",
+      "category": "paraphrase",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-redis-maxmemory-temporal",
+      "category": "temporal",
+      "scene": "working",
+      "rank_first_relevant": 2,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-redis-maxmemory-evolution",
+      "category": "evolution",
+      "scene": "working",
+      "rank_first_relevant": 3,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-redis-maxmemory-scene",
+      "category": "scene",
+      "scene": "working",
+      "rank_first_relevant": 3,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-redis-maxmemory-tags",
+      "category": "tags",
+      "scene": "working",
+      "rank_first_relevant": 3,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 4
+    },
+    {
+      "id": "work-redis-maxmemory-layer",
+      "category": "layer",
+      "scene": "working",
+      "rank_first_relevant": 3,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-redis-maxmemory-env",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": 10,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-redis-maxmemory-env-alt",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-cron-silent-exact",
+      "category": "exact",
+      "scene": "working",
+      "rank_first_relevant": 2,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-cron-silent-paraphrase",
+      "category": "paraphrase",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "work-cron-silent-temporal",
+      "category": "temporal",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-cron-silent-evolution",
+      "category": "evolution",
+      "scene": "working",
+      "rank_first_relevant": 2,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-cron-silent-scene",
+      "category": "scene",
+      "scene": "working",
+      "rank_first_relevant": 2,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-cron-silent-tags",
+      "category": "tags",
+      "scene": "working",
+      "rank_first_relevant": 2,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 4
+    },
+    {
+      "id": "work-cron-silent-layer",
+      "category": "layer",
+      "scene": "working",
+      "rank_first_relevant": 2,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-cron-silent-env",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": 2,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-cron-silent-env-alt",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-crashloop-exact",
+      "category": "exact",
+      "scene": "working",
+      "rank_first_relevant": 3,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-crashloop-paraphrase",
+      "category": "paraphrase",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-crashloop-temporal",
+      "category": "temporal",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-crashloop-evolution",
+      "category": "evolution",
+      "scene": "working",
+      "rank_first_relevant": 3,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-crashloop-scene",
+      "category": "scene",
+      "scene": "working",
+      "rank_first_relevant": 3,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-crashloop-tags",
+      "category": "tags",
+      "scene": "working",
+      "rank_first_relevant": 2,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 4
+    },
+    {
+      "id": "work-crashloop-layer",
+      "category": "layer",
+      "scene": "working",
+      "rank_first_relevant": 3,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-crashloop-env",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-crashloop-env-alt",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-conn-pool-exact",
+      "category": "exact",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-conn-pool-paraphrase",
+      "category": "paraphrase",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-conn-pool-temporal",
+      "category": "temporal",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-conn-pool-evolution",
+      "category": "evolution",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-conn-pool-scene",
+      "category": "scene",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-conn-pool-tags",
+      "category": "tags",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 4
+    },
+    {
+      "id": "work-conn-pool-layer",
+      "category": "layer",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-conn-pool-env",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-conn-pool-env-alt",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-log-rotate-exact",
+      "category": "exact",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-log-rotate-paraphrase",
+      "category": "paraphrase",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-log-rotate-temporal",
+      "category": "temporal",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-log-rotate-evolution",
+      "category": "evolution",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-log-rotate-scene",
+      "category": "scene",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-log-rotate-tags",
+      "category": "tags",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 4
+    },
+    {
+      "id": "work-log-rotate-layer",
+      "category": "layer",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-log-rotate-env",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-log-rotate-env-alt",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": 4,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-acme-renew-exact",
+      "category": "exact",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-acme-renew-paraphrase",
+      "category": "paraphrase",
+      "scene": "working",
+      "rank_first_relevant": 10,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "work-acme-renew-temporal",
+      "category": "temporal",
+      "scene": "working",
+      "rank_first_relevant": 4,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-acme-renew-evolution",
+      "category": "evolution",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-acme-renew-scene",
+      "category": "scene",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-acme-renew-tags",
+      "category": "tags",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 4
+    },
+    {
+      "id": "work-acme-renew-layer",
+      "category": "layer",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-acme-renew-env",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "work-acme-renew-env-alt",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-backup-drill-exact",
+      "category": "exact",
+      "scene": "working",
+      "rank_first_relevant": 3,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-backup-drill-paraphrase",
+      "category": "paraphrase",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-backup-drill-temporal",
+      "category": "temporal",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-backup-drill-evolution",
+      "category": "evolution",
+      "scene": "working",
+      "rank_first_relevant": 3,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-backup-drill-scene",
+      "category": "scene",
+      "scene": "working",
+      "rank_first_relevant": 3,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-backup-drill-tags",
+      "category": "tags",
+      "scene": "working",
+      "rank_first_relevant": 2,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 4
+    },
+    {
+      "id": "work-backup-drill-layer",
+      "category": "layer",
+      "scene": "working",
+      "rank_first_relevant": 3,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-backup-drill-env",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-backup-drill-env-alt",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": 7,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-index-bloat-exact",
+      "category": "exact",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-index-bloat-paraphrase",
+      "category": "paraphrase",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-index-bloat-temporal",
+      "category": "temporal",
+      "scene": "working",
+      "rank_first_relevant": 4,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-index-bloat-evolution",
+      "category": "evolution",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-index-bloat-scene",
+      "category": "scene",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-index-bloat-tags",
+      "category": "tags",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 4
+    },
+    {
+      "id": "work-index-bloat-layer",
+      "category": "layer",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-index-bloat-env",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": 8,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-index-bloat-env-alt",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-retry-dlq-exact",
+      "category": "exact",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-retry-dlq-paraphrase",
+      "category": "paraphrase",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-retry-dlq-temporal",
+      "category": "temporal",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-retry-dlq-evolution",
+      "category": "evolution",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-retry-dlq-scene",
+      "category": "scene",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-retry-dlq-tags",
+      "category": "tags",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 4
+    },
+    {
+      "id": "work-retry-dlq-layer",
+      "category": "layer",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-retry-dlq-env",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-retry-dlq-env-alt",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-clock-skew-exact",
+      "category": "exact",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-clock-skew-paraphrase",
+      "category": "paraphrase",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "work-clock-skew-temporal",
+      "category": "temporal",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-clock-skew-evolution",
+      "category": "evolution",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-clock-skew-scene",
+      "category": "scene",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-clock-skew-tags",
+      "category": "tags",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 4
+    },
+    {
+      "id": "work-clock-skew-layer",
+      "category": "layer",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-clock-skew-env",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-clock-skew-env-alt",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-replica-lag-exact",
+      "category": "exact",
+      "scene": "working",
+      "rank_first_relevant": 6,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "work-replica-lag-paraphrase",
+      "category": "paraphrase",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-replica-lag-temporal",
+      "category": "temporal",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-replica-lag-evolution",
+      "category": "evolution",
+      "scene": "working",
+      "rank_first_relevant": 6,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "work-replica-lag-scene",
+      "category": "scene",
+      "scene": "working",
+      "rank_first_relevant": 6,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-replica-lag-tags",
+      "category": "tags",
+      "scene": "working",
+      "rank_first_relevant": 2,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 4
+    },
+    {
+      "id": "work-replica-lag-layer",
+      "category": "layer",
+      "scene": "working",
+      "rank_first_relevant": 6,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "work-replica-lag-env",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": 7,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-replica-lag-env-alt",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-trace-sampling-exact",
+      "category": "exact",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "work-trace-sampling-paraphrase",
+      "category": "paraphrase",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-trace-sampling-temporal",
+      "category": "temporal",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-trace-sampling-evolution",
+      "category": "evolution",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "work-trace-sampling-scene",
+      "category": "scene",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-trace-sampling-tags",
+      "category": "tags",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 4
+    },
+    {
+      "id": "work-trace-sampling-layer",
+      "category": "layer",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "work-trace-sampling-env",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-trace-sampling-env-alt",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-flaky-quarantine-exact",
+      "category": "exact",
+      "scene": "working",
+      "rank_first_relevant": 2,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-flaky-quarantine-paraphrase",
+      "category": "paraphrase",
+      "scene": "working",
+      "rank_first_relevant": 3,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-flaky-quarantine-temporal",
+      "category": "temporal",
+      "scene": "working",
+      "rank_first_relevant": 3,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-flaky-quarantine-evolution",
+      "category": "evolution",
+      "scene": "working",
+      "rank_first_relevant": 2,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-flaky-quarantine-scene",
+      "category": "scene",
+      "scene": "working",
+      "rank_first_relevant": 2,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-flaky-quarantine-tags",
+      "category": "tags",
+      "scene": "working",
+      "rank_first_relevant": 2,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 4
+    },
+    {
+      "id": "work-flaky-quarantine-layer",
+      "category": "layer",
+      "scene": "working",
+      "rank_first_relevant": 2,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-flaky-quarantine-env",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": 4,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-flaky-quarantine-env-alt",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": 5,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-jemalloc-exact",
+      "category": "exact",
+      "scene": "working",
+      "rank_first_relevant": 8,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "work-jemalloc-paraphrase",
+      "category": "paraphrase",
+      "scene": "working",
+      "rank_first_relevant": 7,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-jemalloc-temporal",
+      "category": "temporal",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-jemalloc-evolution",
+      "category": "evolution",
+      "scene": "working",
+      "rank_first_relevant": 9,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "work-jemalloc-scene",
+      "category": "scene",
+      "scene": "working",
+      "rank_first_relevant": 8,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-jemalloc-tags",
+      "category": "tags",
+      "scene": "working",
+      "rank_first_relevant": 3,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 4
+    },
+    {
+      "id": "work-jemalloc-layer",
+      "category": "layer",
+      "scene": "working",
+      "rank_first_relevant": 8,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "work-jemalloc-env",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "work-jemalloc-env-alt",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-redis-pool-exact",
+      "category": "exact",
+      "scene": "working",
+      "rank_first_relevant": 3,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-redis-pool-paraphrase",
+      "category": "paraphrase",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-redis-pool-temporal",
+      "category": "temporal",
+      "scene": "working",
+      "rank_first_relevant": 4,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-redis-pool-evolution",
+      "category": "evolution",
+      "scene": "working",
+      "rank_first_relevant": 3,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-redis-pool-scene",
+      "category": "scene",
+      "scene": "working",
+      "rank_first_relevant": 3,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-redis-pool-tags",
+      "category": "tags",
+      "scene": "working",
+      "rank_first_relevant": 2,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 4
+    },
+    {
+      "id": "work-redis-pool-layer",
+      "category": "layer",
+      "scene": "working",
+      "rank_first_relevant": 3,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-redis-pool-env",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-redis-pool-env-alt",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": 6,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-pg-slow-exact",
+      "category": "exact",
+      "scene": "working",
+      "rank_first_relevant": 3,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-pg-slow-paraphrase",
+      "category": "paraphrase",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-pg-slow-temporal",
+      "category": "temporal",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-pg-slow-evolution",
+      "category": "evolution",
+      "scene": "working",
+      "rank_first_relevant": 3,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-pg-slow-scene",
+      "category": "scene",
+      "scene": "working",
+      "rank_first_relevant": 3,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-pg-slow-tags",
+      "category": "tags",
+      "scene": "working",
+      "rank_first_relevant": 2,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 4
+    },
+    {
+      "id": "work-pg-slow-layer",
+      "category": "layer",
+      "scene": "working",
+      "rank_first_relevant": 3,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-pg-slow-env",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": 10,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-pg-slow-env-alt",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-disk-full-exact",
+      "category": "exact",
+      "scene": "working",
+      "rank_first_relevant": 5,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-disk-full-paraphrase",
+      "category": "paraphrase",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-disk-full-temporal",
+      "category": "temporal",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-disk-full-evolution",
+      "category": "evolution",
+      "scene": "working",
+      "rank_first_relevant": 5,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-disk-full-scene",
+      "category": "scene",
+      "scene": "working",
+      "rank_first_relevant": 5,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-disk-full-tags",
+      "category": "tags",
+      "scene": "working",
+      "rank_first_relevant": 3,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 4
+    },
+    {
+      "id": "work-disk-full-layer",
+      "category": "layer",
+      "scene": "working",
+      "rank_first_relevant": 5,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-disk-full-env",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-disk-full-env-alt",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-dns-exact",
+      "category": "exact",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-dns-paraphrase",
+      "category": "paraphrase",
+      "scene": "working",
+      "rank_first_relevant": 10,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-dns-temporal",
+      "category": "temporal",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-dns-evolution",
+      "category": "evolution",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-dns-scene",
+      "category": "scene",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-dns-tags",
+      "category": "tags",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 4
+    },
+    {
+      "id": "work-dns-layer",
+      "category": "layer",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-dns-env",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": 2,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-dns-env-alt",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-oom-exact",
+      "category": "exact",
+      "scene": "working",
+      "rank_first_relevant": 3,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-oom-paraphrase",
+      "category": "paraphrase",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-oom-temporal",
+      "category": "temporal",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-oom-evolution",
+      "category": "evolution",
+      "scene": "working",
+      "rank_first_relevant": 3,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-oom-scene",
+      "category": "scene",
+      "scene": "working",
+      "rank_first_relevant": 3,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-oom-tags",
+      "category": "tags",
+      "scene": "working",
+      "rank_first_relevant": 2,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 4
+    },
+    {
+      "id": "work-oom-layer",
+      "category": "layer",
+      "scene": "working",
+      "rank_first_relevant": 3,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-oom-env",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": 4,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-oom-env-alt",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-cert-exact",
+      "category": "exact",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-cert-paraphrase",
+      "category": "paraphrase",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-cert-temporal",
+      "category": "temporal",
+      "scene": "working",
+      "rank_first_relevant": 4,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-cert-evolution",
+      "category": "evolution",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-cert-scene",
+      "category": "scene",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-cert-tags",
+      "category": "tags",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 4
+    },
+    {
+      "id": "work-cert-layer",
+      "category": "layer",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-cert-env",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": 7,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-cert-env-alt",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-migration-exact",
+      "category": "exact",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-migration-paraphrase",
+      "category": "paraphrase",
+      "scene": "working",
+      "rank_first_relevant": 3,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-migration-temporal",
+      "category": "temporal",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-migration-evolution",
+      "category": "evolution",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-migration-scene",
+      "category": "scene",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-migration-tags",
+      "category": "tags",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 4
+    },
+    {
+      "id": "work-migration-layer",
+      "category": "layer",
+      "scene": "working",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-migration-env",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": 6,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "work-migration-env-alt",
+      "category": "env",
+      "scene": "working",
+      "rank_first_relevant": null,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-hybrid-exact",
+      "category": "exact",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-hybrid-paraphrase",
+      "category": "paraphrase",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-hybrid-temporal",
+      "category": "temporal",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-hybrid-evolution",
+      "category": "evolution",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-hybrid-scene",
+      "category": "scene",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-hybrid-tags",
+      "category": "tags",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 2
+    },
+    {
+      "id": "code-hybrid-layer",
+      "category": "layer",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-fk-exact",
+      "category": "exact",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-fk-paraphrase",
+      "category": "paraphrase",
+      "scene": "coding",
+      "rank_first_relevant": 3,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-fk-temporal",
+      "category": "temporal",
+      "scene": "coding",
+      "rank_first_relevant": 5,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-fk-evolution",
+      "category": "evolution",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-fk-scene",
+      "category": "scene",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-fk-tags",
+      "category": "tags",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 2
+    },
+    {
+      "id": "code-fk-layer",
+      "category": "layer",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-tools-exact",
+      "category": "exact",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-tools-paraphrase",
+      "category": "paraphrase",
+      "scene": "coding",
+      "rank_first_relevant": 2,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-tools-temporal",
+      "category": "temporal",
+      "scene": "coding",
+      "rank_first_relevant": 2,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-tools-evolution",
+      "category": "evolution",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-tools-scene",
+      "category": "scene",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-tools-tags",
+      "category": "tags",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 2
+    },
+    {
+      "id": "code-tools-layer",
+      "category": "layer",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-tokenizer-exact",
+      "category": "exact",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-tokenizer-paraphrase",
+      "category": "paraphrase",
+      "scene": "coding",
+      "rank_first_relevant": 6,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-tokenizer-temporal",
+      "category": "temporal",
+      "scene": "coding",
+      "rank_first_relevant": 7,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-tokenizer-evolution",
+      "category": "evolution",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-tokenizer-scene",
+      "category": "scene",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-tokenizer-tags",
+      "category": "tags",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 2
+    },
+    {
+      "id": "code-tokenizer-layer",
+      "category": "layer",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-backup-exact",
+      "category": "exact",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-backup-paraphrase",
+      "category": "paraphrase",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-backup-temporal",
+      "category": "temporal",
+      "scene": "coding",
+      "rank_first_relevant": 7,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-backup-evolution",
+      "category": "evolution",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-backup-scene",
+      "category": "scene",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-backup-tags",
+      "category": "tags",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 2
+    },
+    {
+      "id": "code-backup-layer",
+      "category": "layer",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-ratelimit-exact",
+      "category": "exact",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "code-ratelimit-paraphrase",
+      "category": "paraphrase",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-ratelimit-temporal",
+      "category": "temporal",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-ratelimit-evolution",
+      "category": "evolution",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-ratelimit-scene",
+      "category": "scene",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-ratelimit-tags",
+      "category": "tags",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 2
+    },
+    {
+      "id": "code-ratelimit-layer",
+      "category": "layer",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "code-migration-split-exact",
+      "category": "exact",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-migration-split-paraphrase",
+      "category": "paraphrase",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-migration-split-temporal",
+      "category": "temporal",
+      "scene": "coding",
+      "rank_first_relevant": 6,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-migration-split-evolution",
+      "category": "evolution",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-migration-split-scene",
+      "category": "scene",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-migration-split-tags",
+      "category": "tags",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 2
+    },
+    {
+      "id": "code-migration-split-layer",
+      "category": "layer",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-backoff-exact",
+      "category": "exact",
+      "scene": "coding",
+      "rank_first_relevant": 8,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "code-backoff-paraphrase",
+      "category": "paraphrase",
+      "scene": "coding",
+      "rank_first_relevant": null,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-backoff-temporal",
+      "category": "temporal",
+      "scene": "coding",
+      "rank_first_relevant": 8,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-backoff-evolution",
+      "category": "evolution",
+      "scene": "coding",
+      "rank_first_relevant": 8,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "code-backoff-scene",
+      "category": "scene",
+      "scene": "coding",
+      "rank_first_relevant": 8,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "code-backoff-tags",
+      "category": "tags",
+      "scene": "coding",
+      "rank_first_relevant": 1,
+      "relevant_total": 2,
+      "violated_forbidden": false,
+      "result_count": 2
+    },
+    {
+      "id": "code-backoff-layer",
+      "category": "layer",
+      "scene": "coding",
+      "rank_first_relevant": 8,
+      "relevant_total": 2,
+      "violated_forbidden": true,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-0-0-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-0-1-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-0-2-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-1-0-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-1-1-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-1-2-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-2-0-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-2-1-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-2-2-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-3-0-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-3-1-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-3-2-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-4-0-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-4-1-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-4-2-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-5-0-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-5-1-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-5-2-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-6-0-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-6-1-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-6-2-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-7-0-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-7-1-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-7-2-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-8-0-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-8-1-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-8-2-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-9-0-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-9-1-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-9-2-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-10-0-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-10-1-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-10-2-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-11-0-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-11-1-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-11-2-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-12-0-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-12-1-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-12-2-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-13-0-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-13-1-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-13-2-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-14-0-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-14-1-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-14-2-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-15-0-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-15-1-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-15-2-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-16-0-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-16-1-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-16-2-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-17-0-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-17-1-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-17-2-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-18-0-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-18-1-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-18-2-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-19-0-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-19-1-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "no-embed-19-2-lexical",
+      "category": "no_embedding",
+      "scene": "chat",
+      "rank_first_relevant": 1,
+      "relevant_total": 1,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-0-0",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-0-1",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-0-2",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-1-0",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-1-1",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-1-2",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-2-0",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-2-1",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-2-2",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-3-0",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-3-1",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-3-2",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-4-0",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-4-1",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-4-2",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-5-0",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-5-1",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-5-2",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-6-0",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-6-1",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-6-2",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-7-0",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-7-1",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-7-2",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-8-0",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-8-1",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-8-2",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-9-0",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-9-1",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-9-2",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-10-0",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-10-1",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-10-2",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-11-0",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-11-1",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-11-2",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-12-0",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-12-1",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-12-2",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-13-0",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-13-1",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-13-2",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-14-0",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-14-1",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-14-2",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-15-0",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-15-1",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-15-2",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-16-0",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-16-1",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-16-2",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-17-0",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-17-1",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-17-2",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-18-0",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-18-1",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-18-2",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-19-0",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-19-1",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    },
+    {
+      "id": "neg-19-2",
+      "category": "negative",
+      "scene": null,
+      "rank_first_relevant": null,
+      "relevant_total": 0,
+      "violated_forbidden": false,
+      "result_count": 10
+    }
+  ]
 }

@@ -101,6 +101,20 @@ impl InMemoryHubStore {
 
     /// 应用过滤条件（共享辅助）
     fn matches_filter(e: &MemoryEntry, f: &MemoryFilter) -> bool {
+        if !Self::matches_filter_without_text(e, f) {
+            return false;
+        }
+        if let Some(text) = &f.text_contains {
+            // 与 PostgreSQL FTS 同源的分词部分匹配（OR 语义）
+            if mem_core::fts_query_hits(&e.content, text) == 0 {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// 除文本命中外的全部过滤条件（list 需要复用文档词元做相关度排序）
+    fn matches_filter_without_text(e: &MemoryEntry, f: &MemoryFilter) -> bool {
         if let Some(ns) = &f.namespace {
             if &e.namespace != ns {
                 return false;
@@ -128,13 +142,6 @@ impl InMemoryHubStore {
         }
         if let Some(key) = &f.key {
             if e.key.as_deref() != Some(key.as_str()) {
-                return false;
-            }
-        }
-        if let Some(text) = &f.text_contains {
-            // 与 PostgreSQL FTS 同源的分词部分匹配（OR 语义）：
-            // 此前用整段查询做裸子串匹配，内存路径与生产路径词法不同
-            if mem_core::fts_query_hits(&e.content, text) == 0 {
                 return false;
             }
         }
@@ -295,28 +302,45 @@ impl mem_core::MemoryStore for InMemoryHubStore {
     }
 
     async fn list(&self, filter: &MemoryFilter) -> Result<Vec<MemoryEntry>> {
-        let mut out: Vec<MemoryEntry> = self
-            .items
-            .read()
-            .unwrap()
-            .values()
-            .filter(|e| Self::matches_filter(e, filter))
-            .cloned()
-            .collect();
-        match &filter.text_contains {
-            // 与 PostgreSQL 侧一致：带查询词时按词法相关度（词元命中数）排序，
-            // 不做"按更新时间截断"——否则更相关但更旧的文档会在打分前被丢弃
-            Some(text) => {
-                out.sort_by(|a, b| {
-                    let ha = mem_core::fts_query_hits(&a.content, text);
-                    let hb = mem_core::fts_query_hits(&b.content, text);
-                    hb.cmp(&ha)
-                        .then(b.updated_at.cmp(&a.updated_at))
-                        .then(b.id.cmp(&a.id))
-                });
+        // 查询词元只切一次；每条文档的词元也只算一次（此前 filter 与排序各算一遍，
+        // 且每次都重新切查询词，大语料下是主要开销）
+        let query_tokens: Option<std::collections::HashSet<String>> = filter
+            .text_contains
+            .as_deref()
+            .map(|t| mem_core::fts_query_tokens(t).into_iter().collect());
+
+        let mut out: Vec<(usize, MemoryEntry)> = Vec::new();
+        for e in self.items.read().unwrap().values() {
+            if !Self::matches_filter_without_text(e, filter) {
+                continue;
             }
-            None => out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(b.id.cmp(&a.id))),
+            let hits = match &query_tokens {
+                Some(qt) => {
+                    let doc_tokens = mem_core::document_tokens(&e.content);
+                    let hits = qt.intersection(&doc_tokens).count();
+                    if hits == 0 {
+                        continue;
+                    }
+                    hits
+                }
+                None => 0,
+            };
+            out.push((hits, e.clone()));
         }
+
+        // 与 PostgreSQL 侧一致：带查询词时按词法相关度（词元命中数）排序，
+        // 不做"按更新时间截断"——否则更相关但更旧的文档会在打分前被丢弃
+        if query_tokens.is_some() {
+            out.sort_by(|(ha, a), (hb, b)| {
+                hb.cmp(ha)
+                    .then(b.updated_at.cmp(&a.updated_at))
+                    .then(b.id.cmp(&a.id))
+            });
+        } else {
+            out.sort_by(|(_, a), (_, b)| b.updated_at.cmp(&a.updated_at).then(b.id.cmp(&a.id)));
+        }
+
+        let mut out: Vec<MemoryEntry> = out.into_iter().map(|(_, e)| e).collect();
         if let Some(limit) = filter.limit {
             out.truncate(limit);
         }

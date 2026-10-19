@@ -370,7 +370,21 @@ impl HybridRetriever {
     }
 
     /// MMR 重排（嵌入缺失或模型不匹配的项相互相似度按 0 处理）
-    fn mmr_rerank(&self, scored: Vec<Scored<MemoryEntry>>, k: usize) -> Vec<Scored<MemoryEntry>> {
+    ///
+    /// 相关性候选先截断到 `k * MMR_POOL_FACTOR` 再做两两相似度矩阵：
+    /// MMR 的 O(pool²·dim) 相似度计算在大候选池（默认 200）下会成为检索的主要
+    /// 延迟来源；被截断的尾部条目在相关性上已被压制，实践中不会被 MMR 选中
+    /// （与 Lucene 等实现一致的有界 MMR 做法）。
+    fn mmr_rerank(
+        &self,
+        mut scored: Vec<Scored<MemoryEntry>>,
+        k: usize,
+    ) -> Vec<Scored<MemoryEntry>> {
+        const MMR_POOL_FACTOR: usize = 4;
+        let pool = k.saturating_mul(MMR_POOL_FACTOR).max(k);
+        if scored.len() > pool {
+            scored.truncate(pool);
+        }
         let n = scored.len();
         if n <= 1 {
             return scored;

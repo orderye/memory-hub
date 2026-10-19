@@ -50,8 +50,6 @@ fn fixed_now() -> DateTime<Utc> {
 const TOP_K: usize = 10;
 /// 硬负例检查深度
 const FORBIDDEN_K: usize = 3;
-/// 门禁容差：任一指标相对基线允许的最大退化（绝对值）
-const MAX_REGRESSION: f64 = 0.02;
 
 // ============================================================================
 // 数据集
@@ -226,6 +224,384 @@ fn topics() -> Vec<Topic> {
             q_paraphrase: "接口破坏性变更怎么处理",
             envs: &[],
         },
+        // ===== 新增 Chat 主题（补齐到 15 个）=====
+        Topic {
+            id: "chat-session-ttl",
+            scene: S::Chat, namespace: "bench-chat", layer: L::Fact, kind: K::Fact,
+            current: "账户登录会话有效期 720 小时（30 天），超期需重新认证",
+            outdated: "早期账户登录会话有效期仅 24 小时",
+            paraphrase: "登录状态能维持一个月",
+            contradiction: "登录会话永久有效、不再过期",
+            q_exact: "登录会话有效期",
+            q_paraphrase: "登录多久需要重新认证",
+            envs: &[],
+        },
+        Topic {
+            id: "chat-invite",
+            scene: S::Chat, namespace: "bench-chat", layer: L::Knowledge, kind: K::Procedure,
+            current: "新账户注册需要邀请码，邀请码为 8 位随机十六进制字符串",
+            outdated: "早期开放自助注册，无需邀请码",
+            paraphrase: "注册要凭邀请码才能开户",
+            contradiction: "注册完全开放，任何人可自助开户",
+            q_exact: "注册邀请码",
+            q_paraphrase: "开户需要什么凭证",
+            envs: &[],
+        },
+        Topic {
+            id: "chat-rate-limit",
+            scene: S::Chat, namespace: "bench-chat", layer: L::Fact, kind: K::Fact,
+            current: "MCP 接口对每个 Agent 限速每秒 50 次请求，超出返回限流错误",
+            outdated: "早期接口不限速，仅靠反向代理粗粒度限制",
+            paraphrase: "每个 agent 每秒最多五十次请求",
+            contradiction: "接口已完全取消限流",
+            q_exact: "接口限速策略 每秒 50",
+            q_paraphrase: "请求太快会被限流吗",
+            envs: &[],
+        },
+        Topic {
+            id: "chat-backup-cron",
+            scene: S::Chat, namespace: "bench-chat", layer: L::Fact, kind: K::Fact,
+            current: "备份任务每天凌晨 3 点执行，保留 10 份快照",
+            outdated: "备份任务曾每小时执行一次",
+            paraphrase: "快照在每天凌晨三点跑",
+            contradiction: "备份任务已停用，改为手工导出",
+            q_exact: "备份执行时间 凌晨 3 点",
+            q_paraphrase: "备份什么时候跑",
+            envs: &[],
+        },
+        Topic {
+            id: "chat-cjk",
+            scene: S::Chat, namespace: "bench-chat", layer: L::Knowledge, kind: K::Fact,
+            current: "中文检索使用自研 CJK bigram 分词，不依赖数据库分词扩展",
+            outdated: "早期中文检索依赖 jieba 分词扩展",
+            paraphrase: "中文切词是自己实现的，不装扩展",
+            contradiction: "中文检索直接整句匹配，不做分词",
+            q_exact: "中文分词方案 bigram",
+            q_paraphrase: "中文检索怎么切词",
+            envs: &[],
+        },
+        // ===== 新增 Coding 主题（补齐到 15 个）=====
+        Topic {
+            id: "code-idempotency",
+            scene: S::Coding, namespace: "bench-code", layer: L::Fact, kind: K::Fact,
+            current: "写入接口按请求 ID 幂等，24 小时内重复请求直接返回首次结果",
+            outdated: "早期重复请求会真实写入两次",
+            paraphrase: "同一个请求重复提交只生效一次",
+            contradiction: "幂等缓存已移除，请求一律重复执行",
+            q_exact: "写入幂等 请求 ID",
+            q_paraphrase: "重复提交会不会写两遍",
+            envs: &[],
+        },
+        Topic {
+            id: "code-scoped-ns",
+            scene: S::Coding, namespace: "bench-code", layer: L::Fact, kind: K::Fact,
+            current: "命名空间按账户前缀物理隔离，越权访问在存储层直接拒绝",
+            outdated: "早期隔离仅靠应用层校验",
+            paraphrase: "隔离用账户前缀落到物理层",
+            contradiction: "命名空间改为全局共享，取消账户前缀",
+            q_exact: "命名空间物理隔离 账户前缀",
+            q_paraphrase: "不同账户之间怎么隔离",
+            envs: &[],
+        },
+        Topic {
+            id: "code-jemalloc",
+            scene: S::Coding, namespace: "bench-code", layer: L::Fact, kind: K::Fact,
+            current: "服务采用 jemalloc 分配器降低内存碎片率",
+            outdated: "早期使用系统默认分配器",
+            paraphrase: "内存分配器换成了 jemalloc",
+            contradiction: "分配器已切回系统默认实现",
+            q_exact: "jemalloc 分配器",
+            q_paraphrase: "内存分配器用的哪个",
+            envs: &[],
+        },
+        Topic {
+            id: "code-stmt-timeout",
+            scene: S::Coding, namespace: "bench-code", layer: L::Fact, kind: K::Fact,
+            current: "数据库语句超时设置为 30 秒，超时后中断并把错误返回调用方",
+            outdated: "早期没有语句超时，慢查询可能长期占用连接",
+            paraphrase: "SQL 最多跑三十秒就被中断",
+            contradiction: "语句超时已取消，慢查询允许无限等待",
+            q_exact: "数据库语句超时 30 秒",
+            q_paraphrase: "SQL 跑太久会怎样",
+            envs: &[],
+        },
+        Topic {
+            id: "code-redaction",
+            scene: S::Coding, namespace: "bench-code", layer: L::Fact, kind: K::Fact,
+            current: "日志与代码变更记录对 Token、密钥等凭证自动脱敏",
+            outdated: "早期凭证原样落盘，存在泄漏风险",
+            paraphrase: "密钥在日志里会被自动打码",
+            contradiction: "脱敏只对控制台输出生效，落盘保留明文",
+            q_exact: "凭证脱敏策略 Token",
+            q_paraphrase: "日志里会不会泄露密钥",
+            envs: &[],
+        },
+        Topic {
+            id: "code-cursor",
+            scene: S::Coding, namespace: "bench-code", layer: L::Fact, kind: K::Fact,
+            current: "列表接口使用游标分页（updated_at + id 复合游标），禁止 offset 分页",
+            outdated: "早期列表接口使用 offset 分页",
+            paraphrase: "分页改成游标式，不用 offset",
+            contradiction: "列表接口已改回 offset 分页",
+            q_exact: "游标分页 复合游标",
+            q_paraphrase: "列表接口怎么翻页",
+            envs: &[],
+        },
+        Topic {
+            id: "code-sql-validate",
+            scene: S::Coding, namespace: "bench-code", layer: L::Fact, kind: K::Fact,
+            current: "迁移脚本执行前先做 SQL 静态校验，拒绝危险语句",
+            outdated: "早期迁移脚本直接执行",
+            paraphrase: "迁移 SQL 先过静态校验器",
+            contradiction: "静态校验器已移除以提升执行速度",
+            q_exact: "迁移脚本静态校验",
+            q_paraphrase: "迁移 SQL 会被检查吗",
+            envs: &[],
+        },
+        // ===== 新增 Working 主题（补齐到 30 个，全部带环境边界）=====
+        Topic {
+            id: "work-kafka-lag",
+            scene: S::Working, namespace: "bench-work", layer: L::Knowledge, kind: K::Procedure,
+            current: "Kafka 消费积压排查：先看 consumer group lag，再评估扩分区或加消费者",
+            outdated: "早期遇到积压直接重启消费者",
+            paraphrase: "积压先查 lag 再决定扩分区",
+            contradiction: "消费积压无需处理，集群会自行追平",
+            q_exact: "Kafka 消费积压排查 lag",
+            q_paraphrase: "消息积压怎么查",
+            envs: &["kafka:3", "kafka:2"],
+        },
+        Topic {
+            id: "work-es-shard",
+            scene: S::Working, namespace: "bench-work", layer: L::Knowledge, kind: K::Procedure,
+            current: "ES 分片不均时用 cluster reroute 迁移热点分片，避免重建索引",
+            outdated: "早期通过重建索引解决分片倾斜",
+            paraphrase: "分片倾斜要手工 reroute",
+            contradiction: "分片倾斜属于正常现象，无需处理",
+            q_exact: "ES 分片不均 reroute",
+            q_paraphrase: "es 分片倾斜怎么办",
+            envs: &["es:8", "es:7"],
+        },
+        Topic {
+            id: "work-nginx-502",
+            scene: S::Working, namespace: "bench-work", layer: L::Knowledge, kind: K::Procedure,
+            current: "网关 502 排查：先看上游健康检查与连接队列，再定位具体上游实例",
+            outdated: "早期只会重启网关进程",
+            paraphrase: "502 先查上游健康与连接队列",
+            contradiction: "502 是客户端问题，与网关无关",
+            q_exact: "Nginx 502 排查 连接队列",
+            q_paraphrase: "网关报 502 怎么查",
+            envs: &["nginx:1.25", "nginx:1.24"],
+        },
+        Topic {
+            id: "work-mysql-lock",
+            scene: S::Working, namespace: "bench-work", layer: L::Knowledge, kind: K::Procedure,
+            current: "行锁等待用 information_schema.innodb_trx 定位阻塞源再决定 kill 会话",
+            outdated: "早期遇到锁等待只能盲目 kill 会话",
+            paraphrase: "锁等待先查 innodb_trx 找阻塞源",
+            contradiction: "锁等待无需排查，等待即可自动解开",
+            q_exact: "MySQL 行锁等待排查 innodb_trx",
+            q_paraphrase: "数据库锁住了怎么查",
+            envs: &["mysql:8", "mysql:5.7"],
+        },
+        Topic {
+            id: "work-tls-handshake",
+            scene: S::Working, namespace: "bench-work", layer: L::Knowledge, kind: K::Procedure,
+            current: "TLS 握手失败用 openssl s_client 查看证书链与握手时序",
+            outdated: "早期只替换证书不验证链路",
+            paraphrase: "握手失败要看证书链与时序",
+            contradiction: "握手失败重启服务即可，无需排查",
+            q_exact: "TLS 握手失败 openssl s_client",
+            q_paraphrase: "证书握手失败怎么办",
+            envs: &["os:linux", "os:windows"],
+        },
+        Topic {
+            id: "work-jvm-oom",
+            scene: S::Working, namespace: "bench-work", layer: L::Knowledge, kind: K::Procedure,
+            current: "JVM OOM 排查：先取 heap dump 分析对象占用，再评估 Xmx 与泄漏",
+            outdated: "早期遇到 OOM 直接加大 Xmx",
+            paraphrase: "OOM 先看堆转储再调堆大小",
+            contradiction: "OOM 只在测试环境出现，生产无需处理",
+            q_exact: "JVM OOM 排查 heap dump",
+            q_paraphrase: "java 内存溢出怎么查",
+            envs: &["jvm:17", "jvm:8"],
+        },
+        Topic {
+            id: "work-inode",
+            scene: S::Working, namespace: "bench-work", layer: L::Knowledge, kind: K::Procedure,
+            current: "磁盘显示有空间但写入失败时，用 df -i 检查 inode 占用并清理小文件",
+            outdated: "早期只看 df -h 可用空间",
+            paraphrase: "写不进去要看 inode 而不是剩余空间",
+            contradiction: "inode 资源不会耗尽，可忽略",
+            q_exact: "inode 耗尽排查 df -i",
+            q_paraphrase: "磁盘有空间却写不进去",
+            envs: &["os:linux", "os:macos"],
+        },
+        Topic {
+            id: "work-dns-dig",
+            scene: S::Working, namespace: "bench-work", layer: L::Knowledge, kind: K::Procedure,
+            current: "解析超时先在本机 dig 对比公共 DNS，判断是本地解析器还是权威侧问题",
+            outdated: "早期直接改 hosts 绕过解析",
+            paraphrase: "解析超时先本地 dig 与公共 DNS 对比",
+            contradiction: "DNS 超时无需排查，等待恢复即可",
+            q_exact: "DNS 解析超时排查 dig",
+            q_paraphrase: "域名解析很慢怎么查",
+            envs: &["os:linux", "os:windows"],
+        },
+        Topic {
+            id: "work-pg-bloat",
+            scene: S::Working, namespace: "bench-work", layer: L::Knowledge, kind: K::Procedure,
+            current: "表膨胀用 pg_stat_user_tables 判断死元组比例，再安排常规 vacuum",
+            outdated: "早期靠人工估算表体积",
+            paraphrase: "表膨胀看统计视图再排 vacuum",
+            contradiction: "vacuum 会锁表，因此全局禁用",
+            q_exact: "PostgreSQL 表膨胀 vacuum",
+            q_paraphrase: "pg 表越来越大怎么办",
+            envs: &["postgres:15", "postgres:14"],
+        },
+        Topic {
+            id: "work-redis-maxmemory",
+            scene: S::Working, namespace: "bench-work", layer: L::Knowledge, kind: K::Procedure,
+            current: "Redis 内存告警先看 maxmemory-policy 与 bigkey 分布",
+            outdated: "早期内存告警直接扩容实例",
+            paraphrase: "内存告警先查淘汰策略与 bigkey",
+            contradiction: "Redis 内存不会超限，告警可忽略",
+            q_exact: "Redis 内存告警 bigkey",
+            q_paraphrase: "redis 内存满了怎么办",
+            envs: &["redis:7", "redis:6"],
+        },
+        Topic {
+            id: "work-cron-silent",
+            scene: S::Working, namespace: "bench-work", layer: L::Knowledge, kind: K::Procedure,
+            current: "定时任务静默失败排查：先看退出码与执行用户，再检查日志轮转是否吞掉输出",
+            outdated: "早期只确认任务是否注册",
+            paraphrase: "定时任务失败先看退出码与日志轮转",
+            contradiction: "cron 不存在静默失败，任务必然执行",
+            q_exact: "定时任务静默失败排查 cron",
+            q_paraphrase: "cron 没执行怎么查",
+            envs: &["os:linux", "os:macos"],
+        },
+        Topic {
+            id: "work-crashloop",
+            scene: S::Working, namespace: "bench-work", layer: L::Knowledge, kind: K::Procedure,
+            current: "CrashLoopBackOff 排查：先看上一次容器日志与退出码，再确认探针配置",
+            outdated: "早期只看当前容器日志",
+            paraphrase: "崩溃循环要看上一次日志与退出码",
+            contradiction: "崩溃循环重建 Pod 即可，无需分析",
+            q_exact: "CrashLoopBackOff 排查 退出码",
+            q_paraphrase: "pod 一直重启怎么查",
+            envs: &["k8s:prod", "k8s:staging"],
+        },
+        Topic {
+            id: "work-conn-pool",
+            scene: S::Working, namespace: "bench-work", layer: L::Knowledge, kind: K::Procedure,
+            current: "连接池耗尽排查：先看活跃连接与慢查询占用，再评估池上限",
+            outdated: "早期遇到耗尽直接加大池上限",
+            paraphrase: "池子耗尽先看慢查询占用",
+            contradiction: "连接池无需监控，耗尽会自动恢复",
+            q_exact: "连接池耗尽排查 慢查询",
+            q_paraphrase: "连接池满了怎么办",
+            envs: &["os:linux", "os:windows"],
+        },
+        Topic {
+            id: "work-log-rotate",
+            scene: S::Working, namespace: "bench-work", layer: L::Knowledge, kind: K::Procedure,
+            current: "日志暴涨先用 du 定位目录，再调整轮转份数与压缩策略",
+            outdated: "早期直接删除历史日志",
+            paraphrase: "日志暴涨先定位目录再调轮转",
+            contradiction: "日志不需要轮转，磁盘足够大",
+            q_exact: "日志暴涨定位 轮转策略",
+            q_paraphrase: "日志占满磁盘怎么办",
+            envs: &["os:linux", "os:macos"],
+        },
+        Topic {
+            id: "work-acme-renew",
+            scene: S::Working, namespace: "bench-work", layer: L::Knowledge, kind: K::Procedure,
+            current: "证书自动续期失败：先检查 ACME 校验路径与 DNS 记录是否可达",
+            outdated: "早期续期失败靠手工替换证书",
+            paraphrase: "续期失败先查 ACME 校验路径",
+            contradiction: "续期失败可以忽略，证书不会过期",
+            q_exact: "证书续期失败 ACME 校验",
+            q_paraphrase: "自动续期失败怎么办",
+            envs: &["os:linux", "os:windows"],
+        },
+        Topic {
+            id: "work-backup-drill",
+            scene: S::Working, namespace: "bench-work", layer: L::Knowledge, kind: K::Procedure,
+            current: "备份可用性验证必须实际恢复一次并核对校验和，不能只看文件存在",
+            outdated: "早期仅确认备份文件已生成",
+            paraphrase: "备份要真正恢复一次才算验证通过",
+            contradiction: "备份文件存在即视为可用，无需演练",
+            q_exact: "备份可用性验证 校验和",
+            q_paraphrase: "怎么确认备份能用",
+            envs: &["env:prod", "env:dev"],
+        },
+        Topic {
+            id: "work-index-bloat",
+            scene: S::Working, namespace: "bench-work", layer: L::Knowledge, kind: K::Procedure,
+            current: "索引膨胀用 pgstatindex 判断叶页利用率，再决定是否重建",
+            outdated: "早期定期全量重建所有索引",
+            paraphrase: "索引膨胀看 pgstatindex 再重建",
+            contradiction: "索引不会膨胀，无需维护",
+            q_exact: "索引膨胀 重建 pgstatindex",
+            q_paraphrase: "索引越来越大怎么办",
+            envs: &["postgres:15", "postgres:14"],
+        },
+        Topic {
+            id: "work-retry-dlq",
+            scene: S::Working, namespace: "bench-work", layer: L::Knowledge, kind: K::Procedure,
+            current: "消息消费重试采用指数退避，超过阈值进入死信队列人工处理",
+            outdated: "早期失败消息无限重试",
+            paraphrase: "重试走指数退避，超限进死信",
+            contradiction: "失败消息直接丢弃，不保留死信",
+            q_exact: "消息重试 死信队列 退避",
+            q_paraphrase: "消费失败会一直重试吗",
+            envs: &["kafka:3", "rabbitmq:3"],
+        },
+        Topic {
+            id: "work-clock-skew",
+            scene: S::Working, namespace: "bench-work", layer: L::Knowledge, kind: K::Procedure,
+            current: "时钟漂移会导致证书与签名校验失败，用 chrony 校准并监控偏移量",
+            outdated: "早期忽略服务器时间同步",
+            paraphrase: "时间漂移会让校验失败，用 chrony 校准",
+            contradiction: "服务器时间不需要同步，误差无关紧要",
+            q_exact: "时钟漂移 chrony 校准",
+            q_paraphrase: "服务器时间不准怎么办",
+            envs: &["os:linux", "os:windows"],
+        },
+        Topic {
+            id: "work-replica-lag",
+            scene: S::Working, namespace: "bench-work", layer: L::Knowledge, kind: K::Procedure,
+            current: "主从延迟用 pg_stat_replication 观察，超过阈值时按业务降级读主库",
+            outdated: "早期不监控复制延迟",
+            paraphrase: "主从延迟看复制视图，超标就降级读主",
+            contradiction: "主从延迟不影响业务，无需处理",
+            q_exact: "主从延迟 pg_stat_replication",
+            q_paraphrase: "从库数据落后怎么办",
+            envs: &["postgres:15", "mysql:8"],
+        },
+        Topic {
+            id: "work-trace-sampling",
+            scene: S::Working, namespace: "bench-work", layer: L::Knowledge, kind: K::Procedure,
+            current: "链路追踪按 1% 采样上报，错误链路全量保留以便定位",
+            outdated: "早期全量上报导致成本过高",
+            paraphrase: "追踪采样百分之一，错误全留",
+            contradiction: "链路追踪已完全关闭",
+            q_exact: "链路追踪采样策略",
+            q_paraphrase: "追踪成本太高怎么降",
+            envs: &["os:linux", "k8s:prod"],
+        },
+        Topic {
+            id: "work-flaky-quarantine",
+            scene: S::Working, namespace: "bench-work", layer: L::Knowledge, kind: K::Procedure,
+            current: "用例偶发失败先隔离并重跑三次确认，再决定修用例还是修代码",
+            outdated: "早期把偶发失败直接标记忽略",
+            paraphrase: "偶发失败先隔离重跑再定位",
+            contradiction: "偶发失败可长期忽略，不影响发布",
+            q_exact: "用例偶发失败 隔离重跑",
+            q_paraphrase: "CI 不稳定怎么办",
+            envs: &["os:linux", "os:macos"],
+        },
+
         // ===== Working：任务经验与环境边界 =====
         Topic {
             id: "work-jemalloc",
@@ -684,6 +1060,7 @@ fn build_dataset() -> Dataset {
             forbidden: vec![format!("{}-contradiction", t.id)],
         });
         if !t.envs.is_empty() {
+            // 匹配当前环境：目标是对应环境边界的主条目
             ds.queries.push(EvalQuery {
                 id: format!("{}-env", t.id),
                 category: "env",
@@ -697,6 +1074,23 @@ fn build_dataset() -> Dataset {
                 relevant: vec![format!("{}-env-primary", t.id)],
                 forbidden: vec![format!("{}-contradiction", t.id)],
             });
+            if t.envs.len() > 1 {
+                // 另一个环境：memory_search 目前没有结构化 env 参数，
+                // 环境区分只能靠词法（环境标记出现在正文中）
+                ds.queries.push(EvalQuery {
+                    id: format!("{}-env-alt", t.id),
+                    category: "env",
+                    namespace: ns.clone(),
+                    text: format!("{} 【环境 {}】", t.q_exact, t.envs[1]),
+                    scene: Some(t.scene),
+                    layer: None,
+                    tags: None,
+                    valid_at: None,
+                    include_superseded: false,
+                    relevant: vec![format!("{}-env-other", t.id)],
+                    forbidden: vec![],
+                });
+            }
         }
     }
 
@@ -732,86 +1126,106 @@ fn build_dataset() -> Dataset {
     }
 
     // ===== 缺嵌入条目（写入时嵌入失败）：必须仍能靠词法信号召回 =====
-    for (i, (content, query)) in [
-        (
-            "客户投诉工单升级规则：超过 4 小时未响应的 P1 工单自动升级到值班主管",
-            "工单升级规则 4 小时",
-        ),
-        (
-            "灰度发布分批策略：1% → 10% → 50% → 100%，每档观察 30 分钟",
-            "灰度发布分批 观察时长",
-        ),
-        (
-            "供应链对账口径：以到货签收日为准，差异超过 0.5% 触发人工复核",
-            "对账口径 到货签收",
-        ),
-        (
-            "移动端崩溃率红线：单版本崩溃率超过 0.3% 立即回滚",
-            "崩溃率红线 回滚阈值",
-        ),
-        (
-            "内部 API 分页约定：游标式分页，默认每页 50 条，禁止使用 offset",
-            "内部 API 分页约定 游标",
-        ),
-        (
-            "成本归集标签规范：所有云资源必须打 cost-center 标签才能上线",
-            "成本归集标签 cost-center",
-        ),
-    ]
-    .iter()
-    .enumerate()
-    {
-        let key = format!("no-embed-{}", i);
-        let doc_content = content.to_string();
-        push_doc(
-            &mut ds,
-            &mut doc_seq,
-            key.clone(),
-            "bench-chat",
-            &doc_content,
-            MemoryScene::Chat,
-            CognitiveLayer::Fact,
-            MemoryKind::Fact,
-            Some(now - Duration::days(90)),
-            None,
-            Some(now - Duration::days(7)),
-            vec!["topic:no-embed".to_string()],
-            false,
-        );
-        ds.queries.push(EvalQuery {
-            id: format!("{}-lexical", key),
-            category: "no_embedding",
-            namespace: "bench-chat".to_string(),
-            text: query.to_string(),
-            scene: Some(MemoryScene::Chat),
-            layer: None,
-            tags: None,
-            valid_at: None,
-            include_superseded: false,
-            relevant: vec![key.clone()],
-            forbidden: vec![],
-        });
+    // 20 个离线补录主题 × 3 类事项 = 60 条无可检索向量的条目，各自配一条查询
+    const OFFLINE_TOPICS: [&str; 20] = [
+        "机房巡检发现的网线松动",
+        "客户邮件确认的对账口径",
+        "值班交接留下的口头约定",
+        "供应商合同里的赔付条款",
+        "安全审计发现的弱口令",
+        "监控告警的抑制规则",
+        "灰度名单的评估标准",
+        "客户投诉的升级路径",
+        "灾备演练的切换顺序",
+        "成本分摊的归属规则",
+        "资产盘点的标签规范",
+        "发布窗口的冻结时段",
+        "数据保留的删除策略",
+        "接口废弃的下线流程",
+        "权限申请的审批链路",
+        "变更评审的回滚条件",
+        "故障复盘的归档要求",
+        "容量规划的评估周期",
+        "证书清单的续期责任人",
+        "供应商准入的资质清单",
+    ];
+    const OFFLINE_ITEMS: [&str; 3] = ["处置记录", "核对结论", "交接备注"];
+    for (t_idx, topic) in OFFLINE_TOPICS.iter().enumerate() {
+        for (i_idx, item) in OFFLINE_ITEMS.iter().enumerate() {
+            let key = format!("no-embed-{}-{}", t_idx, i_idx);
+            let content = format!("{}：{item}（离线补录，未经向量化）", topic);
+            push_doc(
+                &mut ds,
+                &mut doc_seq,
+                key.clone(),
+                "bench-chat",
+                &content,
+                MemoryScene::Chat,
+                CognitiveLayer::Fact,
+                MemoryKind::Fact,
+                Some(now - Duration::days(90)),
+                None,
+                Some(now - Duration::days(7)),
+                vec!["topic:no-embed".to_string()],
+                false,
+            );
+            ds.queries.push(EvalQuery {
+                id: format!("{}-lexical", key),
+                category: "no_embedding",
+                namespace: "bench-chat".to_string(),
+                text: format!("{topic} {item}"),
+                scene: Some(MemoryScene::Chat),
+                layer: None,
+                tags: None,
+                valid_at: None,
+                include_superseded: false,
+                relevant: vec![key.clone()],
+                forbidden: vec![],
+            });
+        }
     }
 
-    // ===== 负控制查询：期望零命中 =====
-    for (id, text, ns) in [
-        ("neg-1", "火星殖民基地的氧气循环故障日志", "bench-chat"),
-        ("neg-2", "大熊猫繁育基地的饲养排班表", "bench-work"),
-        ("neg-3", "深海潜水器耐压壳焊接工艺", "bench-code"),
-    ] {
-        ds.queries.push(EvalQuery {
-            id: id.to_string(),
-            category: "negative",
-            namespace: ns.to_string(),
-            text: text.to_string(),
-            scene: None,
-            layer: None,
-            tags: None,
-            valid_at: None,
-            include_superseded: false,
-            relevant: vec![],
-            forbidden: vec![],
-        });
+    // ===== 负控制查询：期望零命中（与语料完全无关的领域，20 × 3 = 60 条）=====
+    const UNRELATED_SUBJECTS: [&str; 20] = [
+        "火星殖民基地的氧气循环",
+        "大熊猫繁育基地的饲养排班",
+        "深海潜水器的耐压壳焊接",
+        "热带雨林监测站的供电",
+        "极地科考站的供暖",
+        "沙漠光伏电站的清洗",
+        "远洋渔船的冷链",
+        "高原天文台的镜面镀膜",
+        "古建筑彩绘的修复",
+        "博物馆恒温展柜的湿度",
+        "赛马场的跑道排水",
+        "咖啡庄园的日晒发酵",
+        "蜂场的越冬保温",
+        "盐湖提锂的蒸发池",
+        "跨海大桥的伸缩缝",
+        "山地索道的钢缆探伤",
+        "花房的补光周期",
+        "冰川钻孔的取芯",
+        "舞台机械的液压系统",
+        "海龟保护区的沙滩温度",
+    ];
+    const UNRELATED_ITEMS: [&str; 3] = ["巡检记录", "工艺参数", "排班表"];
+    for (s_idx, subject) in UNRELATED_SUBJECTS.iter().enumerate() {
+        for (i_idx, item) in UNRELATED_ITEMS.iter().enumerate() {
+            let ns = ["bench-chat", "bench-work", "bench-code"][(s_idx + i_idx) % 3];
+            ds.queries.push(EvalQuery {
+                id: format!("neg-{s_idx}-{i_idx}"),
+                category: "negative",
+                namespace: ns.to_string(),
+                text: format!("{subject} {item}"),
+                scene: None,
+                layer: None,
+                tags: None,
+                valid_at: None,
+                include_superseded: false,
+                relevant: vec![],
+                forbidden: vec![],
+            });
+        }
     }
 
     ds
@@ -938,6 +1352,19 @@ struct MetricSet {
     p95_ms: f64,
 }
 
+/// 逐查询结果（配对门禁用：同一条查询在基线/本次之间逐条比较，
+/// 消除"这批查询本身多难"的方差，灵敏度远高于两个独立比例相减）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PerQueryRecord {
+    id: String,
+    category: String,
+    scene: Option<String>,
+    rank_first_relevant: Option<usize>,
+    relevant_total: usize,
+    violated_forbidden: bool,
+    result_count: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BenchReport {
     dataset_fingerprint: String,
@@ -948,6 +1375,8 @@ struct BenchReport {
     overall: MetricSet,
     by_scene: BTreeMap<String, MetricSet>,
     by_category: BTreeMap<String, MetricSet>,
+    #[serde(default)]
+    per_query: Vec<PerQueryRecord>,
 }
 
 fn dataset_fingerprint(ds: &Dataset) -> String {
@@ -971,6 +1400,8 @@ struct QueryOutcome {
     retrieved_relevant: usize,
     relevant_total: usize,
     violated_forbidden: bool,
+    /// 本次检索实际返回的条目数（负控制查询用它判断"是否召回了任何东西"）
+    result_count: usize,
     elapsed_ms: f64,
 }
 
@@ -993,7 +1424,7 @@ fn metrics_for(outcomes: &[QueryOutcome]) -> MetricSet {
         latencies.push(o.elapsed_ms);
         if o.category == "negative" {
             negative_total += 1;
-            if o.rank_first_relevant.is_some() || o.violated_forbidden {
+            if o.result_count > 0 {
                 negatives_hit += 1;
             }
             continue;
@@ -1165,6 +1596,7 @@ async fn run_bench(
         category_metrics.insert(category.to_string(), metrics_for(&subset));
     }
 
+    let per_query: Vec<PerQueryRecord> = outcomes.iter().map(per_query_record).collect();
     let overall = metrics_for(&outcomes);
     Ok(BenchReport {
         dataset_fingerprint: dataset_fingerprint(ds),
@@ -1175,7 +1607,20 @@ async fn run_bench(
         overall,
         by_scene: scene_metrics,
         by_category: category_metrics,
+        per_query,
     })
+}
+
+fn per_query_record(o: &QueryOutcome) -> PerQueryRecord {
+    PerQueryRecord {
+        id: o.id.clone(),
+        category: o.category.to_string(),
+        scene: o.scene.map(|s| format!("{:?}", s).to_lowercase()),
+        rank_first_relevant: o.rank_first_relevant,
+        relevant_total: o.relevant_total,
+        violated_forbidden: o.violated_forbidden,
+        result_count: o.result_count,
+    }
 }
 
 fn clone_outcome(o: &QueryOutcome) -> QueryOutcome {
@@ -1187,6 +1632,7 @@ fn clone_outcome(o: &QueryOutcome) -> QueryOutcome {
         retrieved_relevant: o.retrieved_relevant,
         relevant_total: o.relevant_total,
         violated_forbidden: o.violated_forbidden,
+        result_count: o.result_count,
         elapsed_ms: o.elapsed_ms,
     }
 }
@@ -1205,6 +1651,7 @@ fn score_outcome(
         .map(|d| (d.entry.id, d.key.as_str()))
         .collect();
 
+    let result_count = results.len();
     let mut rank_first_relevant = None;
     let mut retrieved_relevant = 0usize;
     let mut violated_forbidden = false;
@@ -1229,6 +1676,7 @@ fn score_outcome(
         retrieved_relevant,
         relevant_total: q.relevant.len(),
         violated_forbidden,
+        result_count,
         elapsed_ms,
     }
 }
@@ -1322,6 +1770,216 @@ fn print_report(report: &BenchReport) {
     println!("===========================================================\n");
 }
 
+/// 每条查询的 6 个可配对指标：Recall@1/5/10、RR@10、nDCG@10、硬负例违规
+///
+/// 负控制查询不参与前 5 个质量指标（与 `metrics_for` 口径一致），
+/// 它们单独用"是否返回任何结果"衡量。
+fn per_query_values(r: &PerQueryRecord) -> Option<[f64; 6]> {
+    if r.category == "negative" {
+        return None;
+    }
+    let hit = |k: usize| {
+        r.rank_first_relevant
+            .map_or(0.0, |rank| if rank <= k { 1.0 } else { 0.0 })
+    };
+    let rr = r
+        .rank_first_relevant
+        .map_or(0.0, |rank| if rank <= 10 { 1.0 / rank as f64 } else { 0.0 });
+    let ndcg = match r.rank_first_relevant {
+        Some(rank) if rank <= 10 && r.relevant_total > 0 => {
+            let dcg = 1.0 / ((rank as f64 + 1.0).log2());
+            let ideal: f64 = (0..r.relevant_total.min(10))
+                .map(|i| 1.0 / ((i as f64 + 2.0).log2()))
+                .sum();
+            dcg / ideal
+        }
+        _ => 0.0,
+    };
+    let violation = if r.violated_forbidden { 1.0 } else { 0.0 };
+    Some([hit(1), hit(5), hit(10), rr, ndcg, violation])
+}
+
+const PAIRED_METRICS: [(&str, bool); 6] = [
+    ("Recall@1", true),
+    ("Recall@5", true),
+    ("Recall@10", true),
+    ("MRR@10", true),
+    ("nDCG@10", true),
+    ("硬负例违规率", false),
+];
+
+/// 配对比较结果（用于打印与门禁判定）
+struct PairedDelta {
+    metric: &'static str,
+    base_mean: f64,
+    cur_mean: f64,
+    delta: f64,
+    std_err: f64,
+    z: f64,
+    n: usize,
+}
+
+/// 配对检验：同一批查询 id 上逐条比较，返回每个指标的配对差值、标准误与 z 值。
+///
+/// 相比"两个独立比例相减"，配对设计消掉了查询难度差异带来的方差：
+/// 600 条查询下总体指标的配对标准误通常只有 1~2 个百分点，比独立比较小一个量级。
+fn paired_deltas(base: &[PerQueryRecord], cur: &[PerQueryRecord]) -> (Vec<PairedDelta>, usize) {
+    let base_map: HashMap<&str, &PerQueryRecord> =
+        base.iter().map(|r| (r.id.as_str(), r)).collect();
+    let mut diffs: Vec<[f64; 6]> = Vec::new();
+    let mut base_sum = [0.0f64; 6];
+    let mut cur_sum = [0.0f64; 6];
+    let mut matched = 0usize;
+
+    for record in cur {
+        let Some(b) = base_map.get(record.id.as_str()) else {
+            continue;
+        };
+        matched += 1;
+        // 负控制查询不参与质量指标（单独用"是否返回结果"衡量）
+        let (Some(base_vals), Some(cur_vals)) = (per_query_values(b), per_query_values(record))
+        else {
+            continue;
+        };
+        let mut d = [0.0f64; 6];
+        for i in 0..6 {
+            base_sum[i] += base_vals[i];
+            cur_sum[i] += cur_vals[i];
+            d[i] = cur_vals[i] - base_vals[i];
+        }
+        diffs.push(d);
+    }
+
+    let n = diffs.len();
+    let mut out = Vec::new();
+    if n > 0 {
+        for (i, (name, _)) in PAIRED_METRICS.iter().enumerate() {
+            let delta = diffs.iter().map(|d| d[i]).sum::<f64>() / n as f64;
+            let variance = if n > 1 {
+                diffs
+                    .iter()
+                    .map(|d| {
+                        let x = d[i] - delta;
+                        x * x
+                    })
+                    .sum::<f64>()
+                    / (n - 1) as f64
+            } else {
+                0.0
+            };
+            let std_err = (variance / n as f64).sqrt();
+            let z = if std_err > f64::EPSILON {
+                delta / std_err
+            } else if delta.abs() > f64::EPSILON {
+                f64::INFINITY.copysign(delta)
+            } else {
+                0.0
+            };
+            out.push(PairedDelta {
+                metric: name,
+                base_mean: base_sum[i] / n as f64,
+                cur_mean: cur_sum[i] / n as f64,
+                delta,
+                std_err,
+                z,
+                n,
+            });
+        }
+    }
+    (out, matched)
+}
+
+/// 门禁参数：绝对下限 1pt + 配对 z 检验（z >= 2.0）。
+/// 只抓"既超过 1 个百分点、又在统计上可分"的退化，避免噪声触发告警。
+const PAIRED_ABS_FLOOR: f64 = 0.01;
+const PAIRED_Z_CRITICAL: f64 = 2.0;
+/// 类别级门禁的最小配对样本量（不足则只打印不判定）
+const PAIRED_MIN_CATEGORY_N: usize = 30;
+
+fn is_regression(d: &PairedDelta, higher_is_better: bool) -> bool {
+    if higher_is_better {
+        d.delta < -PAIRED_ABS_FLOOR && d.z <= -PAIRED_Z_CRITICAL
+    } else {
+        d.delta > PAIRED_ABS_FLOOR && d.z >= PAIRED_Z_CRITICAL
+    }
+}
+
+fn print_paired(title: &str, deltas: &[PairedDelta]) {
+    println!(
+        "[paired] {title}（n={}，逐查询配对）",
+        deltas.first().map_or(0, |d| d.n)
+    );
+    for d in deltas {
+        println!(
+            "  {:<14} 基线 {:.4} → 本次 {:.4} | Δ {:+.4} | SE {:.4} | z {:+.2}",
+            d.metric, d.base_mean, d.cur_mean, d.delta, d.std_err, d.z
+        );
+    }
+}
+
+/// 门禁：逐指标配对比较 + 分类别配对比较
+fn paired_gate(base: &BenchReport, cur: &BenchReport) -> Vec<String> {
+    let mut failures = Vec::new();
+
+    let expected = base.per_query.len();
+    let (overall, matched) = paired_deltas(&base.per_query, &cur.per_query);
+    if expected > 0 && (matched as f64) < 0.95 * expected as f64 {
+        failures.push(format!(
+            "配对样本不足：基线 {expected} 条，仅匹配到 {matched} 条（<95%），无法做可靠比较"
+        ));
+        return failures;
+    }
+    if overall.is_empty() {
+        failures.push(
+            "基线缺少逐查询记录（旧格式基线），请用 HUB_EVAL_WRITE_BASELINE=1 重新冻结".into(),
+        );
+        return failures;
+    }
+    print_paired("总体", &overall);
+    for (d, (name, higher)) in overall.iter().zip(PAIRED_METRICS) {
+        if is_regression(d, higher) {
+            failures.push(format!(
+                "{name} 退化：{:.4} → {:.4}（Δ {:+.4}，SE {:.4}，z {:+.2}）",
+                d.base_mean, d.cur_mean, d.delta, d.std_err, d.z
+            ));
+        }
+    }
+
+    // 分类别：样本量足够时同样做配对门禁
+    let mut categories: Vec<&str> = base.by_category.keys().map(String::as_str).collect();
+    categories.sort_unstable();
+    for category in categories {
+        let base_sub: Vec<PerQueryRecord> = base
+            .per_query
+            .iter()
+            .filter(|r| r.category == category)
+            .cloned()
+            .collect();
+        let cur_sub: Vec<PerQueryRecord> = cur
+            .per_query
+            .iter()
+            .filter(|r| r.category == category)
+            .cloned()
+            .collect();
+        let (deltas, matched) = paired_deltas(&base_sub, &cur_sub);
+        if deltas.is_empty() || matched < PAIRED_MIN_CATEGORY_N {
+            continue;
+        }
+        print_paired(&format!("类别 {category}"), &deltas);
+        for (d, (name, higher)) in deltas.iter().zip(PAIRED_METRICS) {
+            // 违规率只对"应当有约束"的类别有意义；其余指标按同一规则
+            if is_regression(d, higher) {
+                failures.push(format!(
+                    "[{category}] {name} 退化：{:.4} → {:.4}（Δ {:+.4}，SE {:.4}，z {:+.2}）",
+                    d.base_mean, d.cur_mean, d.delta, d.std_err, d.z
+                ));
+            }
+        }
+    }
+
+    failures
+}
+
 #[tokio::test]
 async fn test_retrieval_bench_gate() {
     let ds = build_dataset();
@@ -1366,72 +2024,10 @@ async fn test_retrieval_bench_gate() {
         base.embedder, report.embedder
     );
 
-    let mut regressions = Vec::new();
-    let compare = |name: &str, base_v: f64, cur_v: f64, higher_is_better: bool| -> Option<String> {
-        let delta = cur_v - base_v;
-        let bad = if higher_is_better {
-            -delta > MAX_REGRESSION
-        } else {
-            delta > MAX_REGRESSION
-        };
-        if bad {
-            Some(format!(
-                "{name}: {:.4} → {:.4}（退化 {:.4}，容差 {:.2}）",
-                base_v,
-                cur_v,
-                if higher_is_better { -delta } else { delta },
-                MAX_REGRESSION
-            ))
-        } else {
-            None
-        }
-    };
-    let pairs: [(&str, f64, f64, bool); 6] = [
-        (
-            "Recall@1",
-            base.overall.recall_at_1,
-            report.overall.recall_at_1,
-            true,
-        ),
-        (
-            "Recall@5",
-            base.overall.recall_at_5,
-            report.overall.recall_at_5,
-            true,
-        ),
-        (
-            "Recall@10",
-            base.overall.recall_at_10,
-            report.overall.recall_at_10,
-            true,
-        ),
-        (
-            "MRR@10",
-            base.overall.mrr_at_10,
-            report.overall.mrr_at_10,
-            true,
-        ),
-        (
-            "nDCG@10",
-            base.overall.ndcg_at_10,
-            report.overall.ndcg_at_10,
-            true,
-        ),
-        (
-            "硬负例违规率",
-            base.overall.forbidden_rate,
-            report.overall.forbidden_rate,
-            false,
-        ),
-    ];
-    for (name, b, c, higher) in pairs {
-        if let Some(msg) = compare(name, b, c, higher) {
-            regressions.push(msg);
-        }
-    }
+    let regressions = paired_gate(&base, &report);
     assert!(
         regressions.is_empty(),
-        "检索质量相对基线退化：\n{}",
+        "检索质量相对基线退化（配对检验）：\n{}",
         regressions.join("\n")
     );
 
