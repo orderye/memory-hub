@@ -33,7 +33,8 @@ impl ConsolidationEngine {
         Self {
             store,
             duplicate_detector: DuplicateDetector::new(sim_threshold),
-            conflict_detector: ConflictDetector::default(),
+            // 阈值梯度统一：语义冲突 0.82 < 去重/整合 sim_threshold < 自动合并 0.98
+            conflict_detector: ConflictDetector::default().with_duplicate_threshold(sim_threshold),
             staleness_detector: StalenessDetector::default(),
             merger: Arc::new(TieredMerger::default()),
             policy: AutoPolicy::default(),
@@ -106,6 +107,12 @@ impl ConsolidationEngine {
         let duplicate_entries_count = dup_entries.len();
         let conflict_entries_count = conf_entries.len();
         let stale_entries_count = stale.len();
+        // 达到"自动归档阈值"的陈旧条目数：把策略里此前未被使用的
+        // auto_archive_stale_score 接进报告（只做建议，不静默归档）
+        let stale_archive_candidates = stale
+            .iter()
+            .filter(|s| s.staleness_score >= self.policy.auto_archive_stale_score)
+            .count();
 
         let redundancy_ratio =
             (duplicate_entries_count as f32 / total_active as f32).clamp(0.0, 1.0);
@@ -126,6 +133,7 @@ impl ConsolidationEngine {
             conflict_entries_count,
             conflict_groups_count: conflicts.len(),
             stale_entries_count,
+            stale_archive_candidates,
             redundancy_ratio,
             conflict_ratio,
             health_score,

@@ -126,6 +126,66 @@ async fn test_milestone1_non_cjs_client_bypasses_untouched() {
 }
 
 #[tokio::test]
+async fn test_dual_search_dedups_near_duplicate_content_across_namespaces() {
+    // 回归：shared 与 bot 私有记忆中的近重复内容此前会同时返回
+    // （只按 id/key 去重，跨命名空间的内容重复原样保留）
+    let state = create_test_state(CjsAdapterConfig::default());
+    let auth = auth_ctx(common::BOOTSTRAP_ACCOUNT_ID, "bot_hero");
+
+    let mut headers = HeaderMap::new();
+    headers.insert("X-Client-Source", HeaderValue::from_static("chuangjieshan"));
+    headers.insert("X-CJS-World-Id", HeaderValue::from_static("world_dedup"));
+    headers.insert("X-CJS-Bot-Id", HeaderValue::from_static("hero"));
+
+    for (id, namespace, text) in [
+        (1, "shared", "生产数据库主库部署在上海可用区 A"),
+        (2, "bot", "生产数据库主库部署在上海可用区 A（副本）"),
+    ] {
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(id)),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "memory_put",
+                "arguments": {"namespace": namespace, "text": text}
+            })),
+        };
+        let resp = handle_jsonrpc_ext(&state, Some(&auth), Some(&headers), req).await;
+        assert!(resp.error.is_none(), "写入失败: {:?}", resp.error);
+    }
+
+    let req_search = JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(json!(3)),
+        method: "tools/call".to_string(),
+        params: Some(json!({
+            "name": "memory_search",
+            "arguments": {"query_text": "生产数据库主库部署在上海", "top_k": 10}
+        })),
+    };
+    let resp = handle_jsonrpc_ext(&state, Some(&auth), Some(&headers), req_search).await;
+    assert!(resp.error.is_none());
+    let results = resp.result.unwrap()["structuredContent"]["results"]
+        .as_array()
+        .unwrap()
+        .clone();
+
+    let copies = results
+        .iter()
+        .filter(|r| {
+            r["memory"]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("生产数据库主库部署")
+        })
+        .count();
+    assert_eq!(
+        copies, 1,
+        "跨命名空间的近重复内容必须只保留一条：{results:#?}"
+    );
+}
+
+#[tokio::test]
 async fn test_milestone2_namespace_routing_and_dual_search() {
     let state = create_test_state(CjsAdapterConfig::default());
     let auth = auth_ctx(common::BOOTSTRAP_ACCOUNT_ID, "bot_hero");

@@ -19,7 +19,7 @@ use mem_core::{
 };
 use std::sync::Arc;
 use store::{InMemoryHubStore, PostgresHubStore};
-use tracing::info;
+use tracing::{info, warn};
 
 #[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
 use tikv_jemallocator::Jemalloc;
@@ -106,7 +106,13 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 
     let working_memory = Arc::new(WorkingMemoryService::new(store.clone()));
     let coding_memory = Arc::new(CodingMemoryService::new(store.clone()));
+    // 生产环境必须接入真实抽取器（LLM）；MockChatCognitiveExtractor 只是占位，
+    // 它不会理解对话内容，Chat 认知流的候选完全依赖调用方注入
     let chat_extractor = Arc::new(mem_core::testing::MockChatCognitiveExtractor::new());
+    warn!(
+        "Chat 认知抽取器当前为 MockChatCognitiveExtractor（占位实现）：未接入真实 LLM 抽取器，\
+         请通过 HUB_CHAT_EXTRACTOR 配置后再启用自动入库"
+    );
     let chat_cognitive = Arc::new(ChatCognitiveService::new(
         store.clone(),
         chat_extractor,

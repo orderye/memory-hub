@@ -9,6 +9,9 @@
 //!    在内存中完成去重与相关性排序截断，返回统一的标准 ToolCallResult。
 
 use super::fingerprint::ChuangjieshanFingerprint;
+
+/// 跨命名空间内容近重复的 Jaccard 阈值
+const CJS_CONTENT_DUP_THRESHOLD: f32 = 0.85;
 use crate::tools::ToolCallResult;
 use crate::ToolDispatcher;
 use common::{AuthCtx, Result};
@@ -128,6 +131,11 @@ impl SmartNamespaceRouter {
             sb.total_cmp(&sa)
         });
 
+        // 跨命名空间内容去重：shared 与 bot 私有记忆里的近重复内容此前会同时保留
+        // （id/key 不同但语义相同）。用与检索同源的分词词元 Jaccard 近似判重，
+        // 保留分数更高的那条；这与设计文档"轻量级去重 + 综合 score 裁剪"的表述一致。
+        deduped = Self::dedup_by_content_similarity(deduped, CJS_CONTENT_DUP_THRESHOLD);
+
         // 截断 top_k
         let top_k = arguments
             .get("top_k")
@@ -140,6 +148,48 @@ impl SmartNamespaceRouter {
         }
 
         Ok(Some(ToolCallResult::success(json!({ "results": deduped }))))
+    }
+
+    /// 内容近重复去重：按当前顺序（分数降序）保留代表条目
+    ///
+    /// 判定用 `mem_core` 的分词词元 Jaccard 相似度（CJK bigram + ASCII 词），
+    /// 阈值取 0.85：同一条记忆在两个命名空间的副本、或措辞微调的重复内容会被合并。
+    fn dedup_by_content_similarity(items: Vec<Value>, threshold: f32) -> Vec<Value> {
+        use std::collections::HashSet;
+
+        let tokens_of = |item: &Value| -> HashSet<String> {
+            item.get("memory")
+                .and_then(|m| m.get("content"))
+                .and_then(Value::as_str)
+                .map(|content| mem_core::fts_doc_tokens(content).into_iter().collect())
+                .unwrap_or_default()
+        };
+        let jaccard = |a: &HashSet<String>, b: &HashSet<String>| -> f32 {
+            if a.is_empty() || b.is_empty() {
+                return 0.0;
+            }
+            let inter = a.intersection(b).count() as f32;
+            let union = a.union(b).count() as f32;
+            if union == 0.0 {
+                0.0
+            } else {
+                inter / union
+            }
+        };
+
+        let mut kept: Vec<Value> = Vec::with_capacity(items.len());
+        let mut kept_tokens: Vec<HashSet<String>> = Vec::with_capacity(items.len());
+        for item in items {
+            let tokens = tokens_of(&item);
+            let duplicate = kept_tokens
+                .iter()
+                .any(|existing| jaccard(existing, &tokens) >= threshold);
+            if !duplicate {
+                kept_tokens.push(tokens);
+                kept.push(item);
+            }
+        }
+        kept
     }
 
     /// 从 ToolCallResult 提取 results 列表

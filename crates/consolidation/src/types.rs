@@ -64,6 +64,9 @@ pub struct ConsolidationStats {
     pub conflict_groups_count: usize,
     /// 陈旧条目数
     pub stale_entries_count: usize,
+    /// 陈旧度达到自动归档阈值的条目数（对应 AutoPolicy::auto_archive_stale_score，
+    /// 仅作为建议计数，不会静默归档）
+    pub stale_archive_candidates: usize,
     /// 记忆冗余率 (0.0 ~ 1.0)
     pub redundancy_ratio: f32,
     /// 冲突率 (0.0 ~ 1.0)

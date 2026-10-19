@@ -210,12 +210,10 @@ impl ChatCognitiveService {
                     });
                 }
                 CognitiveGovernanceMode::SemiAuto | CognitiveGovernanceMode::FullAuto => {
+                    // 两种自动模式都必须遵守 auto_accept_threshold：
+                    // 此前 FullAuto 无条件自动入库，使阈值形同虚设（只剩 <0.5 的底线过滤）
                     let should_auto_accept =
-                        if self.policy.mode == CognitiveGovernanceMode::FullAuto {
-                            true
-                        } else {
-                            candidate.confidence >= self.policy.auto_accept_threshold
-                        };
+                        candidate.confidence >= self.policy.auto_accept_threshold;
 
                     if should_auto_accept {
                         let entry = self
@@ -230,13 +228,26 @@ impl ChatCognitiveService {
                             .await?;
                         committed_entries.push(entry);
                     } else {
+                        // 低于阈值的处置按模式区分：
+                        // - SemiAuto：进入待审提案队列（人工可救回）
+                        // - FullAuto：不静默入库，落一条 Rejected 记录保留审计轨迹
+                        let full_auto = self.policy.mode == CognitiveGovernanceMode::FullAuto;
                         proposals.push(CognitiveProposalRecord {
                             id: Uuid::new_v4(),
                             namespace: input.namespace.clone(),
                             candidate,
                             source_evidence_id: evidence.id,
-                            status: CognitiveProposalStatus::PendingReview,
-                            rejection_reason: None,
+                            status: if full_auto {
+                                CognitiveProposalStatus::Rejected
+                            } else {
+                                CognitiveProposalStatus::PendingReview
+                            },
+                            rejection_reason: full_auto.then(|| {
+                                format!(
+                                    "FullAuto 模式下置信度低于自动接受阈值 {}，未入库（保留审计记录）",
+                                    self.policy.auto_accept_threshold
+                                )
+                            }),
                             resulting_memory_id: None,
                             created_at: now,
                             updated_at: now,
@@ -1485,6 +1496,112 @@ mod tests {
             .as_ref()
             .unwrap()
             .contains("重要业务会话数据"));
+    }
+
+    #[tokio::test]
+    async fn test_full_auto_respects_acceptance_threshold() {
+        // 回归：FullAuto 曾无条件自动入库，auto_accept_threshold 完全不生效
+        let store = Arc::new(TestHubStore::default());
+        let extractor =
+            Arc::new(
+                MockChatCognitiveExtractor::new().with_candidates(vec![CognitiveCandidate {
+                    content: "团队规范：提交前必须补齐集成测试".to_string(),
+                    scene: MemoryScene::Chat,
+                    layer: CognitiveLayer::Knowledge,
+                    // 低于自动接受阈值 0.9
+                    confidence: 0.6,
+                    valid_from: None,
+                    valid_until: None,
+                    occurred_at: None,
+                    tags: vec![],
+                    metadata: serde_json::json!({}),
+                    relation_kind: None,
+                    target_memory_id: None,
+                }]),
+            );
+
+        let service = ChatCognitiveService::new(
+            store.clone(),
+            extractor,
+            CognitivePolicy {
+                mode: CognitiveGovernanceMode::FullAuto,
+                auto_accept_threshold: 0.9,
+            },
+        );
+
+        let res = service
+            .process_chat_session(
+                &auth(),
+                ChatCognitiveInput {
+                    namespace: "test-ns".to_string(),
+                    session_id: "sess-threshold".to_string(),
+                    messages: vec![ChatMessage {
+                        role: ChatRole::User,
+                        content: "提交前要补集成测试".to_string(),
+                        timestamp: None,
+                    }],
+                    occurred_at: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            res.committed_entries.is_empty(),
+            "低于阈值的候选不得在 FullAuto 下自动入库"
+        );
+        assert_eq!(res.proposals.len(), 1);
+        assert_eq!(res.proposals[0].status, CognitiveProposalStatus::Rejected);
+        assert!(
+            res.proposals[0]
+                .rejection_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("自动接受阈值"),
+            "拒绝原因必须说明阈值：{:?}",
+            res.proposals[0].rejection_reason
+        );
+
+        // 同样的候选在阈值放宽后应正常入库（确认不是把候选本身判死）
+        let service_loose = ChatCognitiveService::new(
+            store.clone(),
+            Arc::new(
+                MockChatCognitiveExtractor::new().with_candidates(vec![CognitiveCandidate {
+                    content: "团队规范：提交前必须补齐端到端回归".to_string(),
+                    scene: MemoryScene::Chat,
+                    layer: CognitiveLayer::Knowledge,
+                    confidence: 0.6,
+                    valid_from: None,
+                    valid_until: None,
+                    occurred_at: None,
+                    tags: vec![],
+                    metadata: serde_json::json!({}),
+                    relation_kind: None,
+                    target_memory_id: None,
+                }]),
+            ),
+            CognitivePolicy {
+                mode: CognitiveGovernanceMode::FullAuto,
+                auto_accept_threshold: 0.5,
+            },
+        );
+        let res_loose = service_loose
+            .process_chat_session(
+                &auth(),
+                ChatCognitiveInput {
+                    namespace: "test-ns".to_string(),
+                    session_id: "sess-loose".to_string(),
+                    messages: vec![ChatMessage {
+                        role: ChatRole::User,
+                        content: "提交前要补端到端回归".to_string(),
+                        timestamp: None,
+                    }],
+                    occurred_at: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(res_loose.committed_entries.len(), 1);
     }
 
     #[tokio::test]

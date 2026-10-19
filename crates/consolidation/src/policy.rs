@@ -16,6 +16,11 @@ pub enum PolicyMode {
 }
 
 /// 整合策略配置
+///
+/// **阈值梯度（单一事实来源）**：
+/// `语义冲突 0.82` < `去重/整合 integrate_sim_threshold 0.92` < `自动合并 auto_merge_threshold 0.98`。
+/// 语义冲突检测器通过 `with_duplicate_threshold` 接收去重阈值，保证"相似到 0.92 以上算重复、
+/// 而不是冲突"；自动合并只对 ≥ 0.98 且成员数受控的重复组生效。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutoPolicy {
     pub mode: PolicyMode,
