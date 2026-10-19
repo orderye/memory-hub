@@ -665,6 +665,7 @@ impl BackupService for DefaultBackupService {
                     content_hash: ev.content_hash.clone(),
                     excerpt: ev.excerpt.clone(),
                     occurred_at: ev.occurred_at,
+                    expires_at: ev.expires_at,
                 })
                 .await;
         }
@@ -1208,6 +1209,7 @@ mod tests {
                 excerpt: ev.excerpt.clone(),
                 occurred_at: ev.occurred_at,
                 created_at: chrono::Utc::now(),
+                expires_at: ev.expires_at,
             };
             self.evidences.write().unwrap().push(record.clone());
             Ok(record)
@@ -1260,6 +1262,14 @@ mod tests {
             } else {
                 Err(HubError::NotFound)
             }
+        }
+
+        async fn purge_expired_evidence(
+            &self,
+            _ns: &str,
+            _now: chrono::DateTime<chrono::Utc>,
+        ) -> Result<usize> {
+            Ok(0)
         }
     }
 
@@ -2243,6 +2253,7 @@ mod tests {
             excerpt: Some("用户询问架构配置".to_string()),
             occurred_at: Some(chrono::Utc::now()),
             created_at: chrono::Utc::now(),
+            expires_at: None,
         };
         let rel_v2 = MemoryRelation {
             namespace: Some(ns.to_string()),

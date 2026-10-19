@@ -18,7 +18,15 @@ Working 经验记忆系统（Working Memory System）专为智能体长期多任
    - 负向反馈降低权重与置信度，当衰减至临界值（$< 0.3$）时降级为 `Deprecated`，绝不物理硬删除，保留完整历史审计轨迹。
 4. **环境边界感知（Boundary-Aware Recall）**：
    - 经验严格限定适用环境（如 `["linux", "k8s"]`）；
-   - 执行检索时，若当前运行环境与经验环境不匹配，检索结果显式标记 `env_mismatch = true` 并附带明确警告，同时实施分数惩罚，严禁伪称适用。
+   - 执行检索时，若当前运行环境与经验环境不匹配，检索结果显式标记 `env_mismatch = true` 并附带明确警告，同时实施分数惩罚，严禁伪称适用；
+   - **两种模式，按后果严重程度选**：
+     - **降权模式（默认，`strict_env = false`）**：分数 ×0.5 + 显式告警，
+       结果仍然返回，交由 Agent 判别；
+     - **拒绝模式（`strict_env = true`）**：环境不匹配的经验**直接不返回**。
+       降权只是**排序提示**——Agent 仍可能误取；而把"只适用于 kafka 的处置步骤"
+       用在 JVM 上这类**有安全后果**的场景，需要的是硬规则而不是排序。
+       检索工具 `working_experience_search` 暴露 `strict_env` 参数，
+       语义与测试见 `crates/mem-core/src/working_memory_service.rs`。
 5. **账户沙箱强隔离**：
    - 账户沙箱体系下，跨命名空间任务与经验关联直接阻断（Fail-Closed）。
 

@@ -50,6 +50,16 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let embedder: Arc<dyn Embedder> = embed::build_from_config(&cfg)?;
     info!(provider = %cfg.embed_provider, dim = cfg.embed_dim, "嵌入器已就绪");
 
+    // 语义能力未就绪必须**响亮**地声明：伪向量下检索退化为词法匹配，
+    // 把它当成"语义检索已上线"会让验收结论失真（此前正是这个问题）。
+    if !cfg.semantic_ready() {
+        warn!(
+            provider = %cfg.embed_provider,
+            "语义检索能力未就绪：当前嵌入器为伪向量，检索退化为词法匹配，\
+             语义召回与语义阈值均不可用；生产请配置 HUB_EMBED_PROVIDER=http 与真实嵌入服务"
+        );
+    }
+
     // ===== 访问控制 =====
     let access: Arc<dyn mem_core::AccessChecker> = Arc::new(GrantChecker::new(store.clone()));
 
@@ -90,6 +100,33 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         );
         retriever = retriever.with_scene_weight_profiles(profiles);
     }
+
+    // ===== 默认拒绝阈值 =====
+    // 0 表示显式关闭；否则在调用方未给 min_score 时生效，
+    // 低于阈值的候选一律丢弃（无可信候选时返回"无可靠匹配"）。
+    if cfg.retrieval_min_score > 0.0 {
+        retriever = retriever.with_default_min_score(Some(cfg.retrieval_min_score));
+        info!(
+            min_score = cfg.retrieval_min_score,
+            "已启用默认最小可信分（域外拒绝阈值）"
+        );
+    }
+    if !cfg.retrieval_scene_min_scores.is_empty() {
+        let mut profiles = std::collections::HashMap::new();
+        for (name, value) in &cfg.retrieval_scene_min_scores {
+            let scene = match name.as_str() {
+                "chat" => mem_core::MemoryScene::Chat,
+                "working" => mem_core::MemoryScene::Working,
+                "coding" => mem_core::MemoryScene::Coding,
+                other => {
+                    return Err(format!("未知的场景阈值 profile：{other}").into());
+                }
+            };
+            profiles.insert(scene, *value);
+        }
+        retriever = retriever.with_scene_min_scores(profiles);
+    }
+
     info!(scene_mode = %cfg.retrieval_scene_mode, "检索场景模式");
     let retriever = Arc::new(retriever);
     let memory_service = Arc::new(
@@ -118,6 +155,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         chat_extractor,
         CognitivePolicy {
             mode: CognitiveGovernanceMode::Manual,
+            evidence_retention_days: cfg.evidence_retention_days,
             ..Default::default()
         },
     ));
@@ -177,6 +215,19 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         max_request_bytes: cfg.max_request_bytes,
         rate_limiter,
         interceptor,
+        capabilities: Arc::new(mcp::transport::CapabilityReport {
+            embed_provider: cfg.embed_provider.clone(),
+            embed_model: cfg.embed_model.clone(),
+            embed_dim: cfg.embed_dim,
+            semantic_ready: cfg.semantic_ready(),
+            semantic_reason: cfg.semantic_status_reason(),
+            default_min_score: cfg.retrieval_min_score,
+            scene_min_scores: cfg
+                .retrieval_scene_min_scores
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect(),
+        }),
     };
 
     // ===== 启动方式 =====

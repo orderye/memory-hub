@@ -19,6 +19,7 @@ use axum::Router;
 use common::{AuthCtx, HubError, Result, Scope};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// MCP 标准协议版本（设计规范 5.2 节）
@@ -144,6 +145,44 @@ pub struct McpTransportState {
     pub rate_limiter: Option<Arc<RateLimiter>>,
     /// 工具拦截器（None 表示不拦截直接穿透）
     pub interceptor: Option<Arc<dyn crate::ToolInterceptor>>,
+    /// 运行能力报告（语义能力是否就绪等）
+    pub capabilities: Arc<CapabilityReport>,
+}
+
+/// 运行能力报告
+///
+/// 语义检索能力**必须**在健康检查里显式暴露：伪向量嵌入器（mock）下
+/// 检索退化为词法匹配，把它与"真实语义检索"混为一谈会让验收结论失真。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapabilityReport {
+    /// 嵌入提供方：`mock` | `http`
+    pub embed_provider: String,
+    /// 嵌入模型标识
+    pub embed_model: String,
+    /// 嵌入维度
+    pub embed_dim: usize,
+    /// 语义检索能力是否就绪（仅真实嵌入服务为 true）
+    pub semantic_ready: bool,
+    /// 语义未就绪的原因（就绪时为空）
+    pub semantic_reason: Option<String>,
+    /// 默认最小可信分（0 表示未启用）
+    pub default_min_score: f32,
+    /// 分场景最小可信分
+    pub scene_min_scores: BTreeMap<String, f32>,
+}
+
+impl Default for CapabilityReport {
+    fn default() -> Self {
+        Self {
+            embed_provider: "unknown".to_string(),
+            embed_model: "unknown".to_string(),
+            embed_dim: 0,
+            semantic_ready: false,
+            semantic_reason: Some("未提供能力报告：语义能力按未就绪处理".to_string()),
+            default_min_score: 0.0,
+            scene_min_scores: BTreeMap::new(),
+        }
+    }
 }
 
 /// 基于令牌桶的限流器：按调用方 Agent 单维度限流
@@ -438,6 +477,7 @@ pub fn mcp_router(state: Arc<McpTransportState>) -> Router {
         .route("/mcp/", post(handle_http_mcp).get(handle_http_mcp_get))
         .route("/healthz", axum::routing::get(handle_healthz))
         .route("/readyz", axum::routing::get(handle_readyz))
+        .route("/capabilities", axum::routing::get(handle_capabilities))
         // 体积上限必须在 axum 缓冲请求体之前生效：此前只在 handler 里比对
         // max_request_bytes，那时默认 2MB 的整个 body 已经进了内存。
         .layer(axum::extract::DefaultBodyLimit::max(max_body_bytes))
@@ -466,14 +506,68 @@ async fn handle_healthz() -> Response {
 }
 
 /// 就绪探针（真探库：确认底层存储可用）
+///
+/// 响应体是 JSON：除存储可达性外，**显式声明语义检索能力是否就绪**。
+/// 语义未就绪（伪向量嵌入器）时服务本身仍然可用——但调用方必须知道
+/// 此刻的检索是词法匹配，不是语义检索。
 async fn handle_readyz(State(state): State<SharedState>) -> Response {
-    match state.dispatcher.store.ping().await {
-        Ok(()) => (StatusCode::OK, "ready").into_response(),
+    let store_ok = match state.dispatcher.store.ping().await {
+        Ok(()) => true,
         Err(e) => {
             tracing::error!(error = %e, "MCP 就绪探针失败：存储不可用");
-            (StatusCode::SERVICE_UNAVAILABLE, "database unreachable").into_response()
+            false
         }
+    };
+
+    let caps = &state.capabilities;
+    let body = json!({
+        "status": if store_ok { "ready" } else { "not_ready" },
+        "storage": if store_ok { "reachable" } else { "unreachable" },
+        "semantic": {
+            "ready": caps.semantic_ready,
+            "provider": caps.embed_provider,
+            "model": caps.embed_model,
+            "dim": caps.embed_dim,
+            "reason": caps.semantic_reason,
+        },
+        "retrieval": {
+            "default_min_score": caps.default_min_score,
+            "scene_min_scores": caps.scene_min_scores,
+        },
+    });
+
+    if store_ok {
+        (StatusCode::OK, axum::Json(body)).into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response()
     }
+}
+
+/// 能力清单：显式列出本实例**实际具备**的能力
+///
+/// 与 `/readyz` 的区别：这里是给人和自动化流水线读的完整能力声明，
+/// 用于判断"本实例能否支撑语义检索验收"。
+async fn handle_capabilities(State(state): State<SharedState>) -> Response {
+    let caps = &state.capabilities;
+    (
+        StatusCode::OK,
+        axum::Json(json!({
+            "embed": {
+                "provider": caps.embed_provider,
+                "model": caps.embed_model,
+                "dim": caps.embed_dim,
+            },
+            "semantic": {
+                "ready": caps.semantic_ready,
+                "reason": caps.semantic_reason,
+            },
+            "retrieval": {
+                "default_min_score": caps.default_min_score,
+                "scene_min_scores": caps.scene_min_scores,
+            },
+        })),
+    )
+        .into_response()
 }
 
 /// POST `/mcp`：Streamable HTTP 单消息模式
@@ -720,6 +814,7 @@ mod tests {
             max_request_bytes: 65536,
             rate_limiter: limiter,
             interceptor: None,
+            capabilities: Arc::new(CapabilityReport::default()),
         }
     }
 
@@ -1054,5 +1149,123 @@ mod tests {
         let s = state();
         let resp_ready = handle_readyz(State(Arc::new(s))).await;
         assert_eq!(resp_ready.status(), StatusCode::OK);
+    }
+
+    /// 把响应体读成 JSON
+    async fn body_json(resp: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("读取响应体失败");
+        serde_json::from_slice(&bytes).expect("响应体不是合法 JSON")
+    }
+
+    /// 语义能力未就绪时，健康检查必须**显式**声明
+    ///
+    /// 回归：此前 `/readyz` 只回一个 "ready"，伪向量部署与真实语义部署
+    /// 在探针上无法区分——"接口能返回结果"被当成了"语义检索可用"。
+    #[tokio::test]
+    async fn test_readyz_declares_semantic_capability() {
+        let mut s = state();
+        s.capabilities = Arc::new(CapabilityReport {
+            embed_provider: "mock".to_string(),
+            embed_model: "mock-embedder-v1".to_string(),
+            embed_dim: 1024,
+            semantic_ready: false,
+            semantic_reason: Some("伪向量：语义召回不可用".to_string()),
+            default_min_score: 0.65,
+            scene_min_scores: BTreeMap::new(),
+        });
+
+        let resp = handle_readyz(State(Arc::new(s))).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+
+        assert_eq!(body["status"], json!("ready"));
+        assert_eq!(body["storage"], json!("reachable"));
+        assert_eq!(
+            body["semantic"]["ready"],
+            json!(false),
+            "语义未就绪必须显式声明：{body}"
+        );
+        assert_eq!(body["semantic"]["provider"], json!("mock"));
+        assert_eq!(body["semantic"]["model"], json!("mock-embedder-v1"));
+        assert_eq!(body["semantic"]["dim"], json!(1024));
+        assert!(
+            body["semantic"]["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("伪向量"),
+            "必须给出原因说明：{body}"
+        );
+        // 阈值是 f32，序列化后有精度误差：按容差比较
+        let min_score = body["retrieval"]["default_min_score"]
+            .as_f64()
+            .expect("default_min_score 应为数字");
+        assert!(
+            (min_score - 0.65).abs() < 1e-6,
+            "默认拒绝阈值应被如实报告：{min_score}"
+        );
+    }
+
+    /// 接入真实嵌入服务后，语义能力报告为就绪
+    #[tokio::test]
+    async fn test_readyz_reports_semantic_ready_with_real_embedder() {
+        let mut s = state();
+        s.capabilities = Arc::new(CapabilityReport {
+            embed_provider: "http".to_string(),
+            embed_model: "bge-m3".to_string(),
+            embed_dim: 1024,
+            semantic_ready: true,
+            semantic_reason: None,
+            default_min_score: 0.65,
+            scene_min_scores: BTreeMap::new(),
+        });
+
+        let resp = handle_readyz(State(Arc::new(s))).await;
+        let body = body_json(resp).await;
+        assert_eq!(body["semantic"]["ready"], json!(true));
+        assert_eq!(body["semantic"]["provider"], json!("http"));
+        assert!(body["semantic"]["reason"].is_null());
+    }
+
+    /// 能力清单端点：给人和流水线读的完整能力声明
+    #[tokio::test]
+    async fn test_capabilities_lists_actual_capabilities() {
+        let mut s = state();
+        let mut scene_scores = BTreeMap::new();
+        scene_scores.insert("chat".to_string(), 0.70);
+        s.capabilities = Arc::new(CapabilityReport {
+            embed_provider: "mock".to_string(),
+            embed_model: "mock-embedder-v1".to_string(),
+            embed_dim: 1024,
+            semantic_ready: false,
+            semantic_reason: Some("伪向量：语义召回不可用".to_string()),
+            default_min_score: 0.65,
+            scene_min_scores: scene_scores,
+        });
+
+        let resp = handle_capabilities(State(Arc::new(s))).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+
+        assert_eq!(body["embed"]["provider"], json!("mock"));
+        assert_eq!(body["embed"]["model"], json!("mock-embedder-v1"));
+        assert_eq!(body["semantic"]["ready"], json!(false));
+        let min_score = body["retrieval"]["default_min_score"]
+            .as_f64()
+            .expect("default_min_score 应为数字");
+        assert!((min_score - 0.65).abs() < 1e-6);
+        let chat = body["retrieval"]["scene_min_scores"]["chat"]
+            .as_f64()
+            .expect("chat 阈值应为数字");
+        assert!((chat - 0.70).abs() < 1e-6);
+    }
+
+    /// 缺能力报告时按"语义未就绪"处理——宁可保守，不可误报就绪
+    #[tokio::test]
+    async fn test_missing_capability_report_defaults_to_not_ready() {
+        let caps = CapabilityReport::default();
+        assert!(!caps.semantic_ready);
+        assert!(caps.semantic_reason.is_some());
     }
 }

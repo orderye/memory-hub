@@ -73,6 +73,7 @@ fn create_test_state(config: CjsAdapterConfig) -> McpTransportState {
         max_request_bytes: 65536,
         rate_limiter: None,
         interceptor: Some(interceptor),
+        capabilities: Arc::new(mcp::transport::CapabilityReport::default()),
     }
 }
 

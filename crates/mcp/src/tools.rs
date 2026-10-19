@@ -366,7 +366,21 @@ impl ToolDispatcher {
                                 })
                             })
                             .collect();
-                        ToolCallResult::success(json!({ "results": items }))
+                        // 空结果必须**显式**表达"无可靠匹配"，而不是让调用方
+                        // 把"空数组"误读成"库里没有这条记忆"或"检索坏了"。
+                        // 长期记忆里，一个域外查询硬凑一条低分结果，
+                        // 比明确说"没有"更容易把错误事实写进 Agent 的上下文。
+                        let no_reliable_match = items.is_empty();
+                        ToolCallResult::success(json!({
+                            "results": items,
+                            "no_reliable_match": no_reliable_match,
+                            "reason": if no_reliable_match {
+                                "没有达到最小可信分的候选：本次检索未找到可靠匹配，\
+                                 请勿据此编造事实（可放宽 min_score 或调整查询后重试）"
+                            } else {
+                                ""
+                            },
+                        }))
                     }
                     Err(e) => ToolCallResult::error(&e),
                 }
@@ -1289,6 +1303,9 @@ impl ToolDispatcher {
             query: String,
             #[serde(default)]
             env: Option<String>,
+            /// 严格环境边界：环境不匹配的经验直接不返回（默认 false = 降权 + 告警）
+            #[serde(default)]
+            strict_env: bool,
             #[serde(default = "default_experience_top_k")]
             top_k: usize,
         }
@@ -1305,12 +1322,13 @@ impl ToolDispatcher {
                     })
                     .scoped(auth.account_id);
                 match service
-                    .search_experiences(
+                    .search_experiences_with(
                         auth,
                         &req.namespace,
                         &req.query,
                         req.env.as_deref(),
                         req.top_k.clamp(1, 50),
+                        req.strict_env,
                     )
                     .await
                 {
@@ -1469,18 +1487,26 @@ mod tests {
     use uuid::Uuid;
 
     fn harness() -> (ToolDispatcher, AuthCtx) {
+        harness_with_min_score(None)
+    }
+
+    /// 构造带默认拒绝阈值的分发器（与生产默认一致）
+    fn harness_with_min_score(min_score: Option<f32>) -> (ToolDispatcher, AuthCtx) {
         let store = Arc::new(InMemoryHubStore::new());
         let access = Arc::new(GrantChecker::new(store.clone()));
         let embedder = Arc::new(mem_core::TestEmbedder::default());
-        let retriever = Arc::new(retrieval::HybridRetriever::new(
-            store.clone() as Arc<dyn mem_core::MemoryStore>,
-            embedder.clone(),
-            100,
-            100,
-            [0.5, 0.2, 0.1, 0.1, 0.1],
-            0.7,
-            500,
-        ));
+        let retriever = Arc::new(
+            retrieval::HybridRetriever::new(
+                store.clone() as Arc<dyn mem_core::MemoryStore>,
+                embedder.clone(),
+                100,
+                100,
+                [0.5, 0.2, 0.1, 0.1, 0.1],
+                0.7,
+                500,
+            )
+            .with_default_min_score(min_score),
+        );
         let dispatcher = ToolDispatcher::new(
             Arc::new(
                 mem_core::DefaultMemoryService::new(store.clone(), embedder, access.clone())
@@ -1506,6 +1532,86 @@ mod tests {
 
     fn arg(v: Value) -> Value {
         v
+    }
+
+    /// 检索无结果时必须**显式**表达"无可靠匹配"
+    ///
+    /// 回归：此前只返回空数组，调用方会把"没找到可靠的"误读成
+    /// "库里没有这条记忆"或"检索坏了"，进而自行编造事实。
+    #[tokio::test]
+    async fn test_search_reports_no_reliable_match() {
+        // 生产默认：调用方不传 min_score 时由服务端阈值把关
+        let (d, auth) = harness_with_min_score(Some(0.65));
+        // 先写一条注册命名空间（命名空间不存在时检索是 fail-closed 的）
+        let put = d
+            .dispatch(
+                &auth,
+                "memory_put",
+                arg(json!({
+                    "namespace": "team-x",
+                    "kind": "fact",
+                    "content": "服务端口 3000",
+                })),
+            )
+            .await;
+        assert!(!put.is_error);
+
+        // 查询一个完全无关的主题
+        let res = d
+            .dispatch(
+                &auth,
+                "memory_search",
+                arg(json!({
+                    "namespace": "team-x",
+                    "query_text": "完全不相关的主题：火星基地氧气循环",
+                })),
+            )
+            .await;
+        assert!(!res.is_error, "检索不应报错：{:?}", res.content);
+        let body = res.structured_content.unwrap();
+        assert_eq!(body["results"], json!([]));
+        assert_eq!(
+            body["no_reliable_match"],
+            json!(true),
+            "空结果必须显式声明无可靠匹配：{body}"
+        );
+        assert!(
+            body["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("可靠匹配"),
+            "应给出可操作的说明：{body}"
+        );
+    }
+
+    /// 检索有结果时不得声明"无可靠匹配"
+    #[tokio::test]
+    async fn test_search_with_hit_does_not_claim_no_reliable_match() {
+        let (d, auth) = harness();
+        let put = d
+            .dispatch(
+                &auth,
+                "memory_put",
+                arg(json!({
+                    "namespace": "team-x",
+                    "kind": "fact",
+                    "content": "服务端口 3000",
+                })),
+            )
+            .await;
+        assert!(!put.is_error);
+
+        let res = d
+            .dispatch(
+                &auth,
+                "memory_search",
+                arg(json!({ "namespace": "team-x", "query_text": "服务端口" })),
+            )
+            .await;
+        assert!(!res.is_error);
+        let body = res.structured_content.unwrap();
+        assert_eq!(body["no_reliable_match"], json!(false));
+        assert!(!body["results"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

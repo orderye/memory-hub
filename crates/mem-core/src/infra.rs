@@ -176,6 +176,12 @@ pub trait EvidenceStore: Send + Sync {
 
     /// 物理删除单条证据
     async fn delete_evidence(&self, namespace: &str, id: uuid::Uuid) -> Result<()>;
+
+    /// 清理指定命名空间下已过保留期限的证据，返回删除条数。
+    ///
+    /// 证据写入前已脱敏（见 [`crate::redaction`]），本方法是保留期限的执行点：
+    /// 到期即物理删除，不让不可变副本无限期留存。
+    async fn purge_expired_evidence(&self, namespace: &str, now: DateTime<Utc>) -> Result<usize>;
 }
 
 /// 关系网存储（P1 引入）
@@ -550,6 +556,21 @@ pub trait Embedder: Send + Sync {
     fn model_id(&self) -> &str;
     fn dim(&self) -> usize;
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
+
+    /// 该嵌入器是否提供**真实语义信号**。
+    ///
+    /// 伪向量实现（按哈希字节构造的 Mock / Test 嵌入器）返回 `false`：
+    /// 同一语义的两次文本得到互不相关的向量，不相关文本反而可能偶然相近，
+    /// 它的余弦相似度是噪声而不是语义。调用方据此决定：
+    ///
+    /// - 打分时不得把向量维度当作有效信号注入排序（否则噪声按权重放大）；
+    /// - 不得基于向量维度声称"语义能力就绪"（健康检查与评测报告都要区分）；
+    /// - 不得用伪向量下的分数校准真实语义阈值（阈值只在真实模型下校准）。
+    ///
+    /// 真实模型（远程嵌入服务）保持默认 `true`。
+    fn provides_semantic_signal(&self) -> bool {
+        true
+    }
 }
 
 /// 时钟（测试可注入固定时间）

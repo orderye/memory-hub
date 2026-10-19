@@ -17,7 +17,7 @@ use mem_core::MemoryHubStore;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info};
-use worker::{BackupJob, IntegrationScanJob};
+use worker::{BackupJob, EvidenceRetentionJob, IntegrationScanJob};
 
 #[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
 use tikv_jemallocator::Jemalloc;
@@ -53,6 +53,8 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.integrate_max_proposals,
         "backup-worker",
     ));
+    // 证据保留期限：不可变证据行到期即物理删除
+    let evidence_job = Arc::new(EvidenceRetentionJob::new(store.clone(), "backup-worker"));
 
     // 备份调度表（启动期 fail-fast 已由配置校验完成，这里再解析一次拿到句柄）
     let schedule =
@@ -76,6 +78,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_backup = chrono::Utc::now() - chrono::Duration::days(365);
     let mut last_expiry = chrono::Utc::now() - chrono::Duration::days(365);
     let mut last_scan = chrono::Utc::now() - chrono::Duration::days(365);
+    let mut last_evidence = chrono::Utc::now() - chrono::Duration::days(365);
 
     // 主循环：30 秒 tick；到点判定基于 cron next_after 与心跳间隔
     let mut ticker = tokio::time::interval(Duration::from_secs(30));
@@ -119,7 +122,24 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // 3. 整合扫描（跟随备份节奏：每天最多一次）
+        // 3. 证据保留期限清理（跟随过期清理节奏）
+        if expiry_interval.is_some()
+            && (now - last_evidence)
+                >= chrono::Duration::from_std(expiry_interval.unwrap())
+                    .unwrap_or(chrono::Duration::hours(6))
+        {
+            match evidence_job.run_once(now).await {
+                Ok(purged) => {
+                    if purged > 0 {
+                        info!(purged, "过期证据清理完成");
+                    }
+                    last_evidence = now;
+                }
+                Err(e) => error!(error = %e, "过期证据清理失败（下个 tick 重试）"),
+            }
+        }
+
+        // 4. 整合扫描（跟随备份节奏：每天最多一次）
         if (now - last_scan) >= chrono::Duration::hours(24) {
             match integration_job.run_once(now).await {
                 Ok(report) => {

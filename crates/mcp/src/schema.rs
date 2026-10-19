@@ -211,7 +211,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                         "type": "number",
                         "minimum": 0.0,
                         "maximum": 1.0,
-                        "description": "最小综合相关性分阈值（可选）"
+                        "description": "最小综合相关性分阈值（可选）。省略时使用服务端默认阈值（默认拒绝阈值）；显式给出 0 表示关闭阈值、返回全部候选"
                     },
                     "scene": {
                         "type": "string",
@@ -843,6 +843,11 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                         "type": "string",
                         "maxLength": 128,
                         "description": "当前执行环境（如 linux / macos / postgres）；给出后与经验 boundary_envs 匹配，不匹配则降权并告警"
+                    },
+                    "strict_env": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "严格环境边界：环境不匹配的经验直接不返回（默认 false = 仅降权并告警）。有安全后果的场景应开启——降权只是排序提示，硬拒绝才是规则"
                     },
                     "top_k": {
                         "type": "integer",

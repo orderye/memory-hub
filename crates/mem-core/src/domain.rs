@@ -184,6 +184,9 @@ pub enum CognitiveProposalStatus {
 }
 
 /// 原始证据存根（P1 引入，Append-only）
+///
+/// 「不可变」= 写入后不可悄悄改写；写入**之前**的脱敏与最小化是允许且必需的
+/// （见 [`crate::redaction`]）。`expires_at` 是保留期限：到期后由清理任务物理删除。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryEvidence {
     pub id: Uuid,
@@ -197,6 +200,9 @@ pub struct MemoryEvidence {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub occurred_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+    /// 保留期限到期时刻（None = 永久保留）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 /// 新证据存根追加请求
@@ -213,6 +219,9 @@ pub struct NewEvidence {
     pub excerpt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub occurred_at: Option<DateTime<Utc>>,
+    /// 保留期限到期时刻（None = 永久保留）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 /// 记忆实体关系（P1 引入）
@@ -344,6 +353,12 @@ pub enum CognitiveGovernanceMode {
 pub struct CognitivePolicy {
     pub mode: CognitiveGovernanceMode,
     pub auto_accept_threshold: f32,
+    /// 证据保留期限（天）；0 = 永久保留。
+    ///
+    /// 证据行是"写入后不可改"的，所以敏感内容必须在**写入前**脱敏
+    /// （见 [`crate::redaction`]）；保留期限则是第二道防线：
+    /// 到期后由清理任务物理删除，不让不可变副本无限期留存。
+    pub evidence_retention_days: u32,
 }
 
 impl Default for CognitivePolicy {
@@ -351,6 +366,7 @@ impl Default for CognitivePolicy {
         Self {
             mode: CognitiveGovernanceMode::Manual,
             auto_accept_threshold: 0.95,
+            evidence_retention_days: 90,
         }
     }
 }

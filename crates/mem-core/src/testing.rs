@@ -62,6 +62,12 @@ impl Embedder for TestEmbedder {
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         Ok(texts.iter().map(|t| self.generate_vector(t)).collect())
     }
+
+    /// 伪向量：余弦相似度是哈希噪声，不构成语义信号。
+    /// 检索打分据此把向量维度标记为"不可用"，健康检查据此声明语义能力未就绪。
+    fn provides_semantic_signal(&self) -> bool {
+        false
+    }
 }
 
 use crate::domain::{ChatCognitiveInput, CognitiveCandidate};
@@ -541,6 +547,7 @@ impl EvidenceStore for TestHubStore {
             excerpt: ev.excerpt.clone(),
             occurred_at: ev.occurred_at,
             created_at: Utc::now(),
+            expires_at: ev.expires_at,
         };
         self.evidences.write().unwrap().push(record.clone());
         Ok(record)
@@ -593,6 +600,13 @@ impl EvidenceStore for TestHubStore {
         } else {
             Err(HubError::NotFound)
         }
+    }
+
+    async fn purge_expired_evidence(&self, ns: &str, now: chrono::DateTime<Utc>) -> Result<usize> {
+        let mut list = self.evidences.write().unwrap();
+        let before = list.len();
+        list.retain(|e| !(e.namespace == ns && e.expires_at.is_some_and(|exp| exp <= now)));
+        Ok(before - list.len())
     }
 }
 

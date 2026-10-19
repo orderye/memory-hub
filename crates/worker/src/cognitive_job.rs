@@ -209,6 +209,7 @@ mod tests {
         let policy = CognitivePolicy {
             mode: CognitiveGovernanceMode::FullAuto,
             auto_accept_threshold: 0.7,
+            ..Default::default()
         };
 
         let service = Arc::new(ChatCognitiveService::new(store.clone(), extractor, policy));
@@ -259,6 +260,7 @@ mod tests {
         let policy = CognitivePolicy {
             mode: CognitiveGovernanceMode::FullAuto,
             auto_accept_threshold: 0.7,
+            ..Default::default()
         };
 
         let service = Arc::new(ChatCognitiveService::new(store.clone(), extractor, policy));

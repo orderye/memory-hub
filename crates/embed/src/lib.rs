@@ -83,6 +83,14 @@ impl Embedder for MockEmbedder {
         }
         Ok(results)
     }
+
+    /// Mock 向量由 SHA-256 字节构造，余弦相似度是噪声而非语义。
+    ///
+    /// 声明 `false` 后，检索打分会把向量维度视为"不可用"并按剩余维度归一化，
+    /// 健康检查也会据此声明"语义能力未就绪"——不让伪向量冒充语义检索。
+    fn provides_semantic_signal(&self) -> bool {
+        false
+    }
 }
 
 /// 嵌入器提供方选择
@@ -112,7 +120,9 @@ impl EmbedderKind {
 /// 用 mock，合并后重算出的向量会把条目挪到另一个空间，检索与整合双双失真。
 /// 因此提供方与维度都由启动期强校验的 `AppConfig` 决定，缺失即 fail-fast。
 pub fn build_from_config(cfg: &common::AppConfig) -> Result<Arc<dyn mem_core::Embedder>> {
-    let model = std::env::var("HUB_EMBED_MODEL").unwrap_or_else(|_| "bge-m3".to_string());
+    // 模型标识取自已校验的 AppConfig（单一事实来源）：健康检查报告里展示的
+    // 模型名必须与实际使用的模型一致，不能各读各的环境变量。
+    let model = cfg.embed_model.clone();
     match cfg.embed_provider.as_str() {
         "http" => {
             let endpoint = cfg

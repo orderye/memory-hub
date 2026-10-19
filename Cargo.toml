@@ -85,6 +85,8 @@ zeroize = { version = "1.8", features = ["derive"] }
 sha2 = "0.10"
 hex = "0.4"
 base64 = "0.22"
+# 证据脱敏：凭证 / 私钥 / 个人信息的模式匹配
+regex = "1.13"
 arc-swap = "1.7"
 subtle = "2.6"
 argon2 = "0.5"

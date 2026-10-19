@@ -30,7 +30,7 @@ use common::{AccountId, AuthCtx, Result, Scope};
 use mem_core::{
     domain::{CognitiveLayer, MemoryEntry, MemoryKind, MemoryScene, MemoryStatus},
     testing::{FixedClock, TestEmbedder},
-    AccountScopedStore, Embedder, MemoryHubStore, MemoryStore, Retriever, SearchQuery,
+    AccountScopedStore, Embedder, GrantStore, MemoryHubStore, MemoryStore, Retriever, SearchQuery,
 };
 use retrieval::HybridRetriever;
 use serde::{Deserialize, Serialize};
@@ -1346,6 +1346,12 @@ struct MetricSet {
     ndcg_at_10: f64,
     /// 硬负例违规率（Top-3 内出现 forbidden 的查询占比）
     forbidden_rate: f64,
+    /// 首位误取率（**第 1 条**结果就是硬负例的查询占比）
+    ///
+    /// 与 `forbidden_rate` 的区别：Top-3 里混入矛盾项，Agent 尚可凭排序
+    /// 与判断回避；首位就是矛盾项，则 Agent 会直接把它当成答案依据。
+    /// 这才是长期记忆里真正会造成错误事实的路径。
+    first_hit_forbidden_rate: f64,
     /// 负控制查询被命中的比例（越低越好）
     negative_hit_rate: f64,
     p50_ms: f64,
@@ -1362,6 +1368,9 @@ struct PerQueryRecord {
     rank_first_relevant: Option<usize>,
     relevant_total: usize,
     violated_forbidden: bool,
+    /// 第 1 条结果就是硬负例
+    #[serde(default)]
+    first_hit_forbidden: bool,
     result_count: usize,
 }
 
@@ -1371,6 +1380,9 @@ struct BenchReport {
     dataset_docs: usize,
     dataset_queries: usize,
     embedder: String,
+    /// 嵌入器是否提供真实语义信号（false = 伪向量，指标不代表语义能力）
+    #[serde(default)]
+    semantic_ready: bool,
     config: String,
     overall: MetricSet,
     by_scene: BTreeMap<String, MetricSet>,
@@ -1400,6 +1412,8 @@ struct QueryOutcome {
     retrieved_relevant: usize,
     relevant_total: usize,
     violated_forbidden: bool,
+    /// 第 1 条结果就是硬负例
+    first_hit_forbidden: bool,
     /// 本次检索实际返回的条目数（负控制查询用它判断"是否召回了任何东西"）
     result_count: usize,
     elapsed_ms: f64,
@@ -1416,6 +1430,7 @@ fn metrics_for(outcomes: &[QueryOutcome]) -> MetricSet {
     let mut mrr = 0.0f64;
     let mut ndcg = 0.0f64;
     let mut forbidden = 0usize;
+    let mut first_hit_forbidden = 0usize;
     let mut negatives_hit = 0usize;
     let mut negative_total = 0usize;
     let mut latencies: Vec<f64> = Vec::with_capacity(n);
@@ -1459,6 +1474,9 @@ fn metrics_for(outcomes: &[QueryOutcome]) -> MetricSet {
         if o.violated_forbidden {
             forbidden += 1;
         }
+        if o.first_hit_forbidden {
+            first_hit_forbidden += 1;
+        }
     }
 
     let effective = n - negative_total;
@@ -1480,6 +1498,7 @@ fn metrics_for(outcomes: &[QueryOutcome]) -> MetricSet {
         mrr_at_10: mrr / effective.max(1) as f64,
         ndcg_at_10: ndcg / effective.max(1) as f64,
         forbidden_rate: forbidden as f64 / effective.max(1) as f64,
+        first_hit_forbidden_rate: first_hit_forbidden as f64 / effective.max(1) as f64,
         negative_hit_rate: if negative_total == 0 {
             0.0
         } else {
@@ -1603,6 +1622,7 @@ async fn run_bench(
         dataset_docs: ds.docs.len(),
         dataset_queries: ds.queries.len(),
         embedder: embedder.model_id().to_string(),
+        semantic_ready: embedder.provides_semantic_signal(),
         config: label_config,
         overall,
         by_scene: scene_metrics,
@@ -1619,6 +1639,7 @@ fn per_query_record(o: &QueryOutcome) -> PerQueryRecord {
         rank_first_relevant: o.rank_first_relevant,
         relevant_total: o.relevant_total,
         violated_forbidden: o.violated_forbidden,
+        first_hit_forbidden: o.first_hit_forbidden,
         result_count: o.result_count,
     }
 }
@@ -1632,6 +1653,7 @@ fn clone_outcome(o: &QueryOutcome) -> QueryOutcome {
         retrieved_relevant: o.retrieved_relevant,
         relevant_total: o.relevant_total,
         violated_forbidden: o.violated_forbidden,
+        first_hit_forbidden: o.first_hit_forbidden,
         result_count: o.result_count,
         elapsed_ms: o.elapsed_ms,
     }
@@ -1655,6 +1677,7 @@ fn score_outcome(
     let mut rank_first_relevant = None;
     let mut retrieved_relevant = 0usize;
     let mut violated_forbidden = false;
+    let mut first_hit_forbidden = false;
     for (idx, scored) in results.iter().enumerate() {
         if let Some(key) = key_by_id.get(&scored.item.id) {
             if relevant.contains(key) {
@@ -1666,6 +1689,9 @@ fn score_outcome(
             if idx < FORBIDDEN_K && forbidden.contains(key) {
                 violated_forbidden = true;
             }
+            if idx == 0 && forbidden.contains(key) {
+                first_hit_forbidden = true;
+            }
         }
     }
     QueryOutcome {
@@ -1676,11 +1702,17 @@ fn score_outcome(
         retrieved_relevant,
         relevant_total: q.relevant.len(),
         violated_forbidden,
+        first_hit_forbidden,
         result_count,
         elapsed_ms,
     }
 }
 
+/// 生产默认配置的检索器
+///
+/// 包含**默认拒绝阈值**：评测必须反映生产行为——
+/// 生产上调用方不传 min_score 时就是这个阈值在把关，
+/// 评测若不带阈值，量到的就不是线上会发生的事。
 fn default_retriever(
     store: AccountScopedStore<dyn MemoryHubStore>,
     embedder: Arc<dyn Embedder>,
@@ -1695,6 +1727,7 @@ fn default_retriever(
         1000,
     )
     .with_clock(Arc::new(FixedClock::new(fixed_now())))
+    .with_default_min_score(Some(common::DEFAULT_RETRIEVAL_MIN_SCORE))
 }
 
 // ============================================================================
@@ -1729,6 +1762,14 @@ fn print_report(report: &BenchReport) {
         report.dataset_docs, report.dataset_queries, report.dataset_fingerprint
     );
     println!("嵌入器: {}", report.embedder);
+    println!(
+        "语义能力: {}",
+        if report.semantic_ready {
+            "已就绪（真实嵌入模型，指标代表语义检索质量）"
+        } else {
+            "未就绪（伪向量：指标只反映管道与词法排序，不代表语义能力）"
+        }
+    );
     println!("配置  : {}", report.config);
     let m = &report.overall;
     println!(
@@ -1740,8 +1781,9 @@ fn print_report(report: &BenchReport) {
         m.ndcg_at_10
     );
     println!(
-        "       : 硬负例违规率 {:.2}% | 负控制命中率 {:.2}% | p50 {:.2}ms | p95 {:.2}ms",
+        "       : 硬负例违规率 {:.2}%（Top-3）| 首位误取率 {:.2}% | 负控制命中率 {:.2}% | p50 {:.2}ms | p95 {:.2}ms",
         m.forbidden_rate * 100.0,
+        m.first_hit_forbidden_rate * 100.0,
         m.negative_hit_rate * 100.0,
         m.p50_ms,
         m.p95_ms
@@ -1774,7 +1816,7 @@ fn print_report(report: &BenchReport) {
 ///
 /// 负控制查询不参与前 5 个质量指标（与 `metrics_for` 口径一致），
 /// 它们单独用"是否返回任何结果"衡量。
-fn per_query_values(r: &PerQueryRecord) -> Option<[f64; 6]> {
+fn per_query_values(r: &PerQueryRecord) -> Option<[f64; 7]> {
     if r.category == "negative" {
         return None;
     }
@@ -1796,16 +1838,26 @@ fn per_query_values(r: &PerQueryRecord) -> Option<[f64; 6]> {
         _ => 0.0,
     };
     let violation = if r.violated_forbidden { 1.0 } else { 0.0 };
-    Some([hit(1), hit(5), hit(10), rr, ndcg, violation])
+    let first_violation = if r.first_hit_forbidden { 1.0 } else { 0.0 };
+    Some([
+        hit(1),
+        hit(5),
+        hit(10),
+        rr,
+        ndcg,
+        violation,
+        first_violation,
+    ])
 }
 
-const PAIRED_METRICS: [(&str, bool); 6] = [
+const PAIRED_METRICS: [(&str, bool); 7] = [
     ("Recall@1", true),
     ("Recall@5", true),
     ("Recall@10", true),
     ("MRR@10", true),
     ("nDCG@10", true),
     ("硬负例违规率", false),
+    ("首位误取率", false),
 ];
 
 /// 配对比较结果（用于打印与门禁判定）
@@ -1826,9 +1878,9 @@ struct PairedDelta {
 fn paired_deltas(base: &[PerQueryRecord], cur: &[PerQueryRecord]) -> (Vec<PairedDelta>, usize) {
     let base_map: HashMap<&str, &PerQueryRecord> =
         base.iter().map(|r| (r.id.as_str(), r)).collect();
-    let mut diffs: Vec<[f64; 6]> = Vec::new();
-    let mut base_sum = [0.0f64; 6];
-    let mut cur_sum = [0.0f64; 6];
+    let mut diffs: Vec<[f64; 7]> = Vec::new();
+    let mut base_sum = [0.0f64; 7];
+    let mut cur_sum = [0.0f64; 7];
     let mut matched = 0usize;
 
     for record in cur {
@@ -1841,8 +1893,8 @@ fn paired_deltas(base: &[PerQueryRecord], cur: &[PerQueryRecord]) -> (Vec<Paired
         else {
             continue;
         };
-        let mut d = [0.0f64; 6];
-        for i in 0..6 {
+        let mut d = [0.0f64; 7];
+        for i in 0..7 {
             base_sum[i] += base_vals[i];
             cur_sum[i] += cur_vals[i];
             d[i] = cur_vals[i] - base_vals[i];
@@ -1987,7 +2039,10 @@ async fn test_retrieval_bench_gate() {
     let report = run_bench(
         default_retriever,
         embedder,
-        "default(strict, w=0.5/0.2/0.1/0.1/0.1, λ=0.7)".into(),
+        format!(
+            "default(strict, w=0.5/0.2/0.1/0.1/0.1, λ=0.7, min_score={})",
+            common::DEFAULT_RETRIEVAL_MIN_SCORE
+        ),
         &ds,
     )
     .await
@@ -2024,6 +2079,17 @@ async fn test_retrieval_bench_gate() {
         base.embedder, report.embedder
     );
 
+    // 配置不同则指标口径不同（权重、阈值、场景模式都会改分数），
+    // 拿两套口径的数字做配对检验等于自欺。必须显式重冻。
+    if base.config != report.config {
+        println!(
+            "[bench] 配置与基线不一致（基线 {} / 本次 {}），跳过逐指标门禁；\
+             确认无回归后用 HUB_EVAL_WRITE_BASELINE=1 重新冻结基线",
+            base.config, report.config
+        );
+        return;
+    }
+
     let regressions = paired_gate(&base, &report);
     assert!(
         regressions.is_empty(),
@@ -2031,9 +2097,26 @@ async fn test_retrieval_bench_gate() {
         regressions.join("\n")
     );
 
+    // 语义验收开关：接入真实嵌入模型后，CI 应设 HUB_EVAL_REQUIRE_SEMANTIC=1，
+    // 让"用伪向量冒充语义质量结论"直接失败。
+    if std::env::var("HUB_EVAL_REQUIRE_SEMANTIC").is_ok() && !report.semantic_ready {
+        panic!(
+            "评测要求真实语义模型，但当前嵌入器 {} 不提供语义信号（伪向量）：\
+             伪向量下的指标不代表语义能力，不得作为语义验收结论",
+            report.embedder
+        );
+    }
+
     println!(
-        "[bench] 门禁通过：{}（嵌入器 {}，数据集指纹 {}）",
-        label, report.embedder, report.dataset_fingerprint
+        "[bench] 门禁通过：{}（嵌入器 {}，数据集指纹 {}，语义能力 {}）",
+        label,
+        report.embedder,
+        report.dataset_fingerprint,
+        if report.semantic_ready {
+            "已就绪"
+        } else {
+            "未就绪"
+        }
     );
 }
 
@@ -2164,6 +2247,420 @@ async fn test_retrieval_bench_ablations() {
 }
 
 // ============================================================================
+// 绝对门禁：域外拒绝率 + 业务正确性（不依赖基线，独立判定）
+// ============================================================================
+//
+// 相对门禁（"相比上次没有退化"）不足以守住检索质量：
+// 一个本身就很弱的基线不发生退化时，测试照样通过。
+// 下面两类门禁给出**绝对**判定，与基线无关：
+//
+// 1. **域外拒绝门禁**：域外查询被命中的比例必须有绝对上限。
+//    长期记忆里，域外查询硬凑一条结果比"没有结果"更危险——
+//    Agent 会把它当成事实依据。
+// 2. **业务正确性门禁**：时间有效性、场景约束、标签/层级约束、
+//    Working 环境边界都属于业务语义要求，必须**零违规**。
+//    这些性质与排序质量无关：即使 Recall@1 很低，
+//    "返回了在参考时点已失效的事实"也是硬错误。
+
+/// 域外误召回率绝对上限（相对"所有域外查询"）
+///
+/// 取值依据：默认拒绝阈值标定结果（见 `test_min_score_calibration`）。
+/// 该上限与嵌入器无关——域外查询无论用什么模型都不该被当成答案。
+const OOD_MAX_HIT_RATE: f64 = 0.10;
+
+/// 首位误取率绝对上限（第 1 条结果即硬负例的查询占比）
+///
+/// Top-3 里混入矛盾项 Agent 尚可回避，首位就是矛盾项则会被直接当答案。
+/// 伪向量下实测 0.56%，这里留出余量但不允许它悄悄变差。
+const FIRST_HIT_FORBIDDEN_MAX_RATE: f64 = 0.02;
+
+/// 生产默认拒绝阈值（与 `common::DEFAULT_RETRIEVAL_MIN_SCORE` 保持一致）
+const DEFAULT_MIN_SCORE: f32 = common::DEFAULT_RETRIEVAL_MIN_SCORE;
+
+/// 构造一个启用了默认拒绝阈值的检索器
+fn thresholded_retriever(
+    store: AccountScopedStore<dyn MemoryHubStore>,
+    embedder: Arc<dyn Embedder>,
+    min_score: f32,
+) -> HybridRetriever {
+    HybridRetriever::new(
+        Arc::new(store) as Arc<dyn MemoryStore>,
+        embedder,
+        100,
+        100,
+        [0.50, 0.20, 0.10, 0.10, 0.10],
+        0.7,
+        1000,
+    )
+    .with_clock(Arc::new(FixedClock::new(fixed_now())))
+    .with_default_min_score(if min_score > 0.0 {
+        Some(min_score)
+    } else {
+        None
+    })
+}
+
+/// 门禁 1：域外误召回率绝对上限
+///
+/// 相对门禁无法抓住"域外查询全部被命中"这种**长期存在**的缺陷——
+/// 它不随版本退化，因此每次都比基线"没有变差"。
+/// 这里给出绝对上限：超过即失败，与基线无关。
+#[tokio::test]
+async fn test_ood_rejection_gate() {
+    let ds = build_dataset();
+    let (embedder, cached, label) = eval_embedder();
+    let report = run_bench(
+        move |store, embedder| thresholded_retriever(store, embedder, DEFAULT_MIN_SCORE),
+        embedder,
+        format!("ood-gate(min_score={DEFAULT_MIN_SCORE})"),
+        &ds,
+    )
+    .await
+    .expect("域外拒绝评测运行失败");
+    if let Some(cached) = &cached {
+        cached.flush();
+    }
+
+    let m = &report.overall;
+    println!(
+        "[ood-gate] 域外命中率 {:.2}%（上限 {:.2}%）| 总体 Recall@1 {:.2}% Recall@5 {:.2}% \
+         MRR@10 {:.4} nDCG@10 {:.4} | 嵌入器 {label}",
+        m.negative_hit_rate * 100.0,
+        OOD_MAX_HIT_RATE * 100.0,
+        m.recall_at_1 * 100.0,
+        m.recall_at_5 * 100.0,
+        m.mrr_at_10,
+        m.ndcg_at_10
+    );
+
+    assert!(
+        m.negative_hit_rate <= OOD_MAX_HIT_RATE,
+        "域外查询误召回率 {:.2}% 超过绝对上限 {:.2}%：\
+         没有达到最小可信分的候选时必须返回\"无可靠匹配\"，而不是硬凑结果",
+        m.negative_hit_rate * 100.0,
+        OOD_MAX_HIT_RATE * 100.0
+    );
+
+    // 首位误取率：第 1 条结果就是硬负例——Agent 会直接把它当成答案依据，
+    // 这是长期记忆里真正造成错误事实的路径，必须有绝对上限。
+    assert!(
+        m.first_hit_forbidden_rate <= FIRST_HIT_FORBIDDEN_MAX_RATE,
+        "首位误取率 {:.2}% 超过绝对上限 {:.2}%：\
+         矛盾事实不得占据首位（长程记忆里它会被直接当作答案依据）",
+        m.first_hit_forbidden_rate * 100.0,
+        FIRST_HIT_FORBIDDEN_MAX_RATE * 100.0
+    );
+}
+
+/// 业务正确性检查结果
+#[derive(Debug, Default)]
+struct ConstraintReport {
+    /// 各类违规计数（约束名 → 违规次数）
+    violations: BTreeMap<String, usize>,
+    /// 违规样例（最多 5 条/类）
+    samples: BTreeMap<String, Vec<String>>,
+    /// 各约束检查的查询数
+    checked: BTreeMap<String, usize>,
+    /// 因"语义能力未就绪"而**暂停判定**的约束（仍然计数并报告，不静默忽略）
+    suspended: BTreeMap<String, String>,
+}
+
+impl ConstraintReport {
+    fn record(&mut self, kind: &str, detail: String) {
+        *self.violations.entry(kind.to_string()).or_insert(0) += 1;
+        let s = self.samples.entry(kind.to_string()).or_default();
+        if s.len() < 5 {
+            s.push(detail);
+        }
+    }
+}
+
+/// 门禁 2：业务语义正确性（时间有效性 / 场景 / 标签 / 层级 / 环境边界）
+///
+/// 这些是**硬正确性**：返回一条在参考时点已失效的事实、
+/// 或一条属于其它场景 / 其它环境的经验，都是错误答案，
+/// 与排序质量无关。任一违规即失败。
+#[tokio::test]
+async fn test_business_constraint_gate() {
+    let ds = build_dataset();
+    let (embedder, _cached, _label) = eval_embedder();
+    let store = seed_dataset(&ds, &embedder)
+        .await
+        .expect("写入评测数据集失败");
+    let retriever = thresholded_retriever(store, embedder.clone(), DEFAULT_MIN_SCORE);
+
+    let auth = AuthCtx {
+        agent_id: "bench-agent".into(),
+        account_id: Uuid::from_u128(0xBEEF),
+        scopes: vec![Scope::Read, Scope::Write],
+        acl: Default::default(),
+    };
+    let key_by_id: HashMap<Uuid, &str> = ds
+        .docs
+        .iter()
+        .map(|d| (d.entry.id, d.key.as_str()))
+        .collect();
+
+    let mut report = ConstraintReport::default();
+    for q in &ds.queries {
+        let query = SearchQuery {
+            namespace: q.namespace.clone(),
+            query_text: q.text.clone(),
+            kinds: None,
+            tags: q.tags.clone(),
+            top_k: TOP_K,
+            include_archived: false,
+            min_score: None,
+            scene: q.scene,
+            layer: q.layer,
+            valid_at: q.valid_at,
+            include_superseded: q.include_superseded,
+        };
+        let results = retriever.search(&auth, &query).await.expect("检索失败");
+
+        for scored in &results {
+            let item = &scored.item;
+            let key = key_by_id.get(&item.id).copied().unwrap_or("<未知>");
+
+            // 1. 时间有效性：返回的条目必须在参考时点有效
+            if let Some(at) = q.valid_at {
+                *report.checked.entry("时间有效性".to_string()).or_insert(0) += 1;
+                let starts_ok = item.valid_from.is_none_or(|v| v <= at);
+                let ends_ok = item.valid_until.is_none_or(|v| v > at);
+                if !(starts_ok && ends_ok) {
+                    report.record(
+                        "时间有效性",
+                        format!("查询 {} 返回了在参考时点无效的条目 {key}", q.id),
+                    );
+                }
+            }
+
+            // 2. 场景约束：请求了场景就不得返回其它场景的条目
+            if let Some(scene) = q.scene {
+                *report.checked.entry("场景约束".to_string()).or_insert(0) += 1;
+                if item.scene != Some(scene) {
+                    report.record(
+                        "场景约束",
+                        format!("查询 {} 返回了场景不匹配的条目 {key}", q.id),
+                    );
+                }
+            }
+
+            // 3. 标签约束
+            if let Some(tags) = &q.tags {
+                *report.checked.entry("标签约束".to_string()).or_insert(0) += 1;
+                if !tags.iter().all(|t| item.tags.contains(t)) {
+                    report.record(
+                        "标签约束",
+                        format!("查询 {} 返回了缺少必需标签的条目 {key}", q.id),
+                    );
+                }
+            }
+
+            // 4. 层级约束
+            if let Some(layer) = q.layer {
+                *report.checked.entry("层级约束".to_string()).or_insert(0) += 1;
+                if item.layer != Some(layer) {
+                    report.record(
+                        "层级约束",
+                        format!("查询 {} 返回了层级不匹配的条目 {key}", q.id),
+                    );
+                }
+            }
+        }
+
+        // 4.5 时间锚定召回：钉住 valid_at 的查询必须真的召回该时点有效的事实。
+        //     这是一条**召回**约束：时间过滤正确但什么都召不回来，同样是错的
+        //     （默认阈值曾把历史事实按"距今多久"压到阈值之下）。
+        //
+        //     但它依赖**语义召回**：历史事实的措辞与查询往往不同，
+        //     词法路根本匹配不上，只能靠向量路找回来。伪向量嵌入器下
+        //     向量路返回的是随机候选，这条约束量到的是"语义能力缺失"，
+        //     不是过滤缺陷——所以无语义信号时**暂停判定但照常计数报告**，
+        //     接上真实模型后自动恢复为硬门禁。
+        if q.valid_at.is_some() && !q.relevant.is_empty() {
+            *report
+                .checked
+                .entry("时间锚定召回".to_string())
+                .or_insert(0) += 1;
+            let hit = results.iter().any(|s| {
+                key_by_id
+                    .get(&s.item.id)
+                    .map(|k| q.relevant.iter().any(|r| r == k))
+                    .unwrap_or(false)
+            });
+            if !hit {
+                report.record(
+                    "时间锚定召回",
+                    format!("查询 {} 钉住时点却没有召回任何有效事实", q.id),
+                );
+            }
+        }
+
+        // 5. Working 环境边界：`memory_search` 没有结构化 env 参数，
+        //    环境只能靠正文里的标记做词法区分，因此这里能断言的是
+        //    **环境匹配的经验必须排在其它环境的等价经验之前**。
+        //    （"环境不匹配的经验不得返回"是硬规则，由 Working 经验检索的
+        //      strict_env 模式负责，见 working_memory_service 的测试。）
+        if let Some(env) = query_env(&q.text) {
+            *report.checked.entry("环境边界".to_string()).or_insert(0) += 1;
+            let topic = topic_of(&q.id);
+            let pos_matched =
+                position_of_key(&results, &key_by_id, &format!("{topic}-env-primary"));
+            let pos_other = position_of_key(&results, &key_by_id, &format!("{topic}-env-other"));
+            if let (Some(matched), Some(other)) = (pos_matched, pos_other) {
+                if matched > other {
+                    report.record(
+                        "环境边界",
+                        format!(
+                            "查询 {} 指定环境 {env}，环境匹配的经验排在了其它环境经验之后",
+                            q.id
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    // 语义能力未就绪时，依赖语义召回的约束暂停判定（但照常计数并报告）
+    let semantic_ready = embedder.provides_semantic_signal();
+    if !semantic_ready {
+        report.suspended.insert(
+            "时间锚定召回".to_string(),
+            "当前嵌入器不提供语义信号：历史事实的措辞与查询不同，词法路匹配不上，\
+             只能靠向量路召回。该约束量到的是语义能力缺失而非过滤缺陷，\
+             因此在伪向量模态下暂停判定；接入真实嵌入模型后自动恢复为硬门禁。"
+                .to_string(),
+        );
+    }
+
+    println!("\n==================== 业务正确性门禁 ====================");
+    for (kind, checked) in &report.checked {
+        let v = report.violations.get(kind).copied().unwrap_or(0);
+        let note = if report.suspended.contains_key(kind) {
+            "（判定已暂停：语义能力未就绪）"
+        } else {
+            ""
+        };
+        println!("  {kind:<8} 检查 {checked} 次，违规 {v} 次 {note}");
+        for s in report.samples.get(kind).into_iter().flatten() {
+            println!("      - {s}");
+        }
+    }
+    for (kind, why) in &report.suspended {
+        println!("  · {kind} 暂停判定：{why}");
+    }
+    println!("=========================================================\n");
+
+    let failures: Vec<String> = report
+        .violations
+        .iter()
+        .filter(|(kind, v)| **v > 0 && !report.suspended.contains_key(*kind))
+        .map(|(kind, v)| {
+            let samples = report
+                .samples
+                .get(kind)
+                .map(|s| s.join("; "))
+                .unwrap_or_default();
+            format!("{kind} 违规 {v} 次：{samples}")
+        })
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "业务语义正确性门禁失败（必须零违规）：\n{}",
+        failures.join("\n")
+    );
+}
+
+/// 从查询 id 里取主题 id：`{topic}-env` → `{topic}`
+fn topic_of(query_id: &str) -> String {
+    query_id
+        .rsplit_once('-')
+        .map(|(head, _)| head.to_string())
+        .unwrap_or_else(|| query_id.to_string())
+}
+
+/// 在结果里找出某个数据集 key 的位置
+fn position_of_key(
+    results: &[mem_core::Scored<MemoryEntry>],
+    key_by_id: &HashMap<Uuid, &str>,
+    key: &str,
+) -> Option<usize> {
+    results
+        .iter()
+        .position(|s| key_by_id.get(&s.item.id).copied() == Some(key))
+}
+
+/// 从查询文本里解析环境标记：`【环境 xxx】`
+fn query_env(text: &str) -> Option<String> {
+    let start = text.find("【环境 ")? + "【环境 ".len();
+    let rest = &text[start..];
+    let end = rest.find('】')?;
+    Some(rest[..end].trim().to_string())
+}
+
+/// 阈值标定：扫描 min_score，输出"域外拒绝对 / 域内召回"的权衡曲线
+///
+/// 这是**真实模型下重新标定默认阈值**的工具：
+/// 接上真实嵌入服务后用 `HUB_EVAL_EMBED_ENDPOINT` 跑一遍，
+/// 选���"域外命中率达标且域内 Recall 最高"的阈值，
+/// 再用它更新 `common::DEFAULT_RETRIEVAL_MIN_SCORE` 并重新冻结基线。
+///
+/// 伪向量下跑出的曲线只反映词法分布，**不能**直接当作语义阈值。
+#[tokio::test]
+#[ignore]
+async fn test_min_score_calibration() {
+    if std::env::var("HUB_EVAL_CALIBRATE").is_err() {
+        println!("[calibrate] 未设置 HUB_EVAL_CALIBRATE=1，跳过阈值标定");
+        return;
+    }
+    let ds = build_dataset();
+    let (embedder, cached, label) = eval_embedder();
+    let thresholds = [
+        0.0f32, 0.40, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90,
+    ];
+
+    println!("\n==================== min_score 阈值标定 ====================");
+    println!("嵌入器: {label}");
+    println!(
+        "{:<8} {:>8} {:>8} {:>8} {:>9} {:>10} {:>9} {:>9}",
+        "阈值", "R@1", "R@5", "R@10", "域外命中", "硬负例违规", "首位误取", "paraphR@1"
+    );
+    for t in thresholds {
+        let t2 = t;
+        let report = run_bench(
+            move |store, embedder| thresholded_retriever(store, embedder, t2),
+            embedder.clone(),
+            format!("calibrate:min_score={t}"),
+            &ds,
+        )
+        .await
+        .expect("标定运行失败");
+        let m = &report.overall;
+        let para = report
+            .by_category
+            .get("paraphrase")
+            .map(|c| c.recall_at_1 * 100.0)
+            .unwrap_or(0.0);
+        println!(
+            "{:<8.2} {:>7.2}% {:>7.2}% {:>7.2}% {:>8.2}% {:>9.2}% {:>8.2}% {:>8.2}%",
+            t,
+            m.recall_at_1 * 100.0,
+            m.recall_at_5 * 100.0,
+            m.recall_at_10 * 100.0,
+            m.negative_hit_rate * 100.0,
+            m.forbidden_rate * 100.0,
+            m.first_hit_forbidden_rate * 100.0,
+            para
+        );
+    }
+    println!("=========================================================\n");
+    if let Some(cached) = &cached {
+        cached.flush();
+    }
+}
+
+// ============================================================================
 // PostgreSQL 评测（HUB_EVAL_PG=1 + DATABASE_URL）
 // ============================================================================
 
@@ -2190,6 +2687,18 @@ async fn test_retrieval_bench_postgres() {
         account,
     ));
 
+    // 命名空间必须先注册：PostgreSQL 上 memories.namespace 有指向
+    // namespaces 的外键，内存存储没有这层约束——不注册会直接撞外键。
+    // 必须通过**带作用域**的 store 注册：写入时用的是账户前缀后的命名空间，
+    // 注册未加前缀的名字等于没注册。
+    let agent = common::AgentId::from("bench-agent");
+    for ns in ["bench-chat", "bench-work", "bench-code"] {
+        scoped
+            .ensure_namespace(ns, &agent)
+            .await
+            .expect("注册评测命名空间失败");
+    }
+
     // 写入数据集（命名空间带账户前缀，评测数据与真实数据隔离）
     let texts: Vec<String> = ds
         .docs
@@ -2213,6 +2722,8 @@ async fn test_retrieval_bench_postgres() {
         scoped.insert(&entry).await.expect("写入失败");
     }
 
+    // 与内存存储路径用**同一套生产配置**（含默认拒绝阈值）：
+    // PG 侧的数字必须与内存侧同口径，否则两边的 p50/p95 与召回都没法互相印证。
     let retriever = HybridRetriever::new(
         scoped.clone() as Arc<dyn MemoryStore>,
         embedder.clone(),
@@ -2222,7 +2733,8 @@ async fn test_retrieval_bench_postgres() {
         0.7,
         3000,
     )
-    .with_clock(Arc::new(FixedClock::new(fixed_now())));
+    .with_clock(Arc::new(FixedClock::new(fixed_now())))
+    .with_default_min_score(Some(DEFAULT_MIN_SCORE));
 
     let auth = AuthCtx {
         agent_id: "bench-agent".into(),

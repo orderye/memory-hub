@@ -14,6 +14,7 @@
 //! - [`integration_service`]：去重与冲突归并
 //! - [`access`]：命名空间 ACL 与访问判定
 //! - [`algorithm`]：打分、余弦与 MMR 等纯函数
+//! - [`redaction`]：证据持久化前的凭证脱敏与最小化
 
 pub mod access;
 pub mod account_scope;
@@ -26,6 +27,7 @@ pub mod domain;
 pub mod infra;
 pub mod integration_service;
 pub mod memory_service;
+pub mod redaction;
 pub mod testing;
 pub mod working_memory_service;
 
@@ -75,6 +77,10 @@ pub use integration_service::{
 pub use memory_service::{
     decode_cursor, encode_cursor, DefaultMemoryService, GetRequest, ListRequest, MemoryService,
     PutRequest,
+};
+pub use redaction::{
+    redact, sanitize_evidence_excerpt, RedactionFinding, RedactionKind, RedactionReport,
+    EVIDENCE_EXCERPT_MAX_CHARS,
 };
 pub use testing::{FixedClock, TestEmbedder, TestHubStore};
 pub use working_memory_service::{ExperienceSearchResult, WorkingMemoryService};

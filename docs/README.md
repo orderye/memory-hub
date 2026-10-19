@@ -8,15 +8,32 @@
 
 | 类别 | 文档名称 | 核心主题与范围 | 适用对象 | 状态 |
 | :--- | :--- | :--- | :--- | :--- |
-| **核心设计** | [`设计-多智能体长期记忆服务.md`](./设计-多智能体长期记忆服务.md) | 记忆中枢总体架构规格书 (v2.1)：两级主体模型、账户沙箱、18 个 MCP 工具合同、OAuth 2.1 规范、备份与整合机制 | 架构师 / 开发者 / 审计者 | **现行规范 (Active)** |
+| **核心设计** | [`设计-多智能体长期记忆服务.md`](./设计-多智能体长期记忆服务.md) | 记忆中枢总体架构规格书 (v2.1)：两级主体模型、账户沙箱、**原始基础工具合同（18 个）**、OAuth 2.1 规范、备份与整合机制 | 架构师 / 开发者 / 审计者 | **历史设计 (Historical)** —— 工具合同已扩展到 28 个，见根目录 README 的工具清单 |
 | **认知升级总纲** | [`Memory_Hub_Cognitive_Upgrade_Agent_Brief.md`](./Memory_Hub_Cognitive_Upgrade_Agent_Brief.md) | 认知升级任务总纲：不可变证据链、时间有效性、Chat/Working/Coding 三大子系统、场景自适应检索实施规范 | 架构师 / Agent 执行者 | **现行规范 (Active)** |
 | **工程审计** | [`upgrade/REPOSITORY_AUDIT.md`](./upgrade/REPOSITORY_AUDIT.md) | 仓库代码审计：工程拓扑、空格路径构建约束、依赖特性分析、安全基线盘点 | 运维人员 / 开发者 | **归档报告 (Reference)** |
 | **质量基线** | [`upgrade/BASELINE.md`](./upgrade/BASELINE.md) | P0 基线验证：跨账户沙箱隔离断言、授权撤销立即生效、安全备份恢复与幂等性测试 | 测试与安全人员 | **归档报告 (Reference)** |
 | **认知子系统** | [`upgrade/CHAT_MEMORY.md`](./upgrade/CHAT_MEMORY.md) | P2 Chat 对话认知流：事实/摘要/偏好/意图四层模型、证据存根、事实演化与版本封堵 | Agent 开发者 / 算法工程师 | **现行规范 (Active)** |
 | **认知子系统** | [`upgrade/WORKING_MEMORY.md`](./upgrade/WORKING_MEMORY.md) | P3 Working 经验记忆：任务事实与通用经验解耦、环境边界感知 (`boundary_envs`)、反馈衰减机制 | 自动化 Agent 开发者 | **现行规范 (Active)** |
 | **认知子系统** | [`upgrade/CODING_MEMORY.md`](./upgrade/CODING_MEMORY.md) | P4 Coding 代码演进链：真实 Git Diff 捕获、SHA-256 幂等、隐私凭证过滤、Thread 与 Revision 模型 | 代码 Agent / 辅助开发工具 | **现行规范 (Active)** |
-| **评测报告** | [`upgrade/EVALUATION.md`](./upgrade/EVALUATION.md) | P5 检索优化与基准评测：6 大测试集、MRR@5 指标、时间有效性过滤与场景提权加成评测报告 | 搜索与评测工程师 | **现行规范 (Active)** |
+| **评测报告** | [`upgrade/EVALUATION.md`](./upgrade/EVALUATION.md) | P5 检索优化与基准评测：**Bench v2（480 文档 / 600 查询，Recall@K / MRR@10 / nDCG@10）**、域外拒绝门禁、业务正确性门禁、阈值标定曲线 | 搜索与评测工程师 | **现行规范 (Active)** |
 | **业务集成** | [`创界山智能接入层实施方案.md`](./创界山智能接入层实施方案.md) | 零侵入防腐中间层实施方案：特征指纹探测、虚拟双路召回、数据法规水印与角色视角整合策略 | 外部业务集成人员 | **集成方案 (Active)** |
+
+---
+
+## 1.1 当前口径速查（Agent 必读）
+
+文档里存在**历史版本**。下表是当前实现的真实口径，照着旧文档生成接口会做错：
+
+| 项目 | 历史文档写法 | **当前口径** | 依据 |
+| :--- | :--- | :--- | :--- |
+| MCP 工具数量 | 18 个（`设计-多智能体长期记忆服务.md`） | **28 个** | 根目录 README「MCP 工具清单」 |
+| 评测指标 | MRR@5、6 大测试集（`upgrade/EVALUATION.md` 旧版） | **Recall@1/5/10、MRR@10、nDCG@10**、硬负例违规率、首位误取率、域外误召回率、p50/p95 延迟 | `crates/retrieval/tests/eval_bench.rs` |
+| 评测规模 | 6 大测试集 | **Bench v2：480 文档 / 600 查询**，指纹 `9f5b3b075a558371` | 同上 |
+| 检索最小分 | 无默认 `min_score` | **默认拒绝阈值 0.65**（`HUB_RETRIEVAL_MIN_SCORE`），无可靠匹配时返回 `no_reliable_match: true` | `crates/common/src/config.rs` |
+| 语义能力 | 隐含"向量服务在跑 = 语义可用" | **伪向量嵌入器不参与打分**；`/readyz`、`/capabilities` 显式声明 `semantic.ready` | `crates/mem-core/src/infra.rs` |
+| 证据写入 | "原封不动保存" | **写入前脱敏 + 最小化 + 到期清理**；"不可变"指写入后不可悄悄改写 | `crates/mem-core/src/redaction.rs` |
+
+> 旧文档保留是为了看清演进脉络，不是当前接口契约。**接口与验收以根目录 README 与本表为准。**
 
 ---
 

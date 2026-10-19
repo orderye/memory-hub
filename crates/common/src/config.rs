@@ -19,6 +19,38 @@ pub const MIN_TOKEN_SECRET_BYTES: usize = 32;
 /// 内置开发占位密钥。它绝不可以通过启动校验，否则等于用公开常量签发令牌。
 pub const INSECURE_DEFAULT_TOKEN_SECRET: &str = "dev-only-insecure-secret";
 
+/// 默认最小可信分（默认拒绝阈值）。
+///
+/// 低于该分的候选一律丢弃；全部被丢弃时对外返回"无可靠匹配"，
+/// 而不是把低分结果硬塞给 Agent（长期记忆里，错误事实比没有事实更糟）。
+///
+/// 取值由标定曲线确定（`crates/retrieval/tests/eval_bench.rs`
+/// 的 `test_min_score_calibration`，480 文档 / 600 查询）：
+///
+/// | 阈值 | Recall@1 | Recall@10 | 域外误召回率 | Top-3 硬负例 | 首位误取率 |
+/// |------|----------|-----------|--------------|--------------|------------|
+/// | 0.00 | 68.33%   | 97.59%    | 100.00%      | 15.19%       | 0.56%      |
+/// | 0.55 | 68.33%   | 97.59%    | 100.00%      | 15.19%       | 0.56%      |
+/// | 0.60 | 68.33%   | 97.59%    | 15.00%       | 15.74%       | 0.56%      |
+/// | 0.65 | 68.15%   | 97.22%    | 0.00%        | 19.63%       | 0.56%      |
+/// | 0.70 | 67.41%   | 94.44%    | 0.00%        | 14.63%       | 0.56%      |
+/// | 0.80 | 62.78%   | 85.93%    | 0.00%        | 8.70%        | 0.19%      |
+///
+/// 选取规则：能把**域外误召回率压到 0** 的最小阈值 —— 即 0.65。
+/// 更高的阈值继续压低 Top-3 硬负例占比，但 Recall@10 掉到 85% 以下，
+/// 属于"用召回深度换表面精度"，不划算。
+///
+/// 关于硬负例：Top-3 里混入矛盾项与**首位**取到矛盾项是两件事。
+/// 实测首位误取率仅 0.56%（矛盾项总是排在正确答案之后），
+/// 这才是长期记忆里真正会造成错误事实的路径；
+/// Top-3 混入矛盾项 Agent 尚可凭排序与判断回避。
+/// 但在伪向量下，词法打分本来就无法区分"同主题但事实矛盾"的条目，
+/// 因此该指标**不构成语义判别能力的结论**，必须在真实嵌入模型下重新判定。
+///
+/// **该值必须在真实嵌入模型下重新标定**：伪向量下的分数分布是词法分布，
+/// 接入真实模型后 sim 维度参与打分，分数尺度会变（见标定用例）。
+pub const DEFAULT_RETRIEVAL_MIN_SCORE: f32 = 0.65;
+
 /// 多智能体长期记忆服务配置项
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -31,6 +63,8 @@ pub struct AppConfig {
     pub embed_dim: usize,
     /// 嵌入器提供方：`mock` | `http`
     pub embed_provider: String,
+    /// 嵌入模型标识（`HUB_EMBED_MODEL`）；仅 http 提供方下有意义
+    pub embed_model: String,
     pub embed_endpoint: Option<String>,
     pub embed_api_key: Option<String>,
 
@@ -69,6 +103,10 @@ pub struct AppConfig {
     pub retrieval_scene_weight_profiles: std::collections::HashMap<String, [f32; SCORE_WEIGHT_LEN]>,
     pub score_weights: [f32; SCORE_WEIGHT_LEN],
     pub mmr_lambda: f32,
+    /// 默认最小可信分（0 = 关闭默认拒绝阈值）
+    pub retrieval_min_score: f32,
+    /// 分场景最小可信分覆盖（缺省回落到 `retrieval_min_score`）
+    pub retrieval_scene_min_scores: std::collections::HashMap<String, f32>,
     /// 单次检索软超时（毫秒），超时返回已召回结果
     pub soft_timeout_ms: u64,
 
@@ -79,6 +117,11 @@ pub struct AppConfig {
     pub backup_retention_days: u32,
     /// 单次快照最大条目数
     pub backup_max_entries: usize,
+    /// 证据保留期限（天）；0 = 永久保留
+    ///
+    /// 证据写入前已脱敏（见 `mem-core::redaction`），本项是第二道防线：
+    /// 到期后由清理任务物理删除，不让不可变副本无限期留存。
+    pub evidence_retention_days: u32,
     /// 定时备份 cron 表达式（5 段：分 时 日 月 周）
     pub backup_cron: String,
 
@@ -167,6 +210,7 @@ impl Default for AppConfig {
             db_statement_timeout_ms: 30_000,
             embed_dim: 1024,
             embed_provider: "mock".to_string(),
+            embed_model: "bge-m3".to_string(),
             embed_endpoint: None,
             embed_api_key: None,
             mcp_bind: "0.0.0.0:3000".parse().unwrap(),
@@ -189,10 +233,13 @@ impl Default for AppConfig {
             retrieval_scene_weight_profiles: std::collections::HashMap::new(),
             score_weights: [0.50, 0.20, 0.10, 0.10, 0.10],
             mmr_lambda: 0.7,
+            retrieval_min_score: DEFAULT_RETRIEVAL_MIN_SCORE,
+            retrieval_scene_min_scores: std::collections::HashMap::new(),
             soft_timeout_ms: 500,
             backup_keep_count: 10,
             backup_retention_days: 90,
             backup_max_entries: DEFAULT_BACKUP_MAX_ENTRIES,
+            evidence_retention_days: 90,
             backup_cron: "0 3 * * *".to_string(),
             integrate_sim_threshold: 0.92,
             integrate_max_proposals: 100,
@@ -217,6 +264,7 @@ impl AppConfig {
             parse_u64("HUB_DB_STATEMENT_TIMEOUT_MS", cfg.db_statement_timeout_ms)?;
         cfg.embed_dim = parse_usize("HUB_EMBED_DIM", cfg.embed_dim)?;
         cfg.embed_provider = var_or("HUB_EMBED_PROVIDER", &cfg.embed_provider).to_lowercase();
+        cfg.embed_model = var_or("HUB_EMBED_MODEL", &cfg.embed_model);
         cfg.embed_endpoint = var("HUB_EMBED_ENDPOINT");
         cfg.embed_api_key = var("HUB_EMBED_API_KEY");
 
@@ -250,11 +298,15 @@ impl AppConfig {
         cfg.retrieval_scene_weight_profiles = parse_scene_weight_profiles()?;
         cfg.score_weights = parse_score_weights()?;
         cfg.mmr_lambda = parse_f32("HUB_MMR_LAMBDA", cfg.mmr_lambda)?;
+        cfg.retrieval_min_score = parse_f32("HUB_RETRIEVAL_MIN_SCORE", cfg.retrieval_min_score)?;
+        cfg.retrieval_scene_min_scores = parse_scene_min_scores()?;
         cfg.soft_timeout_ms = parse_u64("HUB_SOFT_TIMEOUT_MS", cfg.soft_timeout_ms)?;
 
         cfg.backup_keep_count = parse_usize("BACKUP_KEEP_COUNT", cfg.backup_keep_count)?;
         cfg.backup_retention_days = parse_u32("BACKUP_RETENTION_DAYS", cfg.backup_retention_days)?;
         cfg.backup_max_entries = parse_usize("BACKUP_MAX_ENTRIES", cfg.backup_max_entries)?;
+        cfg.evidence_retention_days =
+            parse_u32("HUB_EVIDENCE_RETENTION_DAYS", cfg.evidence_retention_days)?;
         cfg.backup_cron = var_or("BACKUP_CRON", &cfg.backup_cron);
 
         cfg.integrate_sim_threshold =
@@ -279,6 +331,26 @@ impl AppConfig {
     /// 后端是否为 PostgreSQL（三个二进制都用这一判定，避免各自复制字符串前缀检查）
     pub fn is_postgres(&self) -> bool {
         self.db_url.starts_with("postgres://") || self.db_url.starts_with("postgresql://")
+    }
+
+    /// 语义检索能力是否就绪
+    ///
+    /// 只有接入真实嵌入服务（`HUB_EMBED_PROVIDER=http`）才算就绪。
+    /// mock 提供方生成的是伪向量：它的余弦相似度是噪声，
+    /// 此时系统退化为**词法检索**，对外必须如实声明"语义能力未就绪"。
+    pub fn semantic_ready(&self) -> bool {
+        self.embed_provider == "http"
+    }
+
+    /// 语义能力未就绪时的原因说明（供健康检查与启动告警展示）
+    pub fn semantic_status_reason(&self) -> Option<String> {
+        if self.semantic_ready() {
+            return None;
+        }
+        Some(format!(
+            "嵌入提供方为 {}（伪向量），余弦相似度是噪声而非语义：当前为词法检索，语义召回不可用",
+            self.embed_provider
+        ))
     }
 
     /// 强校验：任何越界配置都在启动期失败
@@ -335,6 +407,16 @@ impl AppConfig {
         }
         if self.mmr_lambda < 0.0 || self.mmr_lambda > 1.0 {
             anyhow::bail!("HUB_MMR_LAMBDA 必须落在 [0,1]");
+        }
+        if !(0.0..=1.0).contains(&self.retrieval_min_score) {
+            anyhow::bail!("HUB_RETRIEVAL_MIN_SCORE 必须落在 [0,1]");
+        }
+        for (name, v) in &self.retrieval_scene_min_scores {
+            if !(0.0..=1.0).contains(v) {
+                anyhow::bail!(
+                    "HUB_SCENE_MIN_SCORE_PROFILES 的 {name} 阈值必须落在 [0,1]，当前 {v}"
+                );
+            }
         }
         if let Some(tau) = self.retrieval_recency_tau_days {
             if tau <= 0.0 {
@@ -411,18 +493,22 @@ impl AppConfig {
             .unwrap_or("<unknown>")
             .to_string();
         format!(
-            "db_host={} embed_dim={} embed_provider={} mcp_bind={} auth_bind={} \
+            "db_host={} embed_dim={} embed_provider={} embed_model={} semantic_ready={} \
+             mcp_bind={} auth_bind={} \
              backup_cron={} integrate_threshold={} sweep_h={} origins={} \
-             invite={} bootstrap_pwd={}",
+             min_score={} invite={} bootstrap_pwd={}",
             db_host,
             self.embed_dim,
             self.embed_provider,
+            self.embed_model,
+            self.semantic_ready(),
             self.mcp_bind,
             self.auth_bind,
             self.backup_cron,
             self.integrate_sim_threshold,
             self.expiry_sweep_interval_h,
             self.allowed_origins.len(),
+            self.retrieval_min_score,
             if self.invite_code.is_some() {
                 "set"
             } else {
@@ -486,6 +572,37 @@ fn parse_scene_weight_profiles(
         profiles.insert(name, weights);
     }
     Ok(profiles)
+}
+
+/// 解析分场景最小可信分：`HUB_SCENE_MIN_SCORE_PROFILES="chat=0.55;working=0.65"`
+///
+/// 场景名限定 chat / working / coding；未配置的场景回落到全局 `HUB_RETRIEVAL_MIN_SCORE`。
+/// 分场景阈值存在的意义：不同场景对"宁可无结果"的容忍度不同——
+/// Chat 事实错一次的代价远高于 Working 经验少命中一次。
+fn parse_scene_min_scores() -> anyhow::Result<std::collections::HashMap<String, f32>> {
+    let Some(raw) = var("HUB_SCENE_MIN_SCORE_PROFILES") else {
+        return Ok(std::collections::HashMap::new());
+    };
+    let mut out = std::collections::HashMap::new();
+    for entry in raw.split(';').map(str::trim).filter(|e| !e.is_empty()) {
+        let (name, value) = entry
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("HUB_SCENE_MIN_SCORE_PROFILES 条目缺少 '='：{entry}"))?;
+        let name = name.trim().to_lowercase();
+        if !matches!(name.as_str(), "chat" | "working" | "coding") {
+            anyhow::bail!(
+                "HUB_SCENE_MIN_SCORE_PROFILES 不支持的场景：{name}（仅 chat/working/coding）"
+            );
+        }
+        let v: f32 = value.trim().parse().map_err(|_| {
+            anyhow::anyhow!("HUB_SCENE_MIN_SCORE_PROFILES 的 {name} 阈值不是合法数字")
+        })?;
+        if !(0.0..=1.0).contains(&v) {
+            anyhow::bail!("HUB_SCENE_MIN_SCORE_PROFILES 的 {name} 阈值必须落在 [0,1]");
+        }
+        out.insert(name, v);
+    }
+    Ok(out)
 }
 
 fn parse_score_weights() -> anyhow::Result<[f32; SCORE_WEIGHT_LEN]> {
@@ -790,6 +907,80 @@ mod tests {
             || {
                 let cfg = AppConfig::from_env().unwrap();
                 assert_eq!(cfg.allowed_origins, vec!["https://a.com", "https://b.com"]);
+            },
+        );
+    }
+
+    #[test]
+    fn test_semantic_ready_only_with_real_embedder() {
+        // mock 提供方 = 伪向量 = 语义能力未就绪
+        with_env(&[("HUB_EMBED_PROVIDER", Some("mock"))], || {
+            let cfg = AppConfig::from_env().unwrap();
+            assert!(!cfg.semantic_ready());
+            assert!(cfg.semantic_status_reason().is_some());
+        });
+
+        with_env(
+            &[
+                ("HUB_EMBED_PROVIDER", Some("http")),
+                (
+                    "HUB_EMBED_ENDPOINT",
+                    Some("http://127.0.0.1:9999/v1/embeddings"),
+                ),
+            ],
+            || {
+                let cfg = AppConfig::from_env().unwrap();
+                assert!(cfg.semantic_ready());
+                assert!(cfg.semantic_status_reason().is_none());
+            },
+        );
+    }
+
+    #[test]
+    fn test_min_score_from_env_and_validation() {
+        with_env(&[("HUB_RETRIEVAL_MIN_SCORE", Some("0.72"))], || {
+            let cfg = AppConfig::from_env().unwrap();
+            assert!((cfg.retrieval_min_score - 0.72).abs() < 1e-6);
+        });
+
+        // 越界必须被拒绝：阈值失真会让"无可靠匹配"永远不触发
+        with_env(&[("HUB_RETRIEVAL_MIN_SCORE", Some("1.5"))], || {
+            assert!(AppConfig::from_env().is_err());
+        });
+        with_env(&[("HUB_RETRIEVAL_MIN_SCORE", Some("-0.1"))], || {
+            assert!(AppConfig::from_env().is_err());
+        });
+
+        // 0 = 显式关闭默认拒绝阈值
+        with_env(&[("HUB_RETRIEVAL_MIN_SCORE", Some("0"))], || {
+            let cfg = AppConfig::from_env().unwrap();
+            assert_eq!(cfg.retrieval_min_score, 0.0);
+        });
+    }
+
+    #[test]
+    fn test_scene_min_score_profiles() {
+        with_env(
+            &[(
+                "HUB_SCENE_MIN_SCORE_PROFILES",
+                Some("chat=0.55;working=0.68"),
+            )],
+            || {
+                let cfg = AppConfig::from_env().unwrap();
+                assert_eq!(cfg.retrieval_scene_min_scores.len(), 2);
+                assert!((cfg.retrieval_scene_min_scores["chat"] - 0.55).abs() < 1e-6);
+            },
+        );
+        with_env(
+            &[("HUB_SCENE_MIN_SCORE_PROFILES", Some("unknown=0.5"))],
+            || {
+                assert!(AppConfig::from_env().is_err(), "未知场景名必须被拒绝");
+            },
+        );
+        with_env(
+            &[("HUB_SCENE_MIN_SCORE_PROFILES", Some("chat=2.0"))],
+            || {
+                assert!(AppConfig::from_env().is_err(), "越界阈值必须被拒绝");
             },
         );
     }

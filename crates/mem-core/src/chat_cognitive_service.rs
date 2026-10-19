@@ -75,18 +75,46 @@ impl ChatCognitiveService {
     }
 
     /// 构造脱敏/最小化摘要片段（默认取首条或前几条消息摘要）
+    ///
+    /// 注意：入库前必经 [`crate::redaction`] 脱敏。
     pub fn build_excerpt(input: &ChatCognitiveInput, max_chars: usize) -> String {
-        let mut excerpt = String::new();
+        Self::build_excerpt_report(input, max_chars).text
+    }
+
+    /// 同 [`Self::build_excerpt`]，但额外返回脱敏命中统计（供日志与审计）
+    ///
+    /// 这是**证据持久化前的最后一道闸门**：凭证与个人信息在入库前被替换为
+    /// 占位符，完整对话永不落库（只留定长摘要）。
+    /// 顺序不可颠倒——先截断再脱敏会漏掉被截断掉的尾部凭证。
+    pub fn build_excerpt_report(
+        input: &ChatCognitiveInput,
+        max_chars: usize,
+    ) -> crate::redaction::RedactionReport {
+        // 先拼**整段**会话：脱敏必须覆盖全文，否则摘要窗口之外的凭证
+        // 既不会被替换、也不会被计数（运维看不到"这次会话里有凭证"）。
+        let mut raw = String::new();
         for m in &input.messages {
-            let line = format!("{}: {}\n", m.role.as_str(), m.content.trim());
-            if excerpt.chars().count() + line.chars().count() > max_chars {
-                let remaining = max_chars.saturating_sub(excerpt.chars().count());
-                excerpt.extend(line.chars().take(remaining));
-                break;
-            }
-            excerpt.push_str(&line);
+            raw.push_str(m.role.as_str());
+            raw.push_str(": ");
+            raw.push_str(m.content.trim());
+            raw.push('\n');
         }
-        excerpt
+        // 再脱敏（覆盖全文）→ 最后最小化（定长截断）
+        crate::redaction::sanitize_evidence_excerpt(&raw, max_chars)
+    }
+
+    /// 证据保留期限到期时刻（None = 永久保留）
+    ///
+    /// 证据虽然已脱敏且只存摘要，但它仍是原始会话的片段。
+    /// 默认 90 天后由清理任务物理删除，避免长期留存的不可变副本。
+    fn evidence_expiry(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<chrono::DateTime<chrono::Utc>> {
+        if self.policy.evidence_retention_days == 0 {
+            return None;
+        }
+        Some(now + chrono::Duration::days(self.policy.evidence_retention_days as i64))
     }
 
     /// 执行 Chat 会话认知提炼主流程
@@ -119,6 +147,25 @@ impl ChatCognitiveService {
         let evidence = match existing_evidence {
             Some(ev) => ev,
             None => {
+                // 入库前脱敏 + 最小化：不可变表一旦写入就无法追回泄露的凭证
+                let excerpt_report = Self::build_excerpt_report(
+                    &input,
+                    crate::redaction::EVIDENCE_EXCERPT_MAX_CHARS,
+                );
+                if excerpt_report.has_findings() {
+                    // 只记录类别与数量，绝不把命中内容写进日志
+                    let kinds = excerpt_report
+                        .findings
+                        .iter()
+                        .map(|f| format!("{}×{}", f.kind.label(), f.count))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    tracing::warn!(
+                        namespace = %input.namespace,
+                        redacted = %kinds,
+                        "证据入库前检测到敏感内容并已脱敏"
+                    );
+                }
                 self.store
                     .append_evidence(&NewEvidence {
                         id: None,
@@ -126,8 +173,9 @@ impl ChatCognitiveService {
                         source_kind: EvidenceSourceKind::Session,
                         source_ref: Some(input.session_id.clone()),
                         content_hash: content_hash.clone(),
-                        excerpt: Some(Self::build_excerpt(&input, 500)),
+                        excerpt: Some(excerpt_report.text),
                         occurred_at: input.occurred_at.or(Some(now)),
+                        expires_at: self.evidence_expiry(now),
                     })
                     .await?
             }
@@ -633,6 +681,7 @@ mod tests {
                 excerpt: ev.excerpt.clone(),
                 occurred_at: ev.occurred_at,
                 created_at: Utc::now(),
+                expires_at: ev.expires_at,
             };
             self.evidences.write().unwrap().push(record.clone());
             Ok(record)
@@ -678,6 +727,14 @@ mod tests {
                 .unwrap()
                 .retain(|e| !(e.namespace == ns && e.id == id));
             Ok(())
+        }
+
+        async fn purge_expired_evidence(
+            &self,
+            _ns: &str,
+            _now: chrono::DateTime<chrono::Utc>,
+        ) -> Result<usize> {
+            Ok(0)
         }
     }
 
@@ -1144,6 +1201,7 @@ mod tests {
             CognitivePolicy {
                 mode: CognitiveGovernanceMode::Manual,
                 auto_accept_threshold: 0.95,
+                ..Default::default()
             },
         );
 
@@ -1305,6 +1363,7 @@ mod tests {
             CognitivePolicy {
                 mode: CognitiveGovernanceMode::FullAuto,
                 auto_accept_threshold: 0.9,
+                ..Default::default()
             },
         );
 
@@ -1364,6 +1423,7 @@ mod tests {
             CognitivePolicy {
                 mode: CognitiveGovernanceMode::FullAuto,
                 auto_accept_threshold: 0.5,
+                ..Default::default()
             },
         );
 
@@ -1498,6 +1558,97 @@ mod tests {
             .contains("重要业务会话数据"));
     }
 
+    /// 证据入库前的安全闸门：凭证脱敏 + 保留期限
+    ///
+    /// 回归：原始会话曾被原样写进不可变证据表——一旦写入就再也追不回来。
+    #[tokio::test]
+    async fn test_evidence_is_redacted_before_persistence() {
+        let store = Arc::new(TestHubStore::default());
+        let extractor = Arc::new(MockChatCognitiveExtractor::new().with_failure("timeout"));
+        let service = ChatCognitiveService::new(
+            store.clone(),
+            extractor,
+            CognitivePolicy {
+                evidence_retention_days: 90,
+                ..Default::default()
+            },
+        );
+
+        let secret = "sk-proj-abcdefghijklmnopqrstuvwxyz012345";
+        let input = ChatCognitiveInput {
+            namespace: "safe-ns".to_string(),
+            session_id: "sess-secret".to_string(),
+            messages: vec![
+                ChatMessage {
+                    role: ChatRole::User,
+                    content: format!("这是我的密钥 {secret}，请保密"),
+                    timestamp: None,
+                },
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    content: "已记录。".to_string(),
+                    timestamp: None,
+                },
+            ],
+            occurred_at: None,
+        };
+
+        // 抽取失败也要落证据（这是证据链的核心保证）
+        let res = service.process_chat_session(&auth(), input).await;
+        assert!(res.is_err());
+
+        let evs = store.all_evidence_in_namespace("safe-ns").await.unwrap();
+        assert_eq!(evs.len(), 1);
+        let excerpt = evs[0].excerpt.as_ref().unwrap();
+        assert!(
+            !excerpt.contains(secret),
+            "凭证不得进入不可变证据表：{excerpt}"
+        );
+        assert!(
+            excerpt.contains("[已脱敏:凭证]"),
+            "凭证应被占位符替换：{excerpt}"
+        );
+        // 保留期限必须落库
+        assert!(
+            evs[0].expires_at.is_some(),
+            "证据必须带保留期限，到期由清理任务删除"
+        );
+    }
+
+    /// 保留期限 = 0 表示永久保留
+    #[tokio::test]
+    async fn test_evidence_retention_zero_means_forever() {
+        let store = Arc::new(TestHubStore::default());
+        let extractor = Arc::new(MockChatCognitiveExtractor::new().with_failure("timeout"));
+        let service = ChatCognitiveService::new(
+            store.clone(),
+            extractor,
+            CognitivePolicy {
+                evidence_retention_days: 0,
+                ..Default::default()
+            },
+        );
+
+        let input = ChatCognitiveInput {
+            namespace: "keep-ns".to_string(),
+            session_id: "sess-keep".to_string(),
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "普通内容".to_string(),
+                timestamp: None,
+            }],
+            occurred_at: None,
+        };
+        assert!(service.process_chat_session(&auth(), input).await.is_err());
+
+        let evs = store.all_evidence_in_namespace("keep-ns").await.unwrap();
+        assert_eq!(evs.len(), 1);
+        assert!(
+            evs[0].expires_at.is_none(),
+            "保留期限为 0 时证据不设到期时间"
+        );
+    }
+
     #[tokio::test]
     async fn test_full_auto_respects_acceptance_threshold() {
         // 回归：FullAuto 曾无条件自动入库，auto_accept_threshold 完全不生效
@@ -1526,6 +1677,7 @@ mod tests {
             CognitivePolicy {
                 mode: CognitiveGovernanceMode::FullAuto,
                 auto_accept_threshold: 0.9,
+                ..Default::default()
             },
         );
 
@@ -1583,6 +1735,7 @@ mod tests {
             CognitivePolicy {
                 mode: CognitiveGovernanceMode::FullAuto,
                 auto_accept_threshold: 0.5,
+                ..Default::default()
             },
         );
         let res_loose = service_loose
@@ -1630,6 +1783,7 @@ mod tests {
             CognitivePolicy {
                 mode: CognitiveGovernanceMode::FullAuto,
                 auto_accept_threshold: 0.9,
+                ..Default::default()
             },
         );
 

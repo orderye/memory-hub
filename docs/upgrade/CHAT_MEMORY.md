@@ -75,8 +75,52 @@ ChatCognitiveInput (messages, session_id, namespace)
 ## 4. 保留策略与生命周期管理
 
 ### 4.1 证据存根 (MemoryEvidence)
-- **不可变性**：只增不改（Append-only），禁止对已有证据进行 UPDATE 或物理 DELETE。
-- **隐私脱敏**：默认仅保存最小必要的脱敏片段（Excerpt），避免直接全文复制完整私密对话。
+
+#### 边界定义：「不可变」指写入之后，不是写入之前
+
+| 说法 | 含义 | 是否成立 |
+| :--- | :--- | :--- |
+| 证据行写入后不可悄悄改写 | 只增不改（Append-only），禁止 UPDATE / 静默 DELETE | ✅ 成立 |
+| 证据行写入前不能做任何处理 | 原始对话原封不动入库 | ❌ **不成立** |
+
+**必须写清楚这一点**：不可变表一旦写入，就无法追回。Token、密码、私钥、个人信息
+一旦落进 `memory_evidence`，之后再"修订"或"删除"也补不回来——原始副本可能已随备份扩散。
+因此敏感内容的处理必须发生在**持久化之前**，而不是寄望于写入之后再补救。
+
+#### 写入前的三道处理（`crates/mem-core/src/redaction.rs`）
+
+1. **凭证扫描**（Credential）：私钥块（`-----BEGIN … PRIVATE KEY-----`）、
+   API Token（`sk-` / `ghp_` / `github_pat_` / `glpat-` / `xox*` / `AKIA` / `AIza`）、
+   JWT、`Bearer` / `Basic` 令牌、带口令的连接串（`scheme://user:pass@host`）、
+   赋值型密钥（`password=` / `api_key:` / `client_secret=` …）——全部替换为 `[已脱敏:凭证]`。
+   赋值型规则只替换**值**，保留键名，便于事后审计"这里曾经有过一个口令"而不泄露口令本身。
+2. **敏感片段处理**（PersonalData）：邮箱、手机号、身份证号做掩码，替换为 `[已脱敏:个人信息]`。
+3. **最小化保存**：证据行只保存定长摘要（`EVIDENCE_EXCERPT_MAX_CHARS`，默认 500 字符），
+   **完整对话永不落库**。顺序不可颠倒——先截断再脱敏会漏掉被截断掉的尾部凭证。
+
+> 词元与文档侧同源：脱敏在 CJK 文本里同样生效（"我的密钥是sk-…"这类中英混排不能漏检）。
+> 实现上不用 `` 词边界（CJK 属 Unicode 词字符，边界在中文里不可靠），改用"上下文在捕获组之外"。
+
+#### 保留期限（第二道防线）
+
+- 每条证据带 `expires_at`（`HUB_EVIDENCE_RETENTION_DAYS`，默认 **90 天**；0 = 永久保留）；
+- 到期由 `EvidenceRetentionJob` **物理删除**（`backup-worker` 周期执行），不让不可变副本无限期留存；
+- 历史数据 `expires_at` 为 NULL，不做隐式删除。
+
+#### 对照：Coding 路径的既有做法
+
+Coding 修订链对 diff 采取的是**拒绝入库**策略（命中敏感凭证直接报错，不持久化）。
+Chat 证据路径不能这么做——证据的用途就是"模型抽取失败时原始材料不丢失"，
+所以采用**脱敏后入库**而不是拒绝。这两条路径的差异是有意为之，不是遗漏。
+
+#### 独立安全测试
+
+证据表有**独立**的安全测试（不依赖其它模块的测试通过）：
+
+- `crates/mem-core/src/redaction.rs`：各类凭证形态、私钥块、个人信息、中英混排、
+  纯数字不误伤、统计信息不泄露原文；
+- `crates/mem-core/src/chat_cognitive_service.rs`：入库前的脱敏与保留期限；
+- `crates/worker/src/evidence_job.rs`：到期清理只删已到期证据。
 
 ### 4.2 事实演化 (Supersedes)
 - 当新事实明确声明取代（`relation_kind: Supersedes`）或与旧版本事实存在演化关系时：

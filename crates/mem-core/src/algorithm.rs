@@ -29,41 +29,30 @@ pub fn l2_normalize(v: &mut [f32]) {
     }
 }
 
-/// 提取检索词元（英文单词 + CJK 整词与 2-gram），剔除低信息量功能词并按序去重
+/// 提取检索词元（与文档侧同源：ASCII 词 + CJK 1-gram/2-gram），按序去重
+///
+/// 查询侧与文档侧**必须**用同一套词法：文档侧词元由
+/// [`crate::cjk::fts_doc_tokens`] 产生（标点分隔 + CJK 1-gram/2-gram），
+/// 打分时用 [`document_tokens`] 取文档词元集合。
+///
+/// 此前查询侧按**空白**切词并额外产出"整词"词元，带来两个真实缺陷：
+///
+/// 1. 带标点的词元永远匹配不上文档——`"os:linux】"` 作为一个整词进入分母，
+///    而文档侧切出的是 `os` / `linux`，于是环境标记（`【环境 redis:7】`）
+///    对打分完全不敏感；
+/// 2. 3 字以上的 CJK 整词（`"目标查询"`）同样在文档里不存在（文档只有
+///    1-gram / 2-gram），白白占住 IDF 分母，把 kw 系统性压低。
+///
+/// 死词元只进分母不进分子，等于给所有查询的匹配度打折。
 pub fn extract_terms(query: &str) -> Vec<String> {
     let mut terms = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let mut push = |t: String| {
+    for t in crate::cjk::fts_doc_tokens(query) {
+        if t.is_empty() {
+            continue;
+        }
         if seen.insert(t.clone()) {
             terms.push(t);
-        }
-    };
-
-    for word in query.split_whitespace() {
-        let has_cjk = word.chars().any(crate::cjk::is_cjk_char);
-        if !has_cjk {
-            if word.chars().count() >= 2 {
-                push(word.to_lowercase());
-            }
-        } else {
-            let chars: Vec<char> = word.chars().collect();
-            if chars.len() <= 4 {
-                let whole = word.to_lowercase();
-                if !crate::cjk::is_low_signal_bigram(&whole)
-                    && !whole.chars().all(crate::cjk::is_function_char)
-                {
-                    push(whole);
-                }
-            }
-            if chars.len() > 2 {
-                for window in chars.windows(2) {
-                    let gram: String = window.iter().collect();
-                    if crate::cjk::is_low_signal_bigram(&gram) {
-                        continue;
-                    }
-                    push(gram.to_lowercase());
-                }
-            }
         }
     }
     terms
@@ -441,7 +430,10 @@ mod tests {
         let rare_doc = document_tokens("东京节点上线");
         let common_doc = document_tokens("缓存策略说明");
         let terms = extract_terms("东京 缓存");
-        assert_eq!(terms.len(), 2);
+        // 查询侧与文档侧同源："东京" → 1-gram 东/京 + 2-gram 东京，共 3 个词元
+        assert_eq!(terms.len(), 6);
+        assert!(terms.contains(&"东京".to_string()));
+        assert!(terms.contains(&"东".to_string()));
 
         // 池内：东京 1 篇、缓存 7 篇
         let idf = |term: &str| match term {
@@ -456,6 +448,43 @@ mod tests {
             "稀有词元命中应高于常见词元命中：{rare} vs {common}"
         );
         assert!(inverse_document_frequency(8, 1) > inverse_document_frequency(8, 7));
+    }
+
+    /// 回归：查询侧词元必须与文档侧同源
+    ///
+    /// 此前查询侧按空白切词，`"os:linux】"` 这样的带标点词元在文档侧
+    /// 根本不存在（文档切出的是 `os` / `linux`），于是它只进分母不进分子，
+    /// 把 kw 压低，也让环境标记对打分完全失效。
+    #[test]
+    fn test_query_terms_share_document_tokenizer() {
+        let terms = extract_terms("DNS 解析超时排查 dig 【环境 os:linux】");
+        for expected in ["dns", "dig", "os", "linux", "环境", "解析"] {
+            assert!(
+                terms.iter().any(|t| t == expected),
+                "查询词元应包含 {expected}（实际: {terms:?}）"
+            );
+        }
+        // 标点不得粘进词元
+        assert!(
+            !terms
+                .iter()
+                .any(|t| t.contains('【') || t.contains('】') || t.contains(':')),
+            "词元不应包含标点：{terms:?}"
+        );
+        // 3 字以上 CJK 整词在文档侧不存在，不应作为死词元进入分母
+        assert!(
+            !terms.contains(&"目标查询".to_string()),
+            "多字整词不应进入查询词元：{terms:?}"
+        );
+    }
+
+    /// 回归：带标点的查询必须能命中对应文档
+    #[test]
+    fn test_punctuated_query_matches_document_token() {
+        let doc = document_tokens("【适用环境 os:linux】先做本机 dig 对比公共 DNS");
+        let terms = extract_terms("【环境 os:linux】");
+        let score = keyword_score_weighted(&doc, &terms, &|_| 1.0);
+        assert!(score > 0.0, "带标点的环境标记必须能命中文档：{score}");
     }
 
     #[test]

@@ -502,6 +502,17 @@ impl<S: EvidenceStore + ?Sized> EvidenceStore for AccountScopedStore<S> {
             .delete_evidence(&self.scoped(namespace), id)
             .await
     }
+
+    /// 清理只在**本账户命名空间前缀内**生效，避免跨账户删除
+    async fn purge_expired_evidence(
+        &self,
+        namespace: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<usize> {
+        self.inner
+            .purge_expired_evidence(&self.scoped(namespace), now)
+            .await
+    }
 }
 
 // ===== RelationStore =====

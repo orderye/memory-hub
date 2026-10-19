@@ -36,6 +36,12 @@ pub struct HybridRetriever {
     scene_mode: SceneMode,
     /// 分场景权重 profile（按请求 scene 选择；缺省回落到全局权重）
     scene_weight_profiles: std::collections::HashMap<MemoryScene, [f32; 5]>,
+    /// 嵌入器是否提供真实语义信号（伪向量嵌入器为 false）
+    semantic_ready: bool,
+    /// 默认最小可信分（None = 不启用默认拒绝阈值）
+    default_min_score: Option<f32>,
+    /// 分场景最小可信分覆盖（缺省回落到全局默认）
+    scene_min_scores: std::collections::HashMap<MemoryScene, f32>,
 }
 
 impl HybridRetriever {
@@ -48,6 +54,9 @@ impl HybridRetriever {
         mmr_lambda: f32,
         soft_timeout_ms: u64,
     ) -> Self {
+        // 伪向量嵌入器的余弦相似度是噪声：此时本检索器退化为**词法检索**，
+        // 向量维度不参与打分（见 [`Self::score_items`]）。
+        let semantic_ready = embedder.provides_semantic_signal();
         Self {
             store,
             embedder,
@@ -60,7 +69,59 @@ impl HybridRetriever {
             recency_tau_override: None,
             scene_mode: SceneMode::Strict,
             scene_weight_profiles: std::collections::HashMap::new(),
+            semantic_ready,
+            default_min_score: None,
+            scene_min_scores: std::collections::HashMap::new(),
         }
+    }
+
+    /// 本实例是否具备真实语义检索能力
+    pub fn semantic_ready(&self) -> bool {
+        self.semantic_ready
+    }
+
+    /// 设置默认最小可信分（builder）
+    ///
+    /// 请求未显式给出 `min_score` 时生效：低于该分的候选一律丢弃，
+    /// 全部被丢弃时对外返回"无可靠匹配"，而不是强行给出低分结果。
+    pub fn with_default_min_score(mut self, min_score: Option<f32>) -> Self {
+        self.default_min_score = min_score.map(|v| v.clamp(0.0, 1.0));
+        self
+    }
+
+    /// 设置分场景最小可信分（builder）：场景专属阈值优先于全局默认
+    pub fn with_scene_min_scores(
+        mut self,
+        scores: std::collections::HashMap<MemoryScene, f32>,
+    ) -> Self {
+        self.scene_min_scores = scores
+            .into_iter()
+            .map(|(k, v)| (k, v.clamp(0.0, 1.0)))
+            .collect();
+        self
+    }
+
+    /// 本次请求生效的最小可信分
+    ///
+    /// 优先级：请求显式 `min_score` > 场景专属阈值 > 全局默认阈值。
+    ///
+    /// **时间锚定查询（显式 `valid_at`）不叠加服务端阈值**（默认阈值与场景阈值都不叠加）：
+    /// 这类查询要的是"某个历史时点的事实"，它天然词法更弱、也天然更旧，
+    /// 用按当下相关性标定的阈值去卡它，等于把正确答案挡在门外。
+    /// 调用方仍可显式传 `min_score` 自行把关。
+    fn effective_min_score(&self, q: &SearchQuery) -> Option<f32> {
+        if let Some(m) = q.min_score {
+            return Some(m);
+        }
+        if q.valid_at.is_some() {
+            return None;
+        }
+        if let Some(scene) = q.scene {
+            if let Some(m) = self.scene_min_scores.get(&scene) {
+                return Some(*m);
+            }
+        }
+        self.default_min_score
     }
 
     /// 覆盖近期性时间常数（builder）：默认按记忆类型区分（见 [`recency_tau_days_for`]）
@@ -322,11 +383,24 @@ impl HybridRetriever {
                 let tau = self
                     .recency_tau_override
                     .unwrap_or_else(|| recency_tau_days_for(item.kind));
-                let rec = recency_score(now, item.occurred_at.unwrap_or(item.updated_at), tau);
+                // 近期性以**参考时点**为准：查询钉住了 valid_at（时间旅行）时，
+                // "距今多久"没有意义——问的是"那个时点的最新事实"。
+                // 此前一律按墙上时钟算，把历史事实的分数压到阈值之下，
+                // 导致时间锚定查询反而召不回它本该返回的历史版本。
+                let rec = recency_score(
+                    reference_time,
+                    item.occurred_at.unwrap_or(item.updated_at),
+                    tau,
+                );
                 let prior = layer_prior(item.layer);
                 // 嵌入不可用（服务故障 / 缺失向量 / 模型不匹配）时按剩余
-                // 信号归一化，而不是让该维度按 0 计使分数整体缩水
-                let sim_available = sim.is_some();
+                // 信号归一化，而不是让该维度按 0 计使分数整体缩水。
+                //
+                // 伪向量嵌入器（Mock / Test）同样按"不可用"处理：它的余弦相似度
+                // 是哈希噪声而非语义，若按 0.50 的权重参与打分，等于把噪声注入排序
+                // 并让"最小可信分"阈值失去意义。此处**不改动配置权重**——
+                // 换成真实嵌入模型后，sim 维度自动恢复参与（权重仍是配置值）。
+                let sim_available = self.semantic_ready && sim.is_some();
                 let mut score = calculate_item_score_with_availability(
                     &ItemScoreParams {
                         sim: sim.unwrap_or(0.0),
@@ -427,17 +501,22 @@ impl Retriever for HybridRetriever {
                 .map(|s| (s.item, None))
                 .collect::<Vec<_>>();
             let mut scored = self.score_items(candidates, q, None);
+            // 空查询退化为列表召回，没有相关性信号：只认调用方显式给出的阈值，
+            // 默认拒绝阈值不适用（否则会把"列出全部"的语义误判为"不可靠"）
             if let Some(min_s) = q.min_score {
                 scored.retain(|s| s.score >= min_s);
             }
             return Ok(scored.into_iter().take(top_k).collect());
         }
 
+        // 本次请求生效的最小可信分（显式 > 场景 > 全局默认）
+        let min_score = self.effective_min_score(q);
+
         // 软超时预算统一起算：查询嵌入与双路召回共享同一 deadline，
         // 避免嵌入服务故障把整体耗时拖到 HTTP 客户端超时（10s）
         let deadline = tokio::time::Instant::now() + self.soft_timeout;
 
-        // 查询向量只算一次，双路召回与打分共用
+        // 查询向量只算一次，双路召回与打分共用。
         let query_vec: Option<Vec<f32>> = match tokio::time::timeout_at(
             deadline,
             self.embedder.embed(std::slice::from_ref(&q.query_text)),
@@ -472,7 +551,7 @@ impl Retriever for HybridRetriever {
             }
         };
 
-        // 双路并行且各自受剩余预算约束：超时只丢弃超时的一路，已完成的一路保留
+        // 双路并行且各自受剩余预算约束：超时只丢弃超时的一路，已完成的一路保留。
         let (fts_res, vec_res) = tokio::join!(
             tokio::time::timeout_at(deadline, self.fts_candidates(q)),
             tokio::time::timeout_at(deadline, self.vec_candidates(q, query_vec.as_deref())),
@@ -507,7 +586,7 @@ impl Retriever for HybridRetriever {
             let mut scored = this.score_items(merged, &q_clone, qv_clone.as_deref());
             // min_score 必须在 MMR 之前应用：否则 MMR 先按 top_k 选满、
             // 再被阈值删掉低分项，结果数会少于高阈值下本可返回的数量
-            if let Some(min_s) = q_clone.min_score {
+            if let Some(min_s) = min_score {
                 scored.retain(|s| s.score >= min_s);
             }
             this.mmr_rerank(scored, top_k)
@@ -737,6 +816,55 @@ mod tests {
         )
     }
 
+    /// 测试用"**具备语义信号**"的嵌入器。
+    ///
+    /// `TestEmbedder` 现在声明自己不提供语义信号（伪向量），用它构造的检索器
+    /// 走的是纯词法路径；本替身用于覆盖"向量维度参与打分"的那条路径。
+    /// 行为与 TestEmbedder 一致（相同文本 → 相同向量），只是能力声明不同。
+    struct SemanticTestEmbedder {
+        inner: TestEmbedder,
+    }
+
+    impl SemanticTestEmbedder {
+        fn new() -> Self {
+            Self {
+                inner: TestEmbedder::default(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Embedder for SemanticTestEmbedder {
+        fn model_id(&self) -> &str {
+            "semantic-test-embedder"
+        }
+
+        fn dim(&self) -> usize {
+            self.inner.dim()
+        }
+
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            self.inner.embed(texts).await
+        }
+
+        fn provides_semantic_signal(&self) -> bool {
+            true
+        }
+    }
+
+    /// 构造一个语义能力就绪的检索器
+    fn semantic_retriever(store: Arc<TestStore>) -> HybridRetriever {
+        HybridRetriever::new(
+            store,
+            Arc::new(SemanticTestEmbedder::new()),
+            20,
+            20,
+            [0.5, 0.2, 0.1, 0.1, 0.1],
+            0.7,
+            500,
+        )
+    }
+
     fn query(ns: &str, text: &str) -> SearchQuery {
         SearchQuery {
             namespace: ns.to_string(),
@@ -760,15 +888,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_fts_hit_gets_similarity_from_query_vector() {
-        let r = retriever(Arc::new(TestStore::default()));
-        let embedder = TestEmbedder::default();
+        let r = semantic_retriever(Arc::new(TestStore::default()));
+        let embedder = SemanticTestEmbedder::new();
         let text = "服务部署在东京区域";
         let mut qv = embedder.embed(&[text.to_string()]).await.unwrap().remove(0);
         l2_normalize(&mut qv);
 
         let mut item = entry("ns", text);
         item.embedding = Some(qv.clone());
-        item.embedding_model = Some("test-embedder".to_string());
+        item.embedding_model = Some("semantic-test-embedder".to_string());
 
         // 没有查询向量时（如嵌入服务故障），sim 维度不可用，按剩余信号归一化
         let without = r.score_items(vec![(item.clone(), None)], &query("ns", "东京"), None);
@@ -1009,6 +1137,166 @@ mod tests {
         assert_eq!(res[0].item.content, "完全精确匹配目标查询");
     }
 
+    /// 伪向量嵌入器（无语义信号）下，向量维度不得参与打分
+    #[tokio::test]
+    async fn test_pseudo_vector_embedder_excludes_sim_dimension() {
+        let store = Arc::new(TestStore::default());
+        // 词法精确命中、置信度 1.0、层级 Raw（prior=0.5）
+        store.add(entry("ns", "完全精确匹配目标查询"), None);
+
+        // TestEmbedder 声明自己不提供语义信号 → 检索器是纯词法模式
+        let lexical_only = retriever(store.clone());
+        assert!(!lexical_only.semantic_ready());
+        let q = query("ns", "目标查询");
+        let scored =
+            lexical_only.score_items(vec![(entry("ns", "完全精确匹配目标查询"), None)], &q, None);
+        // 归一化只按可用维度（kw/conf/rec/prior）进行。
+        // 若把死掉的 sim 维度按 0 计（错误做法），总分会被压到 ~0.38；
+        // 正确做法（按剩余维度归一化）应明显高于该值。
+        assert!(
+            scored[0].score > 0.7,
+            "无语义信号时应按剩余维度归一化，不被 sim 权重压低：{:#?}",
+            scored[0].score
+        );
+
+        // 语义能力就绪时，sim 维度按配置权重参与
+        let with_semantic = semantic_retriever(store);
+        assert!(with_semantic.semantic_ready());
+        let embedder = SemanticTestEmbedder::new();
+        let mut qv = embedder
+            .embed(&["完全精确匹配目标查询".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        l2_normalize(&mut qv);
+        let mut item = entry("ns", "完全精确匹配目标查询");
+        item.embedding = Some(qv.clone());
+        item.embedding_model = Some("semantic-test-embedder".to_string());
+        let scored = with_semantic.score_items(vec![(item, None)], &q, Some(&qv));
+        // sim=1.0 按 0.50 权重参与，总分仍在 [0,1] 区间内（权重和为 1）
+        assert!(
+            scored[0].score <= 1.0 && scored[0].score > 0.85,
+            "语义就绪时 sim 按配置权重参与：{:#?}",
+            scored[0].score
+        );
+    }
+
+    /// 默认拒绝阈值：请求未给 min_score 时按配置阈值过滤
+    #[tokio::test]
+    async fn test_default_min_score_rejects_unreliable_candidates() {
+        let store = Arc::new(TestStore::default());
+        // 两条都命中查询词元（FTS 路才会成为候选），但可信度差异大
+        store.add(entry("ns", "目标查询"), None);
+        let mut weak = entry("ns", "目标查询的补充说明");
+        weak.confidence = 0.0;
+        store.add(weak, None);
+
+        // 阈值高于弱候选得分：只留强候选
+        // （查询侧与文档侧同源分词后，两条候选的 kw 都是 1.0，
+        //   差异只来自 confidence：强 0.9 分、弱 0.8 分）
+        let r = retriever(store.clone()).with_default_min_score(Some(0.85));
+        let q = query("ns", "目标查询");
+        let res = r.search(&auth(), &q).await.unwrap();
+        assert_eq!(res.len(), 1, "低分候选必须被默认阈值丢弃");
+        assert_eq!(res[0].item.content, "目标查询");
+
+        // 阈值抬高到强候选之上：全部拒绝（对外表达"无可靠匹配"）
+        let r = retriever(store).with_default_min_score(Some(0.95));
+        let res = r.search(&auth(), &q).await.unwrap();
+        assert!(res.is_empty(), "阈值高于所有候选时应返回空结果");
+    }
+
+    /// 阈值过高时返回空结果（对外据此表达"无可靠匹配"）
+    #[tokio::test]
+    async fn test_default_min_score_can_reject_everything() {
+        let store = Arc::new(TestStore::default());
+        store.add(entry("ns", "完全精确匹配目标查询"), None);
+
+        let r = retriever(store).with_default_min_score(Some(1.01));
+        let q = query("ns", "目标查询");
+        let res = r.search(&auth(), &q).await.unwrap();
+        assert!(res.is_empty(), "阈值高于任何候选时不应返回结果");
+    }
+
+    /// 显式 min_score 优先于默认阈值
+    #[tokio::test]
+    async fn test_explicit_min_score_overrides_default() {
+        let store = Arc::new(TestStore::default());
+        store.add(entry("ns", "目标查询"), None);
+        let mut weak = entry("ns", "目标查询的补充说明");
+        weak.confidence = 0.0;
+        store.add(weak, None);
+
+        let r = retriever(store).with_default_min_score(Some(0.99));
+        let mut q = query("ns", "目标查询");
+        q.min_score = Some(0.01);
+        let res = r.search(&auth(), &q).await.unwrap();
+        assert_eq!(res.len(), 2, "显式阈值必须覆盖默认阈值");
+    }
+
+    /// 时间锚定查询（显式 valid_at）不叠加服务端阈值
+    ///
+    /// 回归：默认阈值是按"当下相关性"标定的，而历史事实天然更旧、词法更弱。
+    /// 叠加阈值会把时间旅行查询的正确答案挡在门外。
+    #[tokio::test]
+    async fn test_time_pinned_query_ignores_default_min_score() {
+        let store = Arc::new(TestStore::default());
+        // 一条历史事实：词法弱、且早已过期
+        let mut old = entry("ns", "早期直接改 hosts 绕过解析");
+        old.occurred_at = Some(chrono::Utc::now() - chrono::Duration::days(300));
+        old.updated_at = old.occurred_at.unwrap();
+        old.valid_from = Some(chrono::Utc::now() - chrono::Duration::days(400));
+        old.valid_until = Some(chrono::Utc::now() - chrono::Duration::days(90));
+        store.add(old, None);
+
+        let r = retriever(store).with_default_min_score(Some(0.65));
+
+        // 普通查询：阈值生效，历史事实被拒
+        let mut q = query("ns", "解析超时");
+        let res = r.search(&auth(), &q).await.unwrap();
+        assert!(res.is_empty(), "普通查询应受默认阈值约束：{res:#?}");
+
+        // 时间锚定查询：不叠加阈值，历史事实必须能被召回
+        q.valid_at = Some(chrono::Utc::now() - chrono::Duration::days(200));
+        let res = r.search(&auth(), &q).await.unwrap();
+        assert_eq!(
+            res.len(),
+            1,
+            "时间锚定查询必须能召回该时点有效的事实：{res:#?}"
+        );
+        assert!(res[0].item.content.contains("hosts"));
+    }
+
+    /// 分场景阈值优先于全局默认
+    #[tokio::test]
+    async fn test_scene_min_score_overrides_default() {
+        let store = Arc::new(TestStore::default());
+        let mut chat_entry = entry("ns", "目标查询");
+        chat_entry.scene = Some(MemoryScene::Chat);
+        store.add(chat_entry, None);
+        let mut coding_entry = entry("ns", "目标查询");
+        coding_entry.scene = Some(MemoryScene::Coding);
+        store.add(coding_entry, None);
+
+        let mut scores = std::collections::HashMap::new();
+        scores.insert(MemoryScene::Chat, 0.99);
+        let r = retriever(store)
+            .with_default_min_score(Some(0.0))
+            .with_scene_min_scores(scores);
+
+        // Chat 场景阈值 0.99 高于候选得分 → 拒绝
+        let mut q = query("ns", "目标查询");
+        q.scene = Some(MemoryScene::Chat);
+        let res = r.search(&auth(), &q).await.unwrap();
+        assert!(res.is_empty(), "场景阈值应生效并拒绝低分候选");
+
+        // 其它场景回落到全局默认，不受 Chat 阈值影响
+        let mut q2 = query("ns", "目标查询");
+        q2.scene = Some(MemoryScene::Coding);
+        let res = r.search(&auth(), &q2).await.unwrap();
+        assert_eq!(res.len(), 1, "场景阈值不应跨场景生效");
+    }
+
     /// 模拟崩溃的嵌入器（下游 503 / 网络故障）
     #[derive(Debug, Clone, Default)]
     struct FailingEmbedder;
@@ -1210,8 +1498,8 @@ mod tests {
     #[tokio::test]
     async fn test_model_mismatched_embedding_not_used_for_similarity() {
         // 回归：embedding_model 从不参与检索 —— 换模型后新旧向量被直接比较
-        let r = retriever(Arc::new(TestStore::default()));
-        let embedder = TestEmbedder::default();
+        let r = semantic_retriever(Arc::new(TestStore::default()));
+        let embedder = SemanticTestEmbedder::new();
         let mut qv = embedder
             .embed(&["东京".to_string()])
             .await
@@ -1221,7 +1509,7 @@ mod tests {
 
         let mut matching = entry("ns", "东京");
         matching.embedding = Some(qv.clone());
-        matching.embedding_model = Some("test-embedder".to_string());
+        matching.embedding_model = Some("semantic-test-embedder".to_string());
         matching.confidence = 0.5;
 
         let mut mismatched = entry("ns", "东京");
@@ -1489,7 +1777,7 @@ mod tests {
         let build = |profiles: Option<std::collections::HashMap<MemoryScene, [f32; 5]>>| {
             let mut r = HybridRetriever::new(
                 store.clone(),
-                Arc::new(TestEmbedder::default()),
+                Arc::new(SemanticTestEmbedder::new()),
                 20,
                 20,
                 [0.0, 0.0, 0.0, 0.0, 1.0],

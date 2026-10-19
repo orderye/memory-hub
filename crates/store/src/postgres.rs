@@ -204,6 +204,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "20261019000009_composite_namespace_fk_hardening",
         include_str!("../migrations/20261019000009_composite_namespace_fk_hardening.sql"),
     ),
+    (
+        "20261019000010_evidence_retention",
+        include_str!("../migrations/20261019000010_evidence_retention.sql"),
+    ),
 ];
 
 /// PostgreSQL 四合一存储
@@ -611,6 +615,7 @@ impl PostgresHubStore {
             excerpt: r.try_get("excerpt").ok().flatten(),
             occurred_at: r.try_get("occurred_at").ok().flatten(),
             created_at: r.try_get("created_at").pg()?,
+            expires_at: r.try_get("expires_at").ok().flatten(),
         })
     }
 
@@ -1977,9 +1982,9 @@ impl EvidenceStore for PostgresHubStore {
         let id = evidence.id.unwrap_or_else(Uuid::new_v4);
         let row = sqlx::query(
             r#"
-            insert into memory_evidence (id, namespace, source_kind, source_ref, content_hash, excerpt, occurred_at, created_at)
-            values ($1, $2, $3, $4, $5, $6, $7, now())
-            returning id, namespace, source_kind, source_ref, content_hash, excerpt, occurred_at, created_at
+            insert into memory_evidence (id, namespace, source_kind, source_ref, content_hash, excerpt, occurred_at, created_at, expires_at)
+            values ($1, $2, $3, $4, $5, $6, $7, now(), $8)
+            returning id, namespace, source_kind, source_ref, content_hash, excerpt, occurred_at, created_at, expires_at
             "#,
         )
         .bind(id)
@@ -1989,6 +1994,7 @@ impl EvidenceStore for PostgresHubStore {
         .bind(&evidence.content_hash)
         .bind(&evidence.excerpt)
         .bind(evidence.occurred_at)
+        .bind(evidence.expires_at)
         .fetch_one(&self.pool)
         .await
         .pg()?;
@@ -1999,7 +2005,7 @@ impl EvidenceStore for PostgresHubStore {
     async fn get_evidence(&self, namespace: &str, id: Uuid) -> Result<MemoryEvidence> {
         let row = sqlx::query(
             r#"
-            select id, namespace, source_kind, source_ref, content_hash, excerpt, occurred_at, created_at
+            select id, namespace, source_kind, source_ref, content_hash, excerpt, occurred_at, created_at, expires_at
             from memory_evidence
             where namespace = $1 and id = $2
             "#,
@@ -2024,7 +2030,7 @@ impl EvidenceStore for PostgresHubStore {
         limit: usize,
     ) -> Result<Vec<MemoryEvidence>> {
         let mut builder: sqlx::QueryBuilder<'_, sqlx::Postgres> = sqlx::QueryBuilder::new(
-            "select id, namespace, source_kind, source_ref, content_hash, excerpt, occurred_at, created_at from memory_evidence where namespace = ",
+            "select id, namespace, source_kind, source_ref, content_hash, excerpt, occurred_at, created_at, expires_at from memory_evidence where namespace = ",
         );
         builder.push_bind(namespace);
 
@@ -2047,7 +2053,7 @@ impl EvidenceStore for PostgresHubStore {
     async fn all_evidence_in_namespace(&self, namespace: &str) -> Result<Vec<MemoryEvidence>> {
         let rows = sqlx::query(
             r#"
-            select id, namespace, source_kind, source_ref, content_hash, excerpt, occurred_at, created_at
+            select id, namespace, source_kind, source_ref, content_hash, excerpt, occurred_at, created_at, expires_at
             from memory_evidence
             where namespace = $1
             order by created_at desc
@@ -2074,6 +2080,20 @@ impl EvidenceStore for PostgresHubStore {
         } else {
             Ok(())
         }
+    }
+
+    /// 清理已过保留期限的证据（NULL = 永久保留，不动）
+    async fn purge_expired_evidence(&self, namespace: &str, now: DateTime<Utc>) -> Result<usize> {
+        let res = sqlx::query(
+            "delete from memory_evidence where namespace = $1 and expires_at is not null and expires_at <= $2",
+        )
+        .bind(namespace)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .pg()?;
+
+        Ok(res.rows_affected() as usize)
     }
 }
 
@@ -3007,7 +3027,7 @@ mod tests {
 
     #[test]
     fn test_migrations_registered() {
-        assert_eq!(MIGRATIONS.len(), 9);
+        assert_eq!(MIGRATIONS.len(), 10);
         assert!(MIGRATIONS[0].0.starts_with("20261011"));
         // 迁移清单必须按版本号字典序排列（执行顺序依赖于此）
         for w in MIGRATIONS.windows(2) {

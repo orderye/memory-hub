@@ -957,6 +957,7 @@ impl mem_core::infra::EvidenceStore for InMemoryHubStore {
             excerpt: evidence.excerpt.clone(),
             occurred_at: evidence.occurred_at,
             created_at,
+            expires_at: evidence.expires_at,
         };
         let mut w = self.evidences.write().unwrap();
         w.insert((evidence.namespace.clone(), id), ev.clone());
@@ -1019,6 +1020,13 @@ impl mem_core::infra::EvidenceStore for InMemoryHubStore {
         } else {
             Ok(())
         }
+    }
+
+    async fn purge_expired_evidence(&self, namespace: &str, now: DateTime<Utc>) -> Result<usize> {
+        let mut w = self.evidences.write().unwrap();
+        let before = w.len();
+        w.retain(|(ns, _), ev| !(ns == namespace && ev.expires_at.is_some_and(|exp| exp <= now)));
+        Ok(before - w.len())
     }
 }
 
@@ -2049,6 +2057,7 @@ mod tests {
                 content_hash: "hash-1".to_string(),
                 excerpt: Some("对话片段1".to_string()),
                 occurred_at: Some(Utc::now()),
+                expires_at: None,
             })
             .await
             .unwrap();
@@ -2062,6 +2071,7 @@ mod tests {
                 content_hash: "hash-2".to_string(),
                 excerpt: Some("commit diff".to_string()),
                 occurred_at: Some(Utc::now()),
+                expires_at: None,
             })
             .await
             .unwrap();

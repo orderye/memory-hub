@@ -12,7 +12,7 @@ pub mod rate_limit;
 pub mod runtime;
 
 pub use auth::{AccountId, Acl, AgentId, AuthCtx, NamespaceGrant, Scope, BOOTSTRAP_ACCOUNT_ID};
-pub use config::AppConfig;
+pub use config::{AppConfig, DEFAULT_RETRIEVAL_MIN_SCORE};
 pub use error::{ErrorDetail, HubError, Result};
 pub use idempotency::{
     result_hash, IdempotencyCheck, IdempotencyEntry, IdempotencyGuard, IdempotencyKey,

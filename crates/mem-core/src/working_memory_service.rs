@@ -310,6 +310,10 @@ impl WorkingMemoryService {
     /// - 命中判定基于分词词元集合与池内 IDF 加权，不再用整段查询做裸子串匹配；
     /// - `env` 给出且与经验 `boundary_envs` 不匹配时降权 ×0.5 并给出显式告警，
     ///   但不吞没结果，交由 Agent 判别；
+    /// - `strict_env` 为真时改为**拒绝**：环境不匹配的经验直接不返回。
+    ///   降权只是排序提示，Agent 仍可能误取；而有安全后果的场景
+    ///   （如把仅适用于 kafka 的处置步骤用在 jvm 上）需要的是硬规则，
+    ///   不能只依赖排序。
     /// - 查询为空时退化为列表召回（按置信度 × 反馈分排序）。
     pub async fn search_experiences(
         &self,
@@ -318,6 +322,20 @@ impl WorkingMemoryService {
         query: &str,
         current_env: Option<&str>,
         limit: usize,
+    ) -> Result<Vec<ExperienceSearchResult>> {
+        self.search_experiences_with(auth, namespace, query, current_env, limit, false)
+            .await
+    }
+
+    /// 同 [`Self::search_experiences`]，但可要求**严格**环境边界（不匹配即拒绝）
+    pub async fn search_experiences_with(
+        &self,
+        auth: &AuthCtx,
+        namespace: &str,
+        query: &str,
+        current_env: Option<&str>,
+        limit: usize,
+        strict_env: bool,
     ) -> Result<Vec<ExperienceSearchResult>> {
         if !auth.has_scope(&Scope::Read) {
             return Err(HubError::InsufficientScope);
@@ -377,6 +395,12 @@ impl WorkingMemoryService {
                         "当前环境 [{}] 与经验适用环境边界 {:?} 不匹配，需谨慎参考",
                         env, exp.boundary_envs
                     ));
+                    if strict_env {
+                        // 严格模式：环境不匹配 = 不可用，直接拒绝。
+                        // 降权只是排序提示，Agent 仍可能误取；有安全后果的场景
+                        // 需要硬规则，而不是"排在后面"。
+                        continue;
+                    }
                     // 环境不匹配时适度降权，但不直接吞没，标明边界供 Agent 判别
                     score *= 0.5;
                 }
@@ -694,6 +718,63 @@ mod tests {
             .unwrap()
             .contains("不匹配"));
         assert!(hits_macos[0].score < hits_linux[0].score, "不匹配环境降权");
+    }
+
+    /// 严格环境边界：环境不匹配的经验**直接不返回**
+    ///
+    /// 降权只是排序提示——Agent 仍可能误取；而有安全后果的场景
+    /// （把只适用于 linux 的处置步骤用在 macOS 上）需要的是硬规则。
+    #[tokio::test]
+    async fn test_strict_env_rejects_mismatched_experience() {
+        let store = Arc::new(TestHubStore::default());
+        let service = WorkingMemoryService::new(store);
+        let auth = make_auth("strict-env-agent");
+
+        let task = service
+            .start_task(&auth, "strict-ns", "配置 jemalloc 内存分配器", None, None)
+            .await
+            .unwrap();
+        let candidate = ExperienceCandidate {
+            task_pattern: "为 Rust 服务启用 jemalloc 减少内存碎片".into(),
+            search_keys: vec!["jemalloc".into(), "memory".into()],
+            solution: "在 main.rs 中配置 #[global_allocator] tikv_jemallocator".into(),
+            preconditions: serde_json::json!({"os": "linux"}),
+            boundary_envs: vec!["linux".into()],
+            failure_modes: vec!["在带有空格路径的 macOS 环境下编译构建失败".into()],
+            validation: serde_json::json!({"rss": "减少 30% 常驻内存"}),
+            confidence: 0.9,
+            source_task_id: task.id,
+        };
+        service
+            .distill_experience(&auth, "strict-ns", candidate)
+            .await
+            .unwrap();
+
+        // 非严格模式：仍然返回，但标明 mismatch 并降权
+        let lenient = service
+            .search_experiences(&auth, "strict-ns", "jemalloc", Some("macos"), 5)
+            .await
+            .unwrap();
+        assert_eq!(lenient.len(), 1);
+        assert!(lenient[0].env_mismatch);
+
+        // 严格模式：环境不匹配 → 硬拒绝，一条都不返回
+        let strict = service
+            .search_experiences_with(&auth, "strict-ns", "jemalloc", Some("macos"), 5, true)
+            .await
+            .unwrap();
+        assert!(
+            strict.is_empty(),
+            "严格环境边界下，环境不匹配的经验必须被拒绝：{strict:?}"
+        );
+
+        // 环境匹配时不受影响
+        let strict_ok = service
+            .search_experiences_with(&auth, "strict-ns", "jemalloc", Some("linux"), 5, true)
+            .await
+            .unwrap();
+        assert_eq!(strict_ok.len(), 1);
+        assert!(!strict_ok[0].env_mismatch);
     }
 
     #[tokio::test]
