@@ -2391,7 +2391,10 @@ mod tests {
                     "repository": "company/backend",
                     "thread_id": thread_id,
                     "file_path": "config/key.rs",
-                    "diff_content": "+const KEY: &str = \"sk-proj-1234567890abcdef1234567890abcdef\";",
+                    "diff_content": format!(
+                        "+const KEY: &str = \"{}\";",
+                        concat!("sk-proj-", "1234567890abcdef1234567890abcdef")
+                    ),
                     "change_kind": "add",
                 })),
             )

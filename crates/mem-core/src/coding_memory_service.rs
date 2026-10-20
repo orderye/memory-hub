@@ -260,10 +260,12 @@ mod tests {
         let svc = CodingMemoryService::new(store);
         let auth = test_auth("coding-agent");
 
+        // 分段拼接的厂商形态见 crates/mem-core/src/redaction.rs 的同款说明：
+        // 公开仓库里连续的凭证字面量会被 secret scanning 当成真实泄露上报。
         let bad_diffs = vec![
-            "AKIAIOSFODNN7EXAMPLE",
-            "sk-proj-1234567890abcdef1234567890abcdef12345678",
-            "ghp_1234567890abcdefghijklmnopqrstuvwxyz",
+            concat!("AKIA", "IOSFODNN7EXAMPLE"),
+            concat!("sk-proj-", "1234567890abcdef1234567890abcdef12345678"),
+            concat!("ghp_", "1234567890abcdefghijklmnopqrstuvwxyz"),
             "bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
             "-----BEGIN RSA PRIVATE KEY-----",
         ];

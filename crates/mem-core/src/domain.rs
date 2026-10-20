@@ -1496,14 +1496,21 @@ mod tests {
         ));
 
         // Bearer 令牌
-        assert!(contains_sensitive_credentials(
-            "Authorization: Bearer eyJhbGciOiJIUzI1NiIs..."
-        ));
+        assert!(contains_sensitive_credentials(concat!(
+            "Authorization: Bearer ",
+            "eyJhbGciOiJIUzI1NiIs..."
+        )));
 
         // OpenAI / LLM API keys
         assert!(contains_sensitive_credentials("sk-1234567890abcdef"));
-        assert!(contains_sensitive_credentials("sk_live_1234567890"));
-        assert!(contains_sensitive_credentials("sk_test_1234567890"));
+        assert!(contains_sensitive_credentials(concat!(
+            "sk_live_",
+            "1234567890"
+        )));
+        assert!(contains_sensitive_credentials(concat!(
+            "sk_test_",
+            "1234567890"
+        )));
 
         // GitHub 令牌变体
         assert!(contains_sensitive_credentials("ghp_1234567890abcdef"));
@@ -1525,11 +1532,20 @@ mod tests {
         assert!(contains_sensitive_credentials("xoxe-1234567890"));
 
         // AWS 访问密钥
-        assert!(contains_sensitive_credentials("AKIAIOSFODNN7EXAMPLE"));
-        assert!(contains_sensitive_credentials("ASIAIOSFODNN7EXAMPLE"));
-        assert!(contains_sensitive_credentials(
-            "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
-        ));
+        // AKIA/ASIA 形态分段拼接：本仓库公开，secret scanning 会把连续字面量
+        // 当成真实凭据上报（曾误报 AWS 临时密钥）。拼接后运行时取值不变。
+        assert!(contains_sensitive_credentials(concat!(
+            "AKIA",
+            "IOSFODNN7EXAMPLE"
+        )));
+        assert!(contains_sensitive_credentials(concat!(
+            "ASIA",
+            "IOSFODNN7EXAMPLE"
+        )));
+        assert!(contains_sensitive_credentials(concat!(
+            "aws_secret_access_key = ",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+        )));
 
         // 各格式私钥
         assert!(contains_sensitive_credentials(

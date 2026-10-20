@@ -258,7 +258,10 @@ mod tests {
             source_task_id: task.id,
             task_pattern: "自动化云数据库配置与部署".into(),
             search_keys: vec!["db".into()],
-            solution: "使用密钥 sk-ant-api03-secret-key-1234567890abcdef 自动化初始化".into(),
+            solution: format!(
+                "使用密钥 {} 自动化初始化",
+                concat!("sk-ant-api03-", "secret-key-1234567890abcdef")
+            ),
             preconditions: serde_json::json!({"cloud": "aws"}),
             boundary_envs: vec!["aws".into()],
             failure_modes: vec!["权限不足".into()],

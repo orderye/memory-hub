@@ -1574,7 +1574,7 @@ mod tests {
             },
         );
 
-        let secret = "sk-proj-abcdefghijklmnopqrstuvwxyz012345";
+        let secret = concat!("sk-proj-", "abcdefghijklmnopqrstuvwxyz012345");
         let input = ChatCognitiveInput {
             namespace: "safe-ns".to_string(),
             session_id: "sess-secret".to_string(),

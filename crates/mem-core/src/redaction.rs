@@ -337,19 +337,28 @@ mod tests {
 
     #[test]
     fn test_redacts_common_credential_shapes() {
+        // 会被厂商模式匹配到的形态，一律用 concat! 拆成"前缀 + 主体"两段。
+        // 本仓库在 GitHub 上是公开的：连续的凭证字面量会被 secret scanning 当成
+        // 真实泄露公开上报（曾误报 Google API Key 与 AWS 临时密钥），push
+        // protection 也可能直接拦下推送。拼接后的运行时字符串与拆分前逐字节一致，
+        // 脱敏规则的覆盖度不受影响。门禁见 crates/mem-core/tests/credential_pattern_guard.rs。
         let cases = [
-            "sk-proj-1234567890abcdef1234567890abcdef",
-            "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
-            "github_pat_11ABCDEFG0abcdefghijklmnop",
-            "glpat-abcdefghij1234567890",
-            "xoxb-123456789012-abcdefghijkl",
-            "AKIAIOSFODNN7EXAMPLE",
-            "AIzaSyA1234567890abcdefghijklmnopqrstuv",
-            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r",
-            "Bearer abcdefghijklmnopqrstuvwxyz012345",
+            concat!("sk-proj-", "1234567890abcdef1234567890abcdef"),
+            concat!("ghp_", "abcdefghijklmnopqrstuvwxyz0123456789"),
+            concat!("github_pat_", "11ABCDEFG0abcdefghijklmnop"),
+            concat!("glpat-", "abcdefghij1234567890"),
+            concat!("xoxb-", "123456789012-abcdefghijkl"),
+            concat!("AKIA", "IOSFODNN7EXAMPLE"),
+            concat!("AIza", "SyA1234567890abcdefghijklmnopqrstuv"),
+            concat!(
+                "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+                ".eyJzdWIiOiIxMjM0NTY3ODkwIn0",
+                ".dBjftJeZ4CVPmB92K27uhbUJU1p1r"
+            ),
+            concat!("Bearer ", "abcdefghijklmnopqrstuvwxyz012345"),
             "postgres://app:sup3rs3cret@db.internal:5432/memory_hub",
             "password = hunter2000",
-            "api_key: AKIAIOSFODNN7EXAMPLE",
+            concat!("api_key: AKIA", "IOSFODNN7EXAMPLE"),
             "client_secret=abcdefgh12345678",
         ];
         for c in cases {
@@ -403,10 +412,10 @@ mod tests {
     #[test]
     fn test_redacts_inside_chinese_text_without_word_boundaries() {
         // 中英混排：CJK 是 Unicode 词字符，\b 在这里不可用
-        let out = redact("我的密钥是sk-proj-abcdefghijklmnopqrstuvwxyz012345请保密");
+        let secret = concat!("sk-proj-", "abcdefghijklmnopqrstuvwxyz012345");
+        let out = redact(&format!("我的密钥是{secret}请保密"));
         assert!(
-            !out.text
-                .contains("sk-proj-abcdefghijklmnopqrstuvwxyz012345"),
+            !out.text.contains(secret),
             "中英混排下的凭证必须被脱敏: {}",
             out.text
         );
@@ -434,30 +443,27 @@ mod tests {
 
     #[test]
     fn test_sanitize_truncates_after_redaction() {
+        let secret = concat!("sk-", "abcdefghijklmnopqrstuvwxyz012345");
         // 凭证位于截断窗口之外：摘要里当然没有它，但整段文本已被脱敏
-        let text = format!(
-            "{}{}",
-            "前缀".repeat(400),
-            "sk-abcdefghijklmnopqrstuvwxyz012345"
-        );
+        let text = format!("{}{}", "前缀".repeat(400), secret);
         let out = sanitize_evidence_excerpt(&text, 100);
         assert!(out.text.chars().count() <= 101, "摘要未超长");
         assert!(
-            !out.text.contains("sk-abcdefghijklmnopqrstuvwxyz012345"),
+            !out.text.contains(secret),
             "尾部凭证不得进入摘要: {}",
             out.text
         );
         assert!(out.has_findings(), "超长文本尾部的凭证也必须被检出");
 
         // 凭证位于截断窗口之内：摘要里必须是占位符
-        let near = format!("sk-abcdefghijklmnopqrstuvwxyz012345{}", "后缀".repeat(200));
+        let near = format!("{}{}", secret, "后缀".repeat(200));
         let out = sanitize_evidence_excerpt(&near, 100);
         assert!(
             out.text.contains("[已脱敏"),
             "窗口内的凭证必须被脱敏: {}",
             out.text
         );
-        assert!(!out.text.contains("sk-abcdefghijklmnopqrstuvwxyz012345"));
+        assert!(!out.text.contains(secret));
     }
 
     #[test]
