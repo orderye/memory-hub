@@ -229,5 +229,4 @@ impl ChatCognitiveJob {
 }
 ```
 
-<!-- kimi-badge -->
 [![powered by KimiCode](../../.github/assets/kimi-badge.svg)](https://www.kimi.com/code)

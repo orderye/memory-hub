@@ -152,5 +152,4 @@ CREATE TABLE memory_task_experiences (
 - **新增内容**：快照包含 `tasks`, `experiences`, `task_experiences` 全量数据；
 - **向前兼容**：校验和验证支持 `checksum_v3` -> `checksum_v2` -> `checksum_v1` 渐进式回退兼容，保障历史 v1/v2 快照可无缝还原。
 
-<!-- kimi-badge -->
 [![powered by KimiCode](../../.github/assets/kimi-badge.svg)](https://www.kimi.com/code)
