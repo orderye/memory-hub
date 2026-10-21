@@ -114,14 +114,16 @@ if [ -n "${PENDING}" ]; then
 fi
 
 # ===== 自检：两端内容必须一致（比树，不比 SHA） =====
+# 注意比的是**本地重放后的分支**（cnb-main）而不是远端跟踪引用（cnb/main）：
+# 重放还没推送时，cnb/main 仍是旧状态，拿它比会误报"内容不一致"。
 echo "== push-cnb: 内容一致性自检 =="
-DIFF_STAT="$(git -C "${CNB_WORKTREE}" diff --stat "${CNB_REMOTE}/${CNB_REMOTE_BRANCH}" origin/${GITHUB_BRANCH})"
+DIFF_STAT="$(git -C "${CNB_WORKTREE}" diff --stat "${CNB_LOCAL_BRANCH}" origin/${GITHUB_BRANCH})"
 if [ -n "${DIFF_STAT}" ]; then
   echo "push-cnb: 两端内容不一致，请检查：" >&2
   echo "${DIFF_STAT}" >&2
   exit 1
 fi
-echo "  内容一致（diff --stat 无输出）"
+echo "  内容一致（${CNB_LOCAL_BRANCH} 与 origin/${GITHUB_BRANCH} 的 diff --stat 无输出）"
 
 echo "== push-cnb: CNB 侧最近提交 =="
 git -C "${CNB_WORKTREE}" log --format='  %h | %ae | %s' -3

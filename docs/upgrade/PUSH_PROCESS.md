@@ -327,9 +327,12 @@ done
 重放完核对内容一致：
 
 ```bash
-git -C .cnb-worktree diff --stat cnb/main origin/main    # 必须无输出
+git -C .cnb-worktree diff --stat cnb-main origin/main     # 必须无输出
 git -C .cnb-worktree log --format='%h | %ae | %s' -3
 ```
+
+> 比的是**本地重放后的 `cnb-main`**，不是远端跟踪引用 `cnb/main`：重放还没推送时
+> `cnb/main` 仍是旧状态，拿它比会误报"内容不一致"。
 
 ### Step 4 · 推 CNB
 
