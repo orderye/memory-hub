@@ -1,5 +1,9 @@
 # 记忆中枢 · 文档中枢与架构导航 (Documentation Hub)
 
+> **语言 / Language**：本目录文档仅提供中文版；项目根 README 提供中英双版本
+> （[简体中文](https://github.com/orderye/memory-hub/blob/main/README.md) ·
+> [English](https://github.com/orderye/memory-hub/blob/main/README.en.md)）。
+
 欢迎查阅 **记忆中枢 (Memory Hub)** 的技术文档库。本目录收录了系统的总体设计规范、认知记忆升级方案、各专业子系统技术协议、基线审计与评测报告。
 
 ---

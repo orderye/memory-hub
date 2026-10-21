@@ -1,14 +1,16 @@
 # 记忆中枢 · Memory Hub
 
+> **语言 / Language**：[简体中文](README.md) · [English](README.en.md)
+
 **给一堆 AI 助手共用的一本长期记忆账本：记得住、查得到、分得清、丢不了。**
 
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
 [![Edition](https://img.shields.io/badge/edition-2021-blue.svg)](https://doc.rust-lang.org/edition-guide/rust-2021/index.html)
-[![Tests](https://img.shields.io/badge/tests-362%20passed-brightgreen.svg)]()
-[![Clippy](https://img.shields.io/badge/clippy-zero%20warnings-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-442%20passed-brightgreen.svg)](https://github.com/orderye/memory-hub/actions/workflows/ci.yml)
+[![Clippy](https://img.shields.io/badge/clippy-zero%20warnings-brightgreen.svg)](https://github.com/orderye/memory-hub/actions/workflows/ci.yml)
 [![MCP](https://img.shields.io/badge/MCP-28%20tools-purple.svg)](https://modelcontextprotocol.io/)
-[![Storage](https://img.shields.io/badge/storage-PostgreSQL%2015%20%2B%20pgvector%20%7C%20%E5%86%85%E5%AD%98-blue.svg)]()
-[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)]()
+[![Storage](https://img.shields.io/badge/storage-PostgreSQL%2015%20%2B%20pgvector%20%7C%20in-memory-blue.svg)](https://www.postgresql.org/)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 
 用一句大白话说：**AI 助手一关窗口就失忆，这个服务负责把该记住的东西存起来，下次接着用。**
 
@@ -445,9 +447,9 @@ HUB_EMBED_MODEL=bge-m3
 
 | 工具 | 权限 | 干什么 |
 | :--- | :--- | :--- |
-| `memory_consolidate` | `memory:write` | 一键整理：查重、查冲突、评陈旧度、按策略合并 |
+| `memory_consolidate` | `memory:write` | 一键整理：查重、查冲突、评陈旧度、按策略合并。可选 `mode` 参数切换候选发现模式（默认禁止逐请求覆盖） |
 | `memory_consolidation_stats` | `memory:read` | 整合健康度（重复组数、冲突组数、陈旧条目、冗余率、健康分） |
-| `memory_integrate_scan` | `memory:write` | 扫描并生成待审提案（已有 open 提案的组会自动跳过） |
+| `memory_integrate_scan` | `memory:write` | 扫描并生成待审提案（已有 open 提案的组会自动跳过）。可选 `mode` 参数，语义同上 |
 | `memory_integration_list` | `memory:read` | 列出待处理提案 |
 | `memory_integration_resolve` | `memory:write` | 裁决提案：`merge` 合并保留溯源 / `dismiss` 保持分立 |
 
@@ -494,11 +496,12 @@ HUB_EMBED_MODEL=bge-m3
 ├── docker-compose.yml          # 一键编排（DB + 三个服务）
 ├── .cnb.yml                    # CNB 云构建：出镜像 → 推制品库 → 部署并探活回滚
 ├── .github/workflows/ci.yml    # GitHub Actions：质量门禁 / PG 集成 / 依赖审计 / Release 构建
+├── scripts/push-cnb.sh         # 双平台推送：以 CNB 身份重放并推送镜像（patch-id 口径）
 ├── docs/                       # 设计与规范文档（见第十一节）
 └── crates/
-    ├── common/                 # 公共部件：配置强校验、脱敏日志、限流、Cron
-    ├── mem-core/               # 领域核心：记忆与备份模型、权限、认知领域服务
-    ├── consolidation/          # 整合中枢：查重、查冲突、分级融合、自动/半自动调度
+    ├── common/                 # 公共部件：配置强校验、脱敏日志、限流、Cron、整合模式枚举
+    ├── mem-core/               # 领域核心：记忆与备份模型、权限、认知领域服务、内容指纹
+    ├── consolidation/          # 整合中枢：候选发现（规则 / 向量）、关系分类、分级融合、自动调度
     ├── store/                  # 存储：PostgreSQL 迁移 + 纯内存双后端
     ├── embed/                  # 嵌入：OpenAI 兼容 HTTP 客户端 + 确定性 Mock
     ├── retrieval/              # 检索：中文分词、双路召回、五维打分、MMR
@@ -522,7 +525,7 @@ HUB_EMBED_MODEL=bge-m3
 cargo test --workspace
 
 # 静态检查（零警告门禁）
-cargo clippy --all-targets -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 
 # 格式检查
 cargo fmt --all -- --check
@@ -590,6 +593,9 @@ CI 分两条：
 | 质量与安全基线 | [`docs/upgrade/BASELINE.md`](docs/upgrade/BASELINE.md) |
 | 仓库与构建环境审计 | [`docs/upgrade/REPOSITORY_AUDIT.md`](docs/upgrade/REPOSITORY_AUDIT.md) |
 | 业务系统零侵入接入方案 | [`docs/创界山智能接入层实施方案.md`](docs/创界山智能接入层实施方案.md) |
+
+> **文档语言**：`docs/` 下的专题文档目前**仅提供中文版**；本 README 提供中英双版本
+> （[English](README.en.md)），其余文档可按需补充。
 
 ---
 
