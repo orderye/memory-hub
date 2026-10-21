@@ -1,8 +1,5 @@
 # 记忆中枢 · Memory Hub
 
-<!-- kimi-badge -->
-[![powered by KimiCode](.github/assets/kimi-badge.svg)](https://www.kimi.com/code)
-
 > **语言 / Language**：[简体中文](README.md) · [English](README.en.md)
 
 **给一堆 AI 助手共用的一本长期记忆账本：记得住、查得到、分得清、丢不了。**
@@ -15,7 +12,7 @@
 [![Storage](https://img.shields.io/badge/storage-PostgreSQL%2015%20%2B%20pgvector%20%7C%20in--memory-blue.svg)](https://www.postgresql.org/)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 
-[![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)
+[![powered by KimiCode](.github/assets/kimi-badge.svg)](https://www.kimi.com/code) [![powered by dsh](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)
 
 用一句大白话说：**AI 助手一关窗口就失忆，这个服务负责把该记住的东西存起来，下次接着用。**
 
