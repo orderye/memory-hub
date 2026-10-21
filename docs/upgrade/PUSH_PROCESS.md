@@ -550,3 +550,6 @@ chmod +x .git/hooks/pre-push
 | worktree | 同一个 git 仓库的多个独立工作区，各自持有独立分支与配置 |
 | 镜像 | CNB 侧只保留 `main`、内容与 GitHub 主线一致的只读副本 |
 | 重放 | 把 GitHub 主线上的提交按 CNB 身份重新提交到 CNB 侧（内容不变，署名与 SHA 变） |
+
+<!-- kimi-badge -->
+[![powered by KimiCode](../../.github/assets/kimi-badge.svg)](https://www.kimi.com/code)

@@ -670,3 +670,6 @@ docker compose ps
 10. **遗留问题：** 仍未验证的模型、数据、性能或生产部署限制，不得写成已完成。
 
 **最终原则再强调一次：A 是“向量辅助发现候选”，不是“AI 自动改写记忆”；B 是“完全不调用向量模型的本地规则整合”。两种模式共享同一套证据约束、安全边界和确定性合并决策。**
+
+<!-- kimi-badge -->
+[![powered by KimiCode](../.github/assets/kimi-badge.svg)](https://www.kimi.com/code)

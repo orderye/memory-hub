@@ -429,3 +429,6 @@ PG 路径里还藏着两个只有在真库上才会暴露的问题（现已修�
 > PG 侧的召回指标略低于内存侧（Recall@1 53.52% vs 68.15%）：
 > PG 走的是真实全文索引与 pgvector，两侧的分词与打分路径本就有差异；
 > 但**域外命中率同样是 0.00%**——默认拒绝阈值在两种存储上都成立。
+
+<!-- kimi-badge -->
+[![powered by KimiCode](../../.github/assets/kimi-badge.svg)](https://www.kimi.com/code)

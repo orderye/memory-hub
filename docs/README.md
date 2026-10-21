@@ -1,5 +1,8 @@
 # 记忆中枢 · 文档中枢与架构导航 (Documentation Hub)
 
+<!-- kimi-badge -->
+[![powered by KimiCode](../.github/assets/kimi-badge.svg)](https://www.kimi.com/code)
+
 > **语言 / Language**：本目录文档仅提供中文版；项目根 README 提供中英双版本
 > （[简体中文](https://github.com/orderye/memory-hub/blob/main/README.md) ·
 > [English](https://github.com/orderye/memory-hub/blob/main/README.en.md)）。

@@ -1,5 +1,8 @@
 # Memory Hub · 记忆中枢
 
+<!-- kimi-badge -->
+[![powered by KimiCode](.github/assets/kimi-badge.svg)](https://www.kimi.com/code)
+
 > **Language / 语言**: [English](README.en.md) · [简体中文](README.md)
 
 **A long-term memory ledger shared by a whole team of AI assistants: it remembers, it retrieves, it keeps things apart, it never loses them.**

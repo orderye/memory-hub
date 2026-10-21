@@ -120,3 +120,6 @@ CREATE TABLE IF NOT EXISTS coding_revisions (
 
 - 经由 50+ 个核心单测与完整工作区测试验证；
 - 覆盖纯新增、修改、删除、重命名、diff 幂等重放、敏感凭证拦截、二进制防护、超大 diff 拦截、以及跨账户租户绝对隔离。
+
+<!-- kimi-badge -->
+[![powered by KimiCode](../../.github/assets/kimi-badge.svg)](https://www.kimi.com/code)

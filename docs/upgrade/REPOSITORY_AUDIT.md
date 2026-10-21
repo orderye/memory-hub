@@ -292,3 +292,6 @@ pub trait GrantStore: Send + Sync {
 1. 仓库当前质量良好，核心底座完善，单测覆盖率高且全数通过。
 2. 架构不变量已清晰，命名冲突与路径差异已全数标记。
 3. Audit-only 完成，进入 P0 阶段前确认无需引入重型依赖，所有后续阶段将严格按 P0 → P1 → P2 → P3 → P4 → P5 顺序分步实施。
+
+<!-- kimi-badge -->
+[![powered by KimiCode](../../.github/assets/kimi-badge.svg)](https://www.kimi.com/code)

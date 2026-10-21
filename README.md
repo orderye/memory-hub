@@ -1,5 +1,8 @@
 # 记忆中枢 · Memory Hub
 
+<!-- kimi-badge -->
+[![powered by KimiCode](.github/assets/kimi-badge.svg)](https://www.kimi.com/code)
+
 > **语言 / Language**：[简体中文](README.md) · [English](README.en.md)
 
 **给一堆 AI 助手共用的一本长期记忆账本：记得住、查得到、分得清、丢不了。**

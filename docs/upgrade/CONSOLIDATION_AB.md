@@ -332,3 +332,6 @@ cargo test --test consolidation_eval -- --nocapture
 
 数据库侧：迁移是**加列**，旧版本程序仍可读写该表；回滚应用版本前无需改 schema。
 如需回滚 schema，`alter table integration_proposals drop column metadata;` 即可（会丢失溯源信息）。
+
+<!-- kimi-badge -->
+[![powered by KimiCode](../../.github/assets/kimi-badge.svg)](https://www.kimi.com/code)

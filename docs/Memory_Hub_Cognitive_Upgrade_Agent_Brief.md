@@ -822,3 +822,6 @@ cargo test -p store --features pg-integration -- --ignored
 - commit SHA
 
 **第一条回复只做 Audit-only。** 在输出 `REPOSITORY_AUDIT.md` 并给出真实源码依据前，不允许编写 migration，不允许添加 crate，不允许猜测现有文件名或接口。
+
+<!-- kimi-badge -->
+[![powered by KimiCode](../.github/assets/kimi-badge.svg)](https://www.kimi.com/code)

@@ -73,3 +73,6 @@
 ## 4. 结论
 
 P0 基线验证与安全回归加固已全部达成。系统状态稳定，无任何历史回归或破坏性变更，具备进入 **P1（证据、时间与关系模型）** 的完整前提。
+
+<!-- kimi-badge -->
+[![powered by KimiCode](../../.github/assets/kimi-badge.svg)](https://www.kimi.com/code)
