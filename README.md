@@ -9,7 +9,7 @@
 
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
 [![Edition](https://img.shields.io/badge/edition-2021-blue.svg)](https://doc.rust-lang.org/edition-guide/rust-2021/index.html)
-[![Tests](https://img.shields.io/badge/tests-442%20passed-brightgreen.svg)](https://github.com/orderye/memory-hub/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/tests-485%20passed-brightgreen.svg)](https://github.com/orderye/memory-hub/actions/workflows/ci.yml)
 [![Clippy](https://img.shields.io/badge/clippy-zero%20warnings-brightgreen.svg)](https://github.com/orderye/memory-hub/actions/workflows/ci.yml)
 [![MCP](https://img.shields.io/badge/MCP-28%20tools-purple.svg)](https://modelcontextprotocol.io/)
 [![Storage](https://img.shields.io/badge/storage-PostgreSQL%2015%20%2B%20pgvector%20%7C%20in--memory-blue.svg)](https://www.postgresql.org/)
