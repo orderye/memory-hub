@@ -9,11 +9,12 @@ pub mod cron;
 pub mod error;
 pub mod idempotency;
 pub mod log;
+pub mod profile;
 pub mod rate_limit;
 pub mod runtime;
 
 pub use auth::{AccountId, Acl, AgentId, AuthCtx, NamespaceGrant, Scope, BOOTSTRAP_ACCOUNT_ID};
-pub use config::{AppConfig, DEFAULT_RETRIEVAL_MIN_SCORE};
+pub use config::{AppConfig, DEFAULT_INTEGRATION_SCAN_MAX_ENTRIES, DEFAULT_RETRIEVAL_MIN_SCORE};
 pub use consolidation::{
     ConsolidationFallback, ConsolidationMode, ConsolidationModeStatus,
     CONSOLIDATION_STRATEGY_VERSION,
@@ -24,6 +25,7 @@ pub use idempotency::{
     IdempotencyRecord, IdempotencyStore, InMemoryIdempotencyStore,
 };
 pub use log::{init_tracing, init_tracing_with_stdio};
+pub use profile::{DeploymentProfile, DEPLOYMENT_PROFILE_ENV};
 pub use rate_limit::{
     is_capacity_enabled, rate_limit_error, InMemoryRateLimitStore, RateDimension, RateLimitStore,
 };

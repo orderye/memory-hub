@@ -38,6 +38,8 @@ pub struct HybridRetriever {
     scene_weight_profiles: std::collections::HashMap<MemoryScene, [f32; 5]>,
     /// 嵌入器是否提供真实语义信号（伪向量嵌入器为 false）
     semantic_ready: bool,
+    /// 嵌入能力是否启用（`HUB_EMBED_PROVIDER=off` 时为 false：不嵌入、不走向量路）
+    embedding_enabled: bool,
     /// 默认最小可信分（None = 不启用默认拒绝阈值）
     default_min_score: Option<f32>,
     /// 分场景最小可信分覆盖（缺省回落到全局默认）
@@ -57,6 +59,8 @@ impl HybridRetriever {
         // 伪向量嵌入器的余弦相似度是噪声：此时本检索器退化为**词法检索**，
         // 向量维度不参与打分（见 [`Self::score_items`]）。
         let semantic_ready = embedder.provides_semantic_signal();
+        // 显式关闭嵌入时，查询向量与向量召回都不该发生：这是配置选择，不是降级。
+        let embedding_enabled = embedder.is_enabled();
         Self {
             store,
             embedder,
@@ -70,6 +74,7 @@ impl HybridRetriever {
             scene_mode: SceneMode::Strict,
             scene_weight_profiles: std::collections::HashMap::new(),
             semantic_ready,
+            embedding_enabled,
             default_min_score: None,
             scene_min_scores: std::collections::HashMap::new(),
         }
@@ -78,6 +83,14 @@ impl HybridRetriever {
     /// 本实例是否具备真实语义检索能力
     pub fn semantic_ready(&self) -> bool {
         self.semantic_ready
+    }
+
+    /// 本次实例是否启用了向量路（嵌入被显式关闭时为 false）
+    ///
+    /// 供 `/capabilities`、`/readyz` 与 `memory_search` 的能力声明使用：
+    /// 调用方必须能区分"关闭"与"向量服务故障降级"。
+    pub fn vector_path_enabled(&self) -> bool {
+        self.embedding_enabled
     }
 
     /// 设置默认最小可信分（builder）
@@ -443,6 +456,14 @@ impl HybridRetriever {
         scored
     }
 
+    /// 候选集中是否存在可用于相似度计算的向量
+    ///
+    /// 用于决定是否值得跑 MMR：全部不可用时相似度矩阵恒为 0，
+    /// MMR 退化为按分排序，跑一遍纯属浪费。
+    fn has_usable_embedding(&self, scored: &[Scored<MemoryEntry>]) -> bool {
+        scored.iter().any(|s| self.embedding_usable(&s.item))
+    }
+
     /// MMR 重排（嵌入缺失或模型不匹配的项相互相似度按 0 处理）
     ///
     /// 相关性候选先截断到 `k * MMR_POOL_FACTOR` 再做两两相似度矩阵：
@@ -516,46 +537,62 @@ impl Retriever for HybridRetriever {
         // 避免嵌入服务故障把整体耗时拖到 HTTP 客户端超时（10s）
         let deadline = tokio::time::Instant::now() + self.soft_timeout;
 
+        // 嵌入被显式关闭（个人轻量部署默认）：不产生查询向量、不走向量召回。
+        // 这是**配置选择**而非降级：不告警、不计入失败，纯粹省下一次外部/CPU 调用。
+        let vector_enabled = self.embedding_enabled;
+
         // 查询向量只算一次，双路召回与打分共用。
-        let query_vec: Option<Vec<f32>> = match tokio::time::timeout_at(
-            deadline,
-            self.embedder.embed(std::slice::from_ref(&q.query_text)),
-        )
-        .await
-        {
-            Ok(Ok(mut vectors)) => vectors
-                .pop()
-                .map(|mut v| {
-                    l2_normalize(&mut v);
-                    v
-                })
-                .or_else(|| {
-                    tracing::warn!(namespace = %q.namespace, "嵌入服务返回空向量列表");
+        let query_vec: Option<Vec<f32>> = if !vector_enabled {
+            None
+        } else {
+            match tokio::time::timeout_at(
+                deadline,
+                self.embedder.embed(std::slice::from_ref(&q.query_text)),
+            )
+            .await
+            {
+                Ok(Ok(mut vectors)) => vectors
+                    .pop()
+                    .map(|mut v| {
+                        l2_normalize(&mut v);
+                        v
+                    })
+                    .or_else(|| {
+                        tracing::warn!(namespace = %q.namespace, "嵌入服务返回空向量列表");
+                        None
+                    }),
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        error = %e,
+                        namespace = %q.namespace,
+                        "查询嵌入失败：向量路不可用，仅关键词召回"
+                    );
                     None
-                }),
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    error = %e,
-                    namespace = %q.namespace,
-                    "查询嵌入失败：向量路不可用，仅关键词召回"
-                );
-                None
-            }
-            Err(_) => {
-                tracing::warn!(
-                    timeout_ms = self.soft_timeout.as_millis(),
-                    namespace = %q.namespace,
-                    "查询嵌入超出软超时预算：向量路不可用，仅关键词召回"
-                );
-                None
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_ms = self.soft_timeout.as_millis(),
+                        namespace = %q.namespace,
+                        "查询嵌入超出软超时预算：向量路不可用，仅关键词召回"
+                    );
+                    None
+                }
             }
         };
 
         // 双路并行且各自受剩余预算约束：超时只丢弃超时的一路，已完成的一路保留。
-        let (fts_res, vec_res) = tokio::join!(
-            tokio::time::timeout_at(deadline, self.fts_candidates(q)),
-            tokio::time::timeout_at(deadline, self.vec_candidates(q, query_vec.as_deref())),
-        );
+        // 向量路关闭时不发起向量召回，也不等待它。
+        let (fts_res, vec_res) = if vector_enabled {
+            tokio::join!(
+                tokio::time::timeout_at(deadline, self.fts_candidates(q)),
+                tokio::time::timeout_at(deadline, self.vec_candidates(q, query_vec.as_deref())),
+            )
+        } else {
+            (
+                tokio::time::timeout_at(deadline, self.fts_candidates(q)).await,
+                Ok(Vec::new()),
+            )
+        };
         let path_timed_out = fts_res.is_err() || vec_res.is_err();
         let merged =
             Self::merge_candidates(fts_res.unwrap_or_default(), vec_res.unwrap_or_default());
@@ -589,7 +626,14 @@ impl Retriever for HybridRetriever {
             if let Some(min_s) = min_score {
                 scored.retain(|s| s.score >= min_s);
             }
-            this.mmr_rerank(scored, top_k)
+            // MMR 的意义是"相关性 + 多样性"。候选集里没有任何可用向量时，
+            // 两两相似度矩阵恒为 0，MMR 的选择顺序与"按分排序后截断"逐条相同，
+            // 直接截断即可省掉 O(pool²·dim) 的相似度矩阵（结果不变）。
+            if this.has_usable_embedding(&scored) {
+                this.mmr_rerank(scored, top_k)
+            } else {
+                scored.into_iter().take(top_k).collect()
+            }
         })
         .await
         .map_err(|e| common::HubError::Internal(anyhow::anyhow!("检索重排任务调度失败: {}", e)))?;
@@ -915,6 +959,89 @@ mod tests {
             "缺嵌入时按可用信号归一化，不应被 sim 权重整体压低：{:#?}",
             without[0].score
         );
+    }
+
+    /// 关闭嵌入的嵌入器：任何 embed 调用都直接 panic（用于证明"一次都没调"）
+    struct DisabledEmbedderForTest;
+
+    #[async_trait]
+    impl Embedder for DisabledEmbedderForTest {
+        fn model_id(&self) -> &str {
+            "disabled"
+        }
+        fn dim(&self) -> usize {
+            1024
+        }
+        async fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            panic!("HUB_EMBED_PROVIDER=off 时检索不得发起任何嵌入调用");
+        }
+        fn provides_semantic_signal(&self) -> bool {
+            false
+        }
+        fn is_enabled(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn test_disabled_embedder_never_calls_embed_and_still_searches() {
+        // 条目自带向量也无所谓：模型标识对不上，一律视为向量不可用
+        let store = Arc::new(TestStore::default());
+        store.add(entry("ns", "服务端口 3000 监听中"), Some(vec![0.5; 1024]));
+        store.add(entry("ns", "数据库端口 5432 监听中"), Some(vec![0.2; 1024]));
+
+        let r = HybridRetriever::new(
+            store.clone() as Arc<dyn MemoryStore>,
+            Arc::new(DisabledEmbedderForTest),
+            100,
+            100,
+            [0.5, 0.2, 0.1, 0.1, 0.1],
+            0.7,
+            500,
+        )
+        .with_default_min_score(Some(0.0));
+        assert!(!r.vector_path_enabled(), "关闭嵌入时向量路必须关闭");
+
+        let hits = r
+            .search(&auth(), &query("ns", "服务端口 3000"))
+            .await
+            .expect("关闭嵌入不得导致检索失败");
+        assert!(!hits.is_empty(), "关键词路仍必须召回结果");
+        assert!(hits[0].item.content.contains("3000"));
+    }
+
+    /// 没有任何可用向量时，MMR 的顺序必须与"按分排序后截断"逐条相同。
+    ///
+    /// 直接测 `mmr_rerank` 本身：如果走 `search`，两侧都会命中"跳过 MMR"的分支，
+    /// 断言通过并不能证明"跳过"与"执行"等价。
+    #[test]
+    fn test_mmr_with_no_usable_embedding_equals_score_order() {
+        let store = Arc::new(TestStore::default());
+        let ranked: Vec<Scored<MemoryEntry>> = [
+            ("a", 0.9f32),
+            ("b", 0.8),
+            ("c", 0.7),
+            ("d", 0.6),
+            ("e", 0.5),
+        ]
+        .into_iter()
+        .map(|(name, score)| {
+            let item = entry("ns", name);
+            store.add(item.clone(), None);
+            Scored { item, score }
+        })
+        .collect();
+
+        let r = retriever(store);
+        let executed = r.mmr_rerank(ranked.clone(), 3);
+        assert_eq!(executed.len(), 3, "必须截断到 top_k");
+        for (x, y) in executed.iter().zip(ranked.iter().take(3)) {
+            assert_eq!(
+                x.item.id, y.item.id,
+                "相似度矩阵全为 0 时，MMR 必须退化成分数序"
+            );
+            assert!((x.score - y.score).abs() < 1e-6);
+        }
     }
 
     #[tokio::test]

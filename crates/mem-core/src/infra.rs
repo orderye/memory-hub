@@ -571,6 +571,18 @@ pub trait Embedder: Send + Sync {
     fn provides_semantic_signal(&self) -> bool {
         true
     }
+
+    /// 该嵌入器是否**启用**（能否产出向量）。
+    ///
+    /// 与 `provides_semantic_signal` 是两个不同问题：前者回答"向量有没有语义"，
+    /// 本方法回答"要不要为这篇记忆/这次查询花一次嵌入调用"。
+    /// 只有显式关闭嵌入（`HUB_EMBED_PROVIDER=off`，个人轻量部署默认）时返回 `false`；
+    /// 调用方据此跳过嵌入调用与向量召回，而不是先发一次必然失败的请求再降级。
+    ///
+    /// 默认 `true`：所有既有实现行为不变。
+    fn is_enabled(&self) -> bool {
+        true
+    }
 }
 
 /// 时钟（测试可注入固定时间）

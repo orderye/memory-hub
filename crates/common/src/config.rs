@@ -6,11 +6,33 @@
 use std::env;
 use std::net::SocketAddr;
 
+use crate::profile::{DeploymentProfile, DEPLOYMENT_PROFILE_ENV};
+
 /// 检索打分的五维权重顺序（sim, kw, conf, rec, fresh）
 pub const SCORE_WEIGHT_LEN: usize = 5;
 
 /// 单次快照的默认条目上限（防止备份无限膨胀）
 pub const DEFAULT_BACKUP_MAX_ENTRIES: usize = 50_000;
+
+/// 单命名空间单次整合扫描的默认条目上限。
+///
+/// 整合扫描要把一个命名空间的活跃条目全部装进内存做候选发现；条目越多，
+/// 内存峰值与候选对数量越难控制。默认 2000 条足以覆盖个人与中小团队命名空间，
+/// 超出时报告里会显式标 `truncated=true`（而不是静默截断）。
+pub const DEFAULT_INTEGRATION_SCAN_MAX_ENTRIES: usize = 2_000;
+
+/// 后台作业跨进程租约的默认窗口（小时）。
+///
+/// 多副本同时运行 backup-worker 时，同一命名空间会被重复扫描（浪费 CPU 与 DB，
+/// 提案本身是幂等的）。租约复用现有的 `rate_limit_buckets` 表：
+/// "窗口内至多放行 1 次"，无需新增表结构或迁移。
+pub const DEFAULT_JOB_LEASE_HOURS: u32 = 24;
+
+/// 整合健康度统计的默认缓存时长（秒）。
+///
+/// `memory_consolidation_stats` 每次调用都会做一次全命名空间候选分析（O(n²) 量级），
+/// 缓存 60 秒可挡掉 Agent 的连环调用与面板轮询；0 表示每次重新计算。
+pub const DEFAULT_CONSOLIDATION_STATS_TTL_S: u64 = 60;
 
 /// 令牌签名密钥的最小长度（字节）。HS256 要拿到 256 位密钥强度，
 /// 短于此值的口令可被离线爆破——而该密钥同时是三个进程共享的验签根。
@@ -54,6 +76,10 @@ pub const DEFAULT_RETRIEVAL_MIN_SCORE: f32 = 0.65;
 /// 多智能体长期记忆服务配置项
 #[derive(Debug, Clone)]
 pub struct AppConfig {
+    // ===== 部署形态 =====
+    /// 部署模式：只影响**默认值**，显式环境变量永远优先（见 `common::profile`）
+    pub deployment_profile: DeploymentProfile,
+
     // ===== 存储与模型 =====
     pub db_url: String,
     pub db_max_connections: u32,
@@ -144,6 +170,12 @@ pub struct AppConfig {
     pub consolidation_embed_min_similarity: Option<f32>,
     /// 纯规则模式的词法候选相似度下限（Jaccard）
     pub consolidation_lexical_min_similarity: f32,
+    /// 单命名空间单次整合扫描的最大活跃条目数（0 = 不限制）
+    pub integration_scan_max_entries: usize,
+    /// 后台作业跨进程租约窗口（小时，0 = 关闭租约）
+    pub job_lease_h: u32,
+    /// 整合健康度统计缓存时长（秒，0 = 每次重算）
+    pub consolidation_stats_ttl_s: u64,
 
     // ===== 时效与限流 =====
     pub idempotency_ttl_h: u32,
@@ -236,6 +268,8 @@ fn parse_list(key: &str) -> Vec<String> {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            // 默认完整生产部署：升级不得改变既有实例的行为
+            deployment_profile: DeploymentProfile::Production,
             db_url: "postgresql://mem_app:secret@localhost:5432/memory_hub".to_string(),
             db_max_connections: 10,
             db_statement_timeout_ms: 30_000,
@@ -281,6 +315,9 @@ impl Default for AppConfig {
             consolidation_embed_top_k: 20,
             consolidation_embed_min_similarity: None,
             consolidation_lexical_min_similarity: 0.80,
+            integration_scan_max_entries: DEFAULT_INTEGRATION_SCAN_MAX_ENTRIES,
+            job_lease_h: DEFAULT_JOB_LEASE_HOURS,
+            consolidation_stats_ttl_s: DEFAULT_CONSOLIDATION_STATS_TTL_S,
             idempotency_ttl_h: 24,
             rate_limit_per_agent_rps: 50,
             max_request_bytes: 262_144,
@@ -291,9 +328,35 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
+    /// 按部署模式给出**默认值**（随后由环境变量逐项覆盖）
+    ///
+    /// 这是"一套实现、两种部署形态"的落点：Lite 与 Production 的差异全部收敛为
+    /// 这里的两个默认值，业务代码只读最终配置，不感知模式分支。
+    ///
+    /// Lite 的默认值只做两件事：
+    /// 1. `HUB_EMBED_PROVIDER=off`：写入不落向量、检索不走向量路、整合无 embedding 可用；
+    /// 2. `EXPIRY_SWEEP_INTERVAL_H=0`：不在常驻进程里跑周期性清扫（改为手动 `--once`）。
+    ///
+    /// 部署者显式设置任一环境变量即可覆盖（例如 Lite 里接入真实嵌入服务）。
+    pub fn defaults_for(profile: DeploymentProfile) -> Self {
+        let mut cfg = Self {
+            deployment_profile: profile,
+            ..Self::default()
+        };
+        if profile.is_lite() {
+            cfg.embed_provider = "off".to_string();
+            cfg.expiry_sweep_interval_h = 0;
+        }
+        cfg
+    }
+
     /// 从环境变量加载并执行严格校验
     pub fn from_env() -> anyhow::Result<Self> {
-        let mut cfg = Self::default();
+        // 先定模式，再取该模式的默认值，最后让显式环境变量逐项覆盖：
+        // 这样"模式"永远不会成为第二个与具体开关等价的配置来源。
+        let profile = DeploymentProfile::parse(&var_or(DEPLOYMENT_PROFILE_ENV, "production"))
+            .map_err(|e| anyhow::anyhow!("{} 非法: {}", DEPLOYMENT_PROFILE_ENV, e))?;
+        let mut cfg = Self::defaults_for(profile);
 
         cfg.db_url = var_or("HUB_DB_URL", &cfg.db_url);
         cfg.db_max_connections = parse_u32("HUB_DB_MAX_CONNECTIONS", cfg.db_max_connections)?;
@@ -377,6 +440,15 @@ impl AppConfig {
             "HUB_CONSOLIDATION_LEXICAL_MIN_SIMILARITY",
             cfg.consolidation_lexical_min_similarity,
         )?;
+        cfg.integration_scan_max_entries = parse_usize(
+            "HUB_INTEGRATION_SCAN_MAX_ENTRIES",
+            cfg.integration_scan_max_entries,
+        )?;
+        cfg.job_lease_h = parse_u32("HUB_JOB_LEASE_H", cfg.job_lease_h)?;
+        cfg.consolidation_stats_ttl_s = parse_u64(
+            "HUB_CONSOLIDATION_STATS_TTL_S",
+            cfg.consolidation_stats_ttl_s,
+        )?;
 
         cfg.idempotency_ttl_h = parse_u32("HUB_IDEMPOTENCY_TTL_H", cfg.idempotency_ttl_h)?;
         cfg.rate_limit_per_agent_rps =
@@ -404,10 +476,24 @@ impl AppConfig {
         self.embed_provider == "http"
     }
 
+    /// 嵌入能力是否启用（决定是否产生/查询向量）
+    ///
+    /// 与 [`Self::semantic_ready`] 区分：
+    /// - 本方法回答"要不要花一次嵌入调用"；
+    /// - `semantic_ready` 回答"这些向量能不能当语义用"。
+    ///
+    /// `mock` 是启用但无语义（开发/测试），`off` 是显式关闭（个人轻量部署默认）。
+    pub fn embedding_enabled(&self) -> bool {
+        self.embed_provider != "off"
+    }
+
     /// 语义能力未就绪时的原因说明（供健康检查与启动告警展示）
     pub fn semantic_status_reason(&self) -> Option<String> {
         if self.semantic_ready() {
             return None;
+        }
+        if !self.embedding_enabled() {
+            return Some("嵌入能力已显式关闭（HUB_EMBED_PROVIDER=off）：写入不产生向量，检索为纯关键词模式，语义召回不可用".to_string());
         }
         Some(format!(
             "嵌入提供方为 {}（伪向量），余弦相似度是噪声而非语义：当前为词法检索，语义召回不可用",
@@ -538,8 +624,27 @@ impl AppConfig {
         }
 
         match self.embed_provider.as_str() {
-            "mock" | "http" => {}
-            other => anyhow::bail!("HUB_EMBED_PROVIDER 只支持 mock | http，当前为 {}", other),
+            "mock" | "http" | "off" => {}
+            other => anyhow::bail!(
+                "HUB_EMBED_PROVIDER 只支持 mock | http | off，当前为 {}",
+                other
+            ),
+        }
+
+        // 关闭嵌入时必须自洽：提供方为 off 却要求向量能力，说明配置被拼错了。
+        // 这里不静默改写任何值，只把矛盾点挑明。
+        if !self.embedding_enabled() && self.consolidation_mode == "hybrid" {
+            tracing::warn!(
+                "HUB_CONSOLIDATION_MODE=hybrid 但 HUB_EMBED_PROVIDER=off：整合将按 HUB_CONSOLIDATION_FALLBACK 降级（不会发出任何嵌入请求）"
+            );
+        }
+        if !self.embedding_enabled() && !self.is_postgres() {
+            tracing::warn!(
+                "嵌入关闭 + 非 PostgreSQL 存储：当前为临时开发模式（重启即失忆），不得作为个人持久化部署对外宣称"
+            );
+        }
+        if self.integration_scan_max_entries == 1 {
+            anyhow::bail!("HUB_INTEGRATION_SCAN_MAX_ENTRIES 必须为 0（不限）或 ≥2");
         }
 
         if self.embed_provider == "http"
@@ -573,15 +678,13 @@ impl AppConfig {
             .unwrap_or("<unknown>")
             .to_string();
         format!(
-            "db_host={} embed_dim={} embed_provider={} embed_model={} semantic_ready={} \
-             mcp_bind={} auth_bind={} \
-             backup_cron={} integrate_threshold={} sweep_h={} origins={} \
-             min_score={} invite={} bootstrap_pwd={} consolidation_mode={} \
-             consolidation_fallback={} consolidation_override={} embed_top_k={}",
+            "profile={} db_host={} embed_dim={} embed_provider={} embed_model={} embed_enabled={} semantic_ready={} mcp_bind={} auth_bind={} backup_cron={} integrate_threshold={} sweep_h={} origins={} min_score={} invite={} bootstrap_pwd={} consolidation_mode={} consolidation_fallback={} consolidation_override={} embed_top_k={} scan_max_entries={} job_lease_h={} stats_ttl_s={}",
+            self.deployment_profile.as_str(),
             db_host,
             self.embed_dim,
             self.embed_provider,
             self.embed_model,
+            self.embedding_enabled(),
             self.semantic_ready(),
             self.mcp_bind,
             self.auth_bind,
@@ -604,6 +707,9 @@ impl AppConfig {
             self.consolidation_fallback,
             self.consolidation_allow_mode_override,
             self.consolidation_embed_top_k,
+            self.integration_scan_max_entries,
+            self.job_lease_h,
+            self.consolidation_stats_ttl_s,
         )
     }
 }
@@ -1068,5 +1174,121 @@ mod tests {
                 assert!(AppConfig::from_env().is_err(), "越界阈值必须被拒绝");
             },
         );
+    }
+
+    #[test]
+    fn test_deployment_profile_defaults_preserve_production_behavior() {
+        // 关键不变式：默认（不设置 HUB_DEPLOYMENT_PROFILE）= 升级前行为
+        with_env(&[("HUB_DEPLOYMENT_PROFILE", None)], || {
+            let cfg = AppConfig::from_env().unwrap();
+            assert_eq!(cfg.deployment_profile, DeploymentProfile::Production);
+            assert_eq!(
+                cfg.embed_provider, "mock",
+                "默认仍为 mock，不得静默改成 off"
+            );
+            assert_eq!(cfg.expiry_sweep_interval_h, 6);
+            assert!(cfg.embedding_enabled());
+        });
+    }
+
+    #[test]
+    fn test_lite_profile_only_changes_defaults() {
+        with_env(&[("HUB_DEPLOYMENT_PROFILE", Some("lite"))], || {
+            let cfg = AppConfig::from_env().unwrap();
+            assert_eq!(cfg.deployment_profile, DeploymentProfile::Lite);
+            assert_eq!(cfg.embed_provider, "off", "Lite 默认关闭嵌入");
+            assert!(!cfg.embedding_enabled());
+            assert!(!cfg.semantic_ready());
+            assert_eq!(cfg.expiry_sweep_interval_h, 0, "Lite 默认不跑周期清扫");
+        });
+
+        // 显式环境变量永远压过 profile 默认值（否则 Lite 无法接入真实向量）
+        with_env(
+            &[
+                ("HUB_DEPLOYMENT_PROFILE", Some("lite")),
+                ("HUB_EMBED_PROVIDER", Some("http")),
+                (
+                    "HUB_EMBED_ENDPOINT",
+                    Some("https://embed.example.com/v1/embeddings"),
+                ),
+            ],
+            || {
+                let cfg = AppConfig::from_env().unwrap();
+                assert_eq!(cfg.embed_provider, "http");
+                assert!(cfg.embedding_enabled());
+                assert!(cfg.semantic_ready());
+            },
+        );
+    }
+
+    #[test]
+    fn test_unknown_deployment_profile_fails_fast() {
+        with_env(&[("HUB_DEPLOYMENT_PROFILE", Some("small"))], || {
+            let err = AppConfig::from_env().unwrap_err();
+            assert!(
+                err.to_string().contains("production | lite"),
+                "未知模式必须启动失败：{err}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_operations_knobs_have_safe_defaults_and_validation() {
+        with_env(&[], || {
+            let cfg = AppConfig::from_env().unwrap();
+            assert_eq!(cfg.integration_scan_max_entries, 2_000);
+            assert_eq!(cfg.job_lease_h, 24);
+            assert_eq!(cfg.consolidation_stats_ttl_s, 60);
+        });
+
+        // 1 条上限没有意义（永远无法凑成一对候选）
+        with_env(&[("HUB_INTEGRATION_SCAN_MAX_ENTRIES", Some("1"))], || {
+            assert!(AppConfig::from_env().is_err());
+        });
+
+        // 0 = 关闭租约 / 取消上限，是合法取值
+        with_env(
+            &[
+                ("HUB_JOB_LEASE_H", Some("0")),
+                ("HUB_INTEGRATION_SCAN_MAX_ENTRIES", Some("0")),
+                ("HUB_CONSOLIDATION_STATS_TTL_S", Some("0")),
+            ],
+            || {
+                let cfg = AppConfig::from_env().unwrap();
+                assert_eq!(cfg.job_lease_h, 0);
+                assert_eq!(cfg.integration_scan_max_entries, 0);
+                assert_eq!(cfg.consolidation_stats_ttl_s, 0);
+            },
+        );
+    }
+
+    #[test]
+    fn test_embed_provider_off_is_accepted_and_documented_in_reason() {
+        with_env(&[("HUB_EMBED_PROVIDER", Some("off"))], || {
+            let cfg = AppConfig::from_env().unwrap();
+            assert!(!cfg.embedding_enabled());
+            let reason = cfg.semantic_status_reason().unwrap_or_default();
+            assert!(
+                reason.contains("HUB_EMBED_PROVIDER=off"),
+                "关闭原因必须指明是显式关闭而不是\"未配置\"：{reason}"
+            );
+            assert!(
+                reason.contains("纯关键词"),
+                "关闭原因须说明检索退化：{reason}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_redacted_summary_reports_profile_and_embedding_state() {
+        let cfg = AppConfig::defaults_for(DeploymentProfile::Lite);
+        let s = cfg.redacted_summary();
+        assert!(s.contains("profile=lite"), "摘要必须包含部署模式：{s}");
+        assert!(
+            s.contains("embed_enabled=false"),
+            "摘要必须包含嵌入开关：{s}"
+        );
+        assert!(s.contains("scan_max_entries=2000"), "{s}");
+        assert!(s.contains("job_lease_h=24"), "{s}");
     }
 }

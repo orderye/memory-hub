@@ -240,7 +240,14 @@ impl DefaultMemoryService {
     }
 
     /// 计算嵌入（失败不阻塞写入：向量检索降级为关键词）
+    ///
+    /// 嵌入被显式关闭（`HUB_EMBED_PROVIDER=off`）时**直接返回 `(None, None)`**：
+    /// 不发起一次注定失败的调用、不写 `embedding` 列，条目以 NULL 向量落库。
+    /// 这样个人轻量部署的每条写入都省掉一次嵌入计算（默认 1024 维 ≈ 4KB 存储）。
     async fn embed_content(&self, content: &str) -> (Option<Vec<f32>>, Option<String>) {
+        if !self.embedder.is_enabled() {
+            return (None, None);
+        }
         match self.embedder.embed(&[content.to_string()]).await {
             Ok(mut vs) if !vs.is_empty() => {
                 let mut v = vs.remove(0);
@@ -882,6 +889,58 @@ mod tests {
             valid_until: None,
             occurred_at: None,
         }
+    }
+
+    /// 关闭嵌入的嵌入器：任何 embed 调用都 panic，用于证明关闭时零嵌入调用
+    struct DisabledTestEmbedder;
+
+    #[async_trait]
+    impl Embedder for DisabledTestEmbedder {
+        fn model_id(&self) -> &str {
+            "disabled"
+        }
+        fn dim(&self) -> usize {
+            1024
+        }
+        async fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            panic!("嵌入关闭时写入不得发起任何嵌入调用");
+        }
+        fn provides_semantic_signal(&self) -> bool {
+            false
+        }
+        fn is_enabled(&self) -> bool {
+            false
+        }
+    }
+
+    /// 关闭嵌入后：写入不产生向量（embedding=None），其余语义（版本、历史、检索可见）不变
+    #[tokio::test]
+    async fn test_put_with_disabled_embedder_stores_no_vector() {
+        let grants = Arc::new(TestGrants::default());
+        let mem = Arc::new(TestMemoryStore::default());
+        let svc = DefaultMemoryService::new(
+            mem.clone(),
+            Arc::new(DisabledTestEmbedder),
+            Arc::new(GrantChecker::new(grants.clone())),
+        );
+        let a = auth("agent-a", vec![Scope::Read, Scope::Write, Scope::Admin]);
+
+        let entry = svc
+            .put(&a, put_req("team-x", "轻量化模式下的写入"))
+            .await
+            .unwrap();
+        assert!(entry.embedding.is_none(), "嵌入关闭时不得写入向量");
+        assert!(entry.embedding_model.is_none());
+
+        // 被再次修订（upsert）也不得凭空产生向量
+        let mut req = put_req("team-x", "轻量化模式下的写入（修订）");
+        req.key = Some("lite:1".to_string());
+        let first = svc.put(&a, req.clone()).await.unwrap();
+        assert!(first.embedding.is_none());
+        req.content = "轻量化模式下的写入（再次修订）".to_string();
+        let second = svc.put(&a, req).await.unwrap();
+        assert_eq!(second.version, first.version + 1);
+        assert!(second.embedding.is_none(), "修订路径同样不得产生向量");
     }
 
     #[tokio::test]

@@ -17,6 +17,12 @@ pub enum RateDimension {
     Agent,
     User,
     Ip,
+    /// 后台作业租约：键形如 `job:<name>[:<namespace>]`
+    ///
+    /// 复用同一套令牌桶实现"窗口内至多放行 1 次"，从而在多副本部署下
+    /// 让同一作业（例如同一命名空间的整合扫描）只被一个副本执行。
+    /// 与请求限流共用 `rate_limit_buckets` 表，无需新增表结构。
+    Job,
 }
 
 impl RateDimension {
@@ -25,6 +31,7 @@ impl RateDimension {
             RateDimension::Agent => "agent",
             RateDimension::User => "user",
             RateDimension::Ip => "ip",
+            RateDimension::Job => "job",
         }
     }
 }
@@ -147,6 +154,25 @@ mod tests {
         assert_eq!(RateDimension::Agent.as_str(), "agent");
         assert_eq!(RateDimension::User.as_str(), "user");
         assert_eq!(RateDimension::Ip.as_str(), "ip");
+        assert_eq!(RateDimension::Job.as_str(), "job");
+    }
+
+    #[tokio::test]
+    async fn test_lease_semantics_capacity_one_window() {
+        // 租约语义：同一 key 在窗口内只放行一次；不同 key 互不影响。
+        let store = InMemoryRateLimitStore::new();
+        assert!(store
+            .try_acquire_in_window(RateDimension::Job, "job:integration-scan:ns-a", 1, 3600)
+            .await
+            .unwrap());
+        assert!(!store
+            .try_acquire_in_window(RateDimension::Job, "job:integration-scan:ns-a", 1, 3600)
+            .await
+            .unwrap());
+        assert!(store
+            .try_acquire_in_window(RateDimension::Job, "job:integration-scan:ns-b", 1, 3600)
+            .await
+            .unwrap());
     }
 
     #[test]
