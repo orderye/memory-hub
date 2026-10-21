@@ -1,10 +1,13 @@
-//! 重复记忆检测器：向量近邻与聚类
+//! 重复记忆分组器：把候选对聚成重复组
 //!
-//! 结合近邻搜索与并查集聚类，把高余弦相似度条目划分为重复组。
+//! 本模块只做**分组与归类**，不产生候选——候选由 `candidates` 下的模式实现产出。
+//! 这样规则模式（纯本地）与向量模式（语义辅助）产出的候选会走**完全相同**的
+//! 分组、归类与自动合并门槛逻辑。
 
+use crate::candidates::{CandidatePair, CandidateRelation, CandidateSource};
 use crate::types::DuplicateGroup;
-use mem_core::{cosine_similarity, MemoryEntry, MemoryKind};
-use std::collections::HashMap;
+use mem_core::MemoryEntry;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 /// 并查集
@@ -42,9 +45,10 @@ impl UnionFind {
     }
 }
 
-/// 重复记忆检测器
+/// 重复记忆分组器
 #[derive(Debug, Clone)]
 pub struct DuplicateDetector {
+    /// 语义重复下限（仅用于记录与统计，实际判定在候选层完成）
     pub sim_threshold: f32,
     pub probe_k: usize,
 }
@@ -62,93 +66,153 @@ impl DuplicateDetector {
         self
     }
 
-    /// 检测条目集合中的重复组
-    pub fn detect_in_entries(&self, entries: &[MemoryEntry]) -> Vec<DuplicateGroup> {
-        let n = entries.len();
-        if n < 2 {
+    /// 依据候选对聚类重复组
+    ///
+    /// - **可聚类关系**（精确重复 / 规范化重复 / 语义近重复）走并查集聚类，
+    ///   保持既有"传递闭包"语义：A~B 且 B~C 时三者同组。
+    /// - **成对关系**（词法近匹配 / 证据不足）只生成两成员组：
+    ///   词法相似只说明"这两条值得一起看"，不足以断言"这几条是同一事实"。
+    pub fn group_candidates(
+        &self,
+        entries: &[MemoryEntry],
+        candidates: &[CandidatePair],
+    ) -> Vec<DuplicateGroup> {
+        if entries.len() < 2 {
             return Vec::new();
         }
+        let index: HashMap<Uuid, usize> =
+            entries.iter().enumerate().map(|(i, e)| (e.id, i)).collect();
 
-        let mut uf = UnionFind::new(n);
-        let mut best_sim = HashMap::<(usize, usize), f32>::new();
+        let mut uf = UnionFind::new(entries.len());
+        let mut cluster_pairs: Vec<&CandidatePair> = Vec::new();
+        let mut pair_groups: Vec<&CandidatePair> = Vec::new();
 
-        // 按类型分类索引，同 kind 之间才做重复检测
-        let mut by_kind: HashMap<MemoryKind, Vec<usize>> = HashMap::new();
-        for (idx, e) in entries.iter().enumerate() {
-            if e.embedding.is_some() {
-                by_kind.entry(e.kind).or_default().push(idx);
-            }
-        }
-
-        for (_kind, indices) in by_kind {
-            if indices.len() < 2 {
+        for c in candidates {
+            let (Some(&ia), Some(&ib)) = (index.get(&c.a), index.get(&c.b)) else {
+                continue;
+            };
+            // 沿用既有语义：只有同类型条目才互为重复候选
+            if entries[ia].kind != entries[ib].kind {
                 continue;
             }
-
-            // 比较同类型内各条目相似度
-            for i_idx in 0..indices.len() {
-                let i = indices[i_idx];
-                let emb_a = entries[i].embedding.as_ref().unwrap();
-
-                for &j in indices.iter().skip(i_idx + 1) {
-                    let emb_b = entries[j].embedding.as_ref().unwrap();
-
-                    let sim = cosine_similarity(emb_a, emb_b);
-                    if sim >= self.sim_threshold {
-                        uf.union(i, j);
-                        let pair = if i < j { (i, j) } else { (j, i) };
-                        best_sim
-                            .entry(pair)
-                            .and_modify(|s| *s = s.max(sim))
-                            .or_insert(sim);
-                    }
+            match c.relation {
+                CandidateRelation::ExactDuplicate
+                | CandidateRelation::CanonicalDuplicate
+                | CandidateRelation::SemanticNearDuplicate => {
+                    uf.union(ia, ib);
+                    cluster_pairs.push(c);
                 }
+                CandidateRelation::Uncertain | CandidateRelation::LexicalNearMatch => {
+                    pair_groups.push(c);
+                }
+                _ => {}
             }
         }
 
-        // 按 root 聚合分组
+        // 按 root 聚合强聚类
         let mut clusters: HashMap<usize, Vec<usize>> = HashMap::new();
-        for i in 0..n {
+        for i in 0..entries.len() {
             let root = uf.find(i);
             clusters.entry(root).or_default().push(i);
         }
 
-        let mut groups = Vec::new();
+        let mut groups: Vec<DuplicateGroup> = Vec::new();
+        let mut clustered: HashSet<usize> = HashSet::new();
+
         for (_root, mut members) in clusters {
             if members.len() < 2 {
                 continue;
             }
-
             // 组内排序：按 updated_at 降序（最新条目优先作为幸存者）
             members.sort_by(|&a, &b| entries[b].updated_at.cmp(&entries[a].updated_at));
 
-            let mut max_sim = 0.0f32;
-            for i in 0..members.len() {
-                for j in (i + 1)..members.len() {
-                    let pair = if members[i] < members[j] {
-                        (members[i], members[j])
-                    } else {
-                        (members[j], members[i])
-                    };
-                    if let Some(&s) = best_sim.get(&pair) {
-                        max_sim = max_sim.max(s);
-                    }
-                }
-            }
+            let member_set: HashSet<usize> = members.iter().copied().collect();
+            let group_pairs: Vec<&CandidatePair> = cluster_pairs
+                .iter()
+                .copied()
+                .filter(|c| {
+                    let ia = index[&c.a];
+                    let ib = index[&c.b];
+                    member_set.contains(&ia) && member_set.contains(&ib)
+                })
+                .collect();
 
+            let (relation, source, reason_code, max_similarity) = summarize(&group_pairs);
             let member_ids: Vec<Uuid> = members.iter().map(|&idx| entries[idx].id).collect();
             let suggested_survivor = entries[members[0]].id;
             let kind = entries[members[0]].kind;
+
+            for &m in &members {
+                clustered.insert(m);
+            }
 
             groups.push(DuplicateGroup {
                 id: Uuid::new_v4(),
                 kind,
                 member_ids,
-                max_similarity: max_sim,
+                max_similarity,
                 suggested_survivor,
+                relation,
+                source,
+                reason_code,
+            });
+        }
+
+        // 成对关系：同组内已聚类的成员不再重复提案
+        for c in pair_groups {
+            let (Some(&ia), Some(&ib)) = (index.get(&c.a), index.get(&c.b)) else {
+                continue;
+            };
+            if clustered.contains(&ia) && clustered.contains(&ib) {
+                continue;
+            }
+            let mut members = [ia, ib];
+            members.sort_by(|&a, &b| entries[b].updated_at.cmp(&entries[a].updated_at));
+            groups.push(DuplicateGroup {
+                id: Uuid::new_v4(),
+                kind: entries[members[0]].kind,
+                member_ids: members.iter().map(|&idx| entries[idx].id).collect(),
+                max_similarity: c.confidence,
+                suggested_survivor: entries[members[0]].id,
+                relation: c.relation,
+                source: c.source,
+                reason_code: c.reason_code.clone(),
             });
         }
 
         groups
+    }
+}
+
+/// 汇总一组候选的关系、来源、原因码与最高置信度
+///
+/// 关系取"最强"（`CandidateRelation::strength`），置信度取最大值。
+fn summarize(pairs: &[&CandidatePair]) -> (CandidateRelation, CandidateSource, String, f32) {
+    let mut best: Option<&CandidatePair> = None;
+    for p in pairs {
+        best = Some(match best {
+            None => p,
+            Some(cur) => {
+                // 关系更强者优先；关系相同则置信度更高者优先
+                let better = p.relation.strength() > cur.relation.strength()
+                    || (p.relation.strength() == cur.relation.strength()
+                        && p.confidence > cur.confidence);
+                if better {
+                    p
+                } else {
+                    cur
+                }
+            }
+        });
+    }
+    let max_similarity = pairs.iter().map(|p| p.confidence).fold(0.0f32, f32::max);
+    match best {
+        Some(p) => (p.relation, p.source, p.reason_code.clone(), max_similarity),
+        None => (
+            CandidateRelation::Uncertain,
+            CandidateSource::Lexical,
+            crate::candidates::REASON_LEXICAL_CANDIDATE_REQUIRES_REVIEW.to_string(),
+            max_similarity,
+        ),
     }
 }

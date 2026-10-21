@@ -9,7 +9,7 @@
 
 use crate::domain::{IntegrationProposal, MemoryEntry};
 use async_trait::async_trait;
-use common::{AuthCtx, Result};
+use common::{AuthCtx, ConsolidationMode, ConsolidationModeStatus, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -23,6 +23,12 @@ pub struct ScanRequest {
     /// 覆盖默认阈值（None 用服务配置）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sim_threshold: Option<f32>,
+    /// 覆盖候选发现模式（None 用服务配置）。
+    ///
+    /// 该字段只有在服务端开启 `HUB_CONSOLIDATION_ALLOW_MODE_OVERRIDE=true` 时才会被采纳；
+    /// 否则请求中的显式模式会被拒绝，调用方应改用部署级配置。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<ConsolidationMode>,
 }
 
 /// 扫描报告
@@ -35,6 +41,8 @@ pub struct ScanReport {
     pub proposals: Vec<IntegrationProposal>,
     /// 因已有 open 提案而跳过的组数
     pub skipped_existing: usize,
+    /// 本次运行的候选策略状态（请求模式 / 实际模式 / 降级 / embedding 调用计数）
+    pub mode: ConsolidationModeStatus,
 }
 
 /// 提案裁决动作

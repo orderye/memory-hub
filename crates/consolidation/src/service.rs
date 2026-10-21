@@ -1,9 +1,10 @@
 //! 整合服务门面：负责权限检查、命名空间作用域包装，内部统一委托 ConsolidationEngine 执行
 
+use crate::candidates::CandidateLimits;
 use crate::engine::ConsolidationEngine;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use common::{AuthCtx, HubError, Result, Scope};
+use common::{AuthCtx, ConsolidationFallback, ConsolidationMode, HubError, Result, Scope};
 use mem_core::{
     account_scope::AccountScopedStore, AccessChecker, Clock, Embedder, IntegrationProposal,
     IntegrationService, IntegrationStore, MemoryEntry, MemoryHubStore, ResolveRequest, ScanReport,
@@ -22,6 +23,14 @@ pub struct DefaultIntegrationService {
     #[allow(dead_code)]
     max_proposals: usize,
     embedder: Option<Arc<dyn Embedder>>,
+    /// 候选发现模式（部署级默认）
+    mode: ConsolidationMode,
+    /// 向量模式不可用时的降级策略
+    fallback: ConsolidationFallback,
+    /// 候选规模限制
+    limits: CandidateLimits,
+    /// 词法候选阈值
+    lexical_min_similarity: f32,
 }
 
 impl DefaultIntegrationService {
@@ -42,6 +51,10 @@ impl DefaultIntegrationService {
             sim_threshold: sim,
             max_proposals: max_p,
             embedder: None,
+            mode: ConsolidationMode::Rules,
+            fallback: ConsolidationFallback::Rules,
+            limits: CandidateLimits::default(),
+            lexical_min_similarity: 0.80,
         }
     }
 
@@ -53,6 +66,29 @@ impl DefaultIntegrationService {
     pub fn with_embedder(mut self, embedder: Arc<dyn Embedder>) -> Self {
         self.embedder = Some(embedder.clone());
         self.engine = Arc::new(self.engine.as_ref().clone().with_embedder(embedder));
+        self
+    }
+
+    /// 设置候选发现模式、降级策略与规模限制
+    pub fn with_mode(
+        mut self,
+        mode: ConsolidationMode,
+        fallback: ConsolidationFallback,
+        limits: CandidateLimits,
+        lexical_min_similarity: f32,
+    ) -> Self {
+        self.mode = mode;
+        self.fallback = fallback;
+        self.limits = limits;
+        self.lexical_min_similarity = lexical_min_similarity.clamp(0.0, 1.0);
+        self.engine = Arc::new(
+            self.engine
+                .as_ref()
+                .clone()
+                .with_mode(mode, fallback)
+                .with_candidate_limits(limits)
+                .with_lexical_min_similarity(self.lexical_min_similarity),
+        );
         self
     }
 
@@ -95,7 +131,16 @@ impl IntegrationService for DefaultIntegrationService {
         }
 
         let scoped_store = Arc::new(AccountScopedStore::new(self.store.clone(), auth.account_id));
-        let scoped_engine = self.engine.with_store(scoped_store);
+        // 逐次请求可指定模式（MCP 层已完成覆盖闸门校验）
+        let mode = req.mode.unwrap_or(self.mode);
+        let scoped_engine = self
+            .engine
+            .as_ref()
+            .clone()
+            .with_mode(mode, self.fallback)
+            .with_candidate_limits(self.limits)
+            .with_lexical_min_similarity(self.lexical_min_similarity)
+            .with_store(scoped_store);
 
         let report = scoped_engine
             .consolidate_namespace(
@@ -112,6 +157,7 @@ impl IntegrationService for DefaultIntegrationService {
             dry_run: report.dry_run,
             proposals: report.proposals,
             skipped_existing: report.skipped_existing,
+            mode: report.mode,
         })
     }
 
@@ -237,6 +283,7 @@ mod tests {
     #[tokio::test]
     async fn test_scan_detects_duplicates_and_dry_run_does_not_persist() {
         let (svc, store) = setup().await;
+        // 默认模式为纯本地规则整合：原文完全相同即为精确重复
         store
             .insert(&make_entry_with_embedding(
                 &scoped_ns("ns"),
@@ -249,7 +296,7 @@ mod tests {
         store
             .insert(&make_entry_with_embedding(
                 &scoped_ns("ns"),
-                "服务器部署在东京区域",
+                "服务器部署在东京",
                 None,
                 Some(near_identical_vec("x", 0.001)),
             ))
@@ -263,6 +310,7 @@ mod tests {
                     namespace: "ns".to_string(),
                     dry_run: true,
                     sim_threshold: Some(0.99),
+                    mode: None,
                 },
             )
             .await
@@ -302,6 +350,7 @@ mod tests {
                     namespace: "ns".to_string(),
                     dry_run: false,
                     sim_threshold: None,
+                    mode: None,
                 },
             )
             .await
@@ -317,6 +366,7 @@ mod tests {
                     namespace: "ns".to_string(),
                     dry_run: false,
                     sim_threshold: None,
+                    mode: None,
                 },
             )
             .await
@@ -352,6 +402,7 @@ mod tests {
                     namespace: "ns".to_string(),
                     dry_run: false,
                     sim_threshold: None,
+                    mode: None,
                 },
             )
             .await
@@ -425,6 +476,7 @@ mod tests {
                     namespace: "ns".to_string(),
                     dry_run: false,
                     sim_threshold: None,
+                    mode: None,
                 },
             )
             .await
@@ -472,6 +524,7 @@ mod tests {
                     namespace: "ns".to_string(),
                     dry_run: false,
                     sim_threshold: None,
+                    mode: None,
                 },
             )
             .await
@@ -509,6 +562,7 @@ mod tests {
                     namespace: "ns".to_string(),
                     dry_run: false,
                     sim_threshold: None,
+                    mode: None,
                 },
             )
             .await
@@ -561,6 +615,7 @@ mod tests {
                     namespace: "ns".to_string(),
                     dry_run: false,
                     sim_threshold: None,
+                    mode: None,
                 },
             )
             .await

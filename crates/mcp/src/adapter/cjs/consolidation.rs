@@ -48,6 +48,17 @@ impl RoleplayConsolidationPolicy {
                             *auto_merge = serde_json::json!(false);
                         }
                     }
+                    // 同一层防护：私有/角色空间强制使用纯本地规则整合，
+                    // 避免把角色扮演的人设内容送到外部嵌入服务
+                    if let Some(mode) = obj.get_mut("mode") {
+                        if mode.as_str() != Some("rules") {
+                            tracing::info!(
+                                namespace = %ns,
+                                "创界山角色扮演防护：拦截并禁用私有/角色空间的向量整合模式"
+                            );
+                            *mode = serde_json::json!("rules");
+                        }
+                    }
                 }
             }
         }

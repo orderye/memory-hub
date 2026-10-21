@@ -233,6 +233,7 @@ async fn test_get_by_id_is_fail_closed_across_accounts() {
         resolution_note: None,
         created_at: Utc::now(),
         resolved_at: None,
+        metadata: serde_json::json!({}),
     };
     sa.save_proposal(&proposal).await.unwrap();
     assert!(sa.get_proposal(proposal.id).await.is_ok());

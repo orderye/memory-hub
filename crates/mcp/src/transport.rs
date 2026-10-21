@@ -169,6 +169,38 @@ pub struct CapabilityReport {
     pub default_min_score: f32,
     /// 分场景最小可信分
     pub scene_min_scores: BTreeMap<String, f32>,
+    /// 记忆整合能力（与检索语义能力是两回事）
+    pub consolidation: ConsolidationCapability,
+}
+
+/// 记忆整合能力声明
+///
+/// **与检索的 `semantic.ready` 明确区分**：整合可以在纯规则模式下完全正常工作，
+/// 不依赖向量服务；反过来，检索具备语义能力也不代表整合已启用向量模式。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsolidationCapability {
+    /// 部署级候选发现模式（`rules` | `hybrid`）
+    pub mode: String,
+    /// 向量模式不可用时的降级策略（`rules` | `error`）
+    pub fallback: String,
+    /// 是否允许逐请求覆盖整合模式
+    pub allow_mode_override: bool,
+    /// 本实例是否具备运行向量整合的能力（真实语义嵌入器已就绪）
+    pub vector_ready: bool,
+    /// 向量候选的相似度阈值是否经过真实模型标定
+    pub threshold_calibrated: bool,
+}
+
+impl Default for ConsolidationCapability {
+    fn default() -> Self {
+        Self {
+            mode: "rules".to_string(),
+            fallback: "rules".to_string(),
+            allow_mode_override: false,
+            vector_ready: false,
+            threshold_calibrated: false,
+        }
+    }
 }
 
 impl Default for CapabilityReport {
@@ -181,6 +213,7 @@ impl Default for CapabilityReport {
             semantic_reason: Some("未提供能力报告：语义能力按未就绪处理".to_string()),
             default_min_score: 0.0,
             scene_min_scores: BTreeMap::new(),
+            consolidation: ConsolidationCapability::default(),
         }
     }
 }
@@ -534,6 +567,13 @@ async fn handle_readyz(State(state): State<SharedState>) -> Response {
             "default_min_score": caps.default_min_score,
             "scene_min_scores": caps.scene_min_scores,
         },
+        "consolidation": {
+            "mode": caps.consolidation.mode,
+            "fallback": caps.consolidation.fallback,
+            "allow_mode_override": caps.consolidation.allow_mode_override,
+            "vector_ready": caps.consolidation.vector_ready,
+            "threshold_calibrated": caps.consolidation.threshold_calibrated,
+        },
     });
 
     if store_ok {
@@ -564,6 +604,13 @@ async fn handle_capabilities(State(state): State<SharedState>) -> Response {
             "retrieval": {
                 "default_min_score": caps.default_min_score,
                 "scene_min_scores": caps.scene_min_scores,
+            },
+            "consolidation": {
+                "mode": caps.consolidation.mode,
+                "fallback": caps.consolidation.fallback,
+                "allow_mode_override": caps.consolidation.allow_mode_override,
+                "vector_ready": caps.consolidation.vector_ready,
+                "threshold_calibrated": caps.consolidation.threshold_calibrated,
             },
         })),
     )
@@ -1174,6 +1221,7 @@ mod tests {
             semantic_reason: Some("伪向量：语义召回不可用".to_string()),
             default_min_score: 0.65,
             scene_min_scores: BTreeMap::new(),
+            consolidation: ConsolidationCapability::default(),
         });
 
         let resp = handle_readyz(State(Arc::new(s))).await;
@@ -1219,6 +1267,7 @@ mod tests {
             semantic_reason: None,
             default_min_score: 0.65,
             scene_min_scores: BTreeMap::new(),
+            consolidation: ConsolidationCapability::default(),
         });
 
         let resp = handle_readyz(State(Arc::new(s))).await;
@@ -1242,6 +1291,7 @@ mod tests {
             semantic_reason: Some("伪向量：语义召回不可用".to_string()),
             default_min_score: 0.65,
             scene_min_scores: scene_scores,
+            consolidation: ConsolidationCapability::default(),
         });
 
         let resp = handle_capabilities(State(Arc::new(s))).await;

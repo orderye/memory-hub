@@ -87,6 +87,8 @@ hex = "0.4"
 base64 = "0.22"
 # 证据脱敏：凭证 / 私钥 / 个人信息的模式匹配
 regex = "1.13"
+# 内容保守规范化（NFKC）：用于整合中枢的规范化指纹
+unicode-normalization = "0.1"
 arc-swap = "1.7"
 subtle = "2.6"
 argon2 = "0.5"

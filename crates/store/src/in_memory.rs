@@ -2019,6 +2019,7 @@ mod tests {
             resolution_note: None,
             created_at: Utc::now(),
             resolved_at: None,
+            metadata: serde_json::json!({}),
         };
         store.save_proposal(&proposal).await.unwrap();
         assert!(store

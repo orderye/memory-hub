@@ -13,6 +13,7 @@ jemalloc = ["dep:tikv-jemallocator"]
 chrono.workspace = true
 common = { workspace = true }
 mem-core = { workspace = true }
+consolidation = { workspace = true }
 store = { workspace = true }
 embed = { workspace = true }
 worker = { workspace = true }

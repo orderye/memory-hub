@@ -132,6 +132,18 @@ pub struct AppConfig {
     pub integrate_max_proposals: usize,
     /// 过期记忆清理间隔（小时，0 表示不在 MCP 进程内跑）
     pub expiry_sweep_interval_h: u32,
+    /// 候选发现模式：`rules`（纯本地规则，默认）| `hybrid`（向量辅助）
+    pub consolidation_mode: String,
+    /// 向量模式不可用时的降级策略：`rules`（降级）| `error`（报错）
+    pub consolidation_fallback: String,
+    /// 是否允许 MCP 单次请求覆盖服务端模式
+    pub consolidation_allow_mode_override: bool,
+    /// 向量模式单次扫描最多新计算的向量条目数
+    pub consolidation_embed_top_k: usize,
+    /// 向量模式语义候选的相似度下限；`None` 表示**未经真实模型标定**
+    pub consolidation_embed_min_similarity: Option<f32>,
+    /// 纯规则模式的词法候选相似度下限（Jaccard）
+    pub consolidation_lexical_min_similarity: f32,
 
     // ===== 时效与限流 =====
     pub idempotency_ttl_h: u32,
@@ -180,6 +192,25 @@ fn parse_f32(key: &str, default: f32) -> anyhow::Result<f32> {
             .trim()
             .parse::<f32>()
             .map_err(|_| anyhow::anyhow!("配置项 {} 不是合法浮点数: {}", key, v)),
+        None => Ok(default),
+    }
+}
+
+/// 解析布尔配置：仅 `true` / `1` / `yes` 为真，其余非空值一律报错
+///
+/// 与 cjs 适配层"非 0/false 即为真"的宽松语义不同：布尔开关写错时
+/// 静默取反会让"是否允许请求覆盖整合模式"这类安全开关失效，因此 fail-fast。
+fn parse_bool(key: &str, default: bool) -> anyhow::Result<bool> {
+    match var(key) {
+        Some(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" => Ok(true),
+            "false" | "0" | "no" => Ok(false),
+            other => Err(anyhow::anyhow!(
+                "配置项 {} 只能是 true/false/1/0/yes/no，当前为 {}",
+                key,
+                other
+            )),
+        },
         None => Ok(default),
     }
 }
@@ -244,6 +275,12 @@ impl Default for AppConfig {
             integrate_sim_threshold: 0.92,
             integrate_max_proposals: 100,
             expiry_sweep_interval_h: 6,
+            consolidation_mode: "rules".to_string(),
+            consolidation_fallback: "rules".to_string(),
+            consolidation_allow_mode_override: false,
+            consolidation_embed_top_k: 20,
+            consolidation_embed_min_similarity: None,
+            consolidation_lexical_min_similarity: 0.80,
             idempotency_ttl_h: 24,
             rate_limit_per_agent_rps: 50,
             max_request_bytes: 262_144,
@@ -315,6 +352,31 @@ impl AppConfig {
             parse_usize("INTEGRATE_MAX_PROPOSALS", cfg.integrate_max_proposals)?;
         cfg.expiry_sweep_interval_h =
             parse_u32("EXPIRY_SWEEP_INTERVAL_H", cfg.expiry_sweep_interval_h)?;
+
+        cfg.consolidation_mode =
+            var_or("HUB_CONSOLIDATION_MODE", &cfg.consolidation_mode).to_lowercase();
+        cfg.consolidation_fallback =
+            var_or("HUB_CONSOLIDATION_FALLBACK", &cfg.consolidation_fallback).to_lowercase();
+        cfg.consolidation_allow_mode_override = parse_bool(
+            "HUB_CONSOLIDATION_ALLOW_MODE_OVERRIDE",
+            cfg.consolidation_allow_mode_override,
+        )?;
+        cfg.consolidation_embed_top_k = parse_usize(
+            "HUB_CONSOLIDATION_EMBED_TOP_K",
+            cfg.consolidation_embed_top_k,
+        )?;
+        cfg.consolidation_embed_min_similarity = match var("HUB_CONSOLIDATION_EMBED_MIN_SIMILARITY")
+        {
+            Some(_) => Some(parse_f32(
+                "HUB_CONSOLIDATION_EMBED_MIN_SIMILARITY",
+                cfg.consolidation_embed_min_similarity.unwrap_or(0.92),
+            )?),
+            None => None,
+        };
+        cfg.consolidation_lexical_min_similarity = parse_f32(
+            "HUB_CONSOLIDATION_LEXICAL_MIN_SIMILARITY",
+            cfg.consolidation_lexical_min_similarity,
+        )?;
 
         cfg.idempotency_ttl_h = parse_u32("HUB_IDEMPOTENCY_TTL_H", cfg.idempotency_ttl_h)?;
         cfg.rate_limit_per_agent_rps =
@@ -443,6 +505,24 @@ impl AppConfig {
         if self.integrate_max_proposals == 0 {
             anyhow::bail!("INTEGRATE_MAX_PROPOSALS 必须大于 0");
         }
+
+        // 整合模式：未知值必须启动失败，绝不静默猜测（也不因配置了检索 embedding
+        // 就自动切到 hybrid——那会把记忆内容发给外部服务）
+        crate::consolidation::ConsolidationMode::parse(&self.consolidation_mode)
+            .map_err(|e| anyhow::anyhow!("HUB_CONSOLIDATION_MODE 非法: {}", e))?;
+        crate::consolidation::ConsolidationFallback::parse(&self.consolidation_fallback)
+            .map_err(|e| anyhow::anyhow!("HUB_CONSOLIDATION_FALLBACK 非法: {}", e))?;
+        if self.consolidation_embed_top_k == 0 || self.consolidation_embed_top_k > 200 {
+            anyhow::bail!("HUB_CONSOLIDATION_EMBED_TOP_K 必须落在 [1,200]");
+        }
+        if let Some(v) = self.consolidation_embed_min_similarity {
+            if !(0.0..=1.0).contains(&v) {
+                anyhow::bail!("HUB_CONSOLIDATION_EMBED_MIN_SIMILARITY 必须落在 [0,1]");
+            }
+        }
+        if !(0.0..=1.0).contains(&self.consolidation_lexical_min_similarity) {
+            anyhow::bail!("HUB_CONSOLIDATION_LEXICAL_MIN_SIMILARITY 必须落在 [0,1]");
+        }
         if self.backup_keep_count == 0 {
             anyhow::bail!("BACKUP_KEEP_COUNT 必须大于 0（至少保留 1 份）");
         }
@@ -496,7 +576,8 @@ impl AppConfig {
             "db_host={} embed_dim={} embed_provider={} embed_model={} semantic_ready={} \
              mcp_bind={} auth_bind={} \
              backup_cron={} integrate_threshold={} sweep_h={} origins={} \
-             min_score={} invite={} bootstrap_pwd={}",
+             min_score={} invite={} bootstrap_pwd={} consolidation_mode={} \
+             consolidation_fallback={} consolidation_override={} embed_top_k={}",
             db_host,
             self.embed_dim,
             self.embed_provider,
@@ -519,6 +600,10 @@ impl AppConfig {
             } else {
                 "unset"
             },
+            self.consolidation_mode,
+            self.consolidation_fallback,
+            self.consolidation_allow_mode_override,
+            self.consolidation_embed_top_k,
         )
     }
 }

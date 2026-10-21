@@ -1,6 +1,6 @@
 //! MCP 工具执行器与双模输出生成
 //!
-//! 18 个工具全部围绕三件事：**存储**（put/get/update/delete/search/list/stats/history）、
+//! 28 个工具全部围绕三件事：**存储**（put/get/update/delete/search/list/stats/history）、
 //! **备份**（backup_create/backup_list/restore）、**整合**（integrate_scan/
 //! integration_list/integration_resolve），外加命名空间共享（grant/revoke）。
 //!
@@ -74,6 +74,18 @@ fn strip_embedding(mut v: Value) -> Value {
 pub struct ConsolidationParams {
     pub sim_threshold: f32,
     pub max_proposals: usize,
+    /// 候选发现模式（默认纯本地规则整合）
+    pub mode: common::ConsolidationMode,
+    /// 向量模式不可用时的降级策略
+    pub fallback: common::ConsolidationFallback,
+    /// 是否允许 MCP 单次请求覆盖服务端模式
+    pub allow_mode_override: bool,
+    /// 向量模式单次扫描最多新计算的向量条目数
+    pub embed_top_k: usize,
+    /// 向量模式语义候选的相似度下限；`None` 表示未经真实模型标定
+    pub embed_min_similarity: Option<f32>,
+    /// 纯规则模式的词法候选相似度下限
+    pub lexical_min_similarity: f32,
 }
 
 impl Default for ConsolidationParams {
@@ -81,6 +93,12 @@ impl Default for ConsolidationParams {
         Self {
             sim_threshold: 0.92,
             max_proposals: 100,
+            mode: common::ConsolidationMode::Rules,
+            fallback: common::ConsolidationFallback::Rules,
+            allow_mode_override: false,
+            embed_top_k: 20,
+            embed_min_similarity: None,
+            lexical_min_similarity: 0.80,
         }
     }
 }
@@ -153,6 +171,32 @@ impl ToolDispatcher {
     pub fn with_coding_memory(mut self, service: Arc<mem_core::CodingMemoryService>) -> Self {
         self.coding_memory = Some(service);
         self
+    }
+
+    /// 解析请求指定的整合模式
+    ///
+    /// `HUB_CONSOLIDATION_ALLOW_MODE_OVERRIDE=false`（默认）时，调用方**不得**逐次
+    /// 切换整合模式：显式请求与服务端默认不一致 → 直接拒绝；一致 → 接受（等价于不覆盖）。
+    ///
+    /// 这道闸门放在 MCP 层：显式选择 `hybrid` 意味着允许把经脱敏的记忆文本发送到
+    /// 已配置的嵌入端点，属于管理员级别的决定，不该由单个请求决定。
+    fn resolve_requested_mode(
+        &self,
+        requested: Option<common::ConsolidationMode>,
+    ) -> Result<common::ConsolidationMode, HubError> {
+        let Some(mode) = requested else {
+            return Ok(self.consolidation.mode);
+        };
+        if !self.consolidation.allow_mode_override {
+            if mode != self.consolidation.mode {
+                return Err(HubError::InvalidArgument(format!(
+                    "服务端未开启 HUB_CONSOLIDATION_ALLOW_MODE_OVERRIDE，整合模式固定为 {}",
+                    self.consolidation.mode.as_str()
+                )));
+            }
+            return Ok(self.consolidation.mode);
+        }
+        Ok(mode)
     }
 
     /// 分发执行
@@ -509,13 +553,20 @@ impl ToolDispatcher {
     // ===== 整合 =====
 
     async fn integrate_scan(&self, auth: &AuthCtx, args: Value) -> ToolCallResult {
-        match serde_json::from_value::<mem_core::ScanRequest>(args) {
-            Ok(req) => match self.integration.scan(auth, req).await {
-                Ok(report) => {
-                    ToolCallResult::success(serde_json::to_value(&report).unwrap_or(Value::Null))
+        match serde_json::from_value::<mem_core::ScanRequest>(args.clone()) {
+            Ok(mut req) => {
+                // 模式覆盖闸门在 MCP 层：未开启覆盖时，调用方不得逐次切换整合模式
+                match self.resolve_requested_mode(req.mode) {
+                    Ok(mode) => req.mode = Some(mode),
+                    Err(e) => return ToolCallResult::error(&e),
                 }
-                Err(e) => ToolCallResult::error(&e),
-            },
+                match self.integration.scan(auth, req).await {
+                    Ok(report) => ToolCallResult::success(
+                        serde_json::to_value(&report).unwrap_or(Value::Null),
+                    ),
+                    Err(e) => ToolCallResult::error(&e),
+                }
+            }
             Err(e) => ToolCallResult::error(&HubError::InvalidArgument(format!(
                 "参数不符合 memory_integrate_scan schema: {}",
                 e
@@ -565,6 +616,8 @@ impl ToolDispatcher {
             sim_threshold: Option<f32>,
             #[serde(default)]
             auto_merge: bool,
+            #[serde(default)]
+            mode: Option<common::ConsolidationMode>,
         }
         let req = match serde_json::from_value::<Req>(args) {
             Ok(r) => r,
@@ -589,12 +642,25 @@ impl ToolDispatcher {
             return ToolCallResult::error(&HubError::InsufficientScope);
         }
 
+        // 模式覆盖闸门：未开启覆盖时，调用方不得逐次切换整合模式
+        let mode = match self.resolve_requested_mode(req.mode) {
+            Ok(m) => m,
+            Err(e) => return ToolCallResult::error(&e),
+        };
+
         let mut engine = consolidation::ConsolidationEngine::new(
             Arc::new(scoped),
             req.sim_threshold
                 .unwrap_or(self.consolidation.sim_threshold),
             self.consolidation.max_proposals,
-        );
+        )
+        .with_mode(mode, self.consolidation.fallback)
+        .with_candidate_limits(consolidation::CandidateLimits {
+            max_embed_entries: self.consolidation.embed_top_k,
+            ..consolidation::CandidateLimits::default()
+        })
+        .with_embed_min_similarity(self.consolidation.embed_min_similarity)
+        .with_lexical_min_similarity(self.consolidation.lexical_min_similarity);
         if let Some(embedder) = &self.embedder {
             engine = engine.with_embedder(embedder.clone());
         }
@@ -1914,7 +1980,6 @@ mod tests {
             arg(json!({ "namespace": "team-hub", "kind": "fact", "content": "集群配置：节点规格 8C16G" })),
         )
         .await;
-
         let stats = d
             .dispatch(
                 &auth,
@@ -2481,6 +2546,146 @@ mod tests {
             )
             .await;
         assert!(!list_res.is_error, "列出意图应成功: {:?}", list_res);
+    }
+
+    // ===== 整合模式：MCP 兼容性与覆盖闸门 =====
+
+    /// 旧客户端（不传 `mode`）必须照常工作
+    #[tokio::test]
+    async fn test_consolidate_without_mode_field_keeps_working() {
+        let (d, auth) = harness();
+        d.dispatch(
+            &auth,
+            "memory_put",
+            arg(json!({ "namespace": "ns", "kind": "fact", "content": "旧客户端也能整合" })),
+        )
+        .await;
+        d.dispatch(
+            &auth,
+            "memory_put",
+            arg(json!({ "namespace": "ns", "kind": "fact", "content": "旧客户端也能整合" })),
+        )
+        .await;
+
+        let res = d
+            .dispatch(
+                &auth,
+                "memory_consolidate",
+                arg(json!({ "namespace": "ns", "dry_run": true })),
+            )
+            .await;
+        assert!(!res.is_error, "不带 mode 的旧请求必须可用: {:?}", res);
+        let sc = res.structured_content.unwrap();
+        // 响应新增模式状态段，既有字段保持不变
+        assert_eq!(sc["mode"]["effective_mode"], "rules");
+        assert_eq!(sc["mode"]["requested_mode"], "rules");
+        assert_eq!(sc["mode"]["embedding_used"], false);
+        assert_eq!(sc["scanned"], 2);
+    }
+
+    /// 默认禁止逐请求覆盖模式：显式请求 hybrid 必须被拒绝
+    #[tokio::test]
+    async fn test_consolidate_rejects_mode_override_when_disabled() {
+        let (d, auth) = harness();
+        // 先建命名空间（首次写入即所有者）
+        d.dispatch(
+            &auth,
+            "memory_put",
+            arg(json!({ "namespace": "ns", "kind": "fact", "content": "用于建命名空间" })),
+        )
+        .await;
+        let res = d
+            .dispatch(
+                &auth,
+                "memory_consolidate",
+                arg(json!({ "namespace": "ns", "dry_run": true, "mode": "hybrid" })),
+            )
+            .await;
+        assert!(
+            res.is_error,
+            "未开启覆盖时必须拒绝逐请求切换模式: {:?}",
+            res
+        );
+        let text = res
+            .structured_content
+            .as_ref()
+            .and_then(|v| v["message_zh"].as_str())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            text.contains("HUB_CONSOLIDATION_ALLOW_MODE_OVERRIDE"),
+            "错误信息须说明如何开启：{text}"
+        );
+    }
+
+    /// 显式请求与服务端默认一致时允许（等价于不覆盖）
+    #[tokio::test]
+    async fn test_consolidate_accepts_mode_equal_to_server_default() {
+        let (d, auth) = harness();
+        d.dispatch(
+            &auth,
+            "memory_put",
+            arg(json!({ "namespace": "ns", "kind": "fact", "content": "用于建命名空间" })),
+        )
+        .await;
+        let res = d
+            .dispatch(
+                &auth,
+                "memory_consolidate",
+                arg(json!({ "namespace": "ns", "dry_run": true, "mode": "rules" })),
+            )
+            .await;
+        assert!(
+            !res.is_error,
+            "与服务端默认一致的显式模式应被接受: {:?}",
+            res
+        );
+    }
+
+    /// 开启覆盖后，显式模式被采纳
+    #[tokio::test]
+    async fn test_consolidate_accepts_mode_override_when_enabled() {
+        let (d, auth) = harness();
+        let d = d.with_consolidation(ConsolidationParams {
+            allow_mode_override: true,
+            ..ConsolidationParams::default()
+        });
+        d.dispatch(
+            &auth,
+            "memory_put",
+            arg(json!({ "namespace": "ns", "kind": "fact", "content": "用于建命名空间" })),
+        )
+        .await;
+        let res = d
+            .dispatch(
+                &auth,
+                "memory_consolidate",
+                arg(json!({ "namespace": "ns", "dry_run": true, "mode": "hybrid" })),
+            )
+            .await;
+        assert!(!res.is_error, "开启覆盖后应接受显式模式: {:?}", res);
+        let sc = res.structured_content.unwrap();
+        assert_eq!(sc["mode"]["requested_mode"], "hybrid");
+    }
+
+    /// 未知模式字符串必须被拒绝，不得静默猜测
+    #[tokio::test]
+    async fn test_consolidate_rejects_unknown_mode_value() {
+        let (d, auth) = harness();
+        d.dispatch(
+            &auth,
+            "memory_put",
+            arg(json!({ "namespace": "ns", "kind": "fact", "content": "用于建命名空间" })),
+        )
+        .await;
+        let res = d
+            .dispatch(
+                &auth,
+                "memory_consolidate",
+                arg(json!({ "namespace": "ns", "dry_run": true, "mode": "semantic" })),
+            )
+            .await;
+        assert!(res.is_error, "未知模式必须被拒绝: {:?}", res);
     }
 
     // 编译期检查：内存实现满足聚合契约

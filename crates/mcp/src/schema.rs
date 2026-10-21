@@ -1,6 +1,6 @@
 //! MCP 工具 JSON Schema 规范定义
 //!
-//! 18 个工具全部只做三件事：**存储**、**备份**、**整合**。
+//! 28 个工具全部只做三件事：**存储**、**备份**、**整合**。
 //! 每个 schema 都关闭 `additionalProperties` 并给出边界约束——
 //! 这是与调用方 Agent 的契约：schema 之外的字段一律拒绝。
 
@@ -411,6 +411,10 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                         "minimum": 0,
                         "maximum": 1,
                         "description": "覆盖默认重复判定阈值"
+                    },
+                    "mode": {
+                        "enum": ["rules", "hybrid"],
+                        "description": "候选发现模式：rules=纯本地规则整合（默认，不调用向量服务）；hybrid=向量辅助整合。默认禁止逐请求覆盖，需服务端开启 HUB_CONSOLIDATION_ALLOW_MODE_OVERRIDE"
                     }
                 }
             }),
@@ -486,6 +490,10 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                         "type": "boolean",
                         "default": false,
                         "description": "是否对高相似度重复自动合并"
+                    },
+                    "mode": {
+                        "enum": ["rules", "hybrid"],
+                        "description": "候选发现模式：rules=纯本地规则整合（默认，不调用向量服务）；hybrid=向量辅助整合。默认禁止逐请求覆盖，需服务端开启 HUB_CONSOLIDATION_ALLOW_MODE_OVERRIDE"
                     }
                 }
             }),

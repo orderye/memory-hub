@@ -1,18 +1,57 @@
-//! 整合中枢核心引擎：统一协调检测、融合与策略调度
+//! 整合中枢核心引擎：统一协调候选发现、关系分类、提案与策略调度
+//!
+//! 流水线（模式差异只在候选层）：
+//!
+//! ```text
+//! 解析有效模式（requested → effective，含降级）
+//!   → 读取候选空间（账户/命名空间/有效期/状态）
+//!   → 候选发现（Rules 或 Hybrid）——每次扫描只算一次
+//!   → 关系分类与冲突检查（共享决策层）
+//!   → 自动合并安全门槛 / 待审提案
+//!   → 证据、审计、统计与版本历史
+//! ```
 
+use crate::candidates::hybrid::HybridCandidateFinder;
+use crate::candidates::rules::RulesCandidateFinder;
+use crate::candidates::{CandidateContext, CandidateFinder, CandidateLimits, CandidateThresholds};
 use crate::detectors::{ConflictDetector, DuplicateDetector, StalenessDetector};
 use crate::merger::{ContentMerger, TieredMerger};
 use crate::policy::AutoPolicy;
 use crate::types::{ConsolidationReport, ConsolidationStats};
 use chrono::Utc;
-use common::{AgentId, HubError, Result};
+use common::{
+    AgentId, ConsolidationFallback, ConsolidationMode, ConsolidationModeStatus, HubError, Result,
+};
 use mem_core::{
     Embedder, IntegrationKind, IntegrationProposal, MemoryEntry, MemoryHubStore, MemoryStatus,
     ProposalStatus, ResolveAction, ResolveRequest, VersionChange,
 };
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
 use uuid::Uuid;
+
+/// 命名空间级互斥锁登记表
+///
+/// 同一进程内对同一命名空间的整合扫描串行化，避免并发扫描重复产出互相冲突的提案。
+/// 跨进程并发（MCP 进程与 backup-worker 进程同时扫同一命名空间）无法用进程内锁覆盖，
+/// 彻底方案是数据库侧的部分唯一索引，属于后续单独评估项。
+static NAMESPACE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    OnceLock::new();
+
+fn namespace_lock(namespace: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let registry = NAMESPACE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = registry.lock().unwrap_or_else(|e| e.into_inner());
+    map.entry(namespace.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+/// 一次扫描的分析结果（候选只算一次，供统计与提案共用）
+struct Analysis {
+    conflicts: Vec<crate::types::ConflictGroup>,
+    duplicates: Vec<crate::types::DuplicateGroup>,
+    status: ConsolidationModeStatus,
+}
 
 /// 整合中枢引擎
 #[derive(Clone)]
@@ -24,8 +63,18 @@ pub struct ConsolidationEngine {
     merger: Arc<dyn ContentMerger>,
     policy: AutoPolicy,
     max_proposals: usize,
-    /// 合并后重算幸存者向量用；未配置时合并会清空幸存者向量而不是留下与正文不符的旧向量
+    /// 合并后重算幸存者向量用；未配置时合并会清空旧向量而不是留下与正文不符的旧向量
     embedder: Option<Arc<dyn Embedder>>,
+    /// 候选发现模式（默认纯本地规则）
+    mode: ConsolidationMode,
+    /// 向量模式不可用时的降级策略
+    fallback: ConsolidationFallback,
+    /// 候选规模限制
+    limits: CandidateLimits,
+    /// 词法候选阈值
+    lexical_min_similarity: f32,
+    /// 向量候选的相似度下限（None = 未经真实模型标定）
+    embed_min_similarity: Option<f32>,
 }
 
 impl ConsolidationEngine {
@@ -40,12 +89,45 @@ impl ConsolidationEngine {
             policy: AutoPolicy::default(),
             max_proposals: max_proposals.max(1),
             embedder: None,
+            mode: ConsolidationMode::Rules,
+            fallback: ConsolidationFallback::Rules,
+            limits: CandidateLimits::default(),
+            lexical_min_similarity: CandidateThresholds::default().lexical_min_similarity,
+            embed_min_similarity: None,
         }
     }
 
-    /// 注入嵌入器：合并后重算幸存者向量
+    /// 注入嵌入器：合并后重算向量
     pub fn with_embedder(mut self, embedder: Arc<dyn Embedder>) -> Self {
         self.embedder = Some(embedder);
+        self
+    }
+
+    /// 设置候选发现模式与降级策略
+    pub fn with_mode(mut self, mode: ConsolidationMode, fallback: ConsolidationFallback) -> Self {
+        self.mode = mode;
+        self.fallback = fallback;
+        self
+    }
+
+    /// 设置候选规模限制
+    pub fn with_candidate_limits(mut self, limits: CandidateLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// 设置词法候选阈值
+    pub fn with_lexical_min_similarity(mut self, threshold: f32) -> Self {
+        self.lexical_min_similarity = threshold.clamp(0.0, 1.0);
+        self
+    }
+
+    /// 设置向量候选的相似度下限
+    ///
+    /// `None` 表示**未经真实模型标定**：此时回落到去重/整合阈值，
+    /// 并在运行状态里标记 `similarity_threshold_calibrated=false`。
+    pub fn with_embed_min_similarity(mut self, threshold: Option<f32>) -> Self {
+        self.embed_min_similarity = threshold.map(|t| t.clamp(0.0, 1.0));
         self
     }
 
@@ -66,16 +148,152 @@ impl ConsolidationEngine {
         cloned
     }
 
-    /// 计算命名空间的记忆整合健康度统计报告
-    pub async fn calculate_stats(&self, namespace: &str) -> Result<ConsolidationStats> {
-        let entries = self
+    /// 当前配置的模式
+    pub fn mode(&self) -> ConsolidationMode {
+        self.mode
+    }
+
+    /// 本引擎是否允许调用嵌入服务
+    ///
+    /// **只有向量模式且嵌入器提供真实语义信号时才允许**。
+    /// 纯规则模式下这是结构性保证：整合链路一次嵌入调用都不会发出。
+    fn embedding_allowed(&self) -> bool {
+        self.mode == ConsolidationMode::Hybrid
+            && self
+                .embedder
+                .as_ref()
+                .map(|e| e.provides_semantic_signal())
+                .unwrap_or(false)
+    }
+
+    /// 解析有效模式：请求模式 → 实际模式（含降级）
+    fn resolve_mode(&self) -> Result<(Arc<dyn CandidateFinder>, ConsolidationModeStatus)> {
+        match self.mode {
+            ConsolidationMode::Rules => Ok((
+                Arc::new(RulesCandidateFinder::new()),
+                ConsolidationModeStatus::rules(),
+            )),
+            ConsolidationMode::Hybrid => {
+                let Some(embedder) = self.embedder.clone() else {
+                    return self.apply_fallback("embedding_provider_not_configured");
+                };
+                if !embedder.provides_semantic_signal() {
+                    return self.apply_fallback("embedding_provider_not_ready");
+                }
+                Ok((
+                    Arc::new(HybridCandidateFinder::new(embedder)),
+                    ConsolidationModeStatus::hybrid(0, 0),
+                ))
+            }
+        }
+    }
+
+    /// 降级处理：`rules` 降级为规则模式；`error` 直接失败且不执行任何整合
+    fn apply_fallback(
+        &self,
+        reason: &str,
+    ) -> Result<(Arc<dyn CandidateFinder>, ConsolidationModeStatus)> {
+        match self.fallback {
+            ConsolidationFallback::Rules => {
+                tracing::warn!(
+                    requested_mode = "hybrid",
+                    reason,
+                    "向量整合不可用，按配置降级为纯规则整合"
+                );
+                Ok((
+                    Arc::new(RulesCandidateFinder::new()),
+                    ConsolidationModeStatus::fallback_to_rules(reason),
+                ))
+            }
+            ConsolidationFallback::Error => Err(HubError::Internal(anyhow::anyhow!(
+                "向量整合不可用（{}），按 HUB_CONSOLIDATION_FALLBACK=error 拒绝执行整合",
+                reason
+            ))),
+        }
+    }
+
+    /// 构造候选阈值
+    ///
+    /// 阈值梯度必须单调：语义冲突下界 < 去重/整合阈值 < 自动合并阈值。
+    /// 请求覆盖的去重阈值若低于语义冲突下界，会让"相似到 0.92 以上算重复、
+    /// 而不是冲突"这条规则失效，因此这里强制抬到语义阈值之上。
+    fn thresholds(&self, sim_threshold: Option<f32>) -> CandidateThresholds {
+        let semantic = self.conflict_detector.semantic_sim_threshold;
+        let duplicate = sim_threshold
+            .unwrap_or(self.duplicate_detector.sim_threshold)
+            .clamp(0.0, 1.0)
+            .max(semantic + 0.01);
+        CandidateThresholds {
+            embed_min_similarity: self.embed_min_similarity,
+            lexical_min_similarity: self.lexical_min_similarity,
+            duplicate_sim_threshold: duplicate,
+            semantic_sim_threshold: semantic,
+            divergence_threshold: self.conflict_detector.divergence_threshold,
+        }
+    }
+
+    /// 载入命名空间内的活跃条目
+    async fn load_active(&self, namespace: &str) -> Result<Vec<MemoryEntry>> {
+        Ok(self
             .store
             .all_in_namespace(namespace, false)
             .await?
             .into_iter()
             .filter(|e| e.status == MemoryStatus::Active)
-            .collect::<Vec<_>>();
+            .collect::<Vec<_>>())
+    }
 
+    /// 一次分析：候选只算一次，统计与提案共用
+    async fn analyze(
+        &self,
+        namespace: &str,
+        entries: &[MemoryEntry],
+        sim_threshold: Option<f32>,
+    ) -> Result<Analysis> {
+        let (finder, mut status) = self.resolve_mode()?;
+        let thresholds = self.thresholds(sim_threshold);
+        status.similarity_threshold_calibrated = thresholds.embed_threshold_calibrated();
+
+        if entries.len() < 2 {
+            return Ok(Analysis {
+                conflicts: Vec::new(),
+                duplicates: Vec::new(),
+                status,
+            });
+        }
+
+        let ctx = CandidateContext {
+            store: self.store.as_ref(),
+            namespace,
+            entries,
+            thresholds,
+            limits: self.limits,
+        };
+        let outcome = finder.find_candidates(&ctx).await?;
+        status.embedding_calls = outcome.embedding_calls;
+        status.embedded_entries = outcome.embedded_entries;
+        if status.effective_mode == ConsolidationMode::Hybrid.as_str() {
+            status.embedding_used = true;
+            status.candidate_strategy = "local_rules+embedding".to_string();
+        }
+
+        let conflicts = self
+            .conflict_detector
+            .group_candidates(entries, &outcome.pairs);
+        let duplicates = self
+            .duplicate_detector
+            .group_candidates(entries, &outcome.pairs);
+
+        Ok(Analysis {
+            conflicts,
+            duplicates,
+            status,
+        })
+    }
+
+    /// 计算命名空间的记忆整合健康度统计报告
+    pub async fn calculate_stats(&self, namespace: &str) -> Result<ConsolidationStats> {
+        let entries = self.load_active(namespace).await?;
         let total_active = entries.len();
         if total_active == 0 {
             return Ok(ConsolidationStats {
@@ -86,19 +304,28 @@ impl ConsolidationEngine {
         }
 
         let now = Utc::now();
-        let duplicates = self.duplicate_detector.detect_in_entries(&entries);
-        let conflicts = self.conflict_detector.detect_in_entries(&entries);
+        let analysis = self.analyze(namespace, &entries, None).await?;
         let stale = self.staleness_detector.detect_in_entries(&entries, now);
+        Ok(self.build_stats(namespace, total_active, &analysis, &stale))
+    }
 
+    /// 汇总健康度指标
+    fn build_stats(
+        &self,
+        namespace: &str,
+        total_active: usize,
+        analysis: &Analysis,
+        stale: &[crate::types::StaleEntry],
+    ) -> ConsolidationStats {
         let mut dup_entries = HashSet::new();
-        for d in &duplicates {
+        for d in &analysis.duplicates {
             for id in &d.member_ids {
                 dup_entries.insert(*id);
             }
         }
 
         let mut conf_entries = HashSet::new();
-        for c in &conflicts {
+        for c in &analysis.conflicts {
             for id in &c.member_ids {
                 conf_entries.insert(*id);
             }
@@ -125,19 +352,19 @@ impl ConsolidationEngine {
                 + 0.15 * (stale_entries_count as f32 / total_active as f32)))
             .clamp(0.0, 1.0);
 
-        Ok(ConsolidationStats {
+        ConsolidationStats {
             namespace: namespace.to_string(),
             total_active,
             duplicate_entries_count,
-            duplicate_groups_count: duplicates.len(),
+            duplicate_groups_count: analysis.duplicates.len(),
             conflict_entries_count,
-            conflict_groups_count: conflicts.len(),
+            conflict_groups_count: analysis.conflicts.len(),
             stale_entries_count,
             stale_archive_candidates,
             redundancy_ratio,
             conflict_ratio,
             health_score,
-        })
+        }
     }
 
     /// 执行一键整合扫描与提案建立（根据策略处理自动合并与提案持久化）
@@ -148,15 +375,17 @@ impl ConsolidationEngine {
         sim_threshold: Option<f32>,
         operator_agent: &AgentId,
     ) -> Result<ConsolidationReport> {
-        let entries = self
-            .store
-            .all_in_namespace(namespace, false)
-            .await?
-            .into_iter()
-            .filter(|e| e.status == MemoryStatus::Active)
-            .collect::<Vec<_>>();
+        // 同命名空间并发扫描串行化，避免重复产出互相冲突的提案
+        let scan_lock = namespace_lock(namespace);
+        let _guard = scan_lock.lock().await;
 
-        let stats = self.calculate_stats(namespace).await?;
+        let entries = self.load_active(namespace).await?;
+        let analysis = self.analyze(namespace, &entries, sim_threshold).await?;
+
+        let now = Utc::now();
+        let stale = self.staleness_detector.detect_in_entries(&entries, now);
+        let stats = self.build_stats(namespace, entries.len(), &analysis, &stale);
+
         let mut report = ConsolidationReport {
             namespace: namespace.to_string(),
             scanned: entries.len(),
@@ -166,18 +395,18 @@ impl ConsolidationEngine {
             auto_merged: 0,
             proposals: Vec::new(),
             stats,
+            mode: analysis.status.clone(),
         };
 
         if entries.len() < 2 {
             return Ok(report);
         }
 
-        // 1. 识别冲突组
-        let conflicts = self.conflict_detector.detect_in_entries(&entries);
+        // 1. 冲突组
         let mut conflict_members: HashSet<Uuid> = HashSet::new();
         let mut new_proposals = Vec::new();
 
-        for c in conflicts {
+        for c in &analysis.conflicts {
             for id in &c.member_ids {
                 conflict_members.insert(*id);
             }
@@ -191,24 +420,25 @@ impl ConsolidationEngine {
                 suggested_survivor: Some(c.suggested_survivor),
                 similarity: 0.0,
                 status: ProposalStatus::Open,
-                resolution_note: Some(c.description),
+                resolution_note: Some(c.description.clone()),
                 created_at: Utc::now(),
                 resolved_at: None,
+                metadata: proposal_metadata(
+                    c.relation,
+                    c.source,
+                    &c.reason_code,
+                    &analysis.status,
+                    Some(c.divergence),
+                ),
             });
         }
 
-        // 2. 识别重复组（剔除已被包含进冲突的成员，避免同一个条目双重提案）
-        let detector = if let Some(thresh) = sim_threshold {
-            DuplicateDetector::new(thresh)
-        } else {
-            self.duplicate_detector.clone()
-        };
-
-        let duplicates = detector.detect_in_entries(&entries);
-        for d in duplicates {
+        // 2. 重复组（剔除已被包含进冲突的成员，避免同一个条目双重提案）
+        for d in &analysis.duplicates {
             let filtered_members: Vec<Uuid> = d
                 .member_ids
-                .into_iter()
+                .iter()
+                .copied()
                 .filter(|id| !conflict_members.contains(id))
                 .collect();
 
@@ -216,11 +446,14 @@ impl ConsolidationEngine {
                 continue;
             }
 
-            // 检查自动合并策略
+            // 自动合并门槛：关系类型 + 相似度 + 成员数（语义候选永远不自动合并）
+            let eligibility = crate::policy::merge_eligibility(d.relation);
             if !dry_run
-                && self
-                    .policy
-                    .should_auto_merge(d.max_similarity, filtered_members.len())
+                && self.policy.should_auto_merge(
+                    eligibility,
+                    d.max_similarity,
+                    filtered_members.len(),
+                )
                 && self
                     .execute_merge(
                         namespace,
@@ -249,6 +482,13 @@ impl ConsolidationEngine {
                 resolution_note: None,
                 created_at: Utc::now(),
                 resolved_at: None,
+                metadata: proposal_metadata(
+                    d.relation,
+                    d.source,
+                    &d.reason_code,
+                    &analysis.status,
+                    Some(d.max_similarity),
+                ),
             });
         }
 
@@ -280,11 +520,6 @@ impl ConsolidationEngine {
             report.proposals.push(proposal);
         }
 
-        // 重新刷新统计
-        report.stats = self
-            .calculate_stats(namespace)
-            .await
-            .unwrap_or(report.stats);
         Ok(report)
     }
 
@@ -298,6 +533,10 @@ impl ConsolidationEngine {
         if proposal.status != ProposalStatus::Open {
             return Err(HubError::Conflict);
         }
+
+        // 与扫描共用命名空间互斥，避免扫描与裁决交叉
+        let resolve_lock = namespace_lock(&proposal.namespace);
+        let _guard = resolve_lock.lock().await;
 
         let now = Utc::now();
         match req.action {
@@ -375,6 +614,7 @@ impl ConsolidationEngine {
 
         // 1. 更新幸存者
         let mut updated_survivor = survivor_entry;
+        let content_changed = merged_output.content != updated_survivor.content;
         updated_survivor.content = merged_output.content;
         updated_survivor.tags = merged_output.tags;
         updated_survivor.metadata = merged_output.metadata;
@@ -383,24 +623,38 @@ impl ConsolidationEngine {
         // 融合后正文已变，幸存者身上的旧向量不再代表新内容：留着它会污染
         // 检索的相似度维度，并让下一轮扫描把同一批条目继续判成重复。
         // 配了嵌入器就重算，没配则清空（宁可少一路召回，也不留错的向量）。
-        match &self.embedder {
-            Some(em) => match em.embed(&[updated_survivor.content.clone()]).await {
-                Ok(mut vectors) if !vectors.is_empty() => {
-                    let mut v = vectors.remove(0);
-                    mem_core::l2_normalize(&mut v);
-                    updated_survivor.embedding = Some(v);
-                    updated_survivor.embedding_model = Some(em.model_id().to_string());
+        //
+        // **纯规则模式下的处理**：正文未变时保留原向量（仍然有效，一次嵌入调用都不需要）；
+        // 正文已变时清空向量——规则模式不得为了"补齐向量"调用嵌入服务
+        // （这会让 B 模式的 embedding 调用数不再是 0）。该条目此后退化为词法可检索，
+        // 直到它被再次写入时重建向量。
+        if content_changed {
+            if self.embedding_allowed() {
+                let em = self
+                    .embedder
+                    .as_ref()
+                    .expect("embedding_allowed 已保证嵌入器存在");
+                match em.embed(&[updated_survivor.content.clone()]).await {
+                    Ok(mut vectors) if !vectors.is_empty() => {
+                        let mut v = vectors.remove(0);
+                        mem_core::l2_normalize(&mut v);
+                        updated_survivor.embedding = Some(v);
+                        updated_survivor.embedding_model = Some(em.model_id().to_string());
+                    }
+                    other => {
+                        tracing::warn!(
+                            memory_id = %updated_survivor.id,
+                            embedding_empty = other.is_ok(),
+                            "合并后重嵌入失败，已清空该条目向量（下次写入时重建）"
+                        );
+                        updated_survivor.embedding = None;
+                    }
                 }
-                other => {
-                    tracing::warn!(
-                        memory_id = %updated_survivor.id,
-                        embedding_empty = other.is_ok(),
-                        "合并后重嵌入失败，已清空该条目向量（下次写入时重建）"
-                    );
-                    updated_survivor.embedding = None;
-                }
-            },
-            None => {
+            } else {
+                tracing::info!(
+                    memory_id = %updated_survivor.id,
+                    "纯规则模式合并：正文已变且不调用嵌入服务，已清空该条目向量（下次写入时重建）"
+                );
                 updated_survivor.embedding = None;
             }
         }
@@ -452,4 +706,26 @@ impl ConsolidationEngine {
 
         Ok(saved)
     }
+}
+
+/// 构造提案溯源元数据
+///
+/// 只记录关系类型、来源、原因码与模式，**不记录任何原始记忆文本、令牌或向量输入**。
+fn proposal_metadata(
+    relation: crate::candidates::CandidateRelation,
+    source: crate::candidates::CandidateSource,
+    reason_code: &str,
+    status: &ConsolidationModeStatus,
+    similarity: Option<f32>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "relation": relation.as_str(),
+        "candidate_source": source.as_str(),
+        "reason_code": reason_code,
+        "mode": status.effective_mode,
+        "requested_mode": status.requested_mode,
+        "strategy_version": status.strategy_version,
+        "fallback_applied": status.fallback_applied,
+        "similarity": similarity,
+    })
 }

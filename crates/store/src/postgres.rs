@@ -208,6 +208,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "20261019000010_evidence_retention",
         include_str!("../migrations/20261019000010_evidence_retention.sql"),
     ),
+    (
+        "20261021000011_consolidation_proposal_metadata",
+        include_str!("../migrations/20261021000011_consolidation_proposal_metadata.sql"),
+    ),
 ];
 
 /// PostgreSQL 四合一存储
@@ -827,6 +831,9 @@ impl PostgresHubStore {
             resolution_note: r.try_get("resolution_note").ok().flatten(),
             created_at: r.try_get("created_at").pg()?,
             resolved_at: r.try_get("resolved_at").ok().flatten(),
+            metadata: r
+                .try_get::<serde_json::Value, _>("metadata")
+                .unwrap_or(serde_json::Value::Object(Default::default())),
         })
     }
 
@@ -1323,8 +1330,8 @@ impl mem_core::IntegrationStore for PostgresHubStore {
         sqlx::query(
             r#"
             insert into integration_proposals
-              (id, namespace, kind, member_ids, suggested_survivor, similarity, status, resolution_note, created_at, resolved_at)
-            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+              (id, namespace, kind, member_ids, suggested_survivor, similarity, status, resolution_note, created_at, resolved_at, metadata)
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             on conflict (id) do update set
               status = excluded.status, resolution_note = excluded.resolution_note,
               resolved_at = excluded.resolved_at, suggested_survivor = excluded.suggested_survivor
@@ -1345,6 +1352,7 @@ impl mem_core::IntegrationStore for PostgresHubStore {
         .bind(&p.resolution_note)
         .bind(p.created_at)
         .bind(p.resolved_at)
+        .bind(&p.metadata)
         .execute(&self.pool)
         .await
         .pg()?;
@@ -1354,7 +1362,7 @@ impl mem_core::IntegrationStore for PostgresHubStore {
     async fn get_proposal(&self, id: Uuid) -> Result<IntegrationProposal> {
         let row = sqlx::query(
             r#"
-            select id, namespace, kind, member_ids, suggested_survivor, similarity, status, resolution_note, created_at, resolved_at
+            select id, namespace, kind, member_ids, suggested_survivor, similarity, status, resolution_note, created_at, resolved_at, metadata
             from integration_proposals where id = $1
             "#,
         )
@@ -1375,7 +1383,7 @@ impl mem_core::IntegrationStore for PostgresHubStore {
             Some(s) => {
                 sqlx::query(
                     r#"
-                    select id, namespace, kind, member_ids, suggested_survivor, similarity, status, resolution_note, created_at, resolved_at
+                    select id, namespace, kind, member_ids, suggested_survivor, similarity, status, resolution_note, created_at, resolved_at, metadata
                     from integration_proposals where namespace = $1 and status = $2
                     order by created_at desc
                     "#,
@@ -1394,7 +1402,7 @@ impl mem_core::IntegrationStore for PostgresHubStore {
             None => {
                 sqlx::query(
                     r#"
-                    select id, namespace, kind, member_ids, suggested_survivor, similarity, status, resolution_note, created_at, resolved_at
+                    select id, namespace, kind, member_ids, suggested_survivor, similarity, status, resolution_note, created_at, resolved_at, metadata
                     from integration_proposals where namespace = $1
                     order by created_at desc
                     "#,
@@ -3027,7 +3035,7 @@ mod tests {
 
     #[test]
     fn test_migrations_registered() {
-        assert_eq!(MIGRATIONS.len(), 10);
+        assert_eq!(MIGRATIONS.len(), 11);
         assert!(MIGRATIONS[0].0.starts_with("20261011"));
         // 迁移清单必须按版本号字典序排列（执行顺序依赖于此）
         for w in MIGRATIONS.windows(2) {

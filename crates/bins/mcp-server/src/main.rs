@@ -134,12 +134,37 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             .with_retriever(retriever),
     );
     let backup_service = Arc::new(DefaultBackupService::new(store.clone(), access.clone()));
-    let integration_service = Arc::new(DefaultIntegrationService::new(
-        store.clone(),
-        access.clone(),
-        cfg.integrate_sim_threshold,
-        cfg.integrate_max_proposals,
-    ));
+    // 整合模式来自配置：默认纯本地规则整合，不会因为配置了检索 embedding 就自动启用向量整合
+    let consolidation_mode = common::ConsolidationMode::parse(&cfg.consolidation_mode)
+        .map_err(|e| anyhow::anyhow!("HUB_CONSOLIDATION_MODE 非法: {}", e))?;
+    let consolidation_fallback = common::ConsolidationFallback::parse(&cfg.consolidation_fallback)
+        .map_err(|e| anyhow::anyhow!("HUB_CONSOLIDATION_FALLBACK 非法: {}", e))?;
+    let consolidation_limits = consolidation::CandidateLimits {
+        max_embed_entries: cfg.consolidation_embed_top_k,
+        ..consolidation::CandidateLimits::default()
+    };
+    info!(
+        mode = %consolidation_mode.as_str(),
+        fallback = %consolidation_fallback.as_str(),
+        allow_mode_override = cfg.consolidation_allow_mode_override,
+        embed_top_k = cfg.consolidation_embed_top_k,
+        embed_min_similarity_calibrated = cfg.consolidation_embed_min_similarity.is_some(),
+        "记忆整合候选策略已就绪"
+    );
+    let integration_service = Arc::new(
+        DefaultIntegrationService::new(
+            store.clone(),
+            access.clone(),
+            cfg.integrate_sim_threshold,
+            cfg.integrate_max_proposals,
+        )
+        .with_mode(
+            consolidation_mode,
+            consolidation_fallback,
+            consolidation_limits,
+            cfg.consolidation_lexical_min_similarity,
+        ),
+    );
 
     let working_memory = Arc::new(WorkingMemoryService::new(store.clone()));
     let coding_memory = Arc::new(CodingMemoryService::new(store.clone()));
@@ -170,6 +195,12 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         .with_consolidation(mcp::ConsolidationParams {
             sim_threshold: cfg.integrate_sim_threshold,
             max_proposals: cfg.integrate_max_proposals,
+            mode: consolidation_mode,
+            fallback: consolidation_fallback,
+            allow_mode_override: cfg.consolidation_allow_mode_override,
+            embed_top_k: cfg.consolidation_embed_top_k,
+            embed_min_similarity: cfg.consolidation_embed_min_similarity,
+            lexical_min_similarity: cfg.consolidation_lexical_min_similarity,
         })
         .with_embedder(embedder.clone())
         .with_working_memory(working_memory)
@@ -227,6 +258,13 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
                 .iter()
                 .map(|(k, v)| (k.clone(), *v))
                 .collect(),
+            consolidation: mcp::transport::ConsolidationCapability {
+                mode: consolidation_mode.as_str().to_string(),
+                fallback: consolidation_fallback.as_str().to_string(),
+                allow_mode_override: cfg.consolidation_allow_mode_override,
+                vector_ready: cfg.semantic_ready(),
+                threshold_calibrated: cfg.consolidation_embed_min_similarity.is_some(),
+            },
         }),
     };
 

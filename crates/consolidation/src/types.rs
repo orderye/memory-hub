@@ -1,5 +1,7 @@
 //! 整合中枢领域类型定义
 
+use crate::candidates::{CandidateRelation, CandidateSource};
+use common::ConsolidationModeStatus;
 use mem_core::{IntegrationProposal, MemoryKind};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -12,6 +14,12 @@ pub struct DuplicateGroup {
     pub member_ids: Vec<Uuid>,
     pub max_similarity: f32,
     pub suggested_survivor: Uuid,
+    /// 组内最强的候选关系（决定该组是否允许自动合并）
+    pub relation: CandidateRelation,
+    /// 候选来源
+    pub source: CandidateSource,
+    /// 稳定原因码（不含原始文本）
+    pub reason_code: String,
 }
 
 /// 冲突类型
@@ -36,6 +44,12 @@ pub struct ConflictGroup {
     pub divergence: f32,
     pub description: String,
     pub suggested_survivor: Uuid,
+    /// 候选关系
+    pub relation: CandidateRelation,
+    /// 候选来源
+    pub source: CandidateSource,
+    /// 稳定原因码（不含原始文本）
+    pub reason_code: String,
 }
 
 /// 陈旧记忆评估
@@ -86,4 +100,6 @@ pub struct ConsolidationReport {
     pub auto_merged: usize,
     pub proposals: Vec<IntegrationProposal>,
     pub stats: ConsolidationStats,
+    /// 本次运行的候选策略状态（请求模式 / 实际模式 / 降级 / embedding 调用计数）
+    pub mode: ConsolidationModeStatus,
 }

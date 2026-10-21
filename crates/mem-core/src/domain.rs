@@ -1411,6 +1411,12 @@ pub struct IntegrationProposal {
     pub created_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_at: Option<DateTime<Utc>>,
+    /// 提案溯源：候选关系、来源、原因码、整合模式与策略版本
+    ///
+    /// 只记录结构化元数据，**不记录任何原始记忆文本、令牌或向量输入**。
+    /// 旧记录没有该字段时读作空对象（`{}`），保证向后兼容。
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub metadata: serde_json::Value,
 }
 
 /// 检索结果（带打分）

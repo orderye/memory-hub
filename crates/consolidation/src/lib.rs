@@ -7,6 +7,7 @@
 //! - 分层内容融合（标签、元数据与补充事实去重拼接）
 //! - 自动化策略引擎（Manual / SemiAuto / FullAuto）
 
+pub mod candidates;
 pub mod detectors;
 pub mod engine;
 pub mod merger;
@@ -14,10 +15,16 @@ pub mod policy;
 pub mod service;
 pub mod types;
 
+pub use candidates::hybrid::HybridCandidateFinder;
+pub use candidates::rules::RulesCandidateFinder;
+pub use candidates::{
+    dedup_pairs, CandidateContext, CandidateFinder, CandidateLimits, CandidateOutcome,
+    CandidatePair, CandidateRelation, CandidateSource, CandidateThresholds,
+};
 pub use detectors::{ConflictDetector, DuplicateDetector, StalenessDetector, UnionFind};
 pub use engine::ConsolidationEngine;
 pub use merger::{ContentMerger, MergeStrategy, MergedOutput, TieredMerger};
-pub use policy::{AutoPolicy, PolicyMode};
+pub use policy::{merge_eligibility, AutoPolicy, MergeEligibility, PolicyMode};
 pub use service::DefaultIntegrationService;
 pub use types::{
     ConflictGroup, ConflictKind, ConsolidationReport, ConsolidationStats, DuplicateGroup,
@@ -68,6 +75,7 @@ mod tests {
     #[tokio::test]
     async fn test_duplicate_detection_and_consolidation_flow() {
         let store = Arc::new(InMemoryHubStore::new());
+        // 默认模式为纯本地规则整合：原文完全相同即为精确重复候选
         let e1 = make_test_entry(
             "ns",
             "PostgreSQL 是开源关系型数据库",
@@ -76,7 +84,7 @@ mod tests {
         );
         let e2 = make_test_entry(
             "ns",
-            "PostgreSQL 是开源关系型数据库系统",
+            "PostgreSQL 是开源关系型数据库",
             None,
             Some(vec![0.99, 0.01]),
         );
@@ -146,5 +154,61 @@ mod tests {
         // 验证被合并条目状态
         let active = store.all_in_namespace("ns", false).await.unwrap();
         assert_eq!(active.len(), 1);
+    }
+
+    /// 默认模式是纯本地规则整合：即便注入了嵌入器，embedding 调用数也必须是 0
+    #[tokio::test]
+    async fn test_rules_mode_never_calls_embedding() {
+        let store = Arc::new(InMemoryHubStore::new());
+        let e1 = make_test_entry("ns", "完全相同的事实", None, Some(vec![1.0, 0.0]));
+        let e2 = make_test_entry("ns", "完全相同的事实", None, Some(vec![1.0, 0.0]));
+        store.insert(&e1).await.unwrap();
+        store.insert(&e2).await.unwrap();
+
+        let counter = Arc::new(mem_core::testing::CountingEmbedder::new(Arc::new(
+            mem_core::testing::TestEmbedder::new(8),
+        )));
+        let engine = ConsolidationEngine::new(store, 0.92, 10)
+            .with_mode(
+                common::ConsolidationMode::Rules,
+                common::ConsolidationFallback::Rules,
+            )
+            .with_embedder(counter.clone());
+        let report = engine
+            .consolidate_namespace("ns", false, None, &"admin-agent".to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(counter.call_count(), 0, "纯规则模式不得调用嵌入服务");
+        assert_eq!(report.mode.effective_mode, "rules");
+        assert!(!report.mode.embedding_used);
+        assert_eq!(report.proposals_created, 1);
+    }
+
+    /// 语义近重复即使相似度极高也不得自动合并（关系门槛优先于分数门槛）
+    #[tokio::test]
+    async fn test_semantic_candidate_is_not_auto_merged() {
+        let store = Arc::new(InMemoryHubStore::new());
+        // 两条内容不同但向量几乎相同：若按旧逻辑（只看相似度）会被自动合并
+        let e1 = make_test_entry("ns", "部署在上海可用区", None, Some(vec![1.0, 0.0]));
+        let e2 = make_test_entry("ns", "部署在北京可用区", None, Some(vec![1.0, 0.0]));
+        store.insert(&e1).await.unwrap();
+        store.insert(&e2).await.unwrap();
+
+        let policy = AutoPolicy {
+            mode: PolicyMode::SemiAuto,
+            auto_merge_threshold: 0.90,
+            auto_merge_max_members: 3,
+            ..Default::default()
+        };
+        let engine = ConsolidationEngine::new(store.clone(), 0.90, 10).with_policy(policy);
+        let report = engine
+            .consolidate_namespace("ns", false, None, &"admin-agent".to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(report.auto_merged, 0, "语义近重复不得自动合并");
+        let active = store.all_in_namespace("ns", false).await.unwrap();
+        assert_eq!(active.len(), 2, "两条记忆都应保持活跃");
     }
 }

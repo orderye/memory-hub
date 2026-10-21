@@ -16,7 +16,7 @@ use common::init_tracing;
 use mem_core::MemoryHubStore;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use worker::{BackupJob, EvidenceRetentionJob, IntegrationScanJob};
 
 #[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
@@ -47,12 +47,44 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.backup_retention_days,
         "backup-worker",
     ));
-    let integration_job = Arc::new(IntegrationScanJob::new(
+    // 整合扫描模式来自配置：默认纯本地规则整合（后台作业同样不默认调用向量服务）
+    let consolidation_mode = common::ConsolidationMode::parse(&cfg.consolidation_mode)
+        .map_err(|e| anyhow!("HUB_CONSOLIDATION_MODE 非法: {}", e))?;
+    let consolidation_fallback = common::ConsolidationFallback::parse(&cfg.consolidation_fallback)
+        .map_err(|e| anyhow!("HUB_CONSOLIDATION_FALLBACK 非法: {}", e))?;
+    let consolidation_limits = consolidation::CandidateLimits {
+        max_embed_entries: cfg.consolidation_embed_top_k,
+        ..consolidation::CandidateLimits::default()
+    };
+    let mut integration_job = IntegrationScanJob::new(
         store.clone(),
         cfg.integrate_sim_threshold,
         cfg.integrate_max_proposals,
         "backup-worker",
-    ));
+    )
+    .with_mode(
+        consolidation_mode,
+        consolidation_fallback,
+        consolidation_limits,
+        cfg.consolidation_lexical_min_similarity,
+    );
+    // 向量模式才注入嵌入器：纯规则模式下后台作业一次嵌入调用都不会发出。
+    // 嵌入器不可用时按配置降级（fallback=rules）或在扫描时报错（fallback=error）。
+    if consolidation_mode == common::ConsolidationMode::Hybrid {
+        match embed::build_from_config(&cfg) {
+            Ok(embedder) => {
+                info!("向量整合模式：后台扫描已装配嵌入器");
+                integration_job = integration_job.with_embedder(embedder);
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "向量整合模式已开启但嵌入器不可用；扫描将按 HUB_CONSOLIDATION_FALLBACK 处理"
+                );
+            }
+        }
+    }
+    let integration_job = Arc::new(integration_job);
     // 证据保留期限：不可变证据行到期即物理删除
     let evidence_job = Arc::new(EvidenceRetentionJob::new(store.clone(), "backup-worker"));
 

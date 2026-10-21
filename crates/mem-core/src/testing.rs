@@ -72,7 +72,152 @@ impl Embedder for TestEmbedder {
 
 use crate::domain::{ChatCognitiveInput, CognitiveCandidate};
 use crate::infra::ChatCognitiveExtractor;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::sync::Mutex;
+
+/// 确定性"语义"测试嵌入器
+///
+/// 与 [`TestEmbedder`]（纯 SHA-256 哈希伪向量，同语义的两次文本得到互不相关的向量）
+/// 不同：它按**字符桶计数**投影到固定维度，词形相近的文本会得到相近向量。
+/// 这足以在测试中区分"向量通道是否真的被走到"，但它**不是真实语义模型**。
+///
+/// ⚠️ `provides_semantic_signal()` 返回 `true` 只是为了让**测试**能进入向量模式分支；
+/// 它的相似度分布与真实嵌入模型完全不同，**不得**用于标定任何阈值，
+/// 更不得用于生产（生产请用 `embed::HttpEmbedder`）。
+pub struct SemanticTestEmbedder {
+    dimension: usize,
+}
+
+impl Default for SemanticTestEmbedder {
+    fn default() -> Self {
+        Self { dimension: 64 }
+    }
+}
+
+impl SemanticTestEmbedder {
+    pub fn new(dimension: usize) -> Self {
+        Self {
+            dimension: dimension.max(1),
+        }
+    }
+
+    /// 字符桶投影：同一段文本总是得到同一个向量
+    fn generate_vector(&self, text: &str) -> Vec<f32> {
+        let mut vec = vec![0.0f32; self.dimension];
+        for (i, ch) in text.chars().filter(|c| !c.is_whitespace()).enumerate() {
+            // 字符码与位置共同决定落桶：既保留字符身份，也保留粗略的顺序信息
+            let bucket = ((ch as usize).wrapping_mul(31).wrapping_add(i)) % self.dimension;
+            vec[bucket] += 1.0;
+        }
+        let norm = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for x in &mut vec {
+                *x /= norm;
+            }
+        }
+        vec
+    }
+}
+
+#[async_trait]
+impl Embedder for SemanticTestEmbedder {
+    fn model_id(&self) -> &str {
+        "semantic-test-embedder"
+    }
+
+    fn dim(&self) -> usize {
+        self.dimension
+    }
+
+    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        Ok(texts.iter().map(|t| self.generate_vector(t)).collect())
+    }
+
+    /// 测试替身：让测试能进入向量模式分支。**不代表真实语义能力**。
+    fn provides_semantic_signal(&self) -> bool {
+        true
+    }
+}
+
+/// 计数嵌入器：在真实嵌入器外面套一层，统计**调用次数**与**处理的文本条数**
+///
+/// 用途：证明"纯规则整合路径一次嵌入调用都不会发出"。
+/// `provides_semantic_signal` 默认跟随被包装的嵌入器；
+/// 用 `with_semantic_signal(true)` 可构造一个"提供真实语义信号"的计数包装器，
+/// 供向量模式的调用隔离测试使用。
+pub struct CountingEmbedder {
+    inner: Arc<dyn Embedder>,
+    calls: AtomicUsize,
+    texts: AtomicUsize,
+    semantic_signal: bool,
+}
+
+impl CountingEmbedder {
+    /// 包装一个已有嵌入器
+    pub fn new(inner: Arc<dyn Embedder>) -> Self {
+        let semantic_signal = inner.provides_semantic_signal();
+        Self {
+            inner,
+            calls: AtomicUsize::new(0),
+            texts: AtomicUsize::new(0),
+            semantic_signal,
+        }
+    }
+
+    /// 强制声明是否提供真实语义信号（默认跟随被包装的嵌入器）
+    pub fn with_semantic_signal(mut self, semantic_signal: bool) -> Self {
+        self.semantic_signal = semantic_signal;
+        self
+    }
+
+    /// 嵌入服务调用次数
+    pub fn call_count(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    /// 提交给嵌入服务的文本条数
+    pub fn text_count(&self) -> usize {
+        self.texts.load(Ordering::SeqCst)
+    }
+
+    /// 重置计数
+    pub fn reset(&self) {
+        self.calls.store(0, Ordering::SeqCst);
+        self.texts.store(0, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl Embedder for CountingEmbedder {
+    fn model_id(&self) -> &str {
+        self.inner.model_id()
+    }
+
+    fn dim(&self) -> usize {
+        self.inner.dim()
+    }
+
+    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.texts.fetch_add(texts.len(), Ordering::SeqCst);
+        self.inner.embed(texts).await
+    }
+
+    fn provides_semantic_signal(&self) -> bool {
+        self.semantic_signal
+    }
+}
+
+impl std::fmt::Debug for CountingEmbedder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CountingEmbedder")
+            .field("model_id", &self.inner.model_id())
+            .field("calls", &self.call_count())
+            .field("texts", &self.text_count())
+            .finish()
+    }
+}
 
 /// 测试用可编程/确定性 Chat 认知抽取器
 #[derive(Default)]

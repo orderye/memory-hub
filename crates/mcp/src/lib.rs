@@ -3,7 +3,7 @@
 //! 多智能体长期记忆服务 MCP 适配层（mcp）
 //!
 //! 提供：
-//! - `ToolDispatcher`：18 个记忆工具调用分发与结构化/文本双模输出
+//! - `ToolDispatcher`：28 个工具调用分发与结构化/文本双模输出
 //! - `handle_discover`, `handle_tools_list`：发现与工具清单契约
 //! - `get_tool_definitions`：JSON Schema 2020-12 严格定义
 //! - `transport`：Streamable HTTP 与 stdio 传输层、JSON-RPC 2.0 帧处理

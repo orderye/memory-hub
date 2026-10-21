@@ -227,6 +227,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "common",
+ "consolidation",
  "embed",
  "mem-core",
  "store",
@@ -372,13 +373,16 @@ dependencies = [
 name = "consolidation"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "chrono",
  "common",
  "embed",
+ "hex",
  "mem-core",
  "serde",
  "serde_json",
+ "sha2",
  "store",
  "tokio",
  "tracing",
@@ -1265,6 +1269,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "unicode-normalization",
  "uuid",
 ]
 

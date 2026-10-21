@@ -4,6 +4,7 @@
 
 pub mod auth;
 pub mod config;
+pub mod consolidation;
 pub mod cron;
 pub mod error;
 pub mod idempotency;
@@ -13,6 +14,10 @@ pub mod runtime;
 
 pub use auth::{AccountId, Acl, AgentId, AuthCtx, NamespaceGrant, Scope, BOOTSTRAP_ACCOUNT_ID};
 pub use config::{AppConfig, DEFAULT_RETRIEVAL_MIN_SCORE};
+pub use consolidation::{
+    ConsolidationFallback, ConsolidationMode, ConsolidationModeStatus,
+    CONSOLIDATION_STRATEGY_VERSION,
+};
 pub use error::{ErrorDetail, HubError, Result};
 pub use idempotency::{
     result_hash, IdempotencyCheck, IdempotencyEntry, IdempotencyGuard, IdempotencyKey,

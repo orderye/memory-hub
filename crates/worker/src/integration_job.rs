@@ -78,6 +78,30 @@ impl IntegrationScanJob {
         Ok(report)
     }
 
+    /// 设置候选发现模式、降级策略与规模限制
+    pub fn with_mode(
+        mut self,
+        mode: common::ConsolidationMode,
+        fallback: common::ConsolidationFallback,
+        limits: consolidation::CandidateLimits,
+        lexical_min_similarity: f32,
+    ) -> Self {
+        self.engine = self
+            .engine
+            .with_mode(mode, fallback)
+            .with_candidate_limits(limits)
+            .with_lexical_min_similarity(lexical_min_similarity);
+        self
+    }
+
+    /// 注入嵌入器：向量模式（`hybrid`）召回语义候选时使用
+    ///
+    /// 纯规则模式不会注入嵌入器——整合链路因此一次嵌入调用都不会发出。
+    pub fn with_embedder(mut self, embedder: Arc<dyn mem_core::Embedder>) -> Self {
+        self.engine = self.engine.with_embedder(embedder);
+        self
+    }
+
     /// 单命名空间扫描（委托独立整合中枢引擎统一执行）
     async fn scan_namespace(&self, namespace: &str) -> Result<usize> {
         let report = self
@@ -194,8 +218,27 @@ mod tests {
         store.insert(&e1).await.unwrap();
         store.insert(&e2).await.unwrap();
 
-        let job = IntegrationScanJob::new(store.clone(), 0.90, 100, "scan-worker");
-        let report = job.run_once(Utc::now()).await.unwrap();
+        // 默认是纯本地规则整合：这两条没有结构化佐证（无标签、无业务键），
+        // 词法相近但不足以断言同一条事实，因此**不产生**重复提案。
+        let rules_job = IntegrationScanJob::new(store.clone(), 0.90, 100, "scan-worker");
+        let rules_report = rules_job.run_once(Utc::now()).await.unwrap();
+        assert_eq!(rules_report.scanned.get("ns2"), Some(&2));
+        assert_eq!(
+            rules_report.proposals.get("ns2"),
+            Some(&0),
+            "纯规则模式不应凭词法相近就判定为重复"
+        );
+
+        // 向量模式：已存向量可用 → 召回语义近重复候选 → 生成提案
+        let hybrid_job = IntegrationScanJob::new(store.clone(), 0.90, 100, "scan-worker")
+            .with_mode(
+                common::ConsolidationMode::Hybrid,
+                common::ConsolidationFallback::Rules,
+                consolidation::CandidateLimits::default(),
+                0.80,
+            )
+            .with_embedder(Arc::new(mem_core::testing::SemanticTestEmbedder::new(64)));
+        let report = hybrid_job.run_once(Utc::now()).await.unwrap();
         assert_eq!(report.scanned.get("ns2"), Some(&2));
         assert_eq!(report.proposals.get("ns2"), Some(&1));
     }

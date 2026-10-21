@@ -24,6 +24,7 @@ pub mod chat_cognitive_service;
 pub mod cjk;
 pub mod coding_memory_service;
 pub mod domain;
+pub mod fingerprint;
 pub mod infra;
 pub mod integration_service;
 pub mod memory_service;
@@ -65,6 +66,7 @@ pub use domain::{
     NewEvidence, NewMemory, NewMemoryExperience, NewMemoryRelation, NewMemoryTask, Page,
     ProposalStatus, RestoreMode, RestoreReport, Scored, TaskStatus, VersionChange,
 };
+pub use fingerprint::{canonical_form, content_fingerprint, same_fingerprint};
 pub use infra::{
     AccessChecker, AccountRecord, AccountStore, AgentRecord, AgentRegistration, AgentStore,
     BackupStore, ChatCognitiveExtractor, Clock, CodingStore, Embedder, EvidenceStore,
@@ -82,5 +84,5 @@ pub use redaction::{
     redact, sanitize_evidence_excerpt, RedactionFinding, RedactionKind, RedactionReport,
     EVIDENCE_EXCERPT_MAX_CHARS,
 };
-pub use testing::{FixedClock, TestEmbedder, TestHubStore};
+pub use testing::{CountingEmbedder, FixedClock, SemanticTestEmbedder, TestEmbedder, TestHubStore};
 pub use working_memory_service::{ExperienceSearchResult, WorkingMemoryService};
