@@ -109,6 +109,24 @@ flowchart TD
 
 ## 3. Quick start
 
+### Two deployment shapes: Personal Lite / Production Full
+
+One codebase, one database schema, one backup format — a single setting picks the **default behavior**:
+
+| | Personal Lite | Production Full (default) |
+| :--- | :--- | :--- |
+| Fits | single machine, one person, a few agents | teams / multi-account / public service |
+| Processes | postgres + auth-server + mcp-server | plus a **long-running** backup-worker |
+| Embedding | `HUB_EMBED_PROVIDER=off`: no vectors, no outbound calls | `mock` (dev) or `http` (real semantics) |
+| Retrieval | keyword-only (FTS + five-signal scoring + `min_score` rejection) | keyword + pgvector semantic recall |
+| Consolidation | local rules only (embedding calls stay 0) | same, may opt into `hybrid` |
+| Background jobs | manual `backup-worker --once` | cron backups + periodic sweeps + cross-replica lease |
+| Security | OAuth 2.1 / ACL / account isolation / backup & restore **all kept** | same |
+
+> **Upgrading changes nothing by default**: `HUB_DEPLOYMENT_PROFILE` defaults to `production`,
+> so leaving it unset means today's behavior. Lite is just a different set of defaults
+> for the same implementation, not a second codebase.
+
 ### Option A: one-command Docker Compose (recommended)
 
 ```bash
@@ -131,6 +149,24 @@ docker compose logs -f mcp-server
 ```
 
 Once it is up, open <http://localhost:8080/account/register> to register an account, then <http://localhost:8080/console> to register an agent (you get a `client_id` / `client_secret` there).
+
+### Option A2: personal lightweight deployment (Lite)
+
+```bash
+# 1. Same .env (at least HUB_TOKEN_SECRET and POSTGRES_PASSWORD)
+cp .env.example .env
+
+# 2. Start Lite: no long-running backup-worker, embedding off by default
+docker compose -f docker-compose.lite.yml up -d --build
+
+# 3. Run one round of background jobs on demand, then exit
+docker compose -f docker-compose.lite.yml run --rm backup-worker --once
+```
+
+Under Lite, `memory_search` is **keyword-only**: the response carries `capabilities.keyword_only=true`,
+while `/capabilities` reports `retrieval.vector_path_enabled=false` and `semantic.ready=false`.
+To enable real vectors, set `HUB_EMBED_PROVIDER=http` + `HUB_EMBED_ENDPOINT` + `HUB_EMBED_API_KEY`
+in `.env` and restart — **only an explicit configuration sends memory content to an embedding endpoint**.
 
 ### Option B: run it locally (development)
 
@@ -522,7 +558,7 @@ A standard Rust workspace, layered by responsibility:
 ## 9. Development, testing and quality gates
 
 ```bash
-# Full test suite (442 cases under the default feature set, 0 failures)
+# Full test suite (485 cases under the default feature set, 0 failures; includes contract snapshot and lightweight cases)
 cargo test --workspace
 
 # Static checks (zero-warning gate)
@@ -548,6 +584,25 @@ CI runs on two platforms:
   ② integration tests against a real PostgreSQL + pgvector database (serialized); ③ dependency admission and security audit (cargo-deny + cargo-audit); ④ release build of the three binaries.
 - **CNB cloud build** (`.cnb.yml`): a push to `main` triggers it — build the image in the cloud → push to the artifact registry → SSH-deploy to the server →
   probe `/readyz`, rolling back to the previous stable version on failure.
+
+### Rollback (application version / deployment shape)
+
+This upgrade **adds no database migration**; Lite and Production share the same schema and backup format,
+so rolling back only involves binaries/images — no database rollback is needed:
+
+```bash
+# 1. Roll back the application: check out the previous stable tag/commit and rebuild
+git checkout <previous stable tag or commit>
+docker compose up -d --build                              # Production
+docker compose -f docker-compose.lite.yml up -d --build    # Lite
+
+# 2. Roll back only the deployment shape: set HUB_DEPLOYMENT_PROFILE back to production
+#    and restart. Data, accounts, ACLs and backups stay untouched (profile only changes defaults).
+```
+
+How to verify backup/restore (`dry_run` writes nothing, a checksum mismatch must refuse to restore,
+`replace` must create a safety backup first) is documented in
+[`docs/upgrade/LIGHTWEIGHT_EXECUTION_REPORT.md`](docs/upgrade/LIGHTWEIGHT_EXECUTION_REPORT.md).
 
 > [!NOTE]
 > **The spaces-in-path trap**: if the checkout lives in a directory containing spaces (some external drives, for example), use `cargo test --workspace` and
@@ -576,6 +631,15 @@ This section exists so nobody steps on a landmine, not to brag:
    so configuring a real embedding service does not automatically turn on vector consolidation; the semantic gain of mode A has to be
    validated with a real model and `cargo test --test consolidation_eval`, see
    [`docs/upgrade/CONSOLIDATION_AB.md`](docs/upgrade/CONSOLIDATION_AB.md).
+
+7. **Cognitive async jobs are not wired yet**: `ChatCognitiveJob` (session distillation retries) and `ExperienceDistillJob` (experience distillation)
+   exist and are tested, but **no binary schedules them** — a real LLM extractor is not integrated yet, and wiring them now
+   would only produce placeholder data from the mock extractor.
+8. **Scheduled snapshots use the v1 payload**: the periodic `backup-worker` snapshot only contains memory entries, while
+   `memory_backup_create` produces a v4 payload (entries, evidence, relations, tasks, experiences, coding threads).
+   Restore accepts v1–v4, but a scheduled snapshot without the evidence chain must not be treated as a full backup.
+9. **Multiple replicas only get "no duplicate execution"** (via `HUB_JOB_LEASE_H`); resumable progress inside a single
+   replica is not provided — bound big namespaces with `HUB_INTEGRATION_SCAN_MAX_ENTRIES`.
 
 ---
 

@@ -25,6 +25,9 @@
 | **评测报告** | [`upgrade/EVALUATION.md`](./upgrade/EVALUATION.md) | P5 检索优化与基准评测：**Bench v2（480 文档 / 600 查询，Recall@K / MRR@10 / nDCG@10）**、域外拒绝门禁、业务正确性门禁、阈值标定曲线 | 搜索与评测工程师 | **现行规范 (Active)** |
 | **整合升级** | [`upgrade/CONSOLIDATION_AB.md`](./upgrade/CONSOLIDATION_AB.md) | 记忆整合 A/B 双模式：候选发现（纯本地规则 / 向量辅助）、关系分类与自动合并安全门槛、溯源字段、整合专属评测 | 架构师 / 开发者 / 审计者 | **现行规范 (Active)** |
 | **发布流程** | [`upgrade/PUSH_PROCESS.md`](./upgrade/PUSH_PROCESS.md) | 双平台（GitHub + CNB）推送规范：身份隔离、patch-id 口径重放、凭证自检、发版与故障排查 | 运维人员 / 贡献者 | **现行规范 (Active)** |
+| **轻量化审计** | [`upgrade/LIGHTWEIGHT_AUDIT.md`](./upgrade/LIGHTWEIGHT_AUDIT.md) | 轻量化升级 P0 源码审计：Workspace/Features/Embedding/Retrieval/Consolidation/Cognitive/Storage/Worker/MCP(28 工具)/Backup/CI/迁移逐项结论与缺口清单 | 架构师 / 审计者 | **现行规范 (Active)** |
+| **性能基线** | [`upgrade/LIGHTWEIGHT_BASELINE.md`](./upgrade/LIGHTWEIGHT_BASELINE.md) | 优化前后实测对比：二进制体积、启动耗时、空闲 RSS、内存库延迟；明确标注 NOT MEASURED 项（真实 PG / 真实嵌入） | 运维 / 性能工程师 | **现行规范 (Active)** |
+| **轻量化执行报告** | [`upgrade/LIGHTWEIGHT_EXECUTION_REPORT.md`](./upgrade/LIGHTWEIGHT_EXECUTION_REPORT.md) | P0–P5 逐阶段实施记录、19 项验收勾选（PASS/BLOCKED/NOT RUN）、已知局限、回滚与复现命令 | 全体 | **现行规范 (Active)** |
 | **业务集成** | [`创界山智能接入层实施方案.md`](./创界山智能接入层实施方案.md) | 零侵入防腐中间层实施方案：特征指纹探测、虚拟双路召回、数据法规水印与角色视角整合策略 | 外部业务集成人员 | **集成方案 (Active)** |
 
 ---

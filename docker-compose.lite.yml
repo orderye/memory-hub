@@ -1,0 +1,136 @@
+# Memory Hub · Personal Lite（个人轻量部署）
+#
+# 用法：
+#   cp .env.example .env          # 至少设置 HUB_TOKEN_SECRET（≥32 字节）与 POSTGRES_PASSWORD
+#   docker compose -f docker-compose.lite.yml up -d
+#
+# 与 docker-compose.yml（Production Full）的区别：
+#   1. 不常驻 backup-worker（个人部署不该养一个空转的定时进程）；
+#   2. 固定 HUB_DEPLOYMENT_PROFILE=lite → 嵌入默认关闭、检索纯关键词、整合零嵌入调用；
+#   3. 资源配额按单机收敛。
+#
+# 手动触发后台作业（整合扫描 / 过期清理 / 证据清理 / 备份），各执行一次后退出：
+#   docker compose -f docker-compose.lite.yml run --rm backup-worker --once
+#
+# 想启用真实向量检索：在 .env 里设置
+#   HUB_EMBED_PROVIDER=http
+#   HUB_EMBED_ENDPOINT=https://your-embedding-service/v1/embeddings
+#   HUB_EMBED_API_KEY=...
+# 然后重启 mcp-server；memory_search 的 capabilities.vector_path_enabled 会变为 true。
+#
+# 数据卷与 Production 完全兼容：两种形态共用同一套 schema 与备份格式，
+# 可以在不改数据的前提下互切（回滚只需把 profile 改回 production 并起全量 compose）。
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg15
+    container_name: memoryhub-lite-postgres
+    restart: always
+    command:
+      - "postgres"
+      - "-c"
+      - "max_connections=60"
+      - "-c"
+      - "shared_buffers=256MB"
+      - "-c"
+      - "work_mem=16MB"
+    environment:
+      POSTGRES_DB: memory_hub
+      POSTGRES_USER: hub_app
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?必须在 .env 中设置 POSTGRES_PASSWORD}"
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # 首次初始化按文件名顺序执行全部迁移（与 Rust migration runner 顺序一致）
+      - ./crates/store/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hub_app -d memory_hub"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  auth-server:
+    image: ${MEMORY_HUB_IMAGE:-docker.cnb.cool/toroyxxx/memory-hub:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: memoryhub-lite-auth
+    restart: always
+    entrypoint: ["/app/auth-server"]
+    env_file: .env
+    environment:
+      HUB_DEPLOYMENT_PROFILE: lite
+      HUB_DB_URL: "postgresql://hub_app:${POSTGRES_PASSWORD:?必须在 .env 中设置 POSTGRES_PASSWORD}@postgres:5432/memory_hub"
+      AUTH_EXTERNAL_BASE_URL: http://localhost:8080
+      TOKIO_WORKER_THREADS: 1
+      HUB_DB_MAX_CONNECTIONS: 4
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  mcp-server:
+    image: ${MEMORY_HUB_IMAGE:-docker.cnb.cool/toroyxxx/memory-hub:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: memoryhub-lite-mcp
+    restart: always
+    entrypoint: ["/app/mcp-server"]
+    env_file: .env
+    environment:
+      HUB_DEPLOYMENT_PROFILE: lite
+      HUB_MCP_BIND: 0.0.0.0:3000
+      HUB_DB_URL: "postgresql://hub_app:${POSTGRES_PASSWORD:?必须在 .env 中设置 POSTGRES_PASSWORD}@postgres:5432/memory_hub"
+      # 个人部署：默认零嵌入调用（.env 里显式设 http 才会启用向量）
+      HUB_EMBED_PROVIDER: ${HUB_EMBED_PROVIDER:-off}
+      TOKIO_WORKER_THREADS: 2
+      HUB_DB_MAX_CONNECTIONS: 8
+      # 保留默认限流（50 RPS/Agent）：stdio 本地代理与个人部署同样需要速率上限，
+      # 关掉它等于给"全权限本地桥接"再加一层无边界放大。
+      RATE_LIMIT_PER_AGENT_RPS: ${RATE_LIMIT_PER_AGENT_RPS:-50}
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:3000/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      auth-server:
+        condition: service_healthy
+
+  # 手动作业容器：默认不启动（profiles 隔离），只在 `run --rm backup-worker --once` 时执行
+  backup-worker:
+    image: ${MEMORY_HUB_IMAGE:-docker.cnb.cool/toroyxxx/memory-hub:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    profiles: ["jobs"]
+    entrypoint: ["/app/backup-worker"]
+    command: ["--once"]
+    restart: "no"
+    env_file: .env
+    environment:
+      HUB_DEPLOYMENT_PROFILE: lite
+      HUB_DB_URL: "postgresql://hub_app:${POSTGRES_PASSWORD:?必须在 .env 中设置 POSTGRES_PASSWORD}@postgres:5432/memory_hub"
+      TOKIO_WORKER_THREADS: 1
+      HUB_DB_MAX_CONNECTIONS: 4
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+    driver: local

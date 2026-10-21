@@ -109,6 +109,23 @@ flowchart TD
 
 ## 三、快速开始
 
+### 两种部署形态：Personal Lite / Production Full
+
+同一套代码、同一套数据库 schema、同一套备份格式，靠一个配置项选择**默认行为**：
+
+| | Personal Lite（个人轻量） | Production Full（完整生产，默认） |
+| :--- | :--- | :--- |
+| 适用 | 单机、个人、少量 Agent | 团队 / 多账户 / 对外服务 |
+| 进程 | postgres + auth-server + mcp-server | 再加**常驻** backup-worker |
+| 嵌入 | `HUB_EMBED_PROVIDER=off`：不产生向量、不外呼任何嵌入服务 | `mock`（开发）或 `http`（真实语义） |
+| 检索 | 纯关键词（FTS + 五维评分 + `min_score` 域外拒绝） | 关键词 + pgvector 语义召回 |
+| 整合 | 纯本地规则（embedding 调用恒为 0） | 同左，可显式切 `hybrid` |
+| 后台作业 | 手动 `backup-worker --once` | cron 备份 + 周期清理 + 跨副本租约 |
+| 安全能力 | OAuth 2.1 / ACL / 账户隔离 / 备份恢复 **全部保留** | 同左 |
+
+> **升级不会改变现有行为**：`HUB_DEPLOYMENT_PROFILE` 默认就是 `production`，
+> 不设置它 = 今天的行为。Lite 只是"同一实现的另一组默认值"，不是另一套代码。
+
 ### 方式 A：Docker Compose 一键起（推荐）
 
 ```bash
@@ -130,6 +147,24 @@ docker compose logs -f mcp-server
 ```
 
 起来之后直接打开 <http://localhost:8080/account/register> 注册账户，再进 <http://localhost:8080/console> 登记一个 Agent（拿到 `client_id` / `client_secret`）。
+
+### 方式 A2：个人轻量部署（Lite）
+
+```bash
+# 1. 同样的 .env（至少填 HUB_TOKEN_SECRET 与 POSTGRES_PASSWORD）
+cp .env.example .env
+
+# 2. 起 Lite：不含常驻 backup-worker，嵌入默认关闭
+docker compose -f docker-compose.lite.yml up -d --build
+
+# 3. 需要时手动跑一轮后台作业（整合扫描 → 过期清理 → 证据清理 → 备份），跑完即退出
+docker compose -f docker-compose.lite.yml run --rm backup-worker --once
+```
+
+Lite 下 `memory_search` 是**纯关键词检索**：响应的 `capabilities.keyword_only` 为 `true`，
+`/capabilities` 里 `retrieval.vector_path_enabled=false`、`semantic.ready=false`。
+想启用真实向量检索，在 `.env` 里显式配置 `HUB_EMBED_PROVIDER=http` +
+`HUB_EMBED_ENDPOINT` + `HUB_EMBED_API_KEY` 后重启——**只有显式配置才会把记忆正文发往嵌入端点**。
 
 ### 方式 B：本地直接跑（开发调试）
 
@@ -524,7 +559,7 @@ HUB_EMBED_MODEL=bge-m3
 ## 九、开发、测试与质量门禁
 
 ```bash
-# 完整测试套件（当前默认特性下 442 个用例，0 失败）
+# 完整测试套件（当前默认特性下 485 个用例，0 失败；含契约快照与轻量化用例）
 cargo test --workspace
 
 # 静态检查（零警告门禁）
@@ -549,6 +584,25 @@ CI 分两条：
   ② PostgreSQL + pgvector 真实库集成测试（串行执行）；③ 依赖准入与安全审计（cargo-deny + cargo-audit）；④ Release 构建三个二进制。
 - **CNB 云构建**（`.cnb.yml`）：push 到 `main` 触发——云端构建镜像 → 推制品库 → SSH 部署到服务器 →
   探活 `/readyz`，失败自动回滚到上一稳定版本。
+
+### 回滚（应用版本 / 部署形态）
+
+本轮升级**没有新增数据库迁移**，Lite 与 Production 共用同一 schema、同一备份格式，
+因此回滚只涉及二进制/镜像，不需要数据库回滚：
+
+```bash
+# 1. 应用版本回滚：回到上一个稳定 tag/commit，重新构建并重启
+git checkout <上一个稳定 tag 或 commit>
+docker compose up -d --build                              # Production
+docker compose -f docker-compose.lite.yml up -d --build    # Lite
+
+# 2. 只回滚\"部署形态\"：把 HUB_DEPLOYMENT_PROFILE 改回 production 并重启，
+#    数据、账户、权限、备份全部不动（profile 只影响默认值）
+```
+
+备份/恢复的验证方式（`dry_run` 必须零写入、校验和不符必须拒绝恢复、
+`replace` 前必须自动生成安全备份）见
+[`docs/upgrade/LIGHTWEIGHT_EXECUTION_REPORT.md`](docs/upgrade/LIGHTWEIGHT_EXECUTION_REPORT.md)。
 
 > [!NOTE]
 > **路径里带空格的坑**：如果代码检出在含空格的目录（比如某些外挂盘），请用 `cargo test --workspace`，
@@ -577,6 +631,15 @@ CI 分两条：
    即使配了真实嵌入服务也不会自动启用向量整合；A 模式的语义增益需真实模型 +
    `cargo test --test consolidation_eval` 才能验收，详见
    [`docs/upgrade/CONSOLIDATION_AB.md`](docs/upgrade/CONSOLIDATION_AB.md)。
+
+7. **认知异步作业尚未装配**：`ChatCognitiveJob`（会话提炼重试）与 `ExperienceDistillJob`（经验提炼）
+   已实现并有测试，但**没有接进任何二进制的调度**——真实 LLM 抽取器尚未接入，
+   接进去只会用 Mock 抽取器产出占位数据。等真实抽取器落地后再装配。
+8. **定时备份的快照是 v1 载荷**：`backup-worker` 的周期快照只包含记忆条目，
+   `memory_backup_create` 走的是 v4 载荷（含证据、关系、任务、经验、代码线程）。
+   恢复路径同时支持 v1–v4，但没有证据链的定时快照不能当作完整备份使用。
+9. **多副本只保证\"不同副本重复执行\"被租约挡住**（`HUB_JOB_LEASE_H`），
+   不保证单副本内部的扫描进度可续传；大命名空间请用 `HUB_INTEGRATION_SCAN_MAX_ENTRIES` 分批。
 
 ---
 
