@@ -16,6 +16,8 @@
 | **认知子系统** | [`upgrade/WORKING_MEMORY.md`](./upgrade/WORKING_MEMORY.md) | P3 Working 经验记忆：任务事实与通用经验解耦、环境边界感知 (`boundary_envs`)、反馈衰减机制 | 自动化 Agent 开发者 | **现行规范 (Active)** |
 | **认知子系统** | [`upgrade/CODING_MEMORY.md`](./upgrade/CODING_MEMORY.md) | P4 Coding 代码演进链：真实 Git Diff 捕获、SHA-256 幂等、隐私凭证过滤、Thread 与 Revision 模型 | 代码 Agent / 辅助开发工具 | **现行规范 (Active)** |
 | **评测报告** | [`upgrade/EVALUATION.md`](./upgrade/EVALUATION.md) | P5 检索优化与基准评测：**Bench v2（480 文档 / 600 查询，Recall@K / MRR@10 / nDCG@10）**、域外拒绝门禁、业务正确性门禁、阈值标定曲线 | 搜索与评测工程师 | **现行规范 (Active)** |
+| **整合升级** | [`upgrade/CONSOLIDATION_AB.md`](./upgrade/CONSOLIDATION_AB.md) | 记忆整合 A/B 双模式：候选发现（纯本地规则 / 向量辅助）、关系分类与自动合并安全门槛、溯源字段、整合专属评测 | 架构师 / 开发者 / 审计者 | **现行规范 (Active)** |
+| **发布流程** | [`upgrade/PUSH_PROCESS.md`](./upgrade/PUSH_PROCESS.md) | 双平台（GitHub + CNB）推送规范：身份隔离、patch-id 口径重放、凭证自检、发版与故障排查 | 运维人员 / 贡献者 | **现行规范 (Active)** |
 | **业务集成** | [`创界山智能接入层实施方案.md`](./创界山智能接入层实施方案.md) | 零侵入防腐中间层实施方案：特征指纹探测、虚拟双路召回、数据法规水印与角色视角整合策略 | 外部业务集成人员 | **集成方案 (Active)** |
 
 ---
@@ -32,6 +34,7 @@
 | 检索最小分 | 无默认 `min_score` | **默认拒绝阈值 0.65**（`HUB_RETRIEVAL_MIN_SCORE`），无可靠匹配时返回 `no_reliable_match: true` | `crates/common/src/config.rs` |
 | 语义能力 | 隐含"向量服务在跑 = 语义可用" | **伪向量嵌入器不参与打分**；`/readyz`、`/capabilities` 显式声明 `semantic.ready` | `crates/mem-core/src/infra.rs` |
 | 证据写入 | "原封不动保存" | **写入前脱敏 + 最小化 + 到期清理**；"不可变"指写入后不可悄悄改写 | `crates/mem-core/src/redaction.rs` |
+| 整合候选发现 | 默认按向量相似度查重 | **默认 `HUB_CONSOLIDATION_MODE=rules`（纯本地规则整合，embedding 调用恒为 0）**；`hybrid` 需显式开启，且**只有原文/规范化后完全相同**的记忆才允许自动合并 | `docs/upgrade/CONSOLIDATION_AB.md` |
 
 > 旧文档保留是为了看清演进脉络，不是当前接口契约。**接口与验收以根目录 README 与本表为准。**
 

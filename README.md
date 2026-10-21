@@ -372,6 +372,45 @@ Recall@1 68.15% / Recall@5 95.37% / Recall@10 97.22% / MRR@10 0.7989 / nDCG@10 0
 - **命名空间级授权**：谁的空间谁能读写，可以单独把某个空间授权给另一个 Agent，也能随时撤销（立即生效）；
 - **三种权限范围**：`memory:read` / `memory:write` / `memory:admin`，每个工具都要声明自己需要哪一级。
 
+### 记忆整合的两种候选发现模式（A / B）
+
+整合中枢负责把"多 Agent 写重了"的记忆收拾干净。它有两种**候选发现**模式，
+但**共用同一套判定与合并逻辑**——模式只影响"从哪找候选"，不影响"能不能合"。
+
+| 模式 | 配置 | 候选从哪来 | 嵌入调用 | 记忆内容出站 |
+| :--- | :--- | :--- | :--- | :--- |
+| **B 纯本地规则**（默认） | `HUB_CONSOLIDATION_MODE=rules` | 规范化指纹、结构化字段（业务键/场景/标签/环境）、本地词法索引 | **恒为 0** | **否** |
+| **A 向量辅助** | `HUB_CONSOLIDATION_MODE=hybrid` | B 的候选 **∪** 嵌入向量召回的语义候选 | 按需、有界、可计数 | 视嵌入端点而定 |
+
+- **默认是 B**：即使配了 `HUB_EMBED_PROVIDER=http`，整合也不会自动调用向量服务——
+  要不要把记忆内容发出去必须由管理员显式决定；
+- **A 只是"向量帮你找候选"**：余弦相似度高只能说明"这两条值得一起看"，
+  说不了"这两条相同"。`PostgreSQL 15` 和 `PostgreSQL 16` 语义很像，但它们是不同事实，
+  绝不能合。**只有原文完全相同、或保守规范化后完全相同**的记忆才允许自动合并，
+  语义近重复一律只出待审提案；
+- **规范化是保守的**：只折叠空白、换行与 Unicode 兼容形式；
+  大小写、否定词、数字、单位、日期、版本号、路径、URL 一律保留
+  （"不是 X" 与 "X"、"v1" 与 "v2" 绝不会落到同一个指纹）；
+- **降级是显式可见的**：`HUB_CONSOLIDATION_FALLBACK=rules` 时，向量不可用就降级为规则模式，
+  响应里如实写明 `requested_mode=hybrid` / `effective_mode=rules` / `fallback_applied=true`，
+  不会把降级结果伪装成成功的向量整合；`=error` 则直接失败，不执行任何整合；
+- **整合与检索互不干扰**：整合模式不改变 `memory_search` 的检索模式、分数与 MMR；
+  整合模式 B 也**不等于**"全系统离线"（检索与认知提炼是否调用模型是另一回事）；
+- 健康检查里 `semantic`（检索语义能力）与 `consolidation`（整合模式）是**分开报**的。
+
+```bash
+# 默认就是 B：不发任何嵌入请求
+HUB_CONSOLIDATION_MODE=rules
+
+# 想用 A：先只预演，观察候选质量
+HUB_CONSOLIDATION_MODE=hybrid
+HUB_EMBED_PROVIDER=http
+HUB_EMBED_ENDPOINT=https://embed.example.com/v1/embeddings
+HUB_EMBED_MODEL=bge-m3
+```
+
+细节见 [`docs/upgrade/CONSOLIDATION_AB.md`](docs/upgrade/CONSOLIDATION_AB.md)。
+
 ### 备份与恢复
 
 - **只读快照**：单个命名空间或整个账户（`*`）都能打快照，带 SHA-256 校验和，建完就改不了；
@@ -479,7 +518,7 @@ Recall@1 68.15% / Recall@5 95.37% / Recall@10 97.22% / MRR@10 0.7989 / nDCG@10 0
 ## 九、开发、测试与质量门禁
 
 ```bash
-# 完整测试套件（当前默认特性下 362 个用例，0 失败）
+# 完整测试套件（当前默认特性下 442 个用例，0 失败）
 cargo test --workspace
 
 # 静态检查（零警告门禁）
@@ -487,6 +526,12 @@ cargo clippy --all-targets -- -D warnings
 
 # 格式检查
 cargo fmt --all -- --check
+
+# 检索评测基线（排序质量；不得因本次改动退化）
+cargo test --test eval_bench -- --nocapture
+
+# 整合评测（整合质量：错误合并数、硬约束违规数、B 模式 embedding 调用数必须为 0）
+cargo test --test consolidation_eval -- --nocapture
 
 # 真实 PostgreSQL 集成测试（需要 DATABASE_URL 指向测试库）
 cargo test -p store --features pg-integration -- --ignored
@@ -522,6 +567,10 @@ CI 分两条：
 4. **`temporal` / `paraphrase` / `env` 三类查询是当前短板**，需要真实嵌入模型介入后复测排序质量。
 5. **证据不可变 ≠ 写前不能脱敏**：凭证扫描、敏感片段掩码、最小化摘要与保留期限都在**写入前/到期清理**
    两道关卡上完成，详见 [`docs/upgrade/CHAT_MEMORY.md`](docs/upgrade/CHAT_MEMORY.md)。
+6. **整合默认不再使用向量**：`HUB_CONSOLIDATION_MODE` 默认 `rules`（纯本地规则整合），
+   即使配了真实嵌入服务也不会自动启用向量整合；A 模式的语义增益需真实模型 +
+   `cargo test --test consolidation_eval` 才能验收，详见
+   [`docs/upgrade/CONSOLIDATION_AB.md`](docs/upgrade/CONSOLIDATION_AB.md)。
 
 ---
 
@@ -536,6 +585,8 @@ CI 分两条：
 | 经验记忆与环境边界 | [`docs/upgrade/WORKING_MEMORY.md`](docs/upgrade/WORKING_MEMORY.md) |
 | 代码演进链与真实 Diff | [`docs/upgrade/CODING_MEMORY.md`](docs/upgrade/CODING_MEMORY.md) |
 | 检索评测、基线与消融 | [`docs/upgrade/EVALUATION.md`](docs/upgrade/EVALUATION.md) |
+| 记忆整合 A/B 双模式（候选发现、合并门槛、评测） | [`docs/upgrade/CONSOLIDATION_AB.md`](docs/upgrade/CONSOLIDATION_AB.md) |
+| 双平台推送流程（GitHub + CNB 身份隔离与重放） | [`docs/upgrade/PUSH_PROCESS.md`](docs/upgrade/PUSH_PROCESS.md) |
 | 质量与安全基线 | [`docs/upgrade/BASELINE.md`](docs/upgrade/BASELINE.md) |
 | 仓库与构建环境审计 | [`docs/upgrade/REPOSITORY_AUDIT.md`](docs/upgrade/REPOSITORY_AUDIT.md) |
 | 业务系统零侵入接入方案 | [`docs/创界山智能接入层实施方案.md`](docs/创界山智能接入层实施方案.md) |
