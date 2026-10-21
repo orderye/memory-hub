@@ -3,12 +3,13 @@
 //! 作业以系统特权主体运行（不经过 AuthCtx），直接操作存储；
 //! 与 MCP 暴露的 `memory_backup_create` 走同一套快照格式与校验和算法。
 
+use crate::lease::JobLease;
 use chrono::{DateTime, Utc};
 use common::{AgentId, Result};
 use mem_core::{BackupRecord, MemoryHubStore};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 /// 备份作业
 pub struct BackupJob {
@@ -17,6 +18,8 @@ pub struct BackupJob {
     retention_days: u32,
     /// 作业执行者标识（记入快照 created_by）
     worker_agent: AgentId,
+    /// 跨进程租约（None = 不做互斥）
+    lease: Option<JobLease>,
 }
 
 /// 单轮备份报告
@@ -26,6 +29,8 @@ pub struct BackupJobReport {
     pub created: Vec<(uuid::Uuid, String)>,
     /// 保留策略删除的快照数与 ID
     pub pruned: Vec<uuid::Uuid>,
+    /// 本轮是否因租约被其它副本占用而整体跳过
+    pub skipped_leased: bool,
 }
 
 impl BackupJob {
@@ -40,11 +45,29 @@ impl BackupJob {
             keep: keep.max(1),
             retention_days,
             worker_agent: worker_agent.into(),
+            lease: None,
         }
+    }
+
+    /// 注入跨进程租约：同一租约窗口内只有一个副本执行定时备份
+    pub fn with_lease(mut self, lease: JobLease) -> Self {
+        self.lease = Some(lease);
+        self
     }
 
     /// 为每个已注册命名空间创建快照，并执行保留策略
     pub async fn run_once(&self, now: DateTime<Utc>) -> Result<BackupJobReport> {
+        // 跨进程互斥：多副本部署时只让一个副本真正执行备份
+        if let Some(lease) = &self.lease {
+            if !lease.try_acquire(&JobLease::global_key("backup")).await? {
+                warn!("备份租约被其它副本占用，本轮跳过");
+                return Ok(BackupJobReport {
+                    skipped_leased: true,
+                    ..Default::default()
+                });
+            }
+        }
+
         info!(worker = %self.worker_agent, "开始执行定时备份作业");
 
         let mut report = BackupJobReport::default();

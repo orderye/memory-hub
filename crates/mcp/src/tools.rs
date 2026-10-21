@@ -86,6 +86,13 @@ pub struct ConsolidationParams {
     pub embed_min_similarity: Option<f32>,
     /// 纯规则模式的词法候选相似度下限
     pub lexical_min_similarity: f32,
+    /// 单命名空间单次扫描的活跃条目上限（0 = 不限制）
+    pub scan_max_entries: usize,
+    /// 整合健康度统计的缓存时长（秒，0 = 每次重算）
+    ///
+    /// `memory_consolidation_stats` 每次都要做一遍全命名空间候选分析；
+    /// Agent 连环调用或面板轮询会把它变成最贵的热点。缓存并显式回报 `cached`。
+    pub stats_ttl_s: u64,
 }
 
 impl Default for ConsolidationParams {
@@ -99,6 +106,8 @@ impl Default for ConsolidationParams {
             embed_top_k: 20,
             embed_min_similarity: None,
             lexical_min_similarity: 0.80,
+            scan_max_entries: 2_000,
+            stats_ttl_s: 60,
         }
     }
 }
@@ -121,6 +130,12 @@ pub struct ToolDispatcher {
     pub working_memory: Option<Arc<mem_core::WorkingMemoryService>>,
     /// Coding 代码演进记忆服务（主题线程与修订记录）
     pub coding_memory: Option<Arc<mem_core::CodingMemoryService>>,
+    /// 整合健康度统计缓存：`(account, namespace) → (写入时刻, 响应)`
+    ///
+    /// 放在 `Arc<Mutex<..>>` 里是因为 `ToolDispatcher` 会被克隆分发；
+    /// 缓存只影响"多久重算一次"，不改变任何数据语义。
+    stats_cache:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Value)>>>,
 }
 
 impl ToolDispatcher {
@@ -140,7 +155,24 @@ impl ToolDispatcher {
             chat_cognitive: None,
             working_memory: None,
             coding_memory: None,
+            stats_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
+    }
+
+    /// 本次实例是否启用向量路（嵌入被显式关闭时为 false）
+    fn vector_path_enabled(&self) -> bool {
+        self.embedder
+            .as_ref()
+            .map(|e| e.is_enabled())
+            .unwrap_or(false)
+    }
+
+    /// 本次实例是否具备真实语义能力（伪向量/关闭均为 false）
+    fn semantic_ready(&self) -> bool {
+        self.embedder
+            .as_ref()
+            .map(|e| e.provides_semantic_signal())
+            .unwrap_or(false)
     }
 
     /// 以配置注入整合参数
@@ -417,6 +449,13 @@ impl ToolDispatcher {
                         let no_reliable_match = items.is_empty();
                         ToolCallResult::success(json!({
                             "results": items,
+                            // 能力声明（追加字段，不改动既有键）：调用方必须能区分
+                            // "检索为纯关键词模式" 与 "向量服务临时故障降级"
+                            "capabilities": {
+                                "semantic_ready": self.semantic_ready(),
+                                "vector_path_enabled": self.vector_path_enabled(),
+                                "keyword_only": !self.vector_path_enabled(),
+                            },
                             "no_reliable_match": no_reliable_match,
                             "reason": if no_reliable_match {
                                 "没有达到最小可信分的候选：本次检索未找到可靠匹配，\
@@ -660,7 +699,9 @@ impl ToolDispatcher {
             ..consolidation::CandidateLimits::default()
         })
         .with_embed_min_similarity(self.consolidation.embed_min_similarity)
-        .with_lexical_min_similarity(self.consolidation.lexical_min_similarity);
+        .with_lexical_min_similarity(self.consolidation.lexical_min_similarity)
+        // 有界扫描：大命名空间不得一次全量装载（超限时报告标 truncated）
+        .with_scan_limit(self.consolidation.scan_max_entries);
         if let Some(embedder) = &self.embedder {
             engine = engine.with_embedder(embedder.clone());
         }
@@ -714,15 +755,54 @@ impl ToolDispatcher {
             return ToolCallResult::error(&HubError::InsufficientScope);
         }
 
+        // 统计缓存：`memory_consolidation_stats` 每次都要做一遍全库候选分析，
+        // Agent 连环调用 / 面板轮询会把它变成最贵的热点。缓存并**显式**回报命中状态，
+        // 不让调用方把"60 秒前的抽样"误当成实时结论。
+        let cache_key = format!("{}:{}", auth.account_id, req.namespace);
+        let now = std::time::Instant::now();
+        if self.consolidation.stats_ttl_s > 0 {
+            if let Ok(guard) = self.stats_cache.lock() {
+                if let Some((at, value)) = guard.get(&cache_key) {
+                    let age = now.saturating_duration_since(*at);
+                    if age.as_secs() < self.consolidation.stats_ttl_s {
+                        let mut out = value.clone();
+                        if let Some(obj) = out.as_object_mut() {
+                            obj.insert("cached".to_string(), json!(true));
+                            obj.insert("cache_age_s".to_string(), json!(age.as_secs()));
+                        }
+                        return ToolCallResult::success(out);
+                    }
+                }
+            }
+        }
+
         let engine = consolidation::ConsolidationEngine::new(
             Arc::new(scoped),
             self.consolidation.sim_threshold,
             self.consolidation.max_proposals,
-        );
+        )
+        .with_scan_limit(self.consolidation.scan_max_entries);
 
         match engine.calculate_stats(&req.namespace).await {
             Ok(stats) => {
-                ToolCallResult::success(serde_json::to_value(&stats).unwrap_or(Value::Null))
+                let mut value = serde_json::to_value(&stats).unwrap_or(Value::Null);
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert("cached".to_string(), json!(false));
+                    obj.insert("cache_age_s".to_string(), json!(0));
+                }
+                if self.consolidation.stats_ttl_s > 0 {
+                    if let Ok(mut guard) = self.stats_cache.lock() {
+                        guard.insert(cache_key, (now, value.clone()));
+                        // 防无界增长：条目过多时只保留仍在有效期内的
+                        if guard.len() > 512 {
+                            guard.retain(|_, (at, _)| {
+                                now.saturating_duration_since(*at).as_secs()
+                                    < self.consolidation.stats_ttl_s
+                            });
+                        }
+                    }
+                }
+                ToolCallResult::success(value)
             }
             Err(e) => ToolCallResult::error(&e),
         }
@@ -1678,6 +1758,85 @@ mod tests {
         let body = res.structured_content.unwrap();
         assert_eq!(body["no_reliable_match"], json!(false));
         assert!(!body["results"].as_array().unwrap().is_empty());
+    }
+
+    /// 检索响应必须自报能力状态：没有向量能力时 keyword_only=true。
+    /// 调用方据此区分"这就是纯关键词模式"与"向量服务临时故障降级"。
+    #[tokio::test]
+    async fn test_search_reports_capability_state() {
+        let (d, auth) = harness();
+        let put = d
+            .dispatch(
+                &auth,
+                "memory_put",
+                arg(json!({
+                    "namespace": "team-x",
+                    "kind": "fact",
+                    "content": "服务端口 3000",
+                })),
+            )
+            .await;
+        assert!(!put.is_error);
+
+        let res = d
+            .dispatch(
+                &auth,
+                "memory_search",
+                arg(json!({ "namespace": "team-x", "query_text": "服务端口" })),
+            )
+            .await;
+        assert!(!res.is_error);
+        let body = res.structured_content.unwrap();
+        assert_eq!(
+            body["capabilities"]["vector_path_enabled"],
+            json!(false),
+            "未注入嵌入器时向量路必须声明为关闭：{body}"
+        );
+        assert_eq!(body["capabilities"]["keyword_only"], json!(true));
+        assert_eq!(body["capabilities"]["semantic_ready"], json!(false));
+    }
+
+    /// 整合统计缓存：第二次调用必须命中缓存并如实标注 cached=true
+    #[tokio::test]
+    async fn test_consolidation_stats_are_cached_and_marked() {
+        let (d, auth) = harness();
+        let put = d
+            .dispatch(
+                &auth,
+                "memory_put",
+                arg(json!({
+                    "namespace": "team-x",
+                    "kind": "fact",
+                    "content": "服务端口 3000",
+                })),
+            )
+            .await;
+        assert!(!put.is_error);
+
+        let first = d
+            .dispatch(
+                &auth,
+                "memory_consolidation_stats",
+                arg(json!({ "namespace": "team-x" })),
+            )
+            .await;
+        assert!(!first.is_error);
+        let first_body = first.structured_content.unwrap();
+        assert_eq!(first_body["cached"], json!(false), "首次必须实际计算");
+
+        let second = d
+            .dispatch(
+                &auth,
+                "memory_consolidation_stats",
+                arg(json!({ "namespace": "team-x" })),
+            )
+            .await;
+        let second_body = second.structured_content.unwrap();
+        assert_eq!(second_body["cached"], json!(true), "TTL 内必须命中缓存");
+        assert_eq!(
+            second_body["total_active"], first_body["total_active"],
+            "缓存命中不得改变统计内容"
+        );
     }
 
     #[tokio::test]

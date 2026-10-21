@@ -7,17 +7,20 @@
 //! 作业以系统特权主体运行（不经过 AuthCtx），直接操作存储；
 //! 它只删除 `expires_at` 已到且非空的证据行，`expires_at` 为空表示永久保留。
 
+use crate::lease::JobLease;
 use chrono::{DateTime, Utc};
 use common::Result;
 use mem_core::MemoryHubStore;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 /// 证据清理作业
 pub struct EvidenceRetentionJob {
     store: Arc<dyn MemoryHubStore>,
     /// 作业执行者标识
     worker_agent: String,
+    /// 跨进程租约（None = 不做互斥）
+    lease: Option<JobLease>,
 }
 
 impl EvidenceRetentionJob {
@@ -25,11 +28,27 @@ impl EvidenceRetentionJob {
         Self {
             store,
             worker_agent: worker_agent.into(),
+            lease: None,
         }
+    }
+
+    /// 注入跨进程租约：同一租约窗口内只有一个副本执行证据清理
+    pub fn with_lease(mut self, lease: JobLease) -> Self {
+        self.lease = Some(lease);
+        self
     }
 
     /// 清理已过保留期限的证据，返回删除条数
     pub async fn run_once(&self, now: DateTime<Utc>) -> Result<usize> {
+        if let Some(lease) = &self.lease {
+            if !lease
+                .try_acquire(&JobLease::global_key("evidence-purge"))
+                .await?
+            {
+                warn!(worker = %self.worker_agent, "证据清理租约被其它副本占用，本轮跳过");
+                return Ok(0);
+            }
+        }
         let namespaces = mem_core::GrantStore::list_namespace_infos(self.store.as_ref()).await?;
         let mut purged = 0usize;
         for info in namespaces {

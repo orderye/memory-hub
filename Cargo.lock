@@ -230,6 +230,7 @@ dependencies = [
  "consolidation",
  "embed",
  "mem-core",
+ "serde_json",
  "store",
  "tikv-jemallocator",
  "tokio",

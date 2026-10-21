@@ -3,12 +3,13 @@
 //! 只生成提案，绝不自动合并——合并必须由 Agent 显式裁决
 //! （参阅 `DefaultIntegrationService::resolve`）。
 
+use crate::lease::JobLease;
 use chrono::{DateTime, Utc};
 use common::{AgentId, Result};
 use consolidation::ConsolidationEngine;
 use mem_core::MemoryHubStore;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 /// 整合扫描作业
 pub struct IntegrationScanJob {
@@ -19,15 +20,23 @@ pub struct IntegrationScanJob {
     max_proposals: usize,
     /// 作业执行者标识
     worker_agent: AgentId,
+    /// 跨进程租约（None = 单机/手动执行，不做互斥）
+    lease: Option<JobLease>,
 }
 
 /// 单轮扫描报告
 #[derive(Debug, Clone, Default)]
 pub struct IntegrationScanReport {
-    /// 各命名空间扫描的条目数
+    /// 各命名空间实际扫描的条目数
     pub scanned: std::collections::HashMap<String, usize>,
-    /// 各命名空间新建的提案数
+    /// 各命名空间本轮新建的提案数（0 也记录：区分"没扫到"与"扫了没新提案"）
     pub proposals: std::collections::HashMap<String, usize>,
+    /// 因租约被其它副本占用而跳过的命名空间
+    pub skipped_leased: Vec<String>,
+    /// 因单次扫描条目上限而被截断的命名空间（扫描结果只覆盖最近的一部分条目）
+    pub truncated_namespaces: Vec<String>,
+    /// 扫描失败的命名空间（单个命名空间出错不得中断其余命名空间）
+    pub failed_namespaces: Vec<String>,
 }
 
 impl IntegrationScanJob {
@@ -45,7 +54,20 @@ impl IntegrationScanJob {
             sim_threshold: sim_threshold.clamp(0.0, 1.0),
             max_proposals: max_proposals.max(1),
             worker_agent: agent,
+            lease: None,
         }
+    }
+
+    /// 注入跨进程租约：同一命名空间在一个租约窗口内只会被一个副本扫描
+    pub fn with_lease(mut self, lease: JobLease) -> Self {
+        self.lease = Some(lease);
+        self
+    }
+
+    /// 设置单次扫描的条目上限（0 = 不限制）
+    pub fn with_scan_limit(mut self, max_entries: usize) -> Self {
+        self.engine = self.engine.with_scan_limit(max_entries);
+        self
     }
 
     /// 扫描全部命名空间（dry_run=false：生成落库提案）
@@ -56,22 +78,45 @@ impl IntegrationScanJob {
         let namespaces = mem_core::MemoryStore::list_namespaces(self.store.as_ref()).await?;
 
         for ns in namespaces {
-            let entries = self.store.all_in_namespace(&ns, false).await?;
-            let active = entries
-                .iter()
-                .filter(|e| e.status == mem_core::MemoryStatus::Active)
-                .count();
-            report.scanned.insert(ns.clone(), active);
-
-            if active < 2 {
-                continue;
+            // 跨进程互斥：同一命名空间在租约窗口内只由一个副本扫描
+            if let Some(lease) = &self.lease {
+                if !lease
+                    .try_acquire(&JobLease::namespace_key("integration-scan", &ns))
+                    .await?
+                {
+                    report.skipped_leased.push(ns.clone());
+                    info!(namespace = %ns, "整合扫描租约被其它副本占用，本轮跳过");
+                    continue;
+                }
             }
 
-            // 复用整合服务的扫描逻辑（内部按成员集合去重，幂等）
-            let created = self.scan_namespace(&ns).await?;
-            report.proposals.insert(ns.clone(), created);
-            if created > 0 {
-                info!(namespace = %ns, created, "整合扫描发现新提案");
+            // 候选空间只由引擎装载一次（此前这里先 all_in_namespace 数一遍活跃条目，
+            // 再让引擎重新装载一次，等于每个命名空间读两遍全量数据）。
+            //
+            // 单个命名空间失败**不得中断整轮扫描**：否则一个坏命名空间会让其余
+            // 命名空间整个窗口都得不到整合（而且它的租约已经被消耗掉了）。
+            let scan = match self.scan_namespace(&ns).await {
+                Ok(scan) => scan,
+                Err(e) => {
+                    warn!(namespace = %ns, error = %e, "整合扫描失败，跳过该命名空间（不影响其余）");
+                    report.failed_namespaces.push(ns.clone());
+                    continue;
+                }
+            };
+            report.scanned.insert(ns.clone(), scan.scanned);
+            if scan.truncated {
+                report.truncated_namespaces.push(ns.clone());
+                warn!(
+                    namespace = %ns,
+                    scanned = scan.scanned,
+                    "整合扫描达到条目上限，本轮只覆盖最近更新的条目"
+                );
+            }
+            // 始终记录（含 0）：报告语义是"各命名空间本轮新建的提案数"，
+            // 缺省与 0 不是一回事——调用方要能区分"没扫到"和"扫了但没有新提案"。
+            report.proposals.insert(ns.clone(), scan.proposals_created);
+            if scan.proposals_created > 0 {
+                info!(namespace = %ns, created = scan.proposals_created, "整合扫描发现新提案");
             }
         }
 
@@ -103,17 +148,15 @@ impl IntegrationScanJob {
     }
 
     /// 单命名空间扫描（委托独立整合中枢引擎统一执行）
-    async fn scan_namespace(&self, namespace: &str) -> Result<usize> {
-        let report = self
-            .engine
+    async fn scan_namespace(&self, namespace: &str) -> Result<consolidation::ConsolidationReport> {
+        self.engine
             .consolidate_namespace(
                 namespace,
                 false,
                 Some(self.sim_threshold),
                 &self.worker_agent,
             )
-            .await?;
-        Ok(report.proposals_created)
+            .await
     }
 
     /// 归档过期条目（与备份作业共用的清理步骤）
@@ -252,7 +295,76 @@ mod tests {
             .unwrap();
         let job = IntegrationScanJob::new(store.clone(), 0.99, 100, "scan-worker");
         let report = job.run_once(Utc::now()).await.unwrap();
-        assert!(report.proposals.is_empty());
+        // 报告现在始终记录"本轮新建提案数"（含 0）：缺省与 0 不是一回事，
+        // 调用方要能区分"没扫到"与"扫了但没有新提案"。
+        assert_eq!(report.proposals.get("ns"), Some(&0));
+    }
+
+    /// 有界扫描：超过条目上限时只扫最近更新的 N 条，并如实标 truncated
+    #[tokio::test]
+    async fn test_scan_is_bounded_and_reports_truncation() {
+        let store = Arc::new(InMemoryHubStore::new());
+        store
+            .ensure_namespace("big", &"agent-a".to_string())
+            .await
+            .unwrap();
+        for i in 0..5 {
+            store
+                .insert(&entry("big", Some(&format!("k{i}")), &format!("内容 {i}")))
+                .await
+                .unwrap();
+        }
+
+        let job =
+            IntegrationScanJob::new(store.clone(), 0.99, 100, "scan-worker").with_scan_limit(2);
+        let report = job.run_once(Utc::now()).await.unwrap();
+        assert_eq!(
+            report.scanned.get("big"),
+            Some(&2),
+            "扫描条目数必须被上限截断到 2"
+        );
+        assert!(
+            report.truncated_namespaces.contains(&"big".to_string()),
+            "截断必须显式上报，不得静默"
+        );
+    }
+
+    /// 跨进程租约：同一窗口内第二个副本必须跳过该命名空间
+    #[tokio::test]
+    async fn test_scan_skips_namespace_when_lease_held_by_peer() {
+        let store = Arc::new(InMemoryHubStore::new());
+        store
+            .ensure_namespace("ns", &"agent-a".to_string())
+            .await
+            .unwrap();
+        store
+            .insert(&entry("ns", Some("db:engine"), "MySQL"))
+            .await
+            .unwrap();
+        store
+            .insert(&entry("ns", Some("db:engine"), "PostgreSQL"))
+            .await
+            .unwrap();
+
+        let rate: std::sync::Arc<dyn common::RateLimitStore> =
+            std::sync::Arc::new(common::InMemoryRateLimitStore::new());
+        let lease = JobLease::from_hours(rate, 24).unwrap();
+
+        let peer_a =
+            IntegrationScanJob::new(store.clone(), 0.99, 100, "worker-a").with_lease(lease.clone());
+        let peer_b =
+            IntegrationScanJob::new(store.clone(), 0.99, 100, "worker-b").with_lease(lease);
+
+        let first = peer_a.run_once(Utc::now()).await.unwrap();
+        assert!(first.scanned.contains_key("ns"));
+        assert!(first.skipped_leased.is_empty());
+
+        let second = peer_b.run_once(Utc::now()).await.unwrap();
+        assert!(
+            second.skipped_leased.contains(&"ns".to_string()),
+            "租约被占用时必须跳过该命名空间"
+        );
+        assert!(second.scanned.is_empty());
     }
 
     #[tokio::test]

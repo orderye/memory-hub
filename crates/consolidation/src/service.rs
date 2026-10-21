@@ -92,6 +92,14 @@ impl DefaultIntegrationService {
         self
     }
 
+    /// 设置单次扫描的活跃条目上限（0 = 不限制）
+    ///
+    /// 生产由 `HUB_INTEGRATION_SCAN_MAX_ENTRIES` 注入；超限时报告里 `truncated=true`。
+    pub fn with_scan_limit(mut self, max_entries: usize) -> Self {
+        self.engine = Arc::new(self.engine.as_ref().clone().with_scan_limit(max_entries));
+        self
+    }
+
     #[cfg(test)]
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
@@ -158,6 +166,7 @@ impl IntegrationService for DefaultIntegrationService {
             proposals: report.proposals,
             skipped_existing: report.skipped_existing,
             mode: report.mode,
+            truncated: report.truncated,
         })
     }
 

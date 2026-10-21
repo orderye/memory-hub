@@ -1,0 +1,1411 @@
+{
+  "format_version": 1,
+  "tool_count": 28,
+  "tools": [
+    {
+      "destructive": false,
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "author": {
+            "description": "提交作者",
+            "maxLength": 128,
+            "type": "string"
+          },
+          "branch": {
+            "description": "所属分支",
+            "maxLength": 256,
+            "type": "string"
+          },
+          "change_kind": {
+            "description": "变更类型",
+            "enum": [
+              "add",
+              "modify",
+              "delete",
+              "rename"
+            ]
+          },
+          "commit_sha": {
+            "description": "Git Commit SHA",
+            "maxLength": 64,
+            "type": "string"
+          },
+          "diff_content": {
+            "description": "代码变更 Unified Diff 文本（自动检测并禁止泄漏 Token/私钥）",
+            "maxLength": 32768,
+            "minLength": 1,
+            "type": "string"
+          },
+          "file_path": {
+            "description": "安全相对文件路径（禁止路径穿越、绝对路径与敏感凭证文件）",
+            "maxLength": 512,
+            "minLength": 1,
+            "type": "string"
+          },
+          "is_committed": {
+            "default": false,
+            "description": "是否已正式提交 Git",
+            "type": "boolean"
+          },
+          "namespace": {
+            "description": "记忆命名空间（小写字母/数字/-/_/./*）；首次写入方自动成为 owner",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z0-9._*-]+$",
+            "type": "string"
+          },
+          "parent_sha": {
+            "description": "父 Commit SHA",
+            "maxLength": 64,
+            "type": "string"
+          },
+          "repository": {
+            "description": "代码仓库标识",
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "source_evidence_id": {
+            "description": "溯源证据 ID",
+            "format": "uuid",
+            "type": "string"
+          },
+          "source_task_id": {
+            "description": "关联 Working Task ID",
+            "format": "uuid",
+            "type": "string"
+          },
+          "symbol_fingerprint": {
+            "description": "变更符号指纹或函数签名摘要",
+            "maxLength": 512,
+            "type": "string"
+          },
+          "thread_id": {
+            "description": "所属代码线程 ID",
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace",
+          "repository",
+          "file_path",
+          "diff_content",
+          "change_kind"
+        ],
+        "type": "object"
+      },
+      "name": "coding_revision_record",
+      "read_only": false,
+      "required": [
+        "namespace",
+        "repository",
+        "file_path",
+        "diff_content",
+        "change_kind"
+      ],
+      "required_scope": "memory:write"
+    },
+    {
+      "destructive": false,
+      "idempotent": false,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "branch": {
+            "description": "目标分支名称",
+            "maxLength": 256,
+            "type": "string"
+          },
+          "description": {
+            "description": "详细背景或设计说明",
+            "maxLength": 4096,
+            "type": "string"
+          },
+          "namespace": {
+            "description": "记忆命名空间（小写字母/数字/-/_/./*）；首次写入方自动成为 owner",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z0-9._*-]+$",
+            "type": "string"
+          },
+          "repository": {
+            "description": "代码仓库标识（如 owner/repo）",
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "task_id": {
+            "description": "可选关联的 Working Task ID",
+            "format": "uuid",
+            "type": "string"
+          },
+          "title": {
+            "description": "线程主题或重构任务标题",
+            "maxLength": 512,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace",
+          "repository",
+          "title"
+        ],
+        "type": "object"
+      },
+      "name": "coding_thread_create",
+      "read_only": false,
+      "required": [
+        "namespace",
+        "repository",
+        "title"
+      ],
+      "required_scope": "memory:write"
+    },
+    {
+      "destructive": false,
+      "idempotent": false,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "metadata": {
+            "description": "可选提炼上下文元数据",
+            "type": "object"
+          },
+          "namespace": {
+            "description": "记忆命名空间（小写字母/数字/-/_/./*）；首次写入方自动成为 owner",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z0-9._*-]+$",
+            "type": "string"
+          },
+          "scene": {
+            "description": "对话所属场景（默认 chat）",
+            "enum": [
+              "chat",
+              "working",
+              "coding"
+            ]
+          },
+          "session_id": {
+            "description": "可选会话/线程标识",
+            "maxLength": 128,
+            "type": "string"
+          },
+          "turns": {
+            "description": "对话轮次列表（包含角色与内容）",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "content": {
+                  "maxLength": 16384,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "role": {
+                  "maxLength": 32,
+                  "minLength": 1,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "role",
+                "content"
+              ],
+              "type": "object"
+            },
+            "minItems": 1,
+            "type": "array"
+          }
+        },
+        "required": [
+          "namespace",
+          "turns"
+        ],
+        "type": "object"
+      },
+      "name": "cognitive_chat_propose",
+      "read_only": false,
+      "required": [
+        "namespace",
+        "turns"
+      ],
+      "required_scope": "memory:write"
+    },
+    {
+      "destructive": false,
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "limit": {
+            "default": 20,
+            "description": "最大返回条数",
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "namespace": {
+            "description": "记忆命名空间（小写字母/数字/-/_/./*）；首次写入方自动成为 owner",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z0-9._*-]+$",
+            "type": "string"
+          },
+          "status": {
+            "description": "提案状态过滤",
+            "enum": [
+              "open",
+              "merged",
+              "dismissed",
+              "expired"
+            ]
+          }
+        },
+        "required": [
+          "namespace"
+        ],
+        "type": "object"
+      },
+      "name": "cognitive_intentions_list",
+      "read_only": true,
+      "required": [
+        "namespace"
+      ],
+      "required_scope": "memory:read"
+    },
+    {
+      "destructive": false,
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "custom_content": {
+            "description": "决策为 modified 时提供的最终修订正文",
+            "maxLength": 8192,
+            "type": "string"
+          },
+          "decision": {
+            "description": "决策操作",
+            "enum": [
+              "accepted",
+              "rejected",
+              "modified"
+            ]
+          },
+          "proposal_id": {
+            "description": "提案 UUID",
+            "format": "uuid",
+            "type": "string"
+          },
+          "reason": {
+            "description": "审核决策理由或备注",
+            "maxLength": 1024,
+            "type": "string"
+          }
+        },
+        "required": [
+          "proposal_id",
+          "decision"
+        ],
+        "type": "object"
+      },
+      "name": "cognitive_proposal_resolve",
+      "read_only": false,
+      "required": [
+        "proposal_id",
+        "decision"
+      ],
+      "required_scope": "memory:write"
+    },
+    {
+      "destructive": false,
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "namespace": {
+            "description": "目标命名空间；`*` 表示全量快照（需要通配读授权才能查看）",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z0-9._*-]+$",
+            "type": "string"
+          },
+          "note": {
+            "description": "备注（如变更原因）",
+            "maxLength": 256,
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace"
+        ],
+        "type": "object"
+      },
+      "name": "memory_backup_create",
+      "read_only": false,
+      "required": [
+        "namespace"
+      ],
+      "required_scope": "memory:admin"
+    },
+    {
+      "destructive": false,
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "namespace": {
+            "description": "省略表示列出全部有权快照",
+            "maxLength": 128,
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "memory_backup_list",
+      "read_only": true,
+      "required": [],
+      "required_scope": "memory:admin"
+    },
+    {
+      "destructive": false,
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "auto_merge": {
+            "default": false,
+            "description": "是否对高相似度重复自动合并",
+            "type": "boolean"
+          },
+          "dry_run": {
+            "default": false,
+            "description": "true = 只预演不落提案",
+            "type": "boolean"
+          },
+          "mode": {
+            "description": "候选发现模式：rules=纯本地规则整合（默认，不调用向量服务）；hybrid=向量辅助整合。默认禁止逐请求覆盖，需服务端开启 HUB_CONSOLIDATION_ALLOW_MODE_OVERRIDE",
+            "enum": [
+              "rules",
+              "hybrid"
+            ]
+          },
+          "namespace": {
+            "description": "记忆命名空间（小写字母/数字/-/_/./*）；首次写入方自动成为 owner",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z0-9._*-]+$",
+            "type": "string"
+          },
+          "sim_threshold": {
+            "description": "覆盖默认重复判定阈值",
+            "maximum": 1,
+            "minimum": 0,
+            "type": "number"
+          }
+        },
+        "required": [
+          "namespace"
+        ],
+        "type": "object"
+      },
+      "name": "memory_consolidate",
+      "read_only": false,
+      "required": [
+        "namespace"
+      ],
+      "required_scope": "memory:write"
+    },
+    {
+      "destructive": false,
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "namespace": {
+            "description": "记忆命名空间（小写字母/数字/-/_/./*）；首次写入方自动成为 owner",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z0-9._*-]+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace"
+        ],
+        "type": "object"
+      },
+      "name": "memory_consolidation_stats",
+      "read_only": true,
+      "required": [
+        "namespace"
+      ],
+      "required_scope": "memory:read"
+    },
+    {
+      "destructive": true,
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "namespace": {
+            "description": "记忆命名空间（小写字母/数字/-/_/./*）；首次写入方自动成为 owner",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z0-9._*-]+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace",
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_delete",
+      "read_only": false,
+      "required": [
+        "namespace",
+        "id"
+      ],
+      "required_scope": "memory:write"
+    },
+    {
+      "destructive": false,
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "description": "记忆条目 ID",
+            "format": "uuid",
+            "type": "string"
+          },
+          "key": {
+            "description": "业务键（与 id 二选一）",
+            "maxLength": 128,
+            "type": "string"
+          },
+          "namespace": {
+            "description": "记忆命名空间（小写字母/数字/-/_/./*）；首次写入方自动成为 owner",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z0-9._*-]+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace"
+        ],
+        "type": "object"
+      },
+      "name": "memory_get",
+      "read_only": true,
+      "required": [
+        "namespace"
+      ],
+      "required_scope": "memory:read"
+    },
+    {
+      "destructive": false,
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "description": "被授权的 Agent 标识",
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "can_read": {
+            "default": true,
+            "type": "boolean"
+          },
+          "can_write": {
+            "default": false,
+            "type": "boolean"
+          },
+          "namespace": {
+            "description": "记忆命名空间（小写字母/数字/-/_/./*）；首次写入方自动成为 owner",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z0-9._*-]+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace",
+          "agent_id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_grant",
+      "read_only": false,
+      "required": [
+        "namespace",
+        "agent_id"
+      ],
+      "required_scope": "memory:admin"
+    },
+    {
+      "destructive": false,
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "namespace": {
+            "description": "记忆命名空间（小写字母/数字/-/_/./*）；首次写入方自动成为 owner",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z0-9._*-]+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace",
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_history",
+      "read_only": true,
+      "required": [
+        "namespace",
+        "id"
+      ],
+      "required_scope": "memory:read"
+    },
+    {
+      "destructive": false,
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "dry_run": {
+            "default": false,
+            "description": "true = 只预演不落提案",
+            "type": "boolean"
+          },
+          "mode": {
+            "description": "候选发现模式：rules=纯本地规则整合（默认，不调用向量服务）；hybrid=向量辅助整合。默认禁止逐请求覆盖，需服务端开启 HUB_CONSOLIDATION_ALLOW_MODE_OVERRIDE",
+            "enum": [
+              "rules",
+              "hybrid"
+            ]
+          },
+          "namespace": {
+            "description": "记忆命名空间（小写字母/数字/-/_/./*）；首次写入方自动成为 owner",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z0-9._*-]+$",
+            "type": "string"
+          },
+          "sim_threshold": {
+            "description": "覆盖默认重复判定阈值",
+            "maximum": 1,
+            "minimum": 0,
+            "type": "number"
+          }
+        },
+        "required": [
+          "namespace"
+        ],
+        "type": "object"
+      },
+      "name": "memory_integrate_scan",
+      "read_only": false,
+      "required": [
+        "namespace"
+      ],
+      "required_scope": "memory:write"
+    },
+    {
+      "destructive": false,
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "namespace": {
+            "description": "记忆命名空间（小写字母/数字/-/_/./*）；首次写入方自动成为 owner",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z0-9._*-]+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace"
+        ],
+        "type": "object"
+      },
+      "name": "memory_integration_list",
+      "read_only": true,
+      "required": [
+        "namespace"
+      ],
+      "required_scope": "memory:read"
+    },
+    {
+      "destructive": false,
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "enum": [
+              "merge",
+              "dismiss"
+            ]
+          },
+          "note": {
+            "description": "裁决理由",
+            "maxLength": 256,
+            "type": "string"
+          },
+          "proposal_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "survivor_id": {
+            "description": "merge 时的幸存条目；省略用提案建议值，必须是提案成员",
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "proposal_id",
+          "action"
+        ],
+        "type": "object"
+      },
+      "name": "memory_integration_resolve",
+      "read_only": false,
+      "required": [
+        "proposal_id",
+        "action"
+      ],
+      "required_scope": "memory:write"
+    },
+    {
+      "destructive": false,
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "cursor": {
+            "description": "上一页返回的 nextCursor",
+            "type": "string"
+          },
+          "kinds": {
+            "items": {
+              "enum": [
+                "fact",
+                "preference",
+                "episode",
+                "note",
+                "skill",
+                "procedure"
+              ]
+            },
+            "maxItems": 6,
+            "type": "array"
+          },
+          "limit": {
+            "default": 50,
+            "maximum": 200,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "namespace": {
+            "description": "记忆命名空间（小写字母/数字/-/_/./*）；首次写入方自动成为 owner",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z0-9._*-]+$",
+            "type": "string"
+          },
+          "source_agent": {
+            "description": "按写入 Agent 过滤",
+            "maxLength": 128,
+            "type": "string"
+          },
+          "statuses": {
+            "default": [
+              "active",
+              "archived"
+            ],
+            "items": {
+              "enum": [
+                "active",
+                "archived",
+                "merged"
+              ]
+            },
+            "maxItems": 3,
+            "type": "array"
+          },
+          "tags": {
+            "items": {
+              "maxLength": 64,
+              "type": "string"
+            },
+            "maxItems": 32,
+            "type": "array"
+          },
+          "text_contains": {
+            "description": "内容子串过滤（不区分大小写）",
+            "maxLength": 256,
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace"
+        ],
+        "type": "object"
+      },
+      "name": "memory_list",
+      "read_only": true,
+      "required": [
+        "namespace"
+      ],
+      "required_scope": "memory:read"
+    },
+    {
+      "destructive": false,
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "confidence": {
+            "default": 1.0,
+            "description": "置信度，用于检索加权",
+            "maximum": 1,
+            "minimum": 0,
+            "type": "number"
+          },
+          "content": {
+            "description": "记忆正文",
+            "maxLength": 8192,
+            "minLength": 1,
+            "type": "string"
+          },
+          "key": {
+            "description": "业务去重键（命名空间内唯一）；提供后 put 走 upsert 语义",
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "kind": {
+            "description": "记忆分类",
+            "enum": [
+              "fact",
+              "preference",
+              "episode",
+              "note",
+              "skill",
+              "procedure"
+            ]
+          },
+          "metadata": {
+            "description": "自定义元数据（jsonb），序列化后不超过 16KB",
+            "type": "object"
+          },
+          "namespace": {
+            "description": "记忆命名空间（小写字母/数字/-/_/./*）；首次写入方自动成为 owner",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z0-9._*-]+$",
+            "type": "string"
+          },
+          "tags": {
+            "items": {
+              "maxLength": 64,
+              "type": "string"
+            },
+            "maxItems": 32,
+            "type": "array"
+          },
+          "ttl_seconds": {
+            "description": "生存秒数；0 或省略表示不过期。到期由 worker 自动归档",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "namespace",
+          "kind",
+          "content"
+        ],
+        "type": "object"
+      },
+      "name": "memory_put",
+      "read_only": false,
+      "required": [
+        "namespace",
+        "kind",
+        "content"
+      ],
+      "required_scope": "memory:write"
+    },
+    {
+      "destructive": true,
+      "idempotent": false,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "backup_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "mode": {
+            "default": "merge",
+            "enum": [
+              "dry_run",
+              "merge",
+              "replace"
+            ]
+          }
+        },
+        "required": [
+          "backup_id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_restore",
+      "read_only": false,
+      "required": [
+        "backup_id"
+      ],
+      "required_scope": "memory:admin"
+    },
+    {
+      "destructive": true,
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "namespace": {
+            "description": "记忆命名空间（小写字母/数字/-/_/./*）；首次写入方自动成为 owner",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z0-9._*-]+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace",
+          "agent_id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_revoke",
+      "read_only": false,
+      "required": [
+        "namespace",
+        "agent_id"
+      ],
+      "required_scope": "memory:admin"
+    },
+    {
+      "destructive": false,
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "include_archived": {
+            "default": false,
+            "description": "是否把已归档条目纳入候选",
+            "type": "boolean"
+          },
+          "include_superseded": {
+            "default": false,
+            "description": "是否包含已失效（superseded）的旧事实",
+            "type": "boolean"
+          },
+          "kinds": {
+            "items": {
+              "enum": [
+                "fact",
+                "preference",
+                "episode",
+                "note",
+                "skill",
+                "procedure"
+              ]
+            },
+            "maxItems": 6,
+            "type": "array"
+          },
+          "layer": {
+            "description": "认知层级过滤（可选）",
+            "type": "string"
+          },
+          "min_score": {
+            "description": "最小综合相关性分阈值（可选）。省略时使用服务端默认阈值（默认拒绝阈值）；显式给出 0 表示关闭阈值、返回全部候选",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "type": "number"
+          },
+          "namespace": {
+            "description": "记忆命名空间（小写字母/数字/-/_/./*）；首次写入方自动成为 owner",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z0-9._*-]+$",
+            "type": "string"
+          },
+          "query_text": {
+            "default": "",
+            "description": "自然语言查询；为空时退化为列表召回",
+            "maxLength": 2048,
+            "type": "string"
+          },
+          "scene": {
+            "description": "认知场景过滤（chat / working / coding，可选）",
+            "enum": [
+              "chat",
+              "working",
+              "coding"
+            ],
+            "type": "string"
+          },
+          "tags": {
+            "description": "标签筛选：条目必须包含全部给定标签（不参与相关性打分）",
+            "items": {
+              "maxLength": 64,
+              "type": "string"
+            },
+            "maxItems": 32,
+            "type": "array"
+          },
+          "top_k": {
+            "default": 10,
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "valid_at": {
+            "description": "时间有效性断言：查询在特定时刻有效的事实（可选）",
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace"
+        ],
+        "type": "object"
+      },
+      "name": "memory_search",
+      "read_only": true,
+      "required": [
+        "namespace"
+      ],
+      "required_scope": "memory:read"
+    },
+    {
+      "destructive": false,
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "namespace": {
+            "description": "记忆命名空间（小写字母/数字/-/_/./*）；首次写入方自动成为 owner",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z0-9._*-]+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace"
+        ],
+        "type": "object"
+      },
+      "name": "memory_stats",
+      "read_only": true,
+      "required": [
+        "namespace"
+      ],
+      "required_scope": "memory:read"
+    },
+    {
+      "destructive": false,
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "confidence": {
+            "maximum": 1,
+            "minimum": 0,
+            "type": "number"
+          },
+          "content": {
+            "maxLength": 8192,
+            "minLength": 1,
+            "type": "string"
+          },
+          "expires_in_seconds": {
+            "description": "重新设置过期：>0 秒后过期；0 清除过期；省略不变",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "fact",
+              "preference",
+              "episode",
+              "note",
+              "skill",
+              "procedure"
+            ]
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "namespace": {
+            "description": "记忆命名空间（小写字母/数字/-/_/./*）；首次写入方自动成为 owner",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z0-9._*-]+$",
+            "type": "string"
+          },
+          "tags": {
+            "items": {
+              "maxLength": 64,
+              "type": "string"
+            },
+            "maxItems": 32,
+            "type": "array"
+          }
+        },
+        "required": [
+          "namespace",
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_update",
+      "read_only": false,
+      "required": [
+        "namespace",
+        "id"
+      ],
+      "required_scope": "memory:write"
+    },
+    {
+      "destructive": false,
+      "idempotent": false,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "boundary_envs": {
+            "description": "适用环境与边界约束（如 os:linux, db:pg）",
+            "items": {
+              "maxLength": 128,
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "confidence": {
+            "default": 1.0,
+            "description": "经验置信度",
+            "maximum": 1,
+            "minimum": 0,
+            "type": "number"
+          },
+          "failure_modes": {
+            "description": "已知失败模式或踩坑警示",
+            "items": {
+              "maxLength": 256,
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "namespace": {
+            "description": "记忆命名空间（小写字母/数字/-/_/./*）；首次写入方自动成为 owner",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z0-9._*-]+$",
+            "type": "string"
+          },
+          "preconditions": {
+            "description": "方案适用的前置条件列表",
+            "items": {
+              "maxLength": 256,
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "search_keys": {
+            "description": "经验检索索引关键词",
+            "items": {
+              "maxLength": 64,
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "solution": {
+            "description": "经过验证的解决方案",
+            "maxLength": 8192,
+            "minLength": 1,
+            "type": "string"
+          },
+          "task": {
+            "description": "任务/问题模式描述",
+            "maxLength": 2048,
+            "minLength": 1,
+            "type": "string"
+          },
+          "task_id": {
+            "description": "可选关联源任务 ID",
+            "format": "uuid",
+            "type": "string"
+          },
+          "validation": {
+            "description": "验证方案或验证标准",
+            "maxLength": 1024,
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace",
+          "task",
+          "solution"
+        ],
+        "type": "object"
+      },
+      "name": "working_experience_distill",
+      "read_only": false,
+      "required": [
+        "namespace",
+        "task",
+        "solution"
+      ],
+      "required_scope": "memory:write"
+    },
+    {
+      "destructive": false,
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "experience_id": {
+            "description": "经验 UUID",
+            "format": "uuid",
+            "type": "string"
+          },
+          "namespace": {
+            "description": "记忆命名空间（小写字母/数字/-/_/./*）；首次写入方自动成为 owner",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z0-9._*-]+$",
+            "type": "string"
+          },
+          "score": {
+            "description": "反馈评分（+1 验证有效，-1 产生故障，0 中立）",
+            "maximum": 1,
+            "minimum": -1,
+            "type": "number"
+          },
+          "status": {
+            "description": "可选更新经验生命周期状态",
+            "enum": [
+              "candidate",
+              "active",
+              "deprecated",
+              "archived"
+            ]
+          }
+        },
+        "required": [
+          "namespace",
+          "experience_id",
+          "score"
+        ],
+        "type": "object"
+      },
+      "name": "working_experience_feedback",
+      "read_only": false,
+      "required": [
+        "namespace",
+        "experience_id",
+        "score"
+      ],
+      "required_scope": "memory:write"
+    },
+    {
+      "destructive": false,
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "env": {
+            "description": "当前执行环境（如 linux / macos / postgres）；给出后与经验 boundary_envs 匹配，不匹配则降权并告警",
+            "maxLength": 128,
+            "type": "string"
+          },
+          "namespace": {
+            "description": "记忆命名空间（小写字母/数字/-/_/./*）；首次写入方自动成为 owner",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z0-9._*-]+$",
+            "type": "string"
+          },
+          "query": {
+            "description": "任务/故障的自然语言描述；为空字符串时退化为列表召回",
+            "maxLength": 2048,
+            "minLength": 1,
+            "type": "string"
+          },
+          "strict_env": {
+            "default": false,
+            "description": "严格环境边界：环境不匹配的经验直接不返回（默认 false = 仅降权并告警）。有安全后果的场景应开启——降权只是排序提示，硬拒绝才是规则",
+            "type": "boolean"
+          },
+          "top_k": {
+            "default": 10,
+            "maximum": 50,
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "namespace",
+          "query"
+        ],
+        "type": "object"
+      },
+      "name": "working_experience_search",
+      "read_only": true,
+      "required": [
+        "namespace",
+        "query"
+      ],
+      "required_scope": "memory:read"
+    },
+    {
+      "destructive": false,
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "failure_reason": {
+            "description": "失败原因（状态为 failed 时填写）",
+            "maxLength": 4096,
+            "type": "string"
+          },
+          "namespace": {
+            "description": "记忆命名空间（小写字母/数字/-/_/./*）；首次写入方自动成为 owner",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z0-9._*-]+$",
+            "type": "string"
+          },
+          "result_summary": {
+            "description": "执行结果摘要",
+            "maxLength": 4096,
+            "type": "string"
+          },
+          "status": {
+            "description": "任务终态",
+            "enum": [
+              "completed",
+              "failed",
+              "cancelled"
+            ]
+          },
+          "task_id": {
+            "description": "任务 UUID",
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace",
+          "task_id",
+          "status"
+        ],
+        "type": "object"
+      },
+      "name": "working_task_finish",
+      "read_only": false,
+      "required": [
+        "namespace",
+        "task_id",
+        "status"
+      ],
+      "required_scope": "memory:write"
+    },
+    {
+      "destructive": false,
+      "idempotent": false,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "metadata": {
+            "description": "任务自定义上下文元数据",
+            "type": "object"
+          },
+          "namespace": {
+            "description": "记忆命名空间（小写字母/数字/-/_/./*）；首次写入方自动成为 owner",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z0-9._*-]+$",
+            "type": "string"
+          },
+          "scene": {
+            "description": "任务发生场景（默认 working）",
+            "enum": [
+              "chat",
+              "working",
+              "coding"
+            ]
+          },
+          "source_evidence_id": {
+            "description": "关联的前置证据 ID",
+            "format": "uuid",
+            "type": "string"
+          },
+          "task": {
+            "description": "任务目标描述",
+            "maxLength": 2048,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace",
+          "task"
+        ],
+        "type": "object"
+      },
+      "name": "working_task_start",
+      "read_only": false,
+      "required": [
+        "namespace",
+        "task"
+      ],
+      "required_scope": "memory:write"
+    }
+  ]
+}

@@ -13,6 +13,7 @@ pub mod cognitive_job;
 pub mod evidence_job;
 pub mod experience_job;
 pub mod integration_job;
+pub mod lease;
 pub mod scheduler;
 
 pub use backup_job::{BackupJob, BackupJobReport};
@@ -20,4 +21,5 @@ pub use cognitive_job::{ChatCognitiveJob, ChatCognitiveJobReport};
 pub use evidence_job::EvidenceRetentionJob;
 pub use experience_job::{ExperienceDistillJob, ExperienceDistillReport};
 pub use integration_job::{IntegrationScanJob, IntegrationScanReport};
+pub use lease::JobLease;
 pub use scheduler::{JobScheduler, ScheduledTask};

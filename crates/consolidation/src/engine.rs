@@ -75,6 +75,12 @@ pub struct ConsolidationEngine {
     lexical_min_similarity: f32,
     /// 向量候选的相似度下限（None = 未经真实模型标定）
     embed_min_similarity: Option<f32>,
+    /// 单次扫描最多装载的活跃条目数（0 = 不限制）
+    ///
+    /// 整合是"把一个命名空间的条目全读进来做 O(n²) 级候选发现"的操作，
+    /// 没有上限时一个大命名空间就能把进程内存顶满。默认由调用方按部署形态注入
+    /// （`HUB_INTEGRATION_SCAN_MAX_ENTRIES`）；0 保留给既有单元测试与显式全量扫描。
+    scan_limit: usize,
 }
 
 impl ConsolidationEngine {
@@ -94,7 +100,19 @@ impl ConsolidationEngine {
             limits: CandidateLimits::default(),
             lexical_min_similarity: CandidateThresholds::default().lexical_min_similarity,
             embed_min_similarity: None,
+            scan_limit: 0,
         }
+    }
+
+    /// 设置单次扫描的活跃条目上限（0 = 不限制）
+    ///
+    /// 超限时只扫描**最近更新**的前 N 条，并在报告里置 `truncated=true`：
+    /// 静默截断会让调用方误以为"整个命名空间都扫过了"。
+    ///
+    /// 上限 1 没有意义（永远凑不成一对候选），这里抬到 2，与配置层校验保持一致。
+    pub fn with_scan_limit(mut self, max_entries: usize) -> Self {
+        self.scan_limit = if max_entries == 1 { 2 } else { max_entries };
+        self
     }
 
     /// 注入嵌入器：合并后重算向量
@@ -155,14 +173,18 @@ impl ConsolidationEngine {
 
     /// 本引擎是否允许调用嵌入服务
     ///
-    /// **只有向量模式且嵌入器提供真实语义信号时才允许**。
+    /// **只有向量模式、嵌入已启用、且嵌入器提供真实语义信号时才允许**。
     /// 纯规则模式下这是结构性保证：整合链路一次嵌入调用都不会发出。
+    ///
+    /// 三个条件缺一不可：`is_enabled` 回答"要不要花一次调用"（`off` 时为 false），
+    /// `provides_semantic_signal` 回答"这些向量能不能当语义用"（伪向量为 false）。
+    /// 只用后者会导致"启用但无信号"的嵌入器在 off 场景下仍然发请求再失败。
     fn embedding_allowed(&self) -> bool {
         self.mode == ConsolidationMode::Hybrid
             && self
                 .embedder
                 .as_ref()
-                .map(|e| e.provides_semantic_signal())
+                .map(|e| e.is_enabled() && e.provides_semantic_signal())
                 .unwrap_or(false)
     }
 
@@ -177,6 +199,9 @@ impl ConsolidationEngine {
                 let Some(embedder) = self.embedder.clone() else {
                     return self.apply_fallback("embedding_provider_not_configured");
                 };
+                if !embedder.is_enabled() {
+                    return self.apply_fallback("embedding_disabled");
+                }
                 if !embedder.provides_semantic_signal() {
                     return self.apply_fallback("embedding_provider_not_ready");
                 }
@@ -232,15 +257,39 @@ impl ConsolidationEngine {
         }
     }
 
-    /// 载入命名空间内的活跃条目
-    async fn load_active(&self, namespace: &str) -> Result<Vec<MemoryEntry>> {
-        Ok(self
-            .store
-            .all_in_namespace(namespace, false)
-            .await?
-            .into_iter()
-            .filter(|e| e.status == MemoryStatus::Active)
-            .collect::<Vec<_>>())
+    /// 载入命名空间内的活跃条目，返回 `(条目, 是否被上限截断)`
+    ///
+    /// - `scan_limit == 0`：保持历史行为，走 `all_in_namespace` 全量读取
+    ///   （内存峰值随命名空间线性增长，只有显式要求时才用）；
+    /// - `scan_limit > 0`：按 `updated_at` 倒序取前 N+1 条，多取一条用于判断
+    ///   "是否还有更多"，并在报告里如实标 `truncated`——只做一次存储调用，
+    ///   不会把整表装进内存。
+    async fn load_active(&self, namespace: &str) -> Result<(Vec<MemoryEntry>, bool)> {
+        if self.scan_limit == 0 {
+            let entries = self
+                .store
+                .all_in_namespace(namespace, false)
+                .await?
+                .into_iter()
+                .filter(|e| e.status == MemoryStatus::Active)
+                .collect::<Vec<_>>();
+            return Ok((entries, false));
+        }
+
+        let filter = mem_core::MemoryFilter {
+            namespace: Some(namespace.to_string()),
+            statuses: Some(vec![MemoryStatus::Active]),
+            limit: Some(self.scan_limit.saturating_add(1)),
+            ..Default::default()
+        };
+        // 存储层过滤条件必须与服务层一致：账户作用域由 store 包装负责
+        let mut entries = self.store.list(&filter).await?;
+        let truncated = entries.len() > self.scan_limit;
+        if truncated {
+            entries.truncate(self.scan_limit);
+        }
+        entries.retain(|e| e.status == MemoryStatus::Active);
+        Ok((entries, truncated))
     }
 
     /// 一次分析：候选只算一次，统计与提案共用
@@ -293,12 +342,13 @@ impl ConsolidationEngine {
 
     /// 计算命名空间的记忆整合健康度统计报告
     pub async fn calculate_stats(&self, namespace: &str) -> Result<ConsolidationStats> {
-        let entries = self.load_active(namespace).await?;
+        let (entries, truncated) = self.load_active(namespace).await?;
         let total_active = entries.len();
         if total_active == 0 {
             return Ok(ConsolidationStats {
                 namespace: namespace.to_string(),
                 health_score: 1.0,
+                truncated,
                 ..Default::default()
             });
         }
@@ -306,7 +356,10 @@ impl ConsolidationEngine {
         let now = Utc::now();
         let analysis = self.analyze(namespace, &entries, None).await?;
         let stale = self.staleness_detector.detect_in_entries(&entries, now);
-        Ok(self.build_stats(namespace, total_active, &analysis, &stale))
+        let mut stats = self.build_stats(namespace, total_active, &analysis, &stale);
+        // 被上限截断时，健康度只代表"最近 N 条"的抽样，必须如实标注
+        stats.truncated = truncated;
+        Ok(stats)
     }
 
     /// 汇总健康度指标
@@ -364,6 +417,8 @@ impl ConsolidationEngine {
             redundancy_ratio,
             conflict_ratio,
             health_score,
+            // 是否被条目上限截断由调用方（calculate_stats）按实际装载结果覆盖
+            truncated: false,
         }
     }
 
@@ -379,12 +434,14 @@ impl ConsolidationEngine {
         let scan_lock = namespace_lock(namespace);
         let _guard = scan_lock.lock().await;
 
-        let entries = self.load_active(namespace).await?;
+        let (entries, truncated) = self.load_active(namespace).await?;
         let analysis = self.analyze(namespace, &entries, sim_threshold).await?;
 
         let now = Utc::now();
         let stale = self.staleness_detector.detect_in_entries(&entries, now);
-        let stats = self.build_stats(namespace, entries.len(), &analysis, &stale);
+        let mut stats = self.build_stats(namespace, entries.len(), &analysis, &stale);
+        // 报告级与统计级必须一致：截断时 stats 也是抽样结果，不能一个是 true 一个是 false
+        stats.truncated = truncated;
 
         let mut report = ConsolidationReport {
             namespace: namespace.to_string(),
@@ -396,6 +453,7 @@ impl ConsolidationEngine {
             proposals: Vec::new(),
             stats,
             mode: analysis.status.clone(),
+            truncated,
         };
 
         if entries.len() < 2 {

@@ -13,8 +13,12 @@
 //! 2. **缺失向量时按需嵌入（有界）**：对没有可用向量的条目，调用既有
 //!    `Embedder::embed`（**仅 embeddings 协议，不触碰任何生成式接口**），
 //!    批大小与条目数都有硬上限。
-//! 3. **ANN 近邻召回**：用 `MemoryStore::similar`（账户作用域 + 命名空间作用域）
-//!    取近邻候选。
+//! 3. **近邻候选生成（进程内）**：对候选空间内的向量做两两比较；条目数超过
+//!    `EXHAUSTIVE_MAX_ENTRIES`（256）时改用多表 LSH 分桶，避免 O(n²) 爆炸。
+//!
+//!    ⚠️ 本实现**不调用** `MemoryStore::similar`：候选空间已经被调用方按
+//!    账户 + 命名空间 + 状态收窄到内存里，再走一次存储层 ANN 查询既绕不开
+//!    权限边界，也会重复计算。此前注释声称走 ANN，与实现不符，已按实际行为修正。
 
 use crate::candidates::rules::RulesCandidateFinder;
 use crate::candidates::*;

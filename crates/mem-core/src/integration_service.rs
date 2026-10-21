@@ -43,6 +43,9 @@ pub struct ScanReport {
     pub skipped_existing: usize,
     /// 本次运行的候选策略状态（请求模式 / 实际模式 / 降级 / embedding 调用计数）
     pub mode: ConsolidationModeStatus,
+    /// 本次扫描是否因"单次扫描条目上限"被截断（`scanned` 不是全库条目数）
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 /// 提案裁决动作

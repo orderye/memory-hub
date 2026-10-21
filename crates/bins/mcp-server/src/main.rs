@@ -41,6 +41,12 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cfg = AppConfig::from_env()?;
     info!(config = %cfg.redacted_summary(), "记忆中枢 MCP Server 启动中");
+    info!(
+        profile = %cfg.deployment_profile.as_str(),
+        label = cfg.deployment_profile.label_zh(),
+        embedding_enabled = cfg.embedding_enabled(),
+        "部署模式"
+    );
 
     // ===== 存储 =====
     let (store, shared_rate_store) = build_store(&cfg).await?;
@@ -151,20 +157,27 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         embed_min_similarity_calibrated = cfg.consolidation_embed_min_similarity.is_some(),
         "记忆整合候选策略已就绪"
     );
-    let integration_service = Arc::new(
-        DefaultIntegrationService::new(
-            store.clone(),
-            access.clone(),
-            cfg.integrate_sim_threshold,
-            cfg.integrate_max_proposals,
-        )
-        .with_mode(
-            consolidation_mode,
-            consolidation_fallback,
-            consolidation_limits,
-            cfg.consolidation_lexical_min_similarity,
-        ),
-    );
+    let mut integration = DefaultIntegrationService::new(
+        store.clone(),
+        access.clone(),
+        cfg.integrate_sim_threshold,
+        cfg.integrate_max_proposals,
+    )
+    .with_mode(
+        consolidation_mode,
+        consolidation_fallback,
+        consolidation_limits,
+        cfg.consolidation_lexical_min_similarity,
+    )
+    // 有界扫描：单命名空间一次最多装载 N 条活跃条目（报告里标 truncated）
+    .with_scan_limit(cfg.integration_scan_max_entries);
+    // 向量模式必须真的拿到嵌入器，否则 memory_integrate_scan 的 hybrid 会**恒降级**
+    // （此前只有 memory_consolidate 注入了嵌入器，两个整合入口能力不一致）。
+    // 纯规则模式不受影响：引擎的 embedding_allowed() 在 Rules 下恒为 false。
+    if cfg.embedding_enabled() {
+        integration = integration.with_embedder(embedder.clone());
+    }
+    let integration_service = Arc::new(integration);
 
     let working_memory = Arc::new(WorkingMemoryService::new(store.clone()));
     let coding_memory = Arc::new(CodingMemoryService::new(store.clone()));
@@ -173,7 +186,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let chat_extractor = Arc::new(mem_core::testing::MockChatCognitiveExtractor::new());
     warn!(
         "Chat 认知抽取器当前为 MockChatCognitiveExtractor（占位实现）：未接入真实 LLM 抽取器，\
-         请通过 HUB_CHAT_EXTRACTOR 配置后再启用自动入库"
+         自动入库候选完全依赖调用方注入；本轮不引入生成式 LLM 依赖"
     );
     let chat_cognitive = Arc::new(ChatCognitiveService::new(
         store.clone(),
@@ -201,6 +214,8 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             embed_top_k: cfg.consolidation_embed_top_k,
             embed_min_similarity: cfg.consolidation_embed_min_similarity,
             lexical_min_similarity: cfg.consolidation_lexical_min_similarity,
+            scan_max_entries: cfg.integration_scan_max_entries,
+            stats_ttl_s: cfg.consolidation_stats_ttl_s,
         })
         .with_embedder(embedder.clone())
         .with_working_memory(working_memory)
@@ -247,6 +262,10 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         rate_limiter,
         interceptor,
         capabilities: Arc::new(mcp::transport::CapabilityReport {
+            deployment_profile: cfg.deployment_profile.as_str().to_string(),
+            // 持久性只取决于存储后端：内存模式重启即失忆，不得对外声称"已持久化"
+            storage_durable: cfg.is_postgres(),
+            vector_path_enabled: cfg.embedding_enabled(),
             embed_provider: cfg.embed_provider.clone(),
             embed_model: cfg.embed_model.clone(),
             embed_dim: cfg.embed_dim,

@@ -155,7 +155,13 @@ pub struct McpTransportState {
 /// 检索退化为词法匹配，把它与"真实语义检索"混为一谈会让验收结论失真。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapabilityReport {
-    /// 嵌入提供方：`mock` | `http`
+    /// 部署模式：`production` | `lite`
+    pub deployment_profile: String,
+    /// 存储是否持久化（`false` = 内存临时模式，重启即失忆）
+    pub storage_durable: bool,
+    /// 向量路是否启用（嵌入被显式关闭时为 `false`）
+    pub vector_path_enabled: bool,
+    /// 嵌入提供方：`mock` | `http` | `off`
     pub embed_provider: String,
     /// 嵌入模型标识
     pub embed_model: String,
@@ -206,6 +212,9 @@ impl Default for ConsolidationCapability {
 impl Default for CapabilityReport {
     fn default() -> Self {
         Self {
+            deployment_profile: "production".to_string(),
+            storage_durable: true,
+            vector_path_enabled: true,
             embed_provider: "unknown".to_string(),
             embed_model: "unknown".to_string(),
             embed_dim: 0,
@@ -438,7 +447,14 @@ pub async fn handle_jsonrpc_ext(
 }
 
 /// 解析单条原始帧并处理（供 stdio 与 HTTP 共用）
-pub async fn handle_raw_frame(state: &McpTransportState, raw: &str) -> Option<JsonRpcResponse> {
+///
+/// `local_auth` 只由 stdio 路径传入（见 [`stdio_local_auth_ctx`]）：
+/// 未显式启用本地代理时为 `None`，此时 `tools/call` 与 HTTP 路径一样要求令牌。
+pub async fn handle_raw_frame(
+    state: &McpTransportState,
+    raw: &str,
+    local_auth: Option<&AuthCtx>,
+) -> Option<JsonRpcResponse> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
@@ -451,9 +467,10 @@ pub async fn handle_raw_frame(state: &McpTransportState, raw: &str) -> Option<Js
             if req.id.is_none() && req.method.starts_with("notifications/") {
                 return None;
             }
-            // stdio 场景无 HTTP 头，鉴权由调用方通过 params 或环境注入的
-            // 服务主体承担；此处视为"已认证的本地桥接"。
-            Some(handle_jsonrpc(state, None, req).await)
+            // stdio 无 HTTP 头：只有显式开启的本地代理才携带身份，否则按"未认证"处理
+            // （历史实现注释声称"视为已认证"，但实际传的是 None，导致 stdio 下
+            //  tools/call 恒返回 AuthRequired——文档与行为对不上）。
+            Some(handle_jsonrpc(state, local_auth, req).await)
         }
         Err(e) => Some(JsonRpcResponse::err(
             None,
@@ -463,9 +480,57 @@ pub async fn handle_raw_frame(state: &McpTransportState, raw: &str) -> Option<Js
     }
 }
 
+/// stdio 本地桥接的鉴权上下文
+///
+/// `HUB_STDIO_LOCAL_AGENT` 未设置（或为空）时返回 `None`：stdio 下的
+/// `tools/call` 与 HTTP 路径一样要求 Bearer 令牌（与升级前行为一致）。
+///
+/// 显式设置后，stdio 会话被视为"进程所有者本人的本地桥接"：以 bootstrap 账户、
+/// 全部 scope 与通配 ACL 运行。安全边界：
+/// - 只对 stdio 生效。stdio 的输入来自启动本进程的父进程，无法被网络访问；
+/// - HTTP 路径完全不受影响，仍严格执行 OAuth 2.1 令牌与 ACL；
+/// - 启用时打印 WARN，日志里能看到"这一实例是单机全权限模式"。
+fn stdio_local_auth_ctx(profile: &str) -> Result<Option<AuthCtx>> {
+    let Ok(raw) = std::env::var("HUB_STDIO_LOCAL_AGENT") else {
+        return Ok(None);
+    };
+    let agent = raw.trim();
+    if agent.is_empty() {
+        return Ok(None);
+    }
+
+    // 只在个人轻量部署（profile=lite）下允许：生产实例开着它等于绕过 OAuth 与
+    // Agent 身份审计，直接获得 bootstrap 账户的 Admin 能力（restore/replace/revoke）。
+    // 这里选择 fail-fast 而不是"静默忽略"，否则运维以为开了却没开/开了却不知道。
+    if profile != "lite" {
+        return Err(HubError::InvalidArgument(format!(
+            "HUB_STDIO_LOCAL_AGENT 只允许在 HUB_DEPLOYMENT_PROFILE=lite 下使用（当前 {profile}）：\
+             生产环境请使用 HTTP + OAuth 2.1 获取令牌"
+        )));
+    }
+
+    let mut acl = common::Acl::default();
+    acl.read_namespaces.insert("*".to_string());
+    acl.write_namespaces.insert("*".to_string());
+    tracing::warn!(
+        agent = %agent,
+        "stdio 本地代理模式已启用：以 bootstrap 账户全权限运行，仅限单机个人部署；         如需账户隔离请改用 HTTP + OAuth 2.1"
+    );
+    Ok(Some(AuthCtx::new(
+        agent.to_string(),
+        common::BOOTSTRAP_ACCOUNT_ID,
+        common::Scope::all(),
+        acl,
+    )))
+}
+
 /// stdio 桥接主循环：读一行、回一帧
 pub async fn run_stdio(state: Arc<McpTransportState>) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    // 身份在会话开始时确定一次：中途改环境变量不应悄悄提升权限。
+    // 是否允许本地代理取决于部署模式（只有 lite 允许）。
+    let local_auth = stdio_local_auth_ctx(state.capabilities.deployment_profile.as_str())?;
 
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
@@ -476,7 +541,7 @@ pub async fn run_stdio(state: Arc<McpTransportState>) -> Result<()> {
         .await
         .map_err(|e| HubError::Internal(anyhow::anyhow!("stdin 读取失败: {}", e)))?
     {
-        if let Some(resp) = handle_raw_frame(&state, &line).await {
+        if let Some(resp) = handle_raw_frame(&state, &line, local_auth.as_ref()).await {
             let payload = serde_json::to_string(&resp)
                 .map_err(|e| HubError::Internal(anyhow::anyhow!("响应序列化失败: {}", e)))?;
             stdout
@@ -556,6 +621,11 @@ async fn handle_readyz(State(state): State<SharedState>) -> Response {
     let body = json!({
         "status": if store_ok { "ready" } else { "not_ready" },
         "storage": if store_ok { "reachable" } else { "unreachable" },
+        // 部署形态：lite 下向量路默认关闭，调用方必须能一眼看出"这是关键词检索"
+        "deployment": {
+            "profile": caps.deployment_profile,
+            "storage_durable": caps.storage_durable,
+        },
         "semantic": {
             "ready": caps.semantic_ready,
             "provider": caps.embed_provider,
@@ -566,6 +636,7 @@ async fn handle_readyz(State(state): State<SharedState>) -> Response {
         "retrieval": {
             "default_min_score": caps.default_min_score,
             "scene_min_scores": caps.scene_min_scores,
+            "vector_path_enabled": caps.vector_path_enabled,
         },
         "consolidation": {
             "mode": caps.consolidation.mode,
@@ -592,6 +663,10 @@ async fn handle_capabilities(State(state): State<SharedState>) -> Response {
     (
         StatusCode::OK,
         axum::Json(json!({
+            "deployment": {
+                "profile": caps.deployment_profile,
+                "storage_durable": caps.storage_durable,
+            },
             "embed": {
                 "provider": caps.embed_provider,
                 "model": caps.embed_model,
@@ -604,6 +679,7 @@ async fn handle_capabilities(State(state): State<SharedState>) -> Response {
             "retrieval": {
                 "default_min_score": caps.default_min_score,
                 "scene_min_scores": caps.scene_min_scores,
+                "vector_path_enabled": caps.vector_path_enabled,
             },
             "consolidation": {
                 "mode": caps.consolidation.mode,
@@ -1138,7 +1214,7 @@ mod tests {
         let s = state();
         // 1. stdio 场景：raw_frame 收到通知帧应返回 None，不向 stdout 发送回包
         let raw = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
-        let resp = handle_raw_frame(&s, raw).await;
+        let resp = handle_raw_frame(&s, raw, None).await;
         assert!(resp.is_none(), "标准通知帧不得回复任何 JSON-RPC 响应");
 
         // 2. HTTP 场景：POST 收到通知帧应返回 204 No Content
@@ -1148,6 +1224,84 @@ mod tests {
         let body = Bytes::from_static(br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
         let resp_http = handle_http_mcp(State(Arc::new(s)), Method::POST, headers, body).await;
         assert_eq!(resp_http.status(), StatusCode::NO_CONTENT);
+    }
+
+    /// stdio 未显式开启本地代理时，tools/call 必须仍然要求令牌
+    /// （历史实现注释声称"视为已认证"，但代码传的是 None，文档与行为不一致）
+    #[tokio::test]
+    async fn test_stdio_tools_call_requires_auth_without_local_agent() {
+        let s = state();
+        let raw = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory_list","arguments":{"namespace":"ns"}}}"#;
+        let resp = handle_raw_frame(&s, raw, None).await.expect("应有响应");
+        let err = resp.error.expect("未认证必须返回错误");
+        // HubError::AuthRequired 统一映射为 JSON-RPC 32001 + "缺少或无效令牌"
+        assert_eq!(
+            err.code, 32001,
+            "未认证必须映射为 AuthRequired 错误码：{err:?}"
+        );
+        assert!(
+            err.message.contains("令牌") || err.message.contains("凭证"),
+            "错误信息须可读：{err:?}"
+        );
+    }
+
+    /// 显式开启本地代理（HUB_STDIO_LOCAL_AGENT 语境）后，stdio 可执行工具调用
+    #[tokio::test]
+    async fn test_stdio_tools_call_with_local_agent_executes() {
+        let s = state();
+        let mut acl = common::Acl::default();
+        acl.read_namespaces.insert("*".to_string());
+        acl.write_namespaces.insert("*".to_string());
+        let local = AuthCtx::new(
+            "local-agent".to_string(),
+            common::BOOTSTRAP_ACCOUNT_ID,
+            common::Scope::all(),
+            acl,
+        );
+
+        let raw = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory_put","arguments":{"namespace":"ns","kind":"fact","content":"stdio 本地桥接可用"}}}"#;
+        let resp = handle_raw_frame(&s, raw, Some(&local))
+            .await
+            .expect("应有响应");
+        assert!(resp.error.is_none(), "本地代理调用不得报错：{resp:?}");
+        let result = resp.result.expect("应有结果");
+        assert_eq!(result["isError"], json!(false));
+        assert!(result["structuredContent"]["memory"]["id"].is_string());
+
+        // 同样的帧在不带本地代理时仍被拒绝（能力只在显式开启后生效）
+        let denied = handle_raw_frame(&s, raw, None).await.expect("应有响应");
+        assert!(denied.error.is_some(), "未开启本地代理时不得放行");
+    }
+
+    /// 本地代理上下文：默认（未设置环境变量）为 None，构造出的上下文具备全权限
+    #[test]
+    fn test_stdio_local_auth_ctx_shape() {
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        std::env::remove_var("HUB_STDIO_LOCAL_AGENT");
+        assert!(
+            stdio_local_auth_ctx("lite").unwrap().is_none(),
+            "未设置 HUB_STDIO_LOCAL_AGENT 时不得默认放行"
+        );
+
+        std::env::set_var("HUB_STDIO_LOCAL_AGENT", "local-agent");
+        // 生产模式必须拒绝：本地代理等于绕过 OAuth 与身份审计
+        let err = stdio_local_auth_ctx("production").unwrap_err();
+        assert!(
+            err.to_string().contains("lite"),
+            "非 lite 模式必须明确拒绝：{err}"
+        );
+        let ctx = stdio_local_auth_ctx("lite")
+            .unwrap()
+            .expect("设置后应构造上下文");
+        std::env::remove_var("HUB_STDIO_LOCAL_AGENT");
+
+        assert_eq!(ctx.agent_id, "local-agent");
+        assert_eq!(ctx.account_id, common::BOOTSTRAP_ACCOUNT_ID);
+        assert!(ctx.has_scope(&Scope::Admin));
+        assert!(ctx.acl.can_read("any-ns") && ctx.acl.can_write("any-ns"));
     }
 
     #[tokio::test]
@@ -1220,8 +1374,7 @@ mod tests {
             semantic_ready: false,
             semantic_reason: Some("伪向量：语义召回不可用".to_string()),
             default_min_score: 0.65,
-            scene_min_scores: BTreeMap::new(),
-            consolidation: ConsolidationCapability::default(),
+            ..Default::default()
         });
 
         let resp = handle_readyz(State(Arc::new(s))).await;
@@ -1266,8 +1419,7 @@ mod tests {
             semantic_ready: true,
             semantic_reason: None,
             default_min_score: 0.65,
-            scene_min_scores: BTreeMap::new(),
-            consolidation: ConsolidationCapability::default(),
+            ..Default::default()
         });
 
         let resp = handle_readyz(State(Arc::new(s))).await;
@@ -1291,7 +1443,7 @@ mod tests {
             semantic_reason: Some("伪向量：语义召回不可用".to_string()),
             default_min_score: 0.65,
             scene_min_scores: scene_scores,
-            consolidation: ConsolidationCapability::default(),
+            ..Default::default()
         });
 
         let resp = handle_capabilities(State(Arc::new(s))).await;

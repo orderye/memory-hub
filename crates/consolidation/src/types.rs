@@ -87,6 +87,11 @@ pub struct ConsolidationStats {
     pub conflict_ratio: f32,
     /// 记忆健康度评分 (0.0 ~ 1.0，越接近 1.0 记忆库越整洁健康)
     pub health_score: f32,
+    /// 本次统计是否因"单次扫描条目上限"而只覆盖了最近的一部分条目
+    ///
+    /// 截断时 `total_active` 与各项比率都是**抽样结果**，调用方不得当成全库结论。
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 /// 一键整合运行报告
@@ -102,4 +107,7 @@ pub struct ConsolidationReport {
     pub stats: ConsolidationStats,
     /// 本次运行的候选策略状态（请求模式 / 实际模式 / 降级 / embedding 调用计数）
     pub mode: ConsolidationModeStatus,
+    /// 本次扫描是否因条目上限被截断（`scanned` 不是全库条目数）
+    #[serde(default)]
+    pub truncated: bool,
 }
