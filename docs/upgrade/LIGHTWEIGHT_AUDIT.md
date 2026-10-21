@@ -1116,3 +1116,5 @@ feature 组合要点：
 ---
 
 *本报告仅记录本次检出（HEAD `3048efc`，2026-10-21 17:33 +0800）的实际源码事实；所有行号均可用 `git show HEAD:<path> | sed -n '<n>p'` 复核。凡标注「未实测 / 未验证」的项，均未在本机执行。*
+
+[![powered by KimiCode](../../.github/assets/kimi-badge.svg)](https://www.kimi.com/code)

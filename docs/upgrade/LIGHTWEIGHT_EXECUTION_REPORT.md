@@ -241,3 +241,5 @@ DATABASE_URL=postgresql://user:pass@127.0.0.1:5432/memory_hub_test \
   `HUB_EMBED_PROVIDER` 改回 `mock|http` 即恢复嵌入。
 - **数据**：Lite/Production 共用 schema 与备份格式，不存在"降级后读不了"的形态。
 - 详见 README「回滚（应用版本 / 部署形态）」。
+
+[![powered by KimiCode](../../.github/assets/kimi-badge.svg)](https://www.kimi.com/code)

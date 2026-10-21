@@ -166,3 +166,5 @@ cargo test -p consolidation --test consolidation_eval -- --nocapture
 
 > `--bulk-entries N` 会在测延迟前额外写入 N 条记忆并再读一次 RSS，
 > 用于观察"是否落向量"对常驻内存的影响（1024 维 f32 ≈ 4 KiB/条）。
+
+[![powered by KimiCode](../../.github/assets/kimi-badge.svg)](https://www.kimi.com/code)
