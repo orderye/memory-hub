@@ -43,6 +43,7 @@ pub use algorithm::{
     calculate_item_score, calculate_item_score_with_availability, cosine_similarity,
     document_tokens, extract_terms, inverse_document_frequency, is_superseded_at, keyword_score,
     keyword_score_weighted, l2_normalize, layer_prior, matches_tag_filter, mmr_rerank,
+    mmr_rerank_by,
     passes_validity_filter, recency_score, recency_tau_days_for, retrieval_reference_time,
     scene_preference_score, validity_filter_time, SceneMode, SearchQuery, SCENE_PREFER_BONUS,
     SCENE_PREFER_PENALTY,

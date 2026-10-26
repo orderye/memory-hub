@@ -305,6 +305,57 @@ impl WorkingMemoryService {
         text
     }
 
+    /// 经验文档词元缓存上限（条目数）：经验池本身被 `EXPERIENCE_SCAN_CAP`
+    /// 限制在 2000，缓存上限略高于它；超限整体清空（偶发重算可接受）
+    const EXPERIENCE_TOKEN_CACHE_CAP: usize = 4096;
+
+    /// 进程内词元缓存：key = (namespace, experience_id)，value = (正文指纹, 词元集)。
+    ///
+    /// `search_experiences` 每次查询都对候选池**全量重新分词**（CJK 1/2-gram），
+    /// 同一条经验在多次查询间被反复切分——这是经验检索在池增大后的主要
+    /// CPU 开销。分词是纯函数，按 (命名空间, id) 缓存即可跨查询复用。
+    ///
+    /// 命中条件带 `searchable_text` 指纹：经验正文理论上可经
+    /// `update_experience` 变更（当前只有状态/反馈会走它），指纹比对保证
+    /// 任何字段变化都会自然失效，不依赖"内容不可变"的约定。
+    fn document_tokens_cached(exp: &MemoryExperience) -> Arc<std::collections::HashSet<String>> {
+        use std::collections::HashMap;
+        use std::hash::{Hash, Hasher};
+        use std::sync::{Arc, Mutex, OnceLock};
+
+        type TokenCache = HashMap<(String, Uuid), (u64, Arc<std::collections::HashSet<String>>)>;
+        static CACHE: OnceLock<Mutex<TokenCache>> = OnceLock::new();
+        fn cache() -> &'static Mutex<TokenCache> {
+            CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+        }
+        fn lock<T>(guard: std::result::Result<T, std::sync::PoisonError<T>>) -> T {
+            guard.unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+
+        let text = Self::searchable_text(exp);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut hasher);
+        let fingerprint = hasher.finish();
+        let key = (exp.namespace.clone(), exp.id);
+
+        {
+            let map = lock(cache().lock());
+            if let Some((fp, tokens)) = map.get(&key) {
+                if *fp == fingerprint {
+                    return tokens.clone();
+                }
+            }
+        }
+
+        let tokens = Arc::new(crate::algorithm::document_tokens(&text));
+        let mut map = lock(cache().lock());
+        if map.len() >= Self::EXPERIENCE_TOKEN_CACHE_CAP {
+            map.clear();
+        }
+        map.insert(key, (fingerprint, tokens.clone()));
+        tokens
+    }
+
     /// 检索可复用经验（与 memory_search 同源的词法打分 + 环境边界匹配）
     ///
     /// - 命中判定基于分词词元集合与池内 IDF 加权，不再用整段查询做裸子串匹配；
@@ -344,9 +395,10 @@ impl WorkingMemoryService {
         let pool = self.scan_experiences(namespace).await?;
 
         let terms = crate::algorithm::extract_terms(query);
-        let docs: Vec<std::collections::HashSet<String>> = pool
+        // 词元集走进程内缓存：同一条经验在多次查询间不必反复分词
+        let docs: Vec<Arc<std::collections::HashSet<String>>> = pool
             .iter()
-            .map(|e| crate::algorithm::document_tokens(&Self::searchable_text(e)))
+            .map(|e| Self::document_tokens_cached(e))
             .collect();
         let pool_size = docs.len();
         let doc_freq: Vec<usize> = terms
@@ -929,6 +981,70 @@ mod tests {
             all.len(),
             205,
             "检索必须分页扫描全量经验，而不是只看最近 100 条"
+        );
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use crate::domain::ExperienceStatus;
+
+    /// 微基准（手动运行）：经验检索的文档分词成本——冷（逐条分词，即缓存前
+    /// 每次查询的成本）vs 热（缓存命中）。
+    /// ```bash
+    /// cargo test -p mem-core --lib working_memory_service::bench -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "微基准：手动运行"]
+    fn test_experience_tokenize_benchmark() {
+        let exps: Vec<MemoryExperience> = (0..2_000usize)
+            .map(|i| MemoryExperience {
+                id: Uuid::from_u128(i as u128),
+                namespace: "bench-ns".to_string(),
+                task: format!("排查生产环境第 {i} 类连接池泄漏并优化最大空闲参数"),
+                search_keys: vec!["redis".into(), "pool".into(), format!("key-{i}")],
+                solution: "调大连接池最大存活时间并配合合理的最大空闲连接数，定期健康探测".into(),
+                preconditions: serde_json::json!({}),
+                boundary_envs: vec!["linux".into()],
+                failure_modes: vec!["空闲连接数设为 0 导致每次重新握手".into()],
+                validation: serde_json::json!({"benchmark": "500 并发压测连接复用正常"}),
+                confidence: 0.9,
+                status: ExperienceStatus::Active,
+                feedback_score: 1.0,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            })
+            .collect();
+
+        // 冷：逐条分词（缓存前每次查询都要付出的成本）
+        let t0 = std::time::Instant::now();
+        let cold: Vec<std::collections::HashSet<String>> = exps
+            .iter()
+            .map(|e| crate::algorithm::document_tokens(&WorkingMemoryService::searchable_text(e)))
+            .collect();
+        let cold_time = t0.elapsed();
+        assert_eq!(cold.len(), exps.len());
+
+        // 首遍走缓存（未命中 → 分词并写缓存）
+        let t1 = std::time::Instant::now();
+        let _warm1: Vec<_> = exps
+            .iter()
+            .map(|e| WorkingMemoryService::document_tokens_cached(e))
+            .collect();
+        let warm1_time = t1.elapsed();
+
+        // 热：缓存全命中——这是"缓存后每次查询"的成本
+        let t2 = std::time::Instant::now();
+        let warm2: Vec<_> = exps
+            .iter()
+            .map(|e| WorkingMemoryService::document_tokens_cached(e))
+            .collect();
+        let warm2_time = t2.elapsed();
+        assert_eq!(warm2.len(), exps.len());
+
+        println!(
+            "2000 条经验分词：冷 {cold_time:?}（缓存前每次查询）| 首遍写缓存 {warm1_time:?} | 缓存命中 {warm2_time:?}（缓存后每次查询）"
         );
     }
 }

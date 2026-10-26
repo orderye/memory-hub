@@ -259,11 +259,34 @@ fn clamped_signals(p: &ItemScoreParams) -> [f32; SCORE_WEIGHT_LEN] {
     ]
 }
 
-/// MMR（最大边际相关性）重排
+/// MMR（最大边际相关性）重排——矩阵版
 ///
 /// `scores` 为相关性分，`sim_matrix[i][j]` 为条目 i 与 j 的相似度。
 /// 返回至多 `k` 个索引，按选中顺序排列。
+///
+/// 内部委托 [`mmr_rerank_by`]。矩阵版要求调用方先做 O(n²) 相似度预计算，
+/// 大候选池下这比选择循环本身更贵；新代码建议直接用惰性版。
 pub fn mmr_rerank(scores: &[f32], sim_matrix: &[Vec<f32>], k: usize, lambda: f32) -> Vec<usize> {
+    mmr_rerank_by(scores, k, lambda, |i, j| {
+        sim_matrix
+            .get(i)
+            .and_then(|row| row.get(j))
+            .copied()
+            .unwrap_or(0.0)
+    })
+}
+
+/// MMR（最大边际相关性）重排——惰性相似度版
+///
+/// `sim(i, j)` 按需返回条目 i 与 j 的相似度（负值按 0 处理，与矩阵版
+/// `fold(0.0, max)` 的语义一致）。选择循环只查询"新选中 × 剩余"的相似度，
+/// 总计算量 O(k·n) 而非 O(n²)：候选池为 top_k 的 4 倍时，top_k=100、
+/// 高维向量场景下省掉一个数量级的余弦计算。结果与矩阵版逐条一致
+/// （`max_sim` 是同一集合 max 的增量维护，遍历顺序与比较符不变）。
+pub fn mmr_rerank_by<F>(scores: &[f32], k: usize, lambda: f32, sim: F) -> Vec<usize>
+where
+    F: Fn(usize, usize) -> f32,
+{
     let n = scores.len();
     if n == 0 || k == 0 {
         return Vec::new();
@@ -273,23 +296,28 @@ pub fn mmr_rerank(scores: &[f32], sim_matrix: &[Vec<f32>], k: usize, lambda: f32
 
     let mut selected: Vec<usize> = Vec::with_capacity(k);
     let mut remaining: Vec<usize> = (0..n).collect();
+    // max_sim[i] = max(0, 与已选中条目的相似度)
+    let mut max_sim: Vec<f32> = vec![0.0; n];
 
     while selected.len() < k && !remaining.is_empty() {
         let mut best_idx = remaining[0];
         let mut best_score = f32::MIN;
         for &i in &remaining {
-            let max_sim = selected
-                .iter()
-                .map(|&j| sim_matrix[i][j])
-                .fold(0.0f32, f32::max);
-            let mmr = lambda * scores[i] - (1.0 - lambda) * max_sim;
+            let mmr = lambda * scores[i] - (1.0 - lambda) * max_sim[i];
             if mmr > best_score {
                 best_score = mmr;
                 best_idx = i;
             }
         }
-        selected.push(best_idx);
-        remaining.retain(|&i| i != best_idx);
+        let chosen = best_idx;
+        selected.push(chosen);
+        remaining.retain(|&i| i != chosen);
+        for &i in &remaining {
+            let s = sim(i, chosen);
+            if s > max_sim[i] {
+                max_sim[i] = s;
+            }
+        }
     }
     selected
 }
@@ -585,5 +613,72 @@ mod tests {
     fn test_mmr_empty() {
         assert!(mmr_rerank(&[], &[], 5, 0.7).is_empty());
         assert!(mmr_rerank(&[1.0], &[vec![1.0]], 0, 0.7).is_empty());
+    }
+
+    /// 确定性伪随机流（xorshift64*），无外部依赖
+    struct XorShift(u64);
+    impl XorShift {
+        fn next_f32(&mut self) -> f32 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            let v = self.0.wrapping_mul(0x2545_F491_4F6C_DD1D);
+            ((v >> 40) as f32) / ((1u64 << 24) as f32) * 2.0 - 1.0
+        }
+    }
+
+    /// 回归：惰性 MMR 与矩阵 MMR 输出必须逐条一致
+    #[test]
+    fn test_mmr_lazy_matches_matrix() {
+        let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
+        for (n, k, lambda) in [(30usize, 7usize, 0.7f32), (1, 5, 0.5), (8, 8, 1.0), (12, 3, 0.0)] {
+            let scores: Vec<f32> = (0..n).map(|_| rng.next_f32()).collect();
+            let matrix: Vec<Vec<f32>> = (0..n)
+                .map(|_| (0..n).map(|_| rng.next_f32()).collect())
+                .collect();
+            let by_matrix = mmr_rerank(&scores, &matrix, k, lambda);
+            let by_lazy = mmr_rerank_by(&scores, k, lambda, |i, j| matrix[i][j]);
+            assert_eq!(
+                by_matrix, by_lazy,
+                "n={n} k={k} lambda={lambda}: 惰性版与矩阵版选择顺序必须一致"
+            );
+        }
+    }
+
+    /// 微基准（手动运行）：O(n²) 矩阵预计算 vs 惰性相似度的重排总耗时。
+    /// ```bash
+    /// cargo test -p mem-core --lib algorithm::tests::test_mmr_benchmark -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "微基准：手动运行"]
+    fn test_mmr_benchmark() {
+        let n = 400usize; // top_k=100 × MMR_POOL_FACTOR=4
+        let dim = 1024usize;
+        let k = 100usize;
+        let mut rng = XorShift(0xDEADBEEF_CAFEF00D);
+        let vecs: Vec<Vec<f32>> = (0..n).map(|_| (0..dim).map(|_| rng.next_f32()).collect()).collect();
+        let scores: Vec<f32> = (0..n).map(|i| 1.0 - i as f32 / n as f32).collect();
+        let cosine = |a: &Vec<f32>, b: &Vec<f32>| -> f32 {
+            a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>()
+        };
+
+        let t0 = std::time::Instant::now();
+        let matrix: Vec<Vec<f32>> = vecs
+            .iter()
+            .map(|a| vecs.iter().map(|b| cosine(a, b).max(0.0)).collect())
+            .collect();
+        let matrix_build = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        let order = mmr_rerank(&scores, &matrix, k, 0.7);
+        let matrix_total = t1.elapsed();
+
+        let t2 = std::time::Instant::now();
+        let order_lazy = mmr_rerank_by(&scores, k, 0.7, |i, j| cosine(&vecs[i], &vecs[j]).max(0.0));
+        let lazy_total = t2.elapsed();
+
+        assert_eq!(order, order_lazy, "等价性：选择顺序必须一致");
+        println!(
+            "n={n} dim={dim} k={k}：矩阵版 = 预计算 {matrix_build:?} + 选择 {matrix_total:?}；惰性版总计 {lazy_total:?}"
+        );
     }
 }

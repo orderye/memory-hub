@@ -472,10 +472,13 @@ impl HybridRetriever {
 
     /// MMR 重排（嵌入缺失或模型不匹配的项相互相似度按 0 处理）
     ///
-    /// 相关性候选先截断到 `k * MMR_POOL_FACTOR` 再做两两相似度矩阵：
-    /// MMR 的 O(pool²·dim) 相似度计算在大候选池（默认 200）下会成为检索的主要
-    /// 延迟来源；被截断的尾部条目在相关性上已被压制，实践中不会被 MMR 选中
+    /// 相关性候选先截断到 `k * MMR_POOL_FACTOR` 再做重排：
+    /// 被截断的尾部条目在相关性上已被压制，实践中不会被 MMR 选中
     /// （与 Lucene 等实现一致的有界 MMR 做法）。
+    ///
+    /// 相似度**惰性**计算（[`mem_core::mmr_rerank_by`]）：MMR 每轮只需
+    /// "新选中 × 剩余"的相似度，总量 O(k·pool)；此前预计算全量 O(pool²·dim)
+    /// 相似度矩阵，top_k=100（pool=400）× 高维向量时是重排阶段的主要延迟。
     fn mmr_rerank(
         &self,
         mut scored: Vec<Scored<MemoryEntry>>,
@@ -490,27 +493,18 @@ impl HybridRetriever {
         if n <= 1 {
             return scored;
         }
-        let sim_matrix: Vec<Vec<f32>> = scored
-            .iter()
-            .map(|a| {
-                scored
-                    .iter()
-                    .map(|b| {
-                        if self.embedding_usable(&a.item) && self.embedding_usable(&b.item) {
-                            match (&a.item.embedding, &b.item.embedding) {
-                                (Some(x), Some(y)) => cosine_similarity(x, y).max(0.0),
-                                _ => 0.0,
-                            }
-                        } else {
-                            0.0
-                        }
-                    })
-                    .collect()
-            })
-            .collect();
-
         let scores: Vec<f32> = scored.iter().map(|s| s.score).collect();
-        let order = mem_core::mmr_rerank(&scores, &sim_matrix, k, self.mmr_lambda);
+        let order = mem_core::mmr_rerank_by(&scores, k, self.mmr_lambda, |i, j| {
+            let (a, b) = (&scored[i].item, &scored[j].item);
+            if self.embedding_usable(a) && self.embedding_usable(b) {
+                match (&a.embedding, &b.embedding) {
+                    (Some(x), Some(y)) => cosine_similarity(x, y).max(0.0),
+                    _ => 0.0,
+                }
+            } else {
+                0.0
+            }
+        });
         order.into_iter().map(|i| scored[i].clone()).collect()
     }
 }
