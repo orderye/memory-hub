@@ -396,10 +396,8 @@ impl WorkingMemoryService {
 
         let terms = crate::algorithm::extract_terms(query);
         // 词元集走进程内缓存：同一条经验在多次查询间不必反复分词
-        let docs: Vec<Arc<std::collections::HashSet<String>>> = pool
-            .iter()
-            .map(Self::document_tokens_cached)
-            .collect();
+        let docs: Vec<Arc<std::collections::HashSet<String>>> =
+            pool.iter().map(Self::document_tokens_cached).collect();
         // 池内 IDF 打分器：与混合检索同一实现（mem_core::PoolLexical）
         let pool_lexical = crate::algorithm::PoolLexical::new(terms, &docs);
 
