@@ -6,7 +6,7 @@
 //! 3. 瞬态错误重试：遇到可重试瞬态异常支持指数退避重试；
 //! 4. 任务事实分离：源任务事实早已安全持久化，经验提炼异步解耦执行。
 
-use common::{AgentId, AuthCtx, HubError, Result};
+use common::{AgentId, AuthCtx, Result};
 use mem_core::domain::{ExperienceCandidate, ExperienceStatus, MemoryExperience};
 use mem_core::working_memory_service::WorkingMemoryService;
 use std::sync::Arc;
@@ -73,6 +73,9 @@ impl ExperienceDistillJob {
     }
 
     /// 执行经验提炼作业并返回完整结果及报告
+    ///
+    /// 重试/退避/可重试判定统一走 [`crate::retry::with_retry`]；
+    /// 质量门槛拒绝（`InvalidArgument`）不可重试，首次即返回。
     pub async fn run_distill_with_result(
         &self,
         auth: &AuthCtx,
@@ -87,77 +90,60 @@ impl ExperienceDistillJob {
             "开始执行 Working 经验记忆提炼作业"
         );
 
-        let mut attempts = 0;
-        let mut last_err = None;
+        let service = self.service.clone();
+        let auth = auth.clone();
+        let namespace = namespace.to_string();
+        let worker = self.worker_agent.clone();
+        let outcome = crate::retry::with_retry(
+            &worker,
+            "experience_distill",
+            self.max_retries,
+            self.initial_backoff_ms,
+            || {
+                let service = service.clone();
+                let auth = auth.clone();
+                let namespace = namespace.clone();
+                let candidate = candidate.clone();
+                Box::pin(async move {
+                    service
+                        .distill_experience(&auth, &namespace, candidate)
+                        .await
+                })
+            },
+        )
+        .await;
 
-        while attempts < self.max_retries {
-            attempts += 1;
-            match self
-                .service
-                .distill_experience(auth, namespace, candidate.clone())
-                .await
-            {
-                Ok(exp) => {
-                    let report = ExperienceDistillReport {
-                        success: true,
-                        attempts,
-                        task_id,
-                        experience_id: Some(exp.id),
-                        status: Some(exp.status),
-                        rejected_reason: None,
-                        error: None,
-                    };
-                    info!(
-                        worker = %self.worker_agent,
-                        attempts,
-                        task_id = %task_id,
-                        experience_id = %exp.id,
-                        status = ?exp.status,
-                        "Working 经验记忆提炼作业执行成功"
-                    );
-                    return Ok((exp, report));
-                }
-                Err(HubError::InvalidArgument(reason)) => {
-                    // 门槛校验失败（非瞬态异常，直接返回并记录拒绝原因）
-                    warn!(
-                        worker = %self.worker_agent,
-                        task_id = %task_id,
-                        reason = %reason,
-                        "经验提炼候选未达质量门槛，已拒绝入库"
-                    );
-                    return Err(HubError::InvalidArgument(reason));
-                }
-                Err(e) => {
-                    let retryable = e.is_retryable();
-                    warn!(
-                        worker = %self.worker_agent,
-                        attempt = attempts,
-                        max_retries = self.max_retries,
-                        retryable,
-                        error = %e,
-                        "经验提炼作业尝试失败"
-                    );
-
-                    if !retryable || attempts >= self.max_retries {
-                        last_err = Some(e);
-                        break;
-                    }
-
-                    // 瞬态重试退避
-                    let backoff = self.initial_backoff_ms * (1 << (attempts - 1));
-                    tokio::time::sleep(tokio::time::Duration::from_millis(backoff)).await;
-                }
+        match outcome {
+            Ok((exp, attempts)) => {
+                let report = ExperienceDistillReport {
+                    success: true,
+                    attempts,
+                    task_id,
+                    experience_id: Some(exp.id),
+                    status: Some(exp.status),
+                    rejected_reason: None,
+                    error: None,
+                };
+                info!(
+                    worker = %self.worker_agent,
+                    attempts,
+                    task_id = %task_id,
+                    experience_id = %exp.id,
+                    status = ?exp.status,
+                    "Working 经验记忆提炼作业执行成功"
+                );
+                Ok((exp, report))
+            }
+            Err(err) => {
+                warn!(
+                    worker = %self.worker_agent,
+                    task_id = %task_id,
+                    error = %err,
+                    "Working 经验记忆提炼作业最终失败"
+                );
+                Err(err)
             }
         }
-
-        let err = last_err.unwrap_or(HubError::Unavailable);
-        warn!(
-            worker = %self.worker_agent,
-            attempts,
-            error = %err,
-            "Working 经验记忆提炼作业最终失败"
-        );
-        Err(err)
     }
 }
 
@@ -165,6 +151,7 @@ impl ExperienceDistillJob {
 mod tests {
     use super::*;
     use common::{Scope, BOOTSTRAP_ACCOUNT_ID};
+    use common::HubError;
     use mem_core::domain::{MemoryScene, TaskStatus};
     use store::InMemoryHubStore;
 

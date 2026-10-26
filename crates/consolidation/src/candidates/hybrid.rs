@@ -24,7 +24,7 @@ use crate::candidates::rules::RulesCandidateFinder;
 use crate::candidates::*;
 use async_trait::async_trait;
 use common::Result;
-use mem_core::{cosine_similarity, Embedder, MemoryEntry, MemoryKind};
+use mem_core::{cosine_similarity, embedding_usable, Embedder, MemoryEntry, MemoryKind};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -185,18 +185,6 @@ impl HybridCandidateFinder {
         }
         Ok((out, calls))
     }
-}
-
-/// 条目向量是否可用于比较
-///
-/// 存在向量，**且**嵌入模型与当前嵌入器一致。跨模型向量不可比，
-/// 视为"向量缺失"（与检索侧 `embedding_usable` 一致）。
-pub fn embedding_usable(entry: &MemoryEntry, model_id: &str) -> bool {
-    entry.embedding.is_some()
-        && entry
-            .embedding_model
-            .as_deref()
-            .is_none_or(|m| m == model_id)
 }
 
 /// 用已存向量生成语义候选（重复带全量比对 + 冲突带候选对生成）
@@ -471,9 +459,9 @@ mod tests {
     fn test_embedding_usable_rejects_model_mismatch() {
         let mut e = entry("x", Some(vec![1.0, 0.0]));
         e.embedding_model = Some("mock-embedder-v1".to_string());
-        assert!(!embedding_usable(&e, "bge-m3"));
+        assert!(!mem_core::embedding_usable(&e, "bge-m3"));
         e.embedding_model = Some("bge-m3".to_string());
-        assert!(embedding_usable(&e, "bge-m3"));
+        assert!(mem_core::embedding_usable(&e, "bge-m3"));
     }
 
     #[tokio::test]

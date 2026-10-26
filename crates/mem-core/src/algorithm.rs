@@ -107,6 +107,63 @@ pub fn keyword_score_weighted(
     }
 }
 
+/// 池内词法打分器：查询词元 + 候选池文档频 → IDF 加权命中度
+///
+/// 混合检索（`retrieval::hybrid`）与经验检索（`working_memory_service`）共用的
+/// "池内 IDF"口径：稀有词元主导命中度，常见词元（高频 bigram）权重自然衰减。
+/// 构建时对每个词元扫一遍候选池求文档频（O(terms·pool) 次集合查询），
+/// 之后每条目打分 O(terms)；词元 → 索引用 HashMap，打分闭包内不做线性查找。
+pub struct PoolLexical {
+    terms: Vec<String>,
+    pool_size: usize,
+    doc_freq: Vec<usize>,
+    term_index: std::collections::HashMap<String, usize>,
+}
+
+impl PoolLexical {
+    /// `terms`：查询词元（[`extract_terms`] 产出）；
+    /// `docs`：候选池每条目的文档词元集（[`document_tokens`] 产出）
+    pub fn new<S>(terms: Vec<String>, docs: &[S]) -> Self
+    where
+        S: std::borrow::Borrow<std::collections::HashSet<String>>,
+    {
+        let pool_size = docs.len();
+        let doc_freq: Vec<usize> = terms
+            .iter()
+            .map(|t| docs.iter().filter(|set| set.borrow().contains(t)).count())
+            .collect();
+        let term_index = terms
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.clone(), i))
+            .collect();
+        Self {
+            terms,
+            pool_size,
+            doc_freq,
+            term_index,
+        }
+    }
+
+    /// 词元的池内 IDF（未收录词元返回 1.0）
+    pub fn idf(&self, term: &str) -> f32 {
+        self.term_index
+            .get(term)
+            .map(|&i| inverse_document_frequency(self.pool_size, self.doc_freq[i]))
+            .unwrap_or(1.0)
+    }
+
+    /// 单条目关键词命中度（IDF 加权，0.0 ~ 1.0）
+    pub fn score(&self, doc_tokens: &std::collections::HashSet<String>) -> f32 {
+        keyword_score_weighted(doc_tokens, &self.terms, &|t| self.idf(t))
+    }
+
+    /// 查询词元为空（如空查询）：无词法信号可贡献
+    pub fn is_empty(&self) -> bool {
+        self.terms.is_empty()
+    }
+}
+
 /// 检索参考时点：显式 `valid_at` 优先，否则取当前时刻。
 ///
 /// 时间有效性过滤与失效惩罚必须使用同一参考时点，避免"按历史时点过滤、
@@ -341,8 +398,10 @@ pub const SCENE_PREFER_BONUS: f32 = 0.05;
 /// 场景偏好降权（prefer 模式下其它已标注场景命中）
 pub const SCENE_PREFER_PENALTY: f32 = 0.05;
 
-/// 应用场景偏好：返回调整后的综合分（`None` 场景视为中性，不做任何调整）
-fn apply_scene_preference(
+/// 场景偏好打分（prefer 模式下）：返回调整后的综合分
+///
+/// 同场景加成、其它已标注场景降权、`None` 场景中性不调整。
+pub fn scene_preference_score(
     score: f32,
     requested: Option<crate::domain::MemoryScene>,
     item_scene: Option<crate::domain::MemoryScene>,
@@ -354,13 +413,17 @@ fn apply_scene_preference(
     }
 }
 
-/// 场景偏好打分（供检索器在 prefer 模式下使用）
-pub fn scene_preference_score(
-    score: f32,
-    requested: Option<crate::domain::MemoryScene>,
-    item_scene: Option<crate::domain::MemoryScene>,
-) -> f32 {
-    apply_scene_preference(score, requested, item_scene)
+/// 条目向量是否可用于与当前嵌入器比较：存在向量，且嵌入模型与当前嵌入器一致
+/// （跨模型向量不可比，按"嵌入缺失"处理）
+///
+/// 检索侧（`retrieval::hybrid`）与整合候选发现（`consolidation`）共用同一判定，
+/// 两处语义漂移会让同一向量在检索与整合里得出不同的可用性结论。
+pub fn embedding_usable(item: &crate::domain::MemoryEntry, model_id: &str) -> bool {
+    item.embedding.is_some()
+        && item
+            .embedding_model
+            .as_deref()
+            .is_none_or(|m| m == model_id)
 }
 
 /// 检索查询（core 定义，retrieval crate 实现）

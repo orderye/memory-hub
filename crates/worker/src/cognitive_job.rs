@@ -6,7 +6,7 @@
 //! 3. 失败安全：无论模型抽取成功或失败，原始证据均已提前持久化（append-only）；
 //! 4. 治理纪律：遵循 Manual/SemiAuto/FullAuto 策略，Manual 模式下绝不自动合入。
 
-use common::{AgentId, AuthCtx, HubError, Result};
+use common::{AgentId, AuthCtx, Result};
 use mem_core::{ChatCognitiveInput, ChatCognitiveResult, ChatCognitiveService};
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -67,6 +67,9 @@ impl ChatCognitiveJob {
     }
 
     /// 执行会话认知提炼并返回完整结果及作业报告
+    ///
+    /// 重试/退避/可重试判定统一走 [`crate::retry::with_retry`]；
+    /// 本方法只负责作业级的开始/成功/最终失败日志与报告组装。
     pub async fn run_session_with_result(
         &self,
         auth: &AuthCtx,
@@ -79,62 +82,52 @@ impl ChatCognitiveJob {
             "开始执行 Chat 认知提炼作业"
         );
 
-        let mut attempts = 0;
-        let mut last_err = None;
+        let service = self.service.clone();
+        let auth = auth.clone();
+        let worker = self.worker_agent.clone();
+        let outcome = crate::retry::with_retry(
+            &worker,
+            "chat_cognitive",
+            self.max_retries,
+            self.initial_backoff_ms,
+            || {
+                let service = service.clone();
+                let auth = auth.clone();
+                let input = input.clone();
+                Box::pin(async move { service.process_chat_session(&auth, input).await })
+            },
+        )
+        .await;
 
-        while attempts < self.max_retries {
-            attempts += 1;
-            match self.service.process_chat_session(auth, input.clone()).await {
-                Ok(res) => {
-                    let report = ChatCognitiveJobReport {
-                        success: true,
-                        attempts,
-                        evidence_id: Some(res.evidence_id),
-                        committed_count: res.committed_entries.len(),
-                        proposals_count: res.proposals.len(),
-                        error: None,
-                    };
-                    info!(
-                        worker = %self.worker_agent,
-                        attempts,
-                        evidence_id = %res.evidence_id,
-                        committed = res.committed_entries.len(),
-                        proposals = res.proposals.len(),
-                        "Chat 认知提炼作业执行成功"
-                    );
-                    return Ok((res, report));
-                }
-                Err(e) => {
-                    let retryable = e.is_retryable();
-                    warn!(
-                        worker = %self.worker_agent,
-                        attempt = attempts,
-                        max_retries = self.max_retries,
-                        retryable,
-                        error = %e,
-                        "Chat 认知提炼尝试失败"
-                    );
-
-                    if !retryable || attempts >= self.max_retries {
-                        last_err = Some(e);
-                        break;
-                    }
-
-                    // 瞬态重试退避
-                    let backoff = self.initial_backoff_ms * (1 << (attempts - 1));
-                    tokio::time::sleep(tokio::time::Duration::from_millis(backoff)).await;
-                }
+        match outcome {
+            Ok((res, attempts)) => {
+                let report = ChatCognitiveJobReport {
+                    success: true,
+                    attempts,
+                    evidence_id: Some(res.evidence_id),
+                    committed_count: res.committed_entries.len(),
+                    proposals_count: res.proposals.len(),
+                    error: None,
+                };
+                info!(
+                    worker = %self.worker_agent,
+                    attempts,
+                    evidence_id = %res.evidence_id,
+                    committed = res.committed_entries.len(),
+                    proposals = res.proposals.len(),
+                    "Chat 认知提炼作业执行成功"
+                );
+                Ok((res, report))
+            }
+            Err(err) => {
+                warn!(
+                    worker = %self.worker_agent,
+                    error = %err,
+                    "Chat 认知提炼作业最终失败"
+                );
+                Err(err)
             }
         }
-
-        let err = last_err.unwrap_or(HubError::Unavailable);
-        warn!(
-            worker = %self.worker_agent,
-            attempts,
-            error = %err,
-            "Chat 认知提炼作业最终失败"
-        );
-        Err(err)
     }
 }
 
@@ -142,6 +135,7 @@ impl ChatCognitiveJob {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use common::HubError;
     use chrono::Utc;
     use common::Scope;
     use mem_core::domain::{

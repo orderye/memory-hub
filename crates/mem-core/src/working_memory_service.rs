@@ -400,18 +400,8 @@ impl WorkingMemoryService {
             .iter()
             .map(|e| Self::document_tokens_cached(e))
             .collect();
-        let pool_size = docs.len();
-        let doc_freq: Vec<usize> = terms
-            .iter()
-            .map(|t| docs.iter().filter(|d| d.contains(t)).count())
-            .collect();
-        let idf = |term: &str| -> f32 {
-            terms
-                .iter()
-                .position(|t| t == term)
-                .map(|i| crate::algorithm::inverse_document_frequency(pool_size, doc_freq[i]))
-                .unwrap_or(1.0)
-        };
+        // 池内 IDF 打分器：与混合检索同一实现（mem_core::PoolLexical）
+        let pool_lexical = crate::algorithm::PoolLexical::new(terms, &docs);
 
         let mut results = Vec::new();
         for (exp, tokens) in pool.into_iter().zip(docs) {
@@ -420,10 +410,10 @@ impl WorkingMemoryService {
                 continue;
             }
 
-            let lexical = if terms.is_empty() {
+            let lexical = if pool_lexical.is_empty() {
                 1.0
             } else {
-                crate::algorithm::keyword_score_weighted(&tokens, &terms, &idf)
+                pool_lexical.score(&tokens)
             };
             if lexical <= 0.0 {
                 continue;

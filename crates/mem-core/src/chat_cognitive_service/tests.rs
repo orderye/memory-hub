@@ -106,20 +106,20 @@ async fn test_review_acceptance_and_rejection() {
 
     let res = service.process_chat_session(&auth(), input).await.unwrap();
     assert_eq!(res.proposals.len(), 1);
+    let rejected_id = res.proposals[0].id;
 
-    // 1. 模拟人工审核：先拒绝
-    let mut rejected_proposal = res.proposals[0].clone();
+    // 1. 模拟人工审核：按持久化提案 ID 拒绝
     let none_entry = service
-        .review_proposal(
+        .review_persisted_proposal(
             &auth(),
-            &mut rejected_proposal,
-            false,
-            Some("信息不准确".into()),
+            rejected_id,
+            CognitiveReviewDecision::Reject {
+                reason: Some("信息不准确".into()),
+            },
         )
         .await
         .unwrap();
     assert!(none_entry.is_none());
-    assert_eq!(rejected_proposal.status, CognitiveProposalStatus::Rejected);
     // 拒绝后不能被检索为已接受事实
     assert!(store
         .all_in_namespace("test-ns", false)
@@ -127,15 +127,51 @@ async fn test_review_acceptance_and_rejection() {
         .unwrap()
         .is_empty());
 
-    // 2. 模拟人工审核：接受
-    let mut accepted_proposal = res.proposals[0].clone();
+    // 2. 已裁决的提案再次裁决 → Conflict（乐观锁防重复采纳）
+    let again = service
+        .review_persisted_proposal(
+            &auth(),
+            rejected_id,
+            CognitiveReviewDecision::Accept {
+                modified_content: None,
+            },
+        )
+        .await;
+    assert!(
+        matches!(again, Err(HubError::Conflict)),
+        "已裁决提案不得再次裁决：{again:?}"
+    );
+
+    // 3. 模拟人工审核：接受（新会话产生的新提案）
+    let res2 = service
+        .process_chat_session(
+            &auth(),
+            ChatCognitiveInput {
+                namespace: "test-ns".to_string(),
+                session_id: "sess-review-2".to_string(),
+                messages: vec![ChatMessage {
+                    role: ChatRole::User,
+                    content: "我的主语言是 Rust".to_string(),
+                    timestamp: None,
+                }],
+                occurred_at: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(res2.proposals.len(), 1);
     let saved = service
-        .review_proposal(&auth(), &mut accepted_proposal, true, None)
+        .review_persisted_proposal(
+            &auth(),
+            res2.proposals[0].id,
+            CognitiveReviewDecision::Accept {
+                modified_content: None,
+            },
+        )
         .await
         .unwrap()
         .expect("接受应生成条目");
 
-    assert_eq!(accepted_proposal.status, CognitiveProposalStatus::Accepted);
     assert_eq!(saved.content, "用户主语言为 Rust");
     assert_eq!(saved.version, 1);
     let active = store.all_in_namespace("test-ns", false).await.unwrap();
@@ -1328,11 +1364,7 @@ async fn test_same_batch_identical_candidates_commit_once() {
         .await
         .unwrap();
 
-    assert_eq!(
-        res.committed_entries.len(),
-        1,
-        "同批相同候选只允许提交一条"
-    );
+    assert_eq!(res.committed_entries.len(), 1, "同批相同候选只允许提交一条");
     let active = store.all_in_namespace("batch-dup-ns", false).await.unwrap();
     assert_eq!(active.len(), 1);
 }
@@ -1345,9 +1377,9 @@ async fn test_evidence_idempotency_survives_beyond_window() {
     let store = Arc::new(TestHubStore::default());
     let service = ChatCognitiveService::new(
         store.clone(),
-        Arc::new(MockChatCognitiveExtractor::new().with_candidates(vec![candidate(
-            "窗口外幂等", 0.99,
-        )])),
+        Arc::new(
+            MockChatCognitiveExtractor::new().with_candidates(vec![candidate("窗口外幂等", 0.99)]),
+        ),
         CognitivePolicy {
             mode: CognitiveGovernanceMode::FullAuto,
             auto_accept_threshold: 0.95,
@@ -1387,10 +1419,7 @@ async fn test_evidence_idempotency_survives_beyond_window() {
             .unwrap();
     }
 
-    let second = service
-        .process_chat_session(&auth(), input)
-        .await
-        .unwrap();
+    let second = service.process_chat_session(&auth(), input).await.unwrap();
     assert_eq!(
         second.evidence_id, first.evidence_id,
         "窗口外仍必须命中同一条证据，不得重复落证据"

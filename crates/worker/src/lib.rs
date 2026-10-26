@@ -14,6 +14,7 @@ pub mod evidence_job;
 pub mod experience_job;
 pub mod integration_job;
 pub mod lease;
+pub(crate) mod retry;
 pub mod scheduler;
 
 pub use backup_job::{BackupJob, BackupJobReport};

@@ -12,13 +12,12 @@ use async_trait::async_trait;
 use common::{AuthCtx, Result};
 use mem_core::{
     algorithm::ItemScoreParams, calculate_item_score_with_availability, cosine_similarity,
-    document_tokens, extract_terms, inverse_document_frequency, is_superseded_at,
-    keyword_score_weighted, l2_normalize, layer_prior, matches_tag_filter, passes_validity_filter,
-    recency_score, recency_tau_days_for, retrieval_reference_time, scene_preference_score,
-    validity_filter_time, Clock, Embedder, MemoryEntry, MemoryFilter, MemoryScene, MemoryStatus,
-    MemoryStore, Retriever, SceneMode, Scored, SearchQuery, SystemClock, SCENE_PREFER_BONUS,
+    document_tokens, embedding_usable, extract_terms, is_superseded_at, l2_normalize, layer_prior,
+    matches_tag_filter, passes_validity_filter, recency_score, recency_tau_days_for,
+    retrieval_reference_time, scene_preference_score, validity_filter_time, Clock, Embedder,
+    MemoryEntry, MemoryFilter, MemoryScene, MemoryStatus, MemoryStore, PoolLexical, Retriever,
+    SceneMode, Scored, SearchQuery, SystemClock, SCENE_PREFER_BONUS,
 };
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -167,6 +166,34 @@ impl HybridRetriever {
         }
     }
 
+    /// 双路召回共用的基础过滤（条件下推到存储层）
+    ///
+    /// 关键词路在此外加 `text_contains`/`limit`，兜底路只加 `limit`；
+    /// 场景一律走 [`Self::scene_pushdown`]——兜底路此前直接硬过滤 `q.scene`，
+    /// 在 prefer 模式下会把本应降权保留的跨场景条目挡在门外。
+    fn base_filter(&self, q: &SearchQuery) -> MemoryFilter {
+        MemoryFilter {
+            namespace: Some(q.namespace.clone()),
+            kinds: q.kinds.clone(),
+            statuses: Some(self.statuses_for(q)),
+            tags: q.tags.clone(),
+            scene: self.scene_pushdown(q),
+            layer: q.layer,
+            // 时间有效性过滤下推到存储层（与打分路径同一语义）
+            valid_at: validity_filter_time(q.valid_at, q.include_superseded, self.clock.now()),
+            ..Default::default()
+        }
+    }
+
+    /// 打分/防御性复核共用的过滤判定（与 [`Self::base_filter`] 同一套条件的
+    /// Rust 侧复核；存储实现差异兜底）
+    fn passes_query_filters(&self, q: &SearchQuery, item: &MemoryEntry, now: chrono::DateTime<chrono::Utc>) -> bool {
+        passes_validity_filter(item, q.valid_at, q.include_superseded, now)
+            && matches_tag_filter(item, &q.tags)
+            && self.scene_keeps(q, item)
+            && (q.layer.is_none() || item.layer == q.layer)
+    }
+
     /// 打分语义下的场景保留判定
     fn scene_keeps(&self, q: &SearchQuery, item: &MemoryEntry) -> bool {
         q.scene.is_none() || self.scene_mode == SceneMode::Prefer || item.scene == q.scene
@@ -185,35 +212,17 @@ impl HybridRetriever {
         self
     }
 
-    /// 条目向量是否可用于比较：存在向量，且嵌入模型与当前查询嵌入器一致
-    /// （跨模型向量不可比，按"嵌入缺失"处理）
-    fn embedding_usable(&self, item: &MemoryEntry) -> bool {
-        item.embedding.is_some()
-            && item
-                .embedding_model
-                .as_deref()
-                .is_none_or(|m| m == self.embedder.model_id())
-    }
-
     /// 关键词路召回
     async fn fts_candidates(&self, q: &SearchQuery) -> Vec<Scored<MemoryEntry>> {
         if q.query_text.trim().is_empty() {
             return Vec::new();
         }
+        // 候选池必须容得下 top_k：此前固定取 fts_k(默认 20)，
+        // 而工具契约允许 top_k 到 100，超出的请求会被静默截断。
         let filter = MemoryFilter {
-            namespace: Some(q.namespace.clone()),
-            kinds: q.kinds.clone(),
-            statuses: Some(self.statuses_for(q)),
-            tags: q.tags.clone(),
             text_contains: Some(q.query_text.clone()),
-            scene: self.scene_pushdown(q),
-            layer: q.layer,
-            // 时间有效性过滤下推到存储层（与打分路径同一语义）
-            valid_at: validity_filter_time(q.valid_at, q.include_superseded, self.clock.now()),
-            // 候选池必须容得下 top_k：此前固定取 fts_k(默认 20)，
-            // 而工具契约允许 top_k 到 100，超出的请求会被静默截断。
             limit: Some(self.fts_k.max(q.top_k)),
-            ..Default::default()
+            ..self.base_filter(q)
         };
         let items = match self.store.list(&filter).await {
             Ok(v) => v,
@@ -243,16 +252,7 @@ impl HybridRetriever {
         };
         // 过滤条件下推到 SQL/存储层：此前 scene/valid_at 只在 Rust 侧事后过滤，
         // 其它场景或已失效条目会先占满 top-k，导致目标场景候选严重缺失
-        let filter = MemoryFilter {
-            namespace: Some(q.namespace.clone()),
-            kinds: q.kinds.clone(),
-            statuses: Some(self.statuses_for(q)),
-            tags: q.tags.clone(),
-            scene: self.scene_pushdown(q),
-            layer: q.layer,
-            valid_at: validity_filter_time(q.valid_at, q.include_superseded, self.clock.now()),
-            ..Default::default()
-        };
+        let filter = self.base_filter(q);
         let items = match self
             .store
             .similar(&filter, qv, self.vec_k.max(q.top_k * 2))
@@ -269,12 +269,7 @@ impl HybridRetriever {
         let now = self.clock.now();
         items
             .into_iter()
-            .filter(|scored| {
-                passes_validity_filter(&scored.item, q.valid_at, q.include_superseded, now)
-                    && matches_tag_filter(&scored.item, &q.tags)
-                    && (q.scene.is_none() || scored.item.scene == q.scene)
-                    && (q.layer.is_none() || scored.item.layer == q.layer)
-            })
+            .filter(|scored| self.passes_query_filters(q, &scored.item, now))
             .collect()
     }
 
@@ -290,15 +285,8 @@ impl HybridRetriever {
     /// 兜底：纯列表召回（超时或查询为空时）
     async fn fallback_candidates(&self, q: &SearchQuery) -> Vec<Scored<MemoryEntry>> {
         let filter = MemoryFilter {
-            namespace: Some(q.namespace.clone()),
-            kinds: q.kinds.clone(),
-            statuses: Some(self.statuses_for(q)),
-            tags: q.tags.clone(),
-            scene: q.scene,
-            layer: q.layer,
-            valid_at: validity_filter_time(q.valid_at, q.include_superseded, self.clock.now()),
             limit: Some(q.top_k.max(1)),
-            ..Default::default()
+            ..self.base_filter(q)
         };
         self.store
             .list(&filter)
@@ -349,46 +337,20 @@ impl HybridRetriever {
             .iter()
             .map(|(item, _)| document_tokens(&item.content))
             .collect();
-        let pool_size = candidate_tokens.len();
-        let doc_freq: Vec<usize> = terms
-            .iter()
-            .map(|t| {
-                candidate_tokens
-                    .iter()
-                    .filter(|set| set.contains(t))
-                    .count()
-            })
-            .collect();
-        // 构建 term -> 索引的 HashMap，避免 idf 闭包内 O(n) 线性查找
-        let term_index: HashMap<&str, usize> = terms
-            .iter()
-            .enumerate()
-            .map(|(i, t)| (t.as_str(), i))
-            .collect();
-        let idf = |term: &str| -> f32 {
-            term_index
-                .get(term)
-                .map(|&i| inverse_document_frequency(pool_size, doc_freq[i]))
-                .unwrap_or(1.0)
-        };
+        let lexical = PoolLexical::new(terms, &candidate_tokens);
 
         // 分场景权重 profile：指定场景且配置了 profile 时优先使用
         let weights = self.weights_for(q);
         let mut scored: Vec<Scored<MemoryEntry>> = candidates
             .into_iter()
             .zip(candidate_tokens)
-            .filter(|((item, _), _)| {
-                passes_validity_filter(item, q.valid_at, q.include_superseded, now)
-                    && matches_tag_filter(item, &q.tags)
-                    && self.scene_keeps(q, item)
-                    && (q.layer.is_none() || item.layer == q.layer)
-            })
+            .filter(|((item, _), _)| self.passes_query_filters(q, item, now))
             .map(|((item, vec_sim), tokens)| {
                 // 关键词路命中此前一律记 sim=0，而 sim 权重高达 0.50 —— 于是
                 // "全文精确命中"最高只能得 0.5 分，被任何中等向量命中压过，
                 // 双路融合名不副实。这里用条目自带向量与查询向量现算相似度。
-                let embedding_usable = self.embedding_usable(&item);
-                let sim = if embedding_usable {
+                let usable = embedding_usable(&item, self.embedder.model_id());
+                let sim = if usable {
                     vec_sim.or_else(|| {
                         let qv = query_vec?;
                         let e = item.embedding.as_deref()?;
@@ -397,7 +359,7 @@ impl HybridRetriever {
                 } else {
                     None
                 };
-                let kw = keyword_score_weighted(&tokens, &terms, &idf);
+                let kw = lexical.score(&tokens);
                 // 近期性以事件时间为准（缺失回落写入时间），衰减常数按记忆类型区分
                 let tau = self
                     .recency_tau_override
@@ -467,7 +429,9 @@ impl HybridRetriever {
     /// 用于决定是否值得跑 MMR：全部不可用时相似度矩阵恒为 0，
     /// MMR 退化为按分排序，跑一遍纯属浪费。
     fn has_usable_embedding(&self, scored: &[Scored<MemoryEntry>]) -> bool {
-        scored.iter().any(|s| self.embedding_usable(&s.item))
+        scored
+            .iter()
+            .any(|s| embedding_usable(&s.item, self.embedder.model_id()))
     }
 
     /// MMR 重排（嵌入缺失或模型不匹配的项相互相似度按 0 处理）
@@ -494,9 +458,10 @@ impl HybridRetriever {
             return scored;
         }
         let scores: Vec<f32> = scored.iter().map(|s| s.score).collect();
+        let model_id = self.embedder.model_id().to_string();
         let order = mem_core::mmr_rerank_by(&scores, k, self.mmr_lambda, |i, j| {
             let (a, b) = (&scored[i].item, &scored[j].item);
-            if self.embedding_usable(a) && self.embedding_usable(b) {
+            if embedding_usable(a, &model_id) && embedding_usable(b, &model_id) {
                 match (&a.embedding, &b.embedding) {
                     (Some(x), Some(y)) => cosine_similarity(x, y).max(0.0),
                     _ => 0.0,

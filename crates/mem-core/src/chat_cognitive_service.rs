@@ -484,61 +484,6 @@ impl ChatCognitiveService {
         self.store.list_cognitive_proposals(namespace, status).await
     }
 
-    /// 人工裁决/审核认知提案（按内存中的提案对象裁决；不推进持久化状态）
-    ///
-    /// 兼容入口：早期提案只存在于 `process_chat_session` 返回值中时使用。
-    /// 新代码应使用 [`Self::review_persisted_proposal`]——那才是带乐观锁、
-    /// 状态可追溯的裁决路径。
-    pub async fn review_proposal(
-        &self,
-        auth: &AuthCtx,
-        proposal: &mut CognitiveProposalRecord,
-        accept: bool,
-        rejection_reason: Option<String>,
-    ) -> Result<Option<MemoryEntry>> {
-        if !auth.has_scope(&Scope::Write) {
-            return Err(HubError::InsufficientScope);
-        }
-
-        let now = Utc::now();
-        if !accept {
-            proposal.status = CognitiveProposalStatus::Rejected;
-            proposal.rejection_reason = rejection_reason;
-            proposal.resolved_by = Some(auth.agent_id.clone());
-            proposal.updated_at = now;
-            return Ok(None);
-        }
-
-        let existing_memories = self
-            .store
-            .all_in_namespace_limited(&proposal.namespace, false, SCAN_LIMIT)
-            .await?
-            .into_iter()
-            .filter(|e| e.status == MemoryStatus::Active)
-            .collect::<Vec<_>>();
-
-        let supersedes_target =
-            self.detect_supersedes_target(&proposal.candidate, &existing_memories);
-
-        let entry = self
-            .commit_candidate(
-                &auth.agent_id,
-                &proposal.namespace,
-                &proposal.candidate,
-                proposal.source_evidence_id,
-                supersedes_target,
-                now,
-            )
-            .await?;
-
-        proposal.status = CognitiveProposalStatus::Accepted;
-        proposal.resulting_memory_id = Some(entry.id);
-        proposal.resolved_by = Some(auth.agent_id.clone());
-        proposal.updated_at = now;
-
-        Ok(Some(entry))
-    }
-
     /// 查询当前有效意图（自动排除已过期意图）
     ///
     /// scene/layer/状态过滤**下推到存储层**（走 `idx_memories_scene_layer` 索引）：
