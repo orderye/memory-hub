@@ -882,6 +882,28 @@ impl EvidenceStore for TestHubStore {
             .collect();
         Ok(list)
     }
+    /// 点查覆盖：不受 `list_evidence` 的 limit 截断影响，
+    /// 保证幂等查重测试能覆盖"证据数超过窗口"的场景
+    async fn find_evidence_by_hash(
+        &self,
+        ns: &str,
+        source_kind: EvidenceSourceKind,
+        source_ref: &str,
+        content_hash: &str,
+    ) -> Result<Option<MemoryEvidence>> {
+        Ok(self
+            .evidences
+            .read()
+            .unwrap()
+            .iter()
+            .find(|e| {
+                e.namespace == ns
+                    && e.source_kind == source_kind
+                    && e.source_ref.as_deref() == Some(source_ref)
+                    && e.content_hash == content_hash
+            })
+            .cloned())
+    }
     async fn all_evidence_in_namespace(&self, ns: &str) -> Result<Vec<MemoryEvidence>> {
         Ok(self
             .evidences

@@ -909,6 +909,63 @@ async fn test_repeated_scan_does_not_recreate_open_proposals() {
     assert_eq!(second.skipped_existing, 1);
 }
 
+/// 回归：裁决的状态检查必须在命名空间互斥锁**内**完成。
+///
+/// 旧实现先在锁外读状态再拿锁：两个并发裁决都能读到 Open，随后串行进锁
+/// 各合并一次（幸存者被二次修订、版本号翻倍）。修复后锁内重读，
+/// 第二个裁决看到 Merged 即返回 Conflict。顺序双裁决锁定该不变量：
+/// 第二次裁决必须 Conflict，幸存者只被合并修订一次。
+#[tokio::test]
+async fn test_second_resolve_of_merged_proposal_conflicts() {
+    let store = Arc::new(InMemoryHubStore::new());
+    let now = fixed_now();
+    for content in ["待裁决内容", "待裁决内容"] {
+        let e = build_entry("ns", &EntrySpec::new(content), now);
+        store.insert(&e).await.unwrap();
+    }
+    let engine = ConsolidationEngine::new(store.clone(), 0.92, 100)
+        .with_mode(ConsolidationMode::Rules, ConsolidationFallback::Rules);
+    let report = engine
+        .consolidate_namespace("ns", false, None, &"eval-agent".to_string())
+        .await
+        .unwrap();
+    assert_eq!(report.proposals_created, 1);
+    let proposal_id = report.proposals[0].id;
+
+    let first = engine
+        .resolve_proposal(
+            mem_core::ResolveRequest {
+                proposal_id,
+                action: mem_core::ResolveAction::Merge,
+                survivor_id: None,
+                note: None,
+            },
+            &"resolver".to_string(),
+        )
+        .await
+        .expect("首次裁决应成功合并");
+    assert_eq!(first.version, 2, "合并应使幸存者版本推进一次");
+
+    let second = engine
+        .resolve_proposal(
+            mem_core::ResolveRequest {
+                proposal_id,
+                action: mem_core::ResolveAction::Merge,
+                survivor_id: None,
+                note: None,
+            },
+            &"resolver".to_string(),
+        )
+        .await;
+    assert!(
+        matches!(second, Err(common::HubError::Conflict)),
+        "已合并提案再次裁决必须 Conflict：{second:?}"
+    );
+
+    let survivor = store.get("ns", first.id).await.unwrap();
+    assert_eq!(survivor.version, 2, "重复裁决不得二次修订幸存者");
+}
+
 #[tokio::test]
 async fn test_dry_run_does_not_change_business_data() {
     let store = Arc::new(InMemoryHubStore::new());

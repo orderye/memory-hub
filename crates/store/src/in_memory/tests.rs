@@ -777,3 +777,23 @@ async fn test_cognitive_proposal_lifecycle_contract() {
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].id, p2.id);
 }
+
+/// 回归：`all_in_namespace_limited` 截断必须按 `updated_at` **降序**取最近更新的
+/// 条目（认知查重的比对语义）。旧实现按 `created_at` 升序截断，
+/// 大命名空间下只看到最老的一批条目，新重复漏判。
+#[tokio::test]
+async fn test_all_in_namespace_limited_returns_most_recently_updated() {
+    let store = InMemoryHubStore::new();
+    for i in 0..5 {
+        let mut e = entry("ns", &format!("条目 {i}"), None);
+        // created_at 递增；把最早创建的条目改成最近更新
+        e.created_at = Utc::now() - chrono::Duration::minutes((100 - i) as i64);
+        e.updated_at = Utc::now() - chrono::Duration::minutes(i as i64);
+        store.insert(&e).await.unwrap();
+    }
+    let top2 = store.all_in_namespace_limited("ns", false, 2).await.unwrap();
+    assert_eq!(top2.len(), 2);
+    // 最近更新的两条：条目 0（0 分钟前）与条目 1（1 分钟前）
+    assert_eq!(top2[0].content, "条目 0");
+    assert_eq!(top2[1].content, "条目 1");
+}

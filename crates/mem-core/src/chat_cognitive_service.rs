@@ -178,18 +178,18 @@ impl ChatCognitiveService {
         let now = Utc::now();
 
         // 步骤 1：持久化原始证据（不可变存根，优先落库，模型超时失败不丢失证据；相同会话与哈希幂等复用）
-        let existing_evidences = self
+        //
+        // 幂等查重走哈希点查（覆盖会话全部历史证据）：此前按"最近 100 条"窗口扫描，
+        // 同一会话证据超过窗口后，重复提交会再落一条证据。
+        let existing_evidence = self
             .store
-            .list_evidence(
+            .find_evidence_by_hash(
                 &input.namespace,
-                Some(EvidenceSourceKind::Session),
-                Some(&input.session_id),
-                100,
+                EvidenceSourceKind::Session,
+                &input.session_id,
+                &content_hash,
             )
             .await?;
-        let existing_evidence = existing_evidences
-            .into_iter()
-            .find(|e| e.content_hash == content_hash);
 
         let evidence = match existing_evidence {
             Some(ev) => ev,
@@ -244,6 +244,11 @@ impl ChatCognitiveService {
             .filter(|e| e.status == MemoryStatus::Active)
             .collect::<Vec<_>>();
 
+        // 同批查重：本循环内已提交的条目也要参与比对，否则同一次抽取返回的
+        // 两个相同候选会各自入库（existing_memories 是循环开始前的快照）
+        let mut batch_committed: std::collections::HashSet<(String, MemoryScene)> =
+            std::collections::HashSet::new();
+
         for candidate in raw_candidates {
             let validation = validate_cognitive_candidate(&candidate);
             if let Err(e) = validation {
@@ -278,10 +283,14 @@ impl ChatCognitiveService {
                 continue;
             }
 
-            // 查重：若命名空间内已存在完全相同内容的活跃条目，幂等跳过以杜绝无限复制
+            // 查重：若命名空间内已存在完全相同内容的活跃条目（含本批刚提交的），
+            // 幂等跳过以杜绝无限复制
+            let content_key = candidate.content.trim().to_string();
+            let scene_key = candidate.scene;
             if existing_memories.iter().any(|e| {
-                e.content.trim() == candidate.content.trim() && e.scene == Some(candidate.scene)
-            }) {
+                e.content.trim() == content_key && e.scene == Some(scene_key)
+            }) || batch_committed.contains(&(content_key.clone(), scene_key))
+            {
                 continue;
             }
 
@@ -322,6 +331,7 @@ impl ChatCognitiveService {
                                 now,
                             )
                             .await?;
+                        batch_committed.insert((content_key, scene_key));
                         committed_entries.push(entry);
                     } else {
                         // 低于阈值的处置按模式区分：

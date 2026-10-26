@@ -587,14 +587,17 @@ impl ConsolidationEngine {
         req: ResolveRequest,
         auth_agent: &AgentId,
     ) -> Result<MemoryEntry> {
+        // 先读一次只为定位命名空间（确定互斥锁的键），锁内**重读**再做状态判定：
+        // 状态检查若发生在锁外，两个并发裁决都能读到 Open，随后串行进锁各合并一次
+        // （幸存者被二次 revise、版本号翻倍）。锁内重读让第二个裁决看到 Merged。
+        let namespace = self.store.get_proposal(req.proposal_id).await?.namespace;
+        let resolve_lock = namespace_lock(&namespace);
+        let _guard = resolve_lock.lock().await;
+
         let mut proposal = self.store.get_proposal(req.proposal_id).await?;
         if proposal.status != ProposalStatus::Open {
             return Err(HubError::Conflict);
         }
-
-        // 与扫描共用命名空间互斥，避免扫描与裁决交叉
-        let resolve_lock = namespace_lock(&proposal.namespace);
-        let _guard = resolve_lock.lock().await;
 
         let now = Utc::now();
         match req.action {

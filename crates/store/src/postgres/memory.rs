@@ -238,7 +238,8 @@ impl mem_core::MemoryStore for PostgresHubStore {
         rows.iter().map(Self::entry_from_row_slim).collect()
     }
 
-    /// 有上限的命名空间条目扫描：SQL 层 LIMIT，避免传输超大结果集
+    /// 有上限的命名空间条目扫描：SQL 层 `ORDER BY updated_at DESC LIMIT`，
+    /// 避免传输超大结果集；最近更新优先（认知查重的比对语义，见 trait 文档）
     async fn all_in_namespace_limited(
         &self,
         namespace: &str,
@@ -246,7 +247,7 @@ impl mem_core::MemoryStore for PostgresHubStore {
         limit: usize,
     ) -> Result<Vec<MemoryEntry>> {
         let sql = format!(
-            "select {} from memories where namespace = $1 {} order by created_at, id limit {}",
+            "select {} from memories where namespace = $1 {} order by updated_at desc, id desc limit {}",
             Self::ENTRY_COLUMNS_NO_EMBEDDING,
             if include_merged {
                 ""

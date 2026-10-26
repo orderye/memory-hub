@@ -227,6 +227,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "20261025000013_fts_retokenize_marker",
         include_str!("../../migrations/20261025000013_fts_retokenize_marker.sql"),
     ),
+    (
+        "20261027000014_memories_ns_updated_index",
+        include_str!("../../migrations/20261027000014_memories_ns_updated_index.sql"),
+    ),
 ];
 
 /// PostgreSQL 四合一存储

@@ -59,6 +59,27 @@ impl mem_core::infra::EvidenceStore for InMemoryHubStore {
         Ok(list)
     }
 
+    /// 按内容哈希点查：与列表实现同源的过滤条件，但不截断窗口，
+    /// 覆盖该会话全部历史证据
+    async fn find_evidence_by_hash(
+        &self,
+        namespace: &str,
+        source_kind: EvidenceSourceKind,
+        source_ref: &str,
+        content_hash: &str,
+    ) -> Result<Option<MemoryEvidence>> {
+        let r = self.evidences.read().unwrap();
+        Ok(r.values()
+            .filter(|ev| {
+                ev.namespace == namespace
+                    && ev.source_kind == source_kind
+                    && ev.source_ref.as_deref() == Some(source_ref)
+                    && ev.content_hash == content_hash
+            })
+            .max_by_key(|ev| ev.created_at)
+            .cloned())
+    }
+
     async fn all_evidence_in_namespace(&self, namespace: &str) -> Result<Vec<MemoryEvidence>> {
         let r = self.evidences.read().unwrap();
         let mut list: Vec<MemoryEvidence> = r

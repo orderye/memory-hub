@@ -74,6 +74,39 @@ impl EvidenceStore for PostgresHubStore {
         rows.iter().map(Self::evidence_from_row).collect()
     }
 
+    /// 按内容哈希点查证据（会话幂等查重）：命中
+    /// `idx_memory_evidence_source_ref (namespace, source_kind, source_ref)`，
+    /// 覆盖该会话全部历史证据，不受列表窗口限制
+    async fn find_evidence_by_hash(
+        &self,
+        namespace: &str,
+        source_kind: EvidenceSourceKind,
+        source_ref: &str,
+        content_hash: &str,
+    ) -> Result<Option<MemoryEvidence>> {
+        let row = sqlx::query(
+            r#"
+            select id, namespace, source_kind, source_ref, content_hash, excerpt, occurred_at, created_at, expires_at
+            from memory_evidence
+            where namespace = $1 and source_kind = $2 and source_ref = $3 and content_hash = $4
+            order by created_at desc
+            limit 1
+            "#,
+        )
+        .bind(namespace)
+        .bind(source_kind.as_str())
+        .bind(source_ref)
+        .bind(content_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .pg()?;
+
+        match row {
+            Some(r) => Ok(Some(Self::evidence_from_row(&r)?)),
+            None => Ok(None),
+        }
+    }
+
     async fn all_evidence_in_namespace(&self, namespace: &str) -> Result<Vec<MemoryEvidence>> {
         let rows = sqlx::query(
             r#"

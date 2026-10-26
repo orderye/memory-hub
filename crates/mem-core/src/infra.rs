@@ -145,9 +145,13 @@ pub trait MemoryStore: Send + Sync {
         include_merged: bool,
     ) -> Result<Vec<MemoryEntry>>;
 
-    /// 有上限的命名空间条目扫描（认知查重用）：最多返回 `limit` 条，
-    /// 避免命名空间条目爆炸时全量加载。默认实现调用 `all_in_namespace` 截断，
-    /// PostgreSQL 等生产存储应覆盖为 SQL 层 `LIMIT`。
+    /// 有上限的命名空间条目扫描（认知查重用）：最多返回 `limit` 条**最近更新**的
+    /// 条目，避免命名空间条目爆炸时全量加载。
+    ///
+    /// 排序为 `updated_at desc`：查重与演化目标选择的语义是"和最近的事实比对"，
+    /// 按 `created_at` 升序截断会让大命名空间只看到最老的一批条目，新重复漏判。
+    /// 默认实现调用 `all_in_namespace` 排序截断，PostgreSQL 等生产存储应覆盖为
+    /// SQL 层 `ORDER BY ... LIMIT`。
     async fn all_in_namespace_limited(
         &self,
         namespace: &str,
@@ -155,6 +159,11 @@ pub trait MemoryStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<MemoryEntry>> {
         let mut all = self.all_in_namespace(namespace, include_merged).await?;
+        all.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then(b.id.cmp(&a.id))
+        });
         if all.len() > limit {
             all.truncate(limit);
         }
@@ -196,6 +205,26 @@ pub trait EvidenceStore: Send + Sync {
         source_ref: Option<&str>,
         limit: usize,
     ) -> Result<Vec<MemoryEvidence>>;
+
+    /// 按内容哈希点查证据（会话幂等查重用）；`None` = 不存在。
+    ///
+    /// 默认实现退化为 `list_evidence` 窗口扫描（历史语义，窗口外的哈希会漏）；
+    /// 生产存储应覆盖为带索引的点查——幂等查重必须覆盖该会话的**全部**历史证据，
+    /// 否则同一会话的证据超过窗口条数后会重复落证据。
+    async fn find_evidence_by_hash(
+        &self,
+        namespace: &str,
+        source_kind: EvidenceSourceKind,
+        source_ref: &str,
+        content_hash: &str,
+    ) -> Result<Option<MemoryEvidence>> {
+        let candidates = self
+            .list_evidence(namespace, Some(source_kind), Some(source_ref), 256)
+            .await?;
+        Ok(candidates
+            .into_iter()
+            .find(|e| e.content_hash == content_hash))
+    }
 
     /// 命名空间下全部证据（备份/恢复用）
     async fn all_evidence_in_namespace(&self, namespace: &str) -> Result<Vec<MemoryEvidence>>;

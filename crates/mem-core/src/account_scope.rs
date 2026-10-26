@@ -527,6 +527,31 @@ impl<S: EvidenceStore + ?Sized> EvidenceStore for AccountScopedStore<S> {
         Ok(ev)
     }
 
+    /// 点查必须委托到内层存储：trait 默认实现退化为窗口扫描，会丢掉
+    /// 生产存储"覆盖会话全部历史证据"的幂等保证
+    async fn find_evidence_by_hash(
+        &self,
+        namespace: &str,
+        source_kind: EvidenceSourceKind,
+        source_ref: &str,
+        content_hash: &str,
+    ) -> Result<Option<MemoryEvidence>> {
+        let mut ev = self
+            .inner
+            .find_evidence_by_hash(
+                &self.scoped(namespace),
+                source_kind,
+                source_ref,
+                content_hash,
+            )
+            .await?;
+        if let Some(e) = ev.as_mut() {
+            self.assert_owned(&e.namespace)?;
+            e.namespace = self.unscoped(&e.namespace);
+        }
+        Ok(ev)
+    }
+
     async fn list_evidence(
         &self,
         namespace: &str,

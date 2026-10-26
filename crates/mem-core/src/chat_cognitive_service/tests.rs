@@ -1,5 +1,5 @@
 use super::*;
-use crate::domain::{ChatMessage, ChatRole};
+use crate::domain::{ChatMessage, ChatRole, EvidenceSourceKind, NewEvidence};
 use crate::infra::*;
 use crate::testing::{MockChatCognitiveExtractor, TestHubStore};
 
@@ -1291,4 +1291,108 @@ async fn test_fullauto_high_confidence_still_autocommits() {
         .unwrap();
     assert_eq!(res.committed_entries.len(), 1);
     assert!(res.proposals.is_empty());
+}
+
+/// 回归：同批候选查重。existing_memories 是循环开始前的快照，
+/// 同一次抽取返回的两个相同候选必须只提交一条（旧实现会提交两条）。
+#[tokio::test]
+async fn test_same_batch_identical_candidates_commit_once() {
+    let store = Arc::new(TestHubStore::default());
+    let service = ChatCognitiveService::new(
+        store.clone(),
+        Arc::new(MockChatCognitiveExtractor::new().with_candidates(vec![
+            candidate("同批重复事实", 0.95),
+            candidate("同批重复事实", 0.95),
+        ])),
+        CognitivePolicy {
+            mode: CognitiveGovernanceMode::FullAuto,
+            auto_accept_threshold: 0.9,
+            ..Default::default()
+        },
+    );
+
+    let res = service
+        .process_chat_session(
+            &auth(),
+            ChatCognitiveInput {
+                namespace: "batch-dup-ns".to_string(),
+                session_id: "sess-batch-dup".to_string(),
+                messages: vec![ChatMessage {
+                    role: ChatRole::User,
+                    content: "记录一条事实两次".to_string(),
+                    timestamp: None,
+                }],
+                occurred_at: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        res.committed_entries.len(),
+        1,
+        "同批相同候选只允许提交一条"
+    );
+    let active = store.all_in_namespace("batch-dup-ns", false).await.unwrap();
+    assert_eq!(active.len(), 1);
+}
+
+/// 回归：证据幂等查重必须覆盖会话**全部**历史证据。
+/// 旧实现按"最近 100 条"窗口扫描：同会话证据超过窗口后，
+/// 重复提交同一会话会再落一条证据（幂等失效）。
+#[tokio::test]
+async fn test_evidence_idempotency_survives_beyond_window() {
+    let store = Arc::new(TestHubStore::default());
+    let service = ChatCognitiveService::new(
+        store.clone(),
+        Arc::new(MockChatCognitiveExtractor::new().with_candidates(vec![candidate(
+            "窗口外幂等", 0.99,
+        )])),
+        CognitivePolicy {
+            mode: CognitiveGovernanceMode::FullAuto,
+            auto_accept_threshold: 0.95,
+            ..Default::default()
+        },
+    );
+    let input = ChatCognitiveInput {
+        namespace: "ev-idem-ns".to_string(),
+        session_id: "sess-ev-idem".to_string(),
+        messages: vec![ChatMessage {
+            role: ChatRole::User,
+            content: "首次提交".to_string(),
+            timestamp: None,
+        }],
+        occurred_at: None,
+    };
+
+    let first = service
+        .process_chat_session(&auth(), input.clone())
+        .await
+        .unwrap();
+
+    // 向同一会话灌入 300 条无关证据，把首条挤出任何列表窗口
+    for i in 0..300 {
+        store
+            .append_evidence(&NewEvidence {
+                id: None,
+                namespace: "ev-idem-ns".to_string(),
+                source_kind: EvidenceSourceKind::Session,
+                source_ref: Some("sess-ev-idem".to_string()),
+                content_hash: format!("dummy-hash-{i:04}"),
+                excerpt: None,
+                occurred_at: None,
+                expires_at: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    let second = service
+        .process_chat_session(&auth(), input)
+        .await
+        .unwrap();
+    assert_eq!(
+        second.evidence_id, first.evidence_id,
+        "窗口外仍必须命中同一条证据，不得重复落证据"
+    );
 }
