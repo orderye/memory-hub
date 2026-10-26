@@ -135,8 +135,8 @@ impl ChatCognitiveJob {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use common::HubError;
     use chrono::Utc;
+    use common::HubError;
     use common::Scope;
     use mem_core::domain::{
         ChatMessage, ChatRole, CognitiveCandidate, CognitiveGovernanceMode, CognitiveLayer,

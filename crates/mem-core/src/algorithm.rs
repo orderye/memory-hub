@@ -694,7 +694,12 @@ mod tests {
     #[test]
     fn test_mmr_lazy_matches_matrix() {
         let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
-        for (n, k, lambda) in [(30usize, 7usize, 0.7f32), (1, 5, 0.5), (8, 8, 1.0), (12, 3, 0.0)] {
+        for (n, k, lambda) in [
+            (30usize, 7usize, 0.7f32),
+            (1, 5, 0.5),
+            (8, 8, 1.0),
+            (12, 3, 0.0),
+        ] {
             let scores: Vec<f32> = (0..n).map(|_| rng.next_f32()).collect();
             let matrix: Vec<Vec<f32>> = (0..n)
                 .map(|_| (0..n).map(|_| rng.next_f32()).collect())
@@ -719,7 +724,9 @@ mod tests {
         let dim = 1024usize;
         let k = 100usize;
         let mut rng = XorShift(0xDEADBEEF_CAFEF00D);
-        let vecs: Vec<Vec<f32>> = (0..n).map(|_| (0..dim).map(|_| rng.next_f32()).collect()).collect();
+        let vecs: Vec<Vec<f32>> = (0..n)
+            .map(|_| (0..dim).map(|_| rng.next_f32()).collect())
+            .collect();
         let scores: Vec<f32> = (0..n).map(|i| 1.0 - i as f32 / n as f32).collect();
         let cosine = |a: &Vec<f32>, b: &Vec<f32>| -> f32 {
             a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>()
