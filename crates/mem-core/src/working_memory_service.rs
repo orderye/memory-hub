@@ -396,8 +396,10 @@ impl WorkingMemoryService {
 
         let terms = crate::algorithm::extract_terms(query);
         // 词元集走进程内缓存：同一条经验在多次查询间不必反复分词
-        let docs: Vec<Arc<std::collections::HashSet<String>>> =
-            pool.iter().map(Self::document_tokens_cached).collect();
+        let docs: Vec<Arc<std::collections::HashSet<String>>> = pool
+            .iter()
+            .map(|e| Self::document_tokens_cached(e))
+            .collect();
         // 池内 IDF 打分器：与混合检索同一实现（mem_core::PoolLexical）
         let pool_lexical = crate::algorithm::PoolLexical::new(terms, &docs);
 
@@ -1018,7 +1020,7 @@ mod bench {
         let t1 = std::time::Instant::now();
         let _warm1: Vec<_> = exps
             .iter()
-            .map(WorkingMemoryService::document_tokens_cached)
+            .map(|e| WorkingMemoryService::document_tokens_cached(e))
             .collect();
         let warm1_time = t1.elapsed();
 
@@ -1026,7 +1028,7 @@ mod bench {
         let t2 = std::time::Instant::now();
         let warm2: Vec<_> = exps
             .iter()
-            .map(WorkingMemoryService::document_tokens_cached)
+            .map(|e| WorkingMemoryService::document_tokens_cached(e))
             .collect();
         let warm2_time = t2.elapsed();
         assert_eq!(warm2.len(), exps.len());

@@ -287,10 +287,9 @@ impl ChatCognitiveService {
             // 幂等跳过以杜绝无限复制
             let content_key = candidate.content.trim().to_string();
             let scene_key = candidate.scene;
-            if existing_memories
-                .iter()
-                .any(|e| e.content.trim() == content_key && e.scene == Some(scene_key))
-                || batch_committed.contains(&(content_key.clone(), scene_key))
+            if existing_memories.iter().any(|e| {
+                e.content.trim() == content_key && e.scene == Some(scene_key)
+            }) || batch_committed.contains(&(content_key.clone(), scene_key))
             {
                 continue;
             }

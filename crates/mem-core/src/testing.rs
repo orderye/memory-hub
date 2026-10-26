@@ -7,7 +7,6 @@
 use crate::infra::Embedder;
 use async_trait::async_trait;
 use common::{HubError, Result};
-use sha2::{Digest, Sha256};
 
 /// 确定性测试嵌入器
 #[derive(Debug, Clone)]
@@ -27,25 +26,7 @@ impl TestEmbedder {
     }
 
     fn generate_vector(&self, text: &str) -> Vec<f32> {
-        let mut vec = Vec::with_capacity(self.dimension);
-        let mut hasher = Sha256::new();
-        hasher.update(text.as_bytes());
-        let hash = hasher.finalize();
-
-        for i in 0..self.dimension {
-            let byte = hash[i % 32];
-            let val = ((f32::from(byte)) / 255.0) * 2.0 - 1.0 + ((i as f32) * 0.001).sin();
-            vec.push(val);
-        }
-
-        let norm_sq: f32 = vec.iter().map(|x| x * x).sum();
-        let norm = norm_sq.sqrt();
-        if norm > 0.0 {
-            for x in &mut vec {
-                *x /= norm;
-            }
-        }
-        vec
+        crate::algorithm::sha256_pseudo_vector(text, self.dimension)
     }
 }
 
@@ -574,6 +555,15 @@ impl MemoryStore for TestHubStore {
         _qv: &[f32],
         _k: usize,
     ) -> Result<Vec<Scored<MemoryEntry>>> {
+        Ok(vec![])
+    }
+
+    async fn embeddings_by_ids(
+        &self,
+        _namespace: &str,
+        _ids: &[uuid::Uuid],
+    ) -> Result<Vec<(uuid::Uuid, Vec<f32>)>> {
+        // 与 similar 一致：测试桩不提供向量路
         Ok(vec![])
     }
 

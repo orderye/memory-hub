@@ -150,15 +150,15 @@
           > /usr/local/cargo/config.toml
     - name: 格式检查
       timeout: 20m
-      script: cargo fmt --all -- --check
-    # 必须带 --all-features：否则 adapter-cjs 与 pg-integration 里的代码
-    # 从头到尾不参与编译，编译错误要到发布构建甚至线上才暴露
+      script: bash scripts/ci/quality-gate.sh fmt
+    # 三步命令统一收口在 scripts/ci/quality-gate.sh（与 GitHub Actions 共用，
+    # 含 --all-features 的必要性说明），此处只保留分步超时
     - name: 静态检查（零警告）
       timeout: 60m
-      script: cargo clippy --all-targets --all-features -- -D warnings
+      script: bash scripts/ci/quality-gate.sh clippy
     - name: 单元与集成测试
       timeout: 60m
-      script: cargo test --workspace --all-features
+      script: bash scripts/ci/quality-gate.sh test
 
 # ==============================================================================
 # 云原生开发环境（仅预览模式，main 与 `$` 共用）

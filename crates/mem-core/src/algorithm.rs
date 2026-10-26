@@ -6,6 +6,7 @@
 use crate::domain::Namespace;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// 五维权重顺序
 pub const SCORE_WEIGHT_LEN: usize = 5;
@@ -27,6 +28,28 @@ pub fn l2_normalize(v: &mut [f32]) {
             *x /= norm;
         }
     }
+}
+
+/// 确定性伪向量：SHA-256 字节 → 连续浮点 → L2 归一化
+///
+/// [`crate::testing::TestEmbedder`] 与 `embed::MockEmbedder` 共用的唯一实现，
+/// 两处必须逐字节一致——否则测试环境与 mock 生产环境会落在两个向量空间，
+/// 检索与整合的行为对照全部失真。产出的向量**没有语义**：余弦相似度是哈希
+/// 噪声，调用方必须配合 `provides_semantic_signal() == false` 使用。
+pub fn sha256_pseudo_vector(text: &str, dimension: usize) -> Vec<f32> {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    let hash = hasher.finalize();
+
+    let mut vec = Vec::with_capacity(dimension);
+    for i in 0..dimension {
+        let byte = hash[i % 32];
+        let val = ((f32::from(byte)) / 255.0) * 2.0 - 1.0 + ((i as f32) * 0.001).sin();
+        vec.push(val);
+    }
+
+    l2_normalize(&mut vec);
+    vec
 }
 
 /// 提取检索词元（与文档侧同源：ASCII 词 + CJK 1-gram/2-gram），按序去重

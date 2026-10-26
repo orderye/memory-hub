@@ -17,7 +17,7 @@ fn test_migrations_registered() {
     // 此前只抽查了 002/003，切分器对 dollar-quoted 块出错时另一条会被静默截断。
     for (version, sql) in MIGRATIONS {
         let stmts = split_sql_statements(sql);
-        assert!(!stmts.is_empty(), "迁移 {} 应至少切出一条语句", version);
+        assert!(stmts.len() >= 1, "迁移 {} 应至少切出一条语句", version);
         assert!(
             stmts.iter().all(|s| s.trim_end().ends_with(';')),
             "迁移 {} 存在未被切分的尾段",

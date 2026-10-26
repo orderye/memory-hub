@@ -15,7 +15,6 @@ pub use http::HttpEmbedder;
 use async_trait::async_trait;
 use common::Result;
 use mem_core::Embedder;
-use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 /// 确定性 Mock 嵌入模型
@@ -40,29 +39,11 @@ impl MockEmbedder {
     }
 
     /// 将文本转为确定性且 L2 模长为 1.0 的向量
+    ///
+    /// 数学实现收敛在 `mem_core::algorithm::sha256_pseudo_vector`（唯一来源），
+    /// 与 `mem_core::testing::TestEmbedder` 共用；本方法只负责组合。
     fn generate_vector(&self, text: &str) -> Vec<f32> {
-        let mut vec = Vec::with_capacity(self.dimension);
-        let mut hasher = Sha256::new();
-        hasher.update(text.as_bytes());
-        let hash = hasher.finalize();
-
-        // 基于哈希生成伪随机连续浮点数
-        for i in 0..self.dimension {
-            let byte = hash[i % 32];
-            let val = ((byte as f32) / 255.0) * 2.0 - 1.0 + ((i as f32) * 0.001).sin();
-            vec.push(val);
-        }
-
-        // L2 归一化
-        let norm_sq: f32 = vec.iter().map(|x| x * x).sum();
-        let norm = norm_sq.sqrt();
-        if norm > 0.0 {
-            for x in &mut vec {
-                *x /= norm;
-            }
-        }
-
-        vec
+        mem_core::algorithm::sha256_pseudo_vector(text, self.dimension)
     }
 }
 
@@ -245,6 +226,22 @@ pub fn build_embedder(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 对拍：MockEmbedder 与 mem_core::testing::TestEmbedder 必须产出逐位相同的向量。
+    /// 两者历史上各有一份相同的哈希数学，一旦实现漂移，测试环境与 mock 生产
+    /// 环境将落在两个向量空间——用本测试钉死"唯一实现"约束。
+    #[tokio::test]
+    async fn test_mock_matches_core_test_embedder_bitwise() {
+        let mock = MockEmbedder::new("mock-embedder-v1", 64);
+        let core = mem_core::testing::TestEmbedder::new(64);
+        let texts = vec![
+            "偏好简短直接的表达".to_string(),
+            "deploy redis on tokyo".to_string(),
+        ];
+        let a = mock.embed(&texts).await.unwrap();
+        let b = core.embed(&texts).await.unwrap();
+        assert_eq!(a, b, "两份伪向量实现必须逐位一致");
+    }
 
     #[tokio::test]
     async fn test_mock_embedder_contract() {

@@ -1127,7 +1127,10 @@ mod tests {
         );
     }
 
-    // 保证 MemoryHubStore 聚合 trait 可被满足（编译期检查）
-    #[allow(dead_code)]
-    fn assert_hub_store<T: MemoryHubStore>() {}
+    #[test]
+    fn test_test_hub_store_implements_memory_hub_store() {
+        // 编译期检查：测试库满足聚合 trait，防止 trait 扩充时测试库悄悄掉队
+        fn assert_hub_store<T: MemoryHubStore>() {}
+        assert_hub_store::<TestHubStore>();
+    }
 }

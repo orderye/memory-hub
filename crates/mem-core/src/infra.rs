@@ -159,7 +159,11 @@ pub trait MemoryStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<MemoryEntry>> {
         let mut all = self.all_in_namespace(namespace, include_merged).await?;
-        all.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(b.id.cmp(&a.id)));
+        all.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then(b.id.cmp(&a.id))
+        });
         if all.len() > limit {
             all.truncate(limit);
         }

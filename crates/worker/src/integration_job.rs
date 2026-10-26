@@ -16,8 +16,6 @@ pub struct IntegrationScanJob {
     engine: ConsolidationEngine,
     store: Arc<dyn MemoryHubStore>,
     sim_threshold: f32,
-    #[allow(dead_code)]
-    max_proposals: usize,
     /// 作业执行者标识
     worker_agent: AgentId,
     /// 跨进程租约（None = 单机/手动执行，不做互斥）
@@ -52,7 +50,6 @@ impl IntegrationScanJob {
             engine,
             store,
             sim_threshold: sim_threshold.clamp(0.0, 1.0),
-            max_proposals: max_proposals.max(1),
             worker_agent: agent,
             lease: None,
         }

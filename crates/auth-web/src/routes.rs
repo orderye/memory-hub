@@ -1411,17 +1411,16 @@ fn urlencoded(s: &str) -> String {
     out
 }
 
-/// 从 HeaderMap 取第一个值（测试辅助）
-#[allow(dead_code)]
-pub fn header_value(headers: &HeaderMap, key: &str) -> Option<String> {
-    headers.get(key)?.to_str().ok().map(str::to_string)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::oauth_flow::RegisterAgentRequest;
     use store::InMemoryHubStore;
+
+    /// 从 HeaderMap 取第一个值（测试辅助）
+    fn header_value(headers: &HeaderMap, key: &str) -> Option<String> {
+        headers.get(key)?.to_str().ok().map(str::to_string)
+    }
 
     fn state() -> AsWebState {
         let store = Arc::new(InMemoryHubStore::new());

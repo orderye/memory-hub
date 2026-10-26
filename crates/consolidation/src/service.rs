@@ -6,9 +6,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use common::{AuthCtx, ConsolidationFallback, ConsolidationMode, HubError, Result, Scope};
 use mem_core::{
-    account_scope::AccountScopedStore, AccessChecker, Clock, Embedder, IntegrationProposal,
+    account_scope::AccountScopedStore, AccessChecker, Embedder, IntegrationProposal,
     IntegrationService, IntegrationStore, MemoryEntry, MemoryHubStore, ResolveRequest, ScanReport,
-    ScanRequest, SystemClock,
+    ScanRequest,
 };
 use std::sync::Arc;
 
@@ -17,11 +17,7 @@ pub struct DefaultIntegrationService {
     engine: Arc<ConsolidationEngine>,
     store: Arc<dyn MemoryHubStore>,
     access: Arc<dyn AccessChecker>,
-    #[allow(dead_code)]
-    clock: Arc<dyn Clock>,
     sim_threshold: f32,
-    #[allow(dead_code)]
-    max_proposals: usize,
     embedder: Option<Arc<dyn Embedder>>,
     /// 候选发现模式（部署级默认）
     mode: ConsolidationMode,
@@ -47,9 +43,7 @@ impl DefaultIntegrationService {
             engine,
             store,
             access,
-            clock: Arc::new(SystemClock),
             sim_threshold: sim,
-            max_proposals: max_p,
             embedder: None,
             mode: ConsolidationMode::Rules,
             fallback: ConsolidationFallback::Rules,
@@ -97,12 +91,6 @@ impl DefaultIntegrationService {
     /// 生产由 `HUB_INTEGRATION_SCAN_MAX_ENTRIES` 注入；超限时报告里 `truncated=true`。
     pub fn with_scan_limit(mut self, max_entries: usize) -> Self {
         self.engine = Arc::new(self.engine.as_ref().clone().with_scan_limit(max_entries));
-        self
-    }
-
-    #[cfg(test)]
-    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
-        self.clock = clock;
         self
     }
 

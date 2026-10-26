@@ -17,6 +17,14 @@ members = [
     "crates/bins/backup-worker",
 ]
 
+# 发布构建：thin LTO + 符号剥离 + 单编译单元。
+# 三只服务端二进制的体积敏感（轻量部署场景），实测收益见 docs/upgrade/LIGHTWEIGHT_BASELINE.md；
+# 不设 panic=abort，保持服务器 panic 时的 unwind 语义与现有回滚策略一致。
+[profile.release]
+lto = "thin"
+strip = "symbols"
+codegen-units = 1
+
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
@@ -52,7 +60,19 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.10", features = ["v4", "serde"] }
 
 # 异步与运行时
-tokio = { version = "1.40", features = ["full"] }
+# 特性按全仓实际用量裁剪（曾为 "full"）：
+# - rt-multi-thread：common::runtime 的 new_multi_thread 生产运行时
+# - macros：#[tokio::test] 与 tokio::join!
+# - time/sync/io-util/net：超时退避、同步原语、stdio 传输、TCP 监听
+tokio = { version = "1.40", features = [
+    "macros",
+    "rt-multi-thread",
+    "time",
+    "sync",
+    "io-util",
+    "io-std",
+    "net",
+] }
 
 # HTTP 服务与传输层
 axum = { version = "0.8", features = ["http1", "tokio", "json", "form", "query"] }
@@ -70,6 +90,9 @@ sqlx = { version = "0.8", default-features = false, features = [
     "json",
     "migrate",
 ] }
+# pgvector 二进制协议类型：vector / halfvec 的 sqlx Encode/Decode，
+# 替代手写的向量文本字面量（省去每次查询 ~12KB 文本的解析与回传）
+pgvector = { version = "0.4", features = ["sqlx", "halfvec"] }
 
 # 外部嵌入服务客户端（OpenAI 兼容 /embeddings 协议）
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2"] }

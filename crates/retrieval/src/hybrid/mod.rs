@@ -187,12 +187,7 @@ impl HybridRetriever {
 
     /// 打分/防御性复核共用的过滤判定（与 [`Self::base_filter`] 同一套条件的
     /// Rust 侧复核；存储实现差异兜底）
-    fn passes_query_filters(
-        &self,
-        q: &SearchQuery,
-        item: &MemoryEntry,
-        now: chrono::DateTime<chrono::Utc>,
-    ) -> bool {
+    fn passes_query_filters(&self, q: &SearchQuery, item: &MemoryEntry, now: chrono::DateTime<chrono::Utc>) -> bool {
         passes_validity_filter(item, q.valid_at, q.include_superseded, now)
             && matches_tag_filter(item, &q.tags)
             && self.scene_keeps(q, item)
