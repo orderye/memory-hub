@@ -6,7 +6,7 @@
 
 use crate::infra::Embedder;
 use async_trait::async_trait;
-use common::Result;
+use common::{HubError, Result};
 use sha2::{Digest, Sha256};
 
 /// 确定性测试嵌入器
@@ -275,7 +275,7 @@ impl ChatCognitiveExtractor for MockChatCognitiveExtractor {
 use crate::domain::*;
 use crate::infra::*;
 use chrono::{DateTime, Utc};
-use common::{AgentId, HubError};
+use common::AgentId;
 use std::collections::HashMap;
 use std::sync::RwLock;
 use uuid::Uuid;
@@ -308,6 +308,7 @@ pub struct TestHubStore {
     pub grants: RwLock<Vec<NamespaceGrantRecord>>,
     pub agents: RwLock<HashMap<AgentId, AgentRecord>>,
     pub proposals: RwLock<HashMap<Uuid, IntegrationProposal>>,
+    pub cognitive_proposals: RwLock<HashMap<Uuid, CognitiveProposalRecord>>,
     pub evidences: RwLock<Vec<MemoryEvidence>>,
     pub relations: RwLock<Vec<MemoryRelation>>,
     pub tasks: RwLock<HashMap<(String, Uuid), MemoryTask>>,
@@ -409,23 +410,50 @@ impl MemoryStore for TestHubStore {
     }
 
     async fn save(&self, e: &MemoryEntry) -> Result<MemoryEntry> {
-        self.items
-            .write()
-            .unwrap()
-            .insert((e.namespace.clone(), e.id), e.clone());
+        // 契约对齐（infra.rs）：save 要求条目已存在，否则 NotFound；
+        // 无条件 upsert 会让依赖 TestHubStore 的测试验不出生产的丢写行为
+        let mut w = self.items.write().unwrap();
+        let key = (e.namespace.clone(), e.id);
+        if !w.contains_key(&key) {
+            return Err(HubError::NotFound);
+        }
+        w.insert(key, e.clone());
         Ok(e.clone())
+    }
+
+    /// 契约对齐（infra.rs）：乐观锁前置不成立（条目不存在或版本不符）
+    /// 一律 Conflict，绝不静默覆盖
+    async fn save_if_version(
+        &self,
+        entry: &MemoryEntry,
+        expected_version: i64,
+    ) -> Result<MemoryEntry> {
+        let mut w = self.items.write().unwrap();
+        match w.get_mut(&(entry.namespace.clone(), entry.id)) {
+            Some(current) if current.version == expected_version => {
+                *current = entry.clone();
+                Ok(entry.clone())
+            }
+            _ => Err(HubError::Conflict),
+        }
     }
 
     async fn revise(
         &self,
         entry: &MemoryEntry,
-        _expected_version: i64,
+        expected_version: i64,
         change: VersionChange,
     ) -> Result<MemoryEntry> {
-        self.items
-            .write()
-            .unwrap()
-            .insert((entry.namespace.clone(), entry.id), entry.clone());
+        // 契约对齐（infra.rs）：版本不符返回 Conflict 而非静默覆盖
+        {
+            let mut w = self.items.write().unwrap();
+            match w.get_mut(&(entry.namespace.clone(), entry.id)) {
+                Some(current) if current.version == expected_version => {
+                    *current = entry.clone();
+                }
+                _ => return Err(HubError::Conflict),
+            }
+        }
         self.versions.write().unwrap().push(MemoryVersion {
             memory_id: entry.id,
             version: entry.version,
@@ -587,6 +615,66 @@ impl IntegrationStore for TestHubStore {
     }
     async fn open_exists(&self, _ns: &str, _members: &[(String, Vec<Uuid>)]) -> Result<bool> {
         Ok(false)
+    }
+}
+
+#[async_trait]
+impl CognitiveProposalStore for TestHubStore {
+    async fn save_cognitive_proposal(&self, p: &CognitiveProposalRecord) -> Result<()> {
+        let mut w = self.cognitive_proposals.write().unwrap();
+        if w.contains_key(&p.id) {
+            return Err(HubError::Conflict);
+        }
+        w.insert(p.id, p.clone());
+        Ok(())
+    }
+
+    async fn get_cognitive_proposal(&self, id: Uuid) -> Result<CognitiveProposalRecord> {
+        self.cognitive_proposals
+            .read()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .ok_or(HubError::NotFound)
+    }
+
+    async fn list_cognitive_proposals(
+        &self,
+        ns: &str,
+        status: Option<CognitiveProposalStatus>,
+    ) -> Result<Vec<CognitiveProposalRecord>> {
+        let mut out: Vec<CognitiveProposalRecord> = self
+            .cognitive_proposals
+            .read()
+            .unwrap()
+            .values()
+            .filter(|p| p.namespace == ns && status.is_none_or(|s| p.status == s))
+            .cloned()
+            .collect();
+        out.sort_by_key(|p| std::cmp::Reverse(p.created_at));
+        Ok(out)
+    }
+
+    async fn update_cognitive_proposal_status(
+        &self,
+        id: Uuid,
+        expected_status: CognitiveProposalStatus,
+        new_status: CognitiveProposalStatus,
+        rejection_reason: Option<&str>,
+        resulting_memory_id: Option<Uuid>,
+        resolved_by: Option<&str>,
+    ) -> Result<CognitiveProposalRecord> {
+        let mut w = self.cognitive_proposals.write().unwrap();
+        let p = w.get_mut(&id).ok_or(HubError::NotFound)?;
+        if p.status != expected_status {
+            return Err(HubError::Conflict);
+        }
+        p.status = new_status;
+        p.rejection_reason = rejection_reason.map(str::to_string);
+        p.resulting_memory_id = resulting_memory_id;
+        p.resolved_by = resolved_by.map(str::to_string);
+        p.updated_at = Utc::now();
+        Ok(p.clone())
     }
 }
 

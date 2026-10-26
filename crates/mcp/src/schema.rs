@@ -648,8 +648,8 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                 "properties": {
                     "namespace": ns_prop(),
                     "status": {
-                        "enum": ["open", "merged", "dismissed", "expired"],
-                        "description": "提案状态过滤"
+                        "enum": ["pending_review", "accepted", "rejected", "superseded", "candidate"],
+                        "description": "认知提案状态过滤（对应 cognitive_chat_propose 产出的提案）"
                     },
                     "limit": {
                         "type": "integer",

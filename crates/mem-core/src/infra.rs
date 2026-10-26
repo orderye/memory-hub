@@ -5,11 +5,11 @@
 
 use crate::domain::{
     BackupRecord, ChatCognitiveInput, CodingRevision, CodingThread, CognitiveCandidate,
-    EvidenceSourceKind, ExperienceStatus, IntegrationProposal, MemoryEntry, MemoryEvidence,
-    MemoryExperience, MemoryFilter, MemoryRelation, MemoryRelationKind, MemoryTask,
-    MemoryTaskExperience, MemoryVersion, Namespace, NamespaceGrantRecord, NamespaceInfo,
-    NewCodingRevision, NewCodingThread, NewEvidence, NewMemoryExperience, NewMemoryRelation,
-    NewMemoryTask, ProposalStatus, Scored, TaskStatus,
+    CognitiveProposalRecord, CognitiveProposalStatus, EvidenceSourceKind, ExperienceStatus,
+    IntegrationProposal, MemoryEntry, MemoryEvidence, MemoryExperience, MemoryFilter,
+    MemoryRelation, MemoryRelationKind, MemoryTask, MemoryTaskExperience, MemoryVersion, Namespace,
+    NamespaceGrantRecord, NamespaceInfo, NewCodingRevision, NewCodingThread, NewEvidence,
+    NewMemoryExperience, NewMemoryRelation, NewMemoryTask, ProposalStatus, Scored, TaskStatus,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -54,7 +54,11 @@ pub trait MemoryStore: Send + Sync {
     /// 按业务键读取
     async fn get_by_key(&self, namespace: &str, key: &str) -> Result<Option<MemoryEntry>>;
 
-    /// 全量写回（service 层负责版本号与时间戳推进）
+    /// 全量写回已存在条目（service 层负责版本号与时间戳推进）。
+    ///
+    /// 契约：**要求条目已存在**——`(namespace, id)` 不存在时返回 `NotFound`，
+    /// 不做 upsert。新建条目必须走 `insert` / `insert_initial`。
+    /// 两个后端（PostgreSQL / 内存）在这一点上语义一致。
     async fn save(&self, entry: &MemoryEntry) -> Result<MemoryEntry>;
 
     /// 乐观并发修订：仅当库中该行当前版本为 `expected_version` 时才写入。
@@ -62,6 +66,9 @@ pub trait MemoryStore: Send + Sync {
     /// `save` 是无条件 `update ... where namespace/id`，两个 Agent 同时读到同一条目
     /// 再各自写回时，后写者会静默覆盖前者的修订与版本推进（丢更新）。
     /// 所有"读-改-写"路径都应改用本方法。
+    ///
+    /// 契约：乐观锁前置条件不成立（条目不存在，或当前版本 ≠
+    /// `expected_version`）一律返回 `Conflict`，绝不静默覆盖。
     ///
     /// 默认实现退化为无条件 `save`，供无需该保证的测试替身使用；
     /// 生产存储与内存存储都必须覆盖。
@@ -75,6 +82,9 @@ pub trait MemoryStore: Send + Sync {
     }
 
     /// 原子修订：写回条目（乐观锁）并追加版本历史，二者必须同成同败。
+    ///
+    /// 契约：与 `save_if_version` 同一乐观锁语义——版本不符或条目不存在
+    /// 返回 `Conflict`，且不追加版本历史。
     ///
     /// `save` + `record_version` 分两步时，第二步失败会留下"条目已推进而历史缺那一版"
     /// 的分叉——而版本历史正是备份与审计的事实来源。`changed_by` 取自
@@ -250,6 +260,42 @@ pub trait IntegrationStore: Send + Sync {
     ) -> Result<bool>;
 }
 
+/// 认知提案存储（Chat 认知提炼的人工审查队列）
+///
+/// 与 [`IntegrationStore`] 是两套**独立的提案 ID 空间**：
+/// 整合提案面向"既有条目怎么归并"，认知提案面向"新候选要不要入库"。
+/// 两者的 UUID 不得互相传用；裁决入口按提案实际归属分发，
+/// 混用时返回明确错误而不是笼统的 NotFound。
+#[async_trait]
+pub trait CognitiveProposalStore: Send + Sync {
+    /// 新建认知提案（id 冲突时报错，不做覆盖更新）
+    async fn save_cognitive_proposal(&self, p: &CognitiveProposalRecord) -> Result<()>;
+
+    /// 按 ID 读取认知提案（不存在返回 NotFound）
+    async fn get_cognitive_proposal(&self, id: uuid::Uuid) -> Result<CognitiveProposalRecord>;
+
+    /// 条件列表（status 为 None 时列出全部状态，按 created_at 降序）
+    async fn list_cognitive_proposals(
+        &self,
+        namespace: &str,
+        status: Option<CognitiveProposalStatus>,
+    ) -> Result<Vec<CognitiveProposalRecord>>;
+
+    /// 更新提案状态（裁决动作）。
+    ///
+    /// `expected_status` 为乐观前置：提案当前状态不是它时返回 `Conflict`，
+    /// 防止两个审查者对同一提案重复裁决（采纳两次会写入两条重复记忆）。
+    async fn update_cognitive_proposal_status(
+        &self,
+        id: uuid::Uuid,
+        expected_status: CognitiveProposalStatus,
+        new_status: CognitiveProposalStatus,
+        rejection_reason: Option<&str>,
+        resulting_memory_id: Option<uuid::Uuid>,
+        resolved_by: Option<&str>,
+    ) -> Result<CognitiveProposalRecord>;
+}
+
 /// 命名空间与授权存储（auth-server 与 mcp-server 共享同一份真实数据）
 #[async_trait]
 pub trait GrantStore: Send + Sync {
@@ -420,6 +466,7 @@ pub trait MemoryHubStore:
     MemoryStore
     + BackupStore
     + IntegrationStore
+    + CognitiveProposalStore
     + GrantStore
     + AgentStore
     + EvidenceStore
@@ -434,6 +481,7 @@ impl<
         T: MemoryStore
             + BackupStore
             + IntegrationStore
+            + CognitiveProposalStore
             + GrantStore
             + AgentStore
             + EvidenceStore

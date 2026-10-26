@@ -24,7 +24,7 @@
 
 use crate::account::{AccountService, SESSION_COOKIE};
 use crate::oauth_flow::{AgentOAuthServer, AuthorizeParams};
-use axum::extract::{Query, State};
+use axum::extract::{ConnectInfo, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -33,6 +33,7 @@ use axum::Router;
 use mem_core::{AccountRecord, GrantStore};
 use serde::Deserialize;
 use serde_json::json;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 /// 路由共享状态
@@ -44,6 +45,9 @@ pub struct AsWebState {
     pub external_base_url: String,
     /// Origin 白名单（非空时校验浏览器侧状态变更请求，防跨站请求伪造）
     pub allowed_origins: Vec<String>,
+    /// 可信反向代理（`TRUSTED_PROXIES`）：仅当 TCP 对端命中时才解析 XFF。
+    /// 空列表 = 无代理部署，一律用 socket 对端地址做 IP 限流。
+    pub trusted_proxies: Vec<std::net::IpAddr>,
     pub rate_limiter: Arc<dyn common::RateLimitStore>,
 }
 
@@ -407,10 +411,57 @@ async fn handle_consent(
 }
 
 /// POST /oauth/token
+///
+/// 未认证端点且每次验证都跑 64MiB 内存硬度的 Argon2id：必须双层限流，
+/// 否则攻击者可用纯 HTTP 请求耗尽认证节点的 CPU/内存（DoS 入口）。
+/// - 按客户端 IP：30/min（同一出口的正常重试不会触顶）
+/// - 按 client_id：10/min（单个 Agent 的令牌轮换频率远低于此）
 async fn handle_token(
     State(s): State<AsWebState>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Form(form): Form<crate::oauth_flow::TokenRequest>,
 ) -> Response {
+    let client_ip = extract_client_ip(&headers, remote, &s.trusted_proxies);
+    // 键加端点前缀：限流桶按 dimension+key 存储，裸 IP 键会让 login(15/min) 与
+    // token(30/min) 共用一个桶并互相钳制容量
+    if !s
+        .rate_limiter
+        .try_acquire_in_window(
+            common::RateDimension::Ip,
+            &format!("token:{client_ip}"),
+            TOKEN_IP_LIMIT_PER_MIN,
+            60,
+        )
+        .await
+        .unwrap_or(true)
+    {
+        return too_many_requests("请求过于频繁，请 1 分钟后重试");
+    }
+
+    // client_id 优先取 Basic 头，其次表单字段；都没有时按 "anonymous" 维度限流，
+    // 防止不带 client_id 的请求绕开第二维
+    let client_key = client_credentials(
+        &headers,
+        form.client_id.as_deref(),
+        form.client_secret.as_deref(),
+    )
+    .map(|(id, _)| id)
+    .unwrap_or_else(|| "anonymous".to_string());
+    if !s
+        .rate_limiter
+        .try_acquire_in_window(
+            common::RateDimension::User,
+            &format!("token-endpoint:{client_key}"),
+            TOKEN_CLIENT_LIMIT_PER_MIN,
+            60,
+        )
+        .await
+        .unwrap_or(true)
+    {
+        return too_many_requests("该客户端令牌请求过于频繁，请 1 分钟后重试");
+    }
+
     match s.oauth.token(form).await {
         Ok(resp) => json_response(serde_json::to_value(&resp).unwrap_or(json!({}))),
         Err(e) => (
@@ -422,6 +473,17 @@ async fn handle_token(
         )
             .into_response(),
     }
+}
+
+/// token 端点按 IP 的限流阈值（次/分钟）
+const TOKEN_IP_LIMIT_PER_MIN: u32 = 30;
+/// token 端点按 client_id 的限流阈值（次/分钟）
+const TOKEN_CLIENT_LIMIT_PER_MIN: u32 = 10;
+/// 注册端点按 IP 的限流阈值（次/分钟）
+const REGISTER_IP_LIMIT_PER_MIN: u32 = 5;
+
+fn too_many_requests(msg: &'static str) -> Response {
+    (StatusCode::TOO_MANY_REQUESTS, msg).into_response()
 }
 
 /// 还原调用方客户端凭据：优先 HTTP Basic（RFC 7662 §2.1 推荐），其次表单字段。
@@ -593,14 +655,34 @@ async fn handle_register_page(State(s): State<AsWebState>) -> Response {
 }
 
 /// POST /account/register
+///
+/// 开放注册与邀请码两种模式都按 IP 限流（5/min）：注册会跑 Argon2 哈希
+/// 并写库，未认证可达；不限制时既是 DoS 入口也是批量注册垃圾账户的入口。
 async fn handle_register_submit(
     State(s): State<AsWebState>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Form(form): Form<RegisterAccountForm>,
 ) -> Response {
     if !origin_allowed(&s, &headers) {
         return (StatusCode::FORBIDDEN, "Origin 不被允许").into_response();
     }
+    let client_ip = extract_client_ip(&headers, remote, &s.trusted_proxies);
+    // 键加端点前缀（与 token 端点同理：避免与 login 的 IP 桶互相钳制容量）
+    if !s
+        .rate_limiter
+        .try_acquire_in_window(
+            common::RateDimension::Ip,
+            &format!("register:{client_ip}"),
+            REGISTER_IP_LIMIT_PER_MIN,
+            60,
+        )
+        .await
+        .unwrap_or(true)
+    {
+        return too_many_requests("注册请求过于频繁，请 1 分钟后重试");
+    }
+
     let invite = (!form.invite_code.trim().is_empty()).then_some(form.invite_code.as_str());
     match s
         .accounts
@@ -646,24 +728,52 @@ async fn handle_login_page(State(s): State<AsWebState>) -> Response {
     )
 }
 
-fn extract_client_ip(headers: &HeaderMap) -> String {
-    headers
+/// 解析客户端 IP（用于 IP 维度限流）。
+///
+/// **默认只信任 TCP 对端地址，完全忽略 `X-Forwarded-For` / `X-Real-IP`**：
+/// 这两个头是任意客户端可写的，直接采信等于让攻击者每请求换一个随机 XFF
+/// 就能绕过 IP 限流。
+///
+/// 仅当对端地址命中 `TRUSTED_PROXIES`（自家反向代理）时才解析 XFF，且取
+/// **从右往左第一个不属于可信代理的 IP**——XFF 由链路上的代理逐跳追加，
+/// 右侧是离本服务最近的代理写入的可信部分，左侧才是客户端可伪造的部分。
+fn extract_client_ip(
+    headers: &HeaderMap,
+    remote: SocketAddr,
+    trusted_proxies: &[std::net::IpAddr],
+) -> String {
+    if !trusted_proxies.contains(&remote.ip()) {
+        return remote.ip().to_string();
+    }
+
+    let forwarded = headers
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .map(|s| s.trim().to_string())
-        .or_else(|| {
-            headers
-                .get("x-real-ip")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.trim().to_string())
-        })
-        .unwrap_or_else(|| "127.0.0.1".to_string())
+        .map(|s| s.split(',').map(str::trim).filter(|s| !s.is_empty()));
+    let mut hops: Vec<&str> = match forwarded {
+        Some(h) => h.collect(),
+        None => return remote.ip().to_string(),
+    };
+
+    // 从右往左跳过可信代理；第一个非可信 IP 即客户端真实地址。
+    // 条目无法解析时视为不可信：采信它会污染限流键，直接回落到对端地址。
+    // XFF 全部为可信代理时（客户端即代理本身），同样回落到对端地址。
+    while let Some(last) = hops.last().copied() {
+        match last.parse::<std::net::IpAddr>() {
+            Ok(ip) if trusted_proxies.contains(&ip) => {
+                hops.pop();
+            }
+            Ok(ip) => return ip.to_string(),
+            Err(_) => return remote.ip().to_string(),
+        }
+    }
+    remote.ip().to_string()
 }
 
 /// POST /account/login
 async fn handle_login_submit(
     State(s): State<AsWebState>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> Response {
@@ -671,7 +781,7 @@ async fn handle_login_submit(
         return (StatusCode::FORBIDDEN, "Origin 不被允许").into_response();
     }
 
-    let client_ip = extract_client_ip(&headers);
+    let client_ip = extract_client_ip(&headers, remote, &s.trusted_proxies);
     // 按 IP 限制每分钟 15 次
     if !s
         .rate_limiter
@@ -1329,6 +1439,7 @@ mod tests {
             )),
             external_base_url: "https://auth.example.com".to_string(),
             allowed_origins: vec![],
+            trusted_proxies: vec![],
             rate_limiter: Arc::new(common::InMemoryRateLimitStore::new()),
         }
     }
@@ -1340,6 +1451,16 @@ mod tests {
             format!("{}={}", SESSION_COOKIE, token).parse().unwrap(),
         );
         h
+    }
+
+    /// 测试用的对端地址（无代理部署下的"真实客户端 IP"）
+    fn remote() -> SocketAddr {
+        "203.0.113.10:4444".parse().unwrap()
+    }
+
+    /// 测试用的可信代理对端地址
+    fn proxy_remote() -> SocketAddr {
+        "10.0.0.2:55555".parse().unwrap()
     }
 
     async fn register_and_login(s: &AsWebState, username: &str) -> String {
@@ -1574,6 +1695,7 @@ mod tests {
         // 注册提交 → 303 + Set-Cookie
         let resp = handle_register_submit(
             State(s.clone()),
+            ConnectInfo(remote()),
             HeaderMap::new(),
             Form(RegisterAccountForm {
                 username: "newbie".to_string(),
@@ -1589,6 +1711,7 @@ mod tests {
         // 登录失败 → 200 + 错误页
         let bad = handle_login_submit(
             State(s),
+            ConnectInfo(remote()),
             HeaderMap::new(),
             Form(LoginForm {
                 username: "newbie".to_string(),
@@ -1605,6 +1728,7 @@ mod tests {
         let s = build_state(store, Some("letmein"));
         let resp = handle_register_submit(
             State(s),
+            ConnectInfo(remote()),
             HeaderMap::new(),
             Form(RegisterAccountForm {
                 username: "newbie".to_string(),
@@ -1727,6 +1851,7 @@ mod tests {
         let s = state();
         let failed = handle_login_submit(
             State(s.clone()),
+            ConnectInfo(remote()),
             HeaderMap::new(),
             Form(LoginForm {
                 username: "bob".to_string(),
@@ -1749,6 +1874,7 @@ mod tests {
         }
         let rate_limited = handle_login_submit(
             State(s.clone()),
+            ConnectInfo(remote()),
             HeaderMap::new(),
             Form(LoginForm {
                 username: "bob".to_string(),
@@ -1760,7 +1886,7 @@ mod tests {
 
         // 按客户端 IP 维度（容量 15/60s）：此时用户名桶仍有余额，被限流即说明 IP 维度生效
         let s = state();
-        let client_ip = extract_client_ip(&HeaderMap::new());
+        let client_ip = extract_client_ip(&HeaderMap::new(), remote(), &[]);
         for _ in 0..15 {
             assert!(s
                 .rate_limiter
@@ -1770,6 +1896,7 @@ mod tests {
         }
         let rate_limited = handle_login_submit(
             State(s.clone()),
+            ConnectInfo(remote()),
             HeaderMap::new(),
             Form(LoginForm {
                 username: "bob".to_string(),
@@ -1778,5 +1905,200 @@ mod tests {
         )
         .await;
         assert_eq!(rate_limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// XFF 三路径：无可信代理忽略 XFF / 可信代理解析 XFF / 不可信来源忽略 XFF
+    #[test]
+    fn test_extract_client_ip_trust_paths() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "1.2.3.4, 10.0.0.2, 10.0.0.3".parse().unwrap(),
+        );
+        let proxies: Vec<std::net::IpAddr> =
+            vec!["10.0.0.2".parse().unwrap(), "10.0.0.3".parse().unwrap()];
+
+        // 1) 无可信代理：XFF 完全忽略，一律用 socket 对端地址
+        assert_eq!(
+            extract_client_ip(&headers, remote(), &[]),
+            "203.0.113.10",
+            "未配置可信代理时 XFF 必须被忽略"
+        );
+
+        // 2) 可信代理来源：从右往左跳过可信代理，取第一个非可信 IP（真实客户端）
+        assert_eq!(
+            extract_client_ip(&headers, proxy_remote(), &proxies),
+            "1.2.3.4",
+            "可信代理的 XFF 应取从右往左第一个非可信 IP"
+        );
+
+        // 3) 不可信来源：即使 XFF 存在也忽略，用对端地址
+        //    （对端是 10.0.0.9，不在可信列表）
+        let other: SocketAddr = "10.0.0.9:55555".parse().unwrap();
+        assert_eq!(
+            extract_client_ip(&headers, other, &proxies),
+            "10.0.0.9",
+            "不可信来源的 XFF 必须被忽略"
+        );
+    }
+
+    /// 可信代理但 XFF 全是可信代理/条目不可解析时的兜底行为
+    #[test]
+    fn test_extract_client_ip_edge_cases() {
+        let proxies: Vec<std::net::IpAddr> = vec!["10.0.0.2".parse().unwrap()];
+
+        // XFF 全部为可信代理：回落到对端地址（此处对端即代理 10.0.0.2）
+        let mut h1 = HeaderMap::new();
+        h1.insert("x-forwarded-for", "10.0.0.2, 10.0.0.2".parse().unwrap());
+        assert_eq!(extract_client_ip(&h1, proxy_remote(), &proxies), "10.0.0.2");
+
+        // XFF 含无法解析的条目：不采信该条目，回落到对端地址
+        let mut h2 = HeaderMap::new();
+        h2.insert("x-forwarded-for", "not-an-ip".parse().unwrap());
+        assert_eq!(
+            extract_client_ip(&h2, proxy_remote(), &proxies),
+            "10.0.0.2",
+            "不可解析的 XFF 条目不得进入限流键"
+        );
+
+        // 无 XFF 头：用对端地址
+        assert_eq!(
+            extract_client_ip(&HeaderMap::new(), remote(), &proxies),
+            "203.0.113.10"
+        );
+
+        // X-Real-IP 不再被采信（旧实现的问题：单头同样可伪造）
+        let mut h3 = HeaderMap::new();
+        h3.insert("x-real-ip", "1.2.3.4".parse().unwrap());
+        assert_eq!(extract_client_ip(&h3, remote(), &proxies), "203.0.113.10");
+    }
+
+    /// token 端点双层限流：IP 维度与 client_id 维度各自独立生效
+    #[tokio::test]
+    async fn test_token_endpoint_rate_limited_by_ip_and_client() {
+        let mk_form = |cid: &str| {
+            Form(crate::oauth_flow::TokenRequest {
+                grant_type: "client_credentials".to_string(),
+                code: None,
+                code_verifier: None,
+                redirect_uri: None,
+                client_id: Some(cid.to_string()),
+                client_secret: Some("x".to_string()),
+                refresh_token: None,
+                scope: None,
+                resource: None,
+            })
+        };
+
+        // 按 client_id 维度（10/min）：打空桶后同 client 的请求应 429，
+        // 且此时 IP 桶余额充足——证明 429 来自 client 维度
+        let s = state();
+        let client_key = "token-endpoint:client-a";
+        let mut drained = 0;
+        while s
+            .rate_limiter
+            .try_acquire_in_window(common::RateDimension::User, client_key, 10, 60)
+            .await
+            .unwrap()
+        {
+            drained += 1;
+            assert!(drained <= 10, "client 维度桶未能在 10 次内打空");
+        }
+        let resp = handle_token(
+            State(s.clone()),
+            ConnectInfo(remote()),
+            HeaderMap::new(),
+            mk_form("client-a"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // 换一个 client_id（IP 桶独立）立即可用——不会互相挤占
+        let s2 = state();
+        let ok_other = handle_token(
+            State(s2),
+            ConnectInfo(remote()),
+            HeaderMap::new(),
+            mk_form("client-b"),
+        )
+        .await;
+        assert_ne!(ok_other.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // 按 IP 维度（容量 30/分钟）：打空后任何 client 的请求都 429
+        let s = state();
+        let mut drained = 0;
+        while s
+            .rate_limiter
+            .try_acquire_in_window(common::RateDimension::Ip, "token:203.0.113.10", 30, 60)
+            .await
+            .unwrap()
+        {
+            drained += 1;
+            assert!(drained <= 30, "IP 维度桶未能在 30 次内打空");
+        }
+        let resp = handle_token(
+            State(s),
+            ConnectInfo(remote()),
+            HeaderMap::new(),
+            mk_form("client-c"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// register 端点按 IP 限流（5/min），开放注册与邀请码两种模式都限
+    #[tokio::test]
+    async fn test_register_endpoint_rate_limited_by_ip() {
+        let mk_form = |invite: &str| {
+            Form(RegisterAccountForm {
+                username: "newbie".to_string(),
+                password: "supersecret".to_string(),
+                display_name: String::new(),
+                invite_code: invite.to_string(),
+            })
+        };
+
+        // 邀请码模式（注册被拒也照样扣令牌：判定在业务逻辑之前）
+        let store = Arc::new(InMemoryHubStore::new());
+        let s = build_state(store, Some("letmein"));
+        let mut drained = 0;
+        while s
+            .rate_limiter
+            .try_acquire_in_window(common::RateDimension::Ip, "register:203.0.113.10", 5, 60)
+            .await
+            .unwrap()
+        {
+            drained += 1;
+            assert!(drained <= 5, "IP 桶未能在 5 次内打空");
+        }
+        let resp = handle_register_submit(
+            State(s),
+            ConnectInfo(remote()),
+            HeaderMap::new(),
+            mk_form("wrong"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // 开放注册模式同样被限
+        let s = state();
+        let mut drained = 0;
+        while s
+            .rate_limiter
+            .try_acquire_in_window(common::RateDimension::Ip, "register:203.0.113.10", 5, 60)
+            .await
+            .unwrap()
+        {
+            drained += 1;
+            assert!(drained <= 5);
+        }
+        let resp = handle_register_submit(
+            State(s),
+            ConnectInfo(remote()),
+            HeaderMap::new(),
+            mk_form(""),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 }

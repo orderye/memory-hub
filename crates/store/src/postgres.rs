@@ -16,13 +16,13 @@ use chrono::{DateTime, Utc};
 use common::{AccountId, AgentId, HubError, Result};
 use mem_core::{
     AccountRecord, BackupRecord, CodeChangeKind, CodingRevision, CodingStore, CodingThread,
-    CognitiveLayer, EvidenceSourceKind, EvidenceStore, ExperienceStatus, ExperienceStore,
-    IntegrationKind, IntegrationProposal, MemoryEntry, MemoryEvidence, MemoryExperience,
-    MemoryFilter, MemoryKind, MemoryRelation, MemoryRelationKind, MemoryScene, MemoryStatus,
-    MemoryTask, MemoryTaskExperience, MemoryVersion, Namespace, NamespaceGrantRecord,
-    NamespaceInfo, NewCodingRevision, NewCodingThread, NewEvidence, NewMemoryExperience,
-    NewMemoryRelation, NewMemoryTask, ProposalStatus, RelationStore, Scored, SessionRecord,
-    TaskStatus, TaskStore, VersionChange,
+    CognitiveLayer, CognitiveProposalRecord, CognitiveProposalStatus, EvidenceSourceKind,
+    EvidenceStore, ExperienceStatus, ExperienceStore, IntegrationKind, IntegrationProposal,
+    MemoryEntry, MemoryEvidence, MemoryExperience, MemoryFilter, MemoryKind, MemoryRelation,
+    MemoryRelationKind, MemoryScene, MemoryStatus, MemoryTask, MemoryTaskExperience, MemoryVersion,
+    Namespace, NamespaceGrantRecord, NamespaceInfo, NewCodingRevision, NewCodingThread,
+    NewEvidence, NewMemoryExperience, NewMemoryRelation, NewMemoryTask, ProposalStatus,
+    RelationStore, Scored, SessionRecord, TaskStatus, TaskStore, VersionChange,
 };
 use sqlx::postgres::{PgConnection, PgPool, PgPoolOptions, PgRow};
 use sqlx::{Connection as _, Row};
@@ -166,6 +166,13 @@ impl<T> PgResultExt<T> for std::result::Result<T, sqlx::Error> {
     }
 }
 
+/// 迁移执行器的事务级咨询锁 key（ASCII "HUBMIGR1"，任意固定 i64 即可，
+/// 只需与库内其他 advisory lock 用法不撞车——本库目前仅此一处）。
+/// 多进程（滚动发布/多副本）同时启动时，并发方在 `pg_advisory_xact_lock`
+/// 上排队而非重复执行 DDL；否则后提交者撞 `_hub_migrations` 主键（23505
+/// → `Conflict`），`connect()` 直接失败、服务起不来。
+const MIGRATION_ADVISORY_LOCK_KEY: i64 = 0x4855_424D_4947_5231;
+
 /// 内嵌迁移清单：按文件名（即版本号）顺序应用
 pub const MIGRATIONS: &[(&str, &str)] = &[
     (
@@ -211,6 +218,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
     (
         "20261021000011_consolidation_proposal_metadata",
         include_str!("../migrations/20261021000011_consolidation_proposal_metadata.sql"),
+    ),
+    (
+        "20261025000012_cognitive_proposals",
+        include_str!("../migrations/20261025000012_cognitive_proposals.sql"),
     ),
 ];
 
@@ -412,8 +423,26 @@ impl PostgresHubStore {
         self.pool.clone()
     }
 
-    /// 应用未执行过的迁移（版本化账本）
+    /// 应用未执行过的迁移（版本化账本）。
+    ///
+    /// 每个迁移在独立事务内：先取 `pg_advisory_xact_lock(MIGRATION_ADVISORY_LOCK_KEY)`，
+    /// 再查账本——查账与 DDL/记账同处锁保护下，消除 check-then-act 竞态。
+    /// 并发进程在锁上排队，拿到锁后看到账本已记录即提交空事务跳过；
+    /// 锁随事务结束自动释放，无需手动 unlock。
     async fn run_migrations(&self) -> Result<()> {
+        // 账本建表与首个迁移同处一把锁下：并发进程同时 create table
+        // 虽有 if not exists，但 PG 的 create table 并非完全无竞态
+        // （并行建表/建索引可能撞 pg_type 唯一键 23505），一并串行化。
+        let mut tx = self.pool.begin().await.pg()?;
+        sqlx::query("set local statement_timeout = 0")
+            .execute(&mut *tx)
+            .await
+            .pg()?;
+        sqlx::query("select pg_advisory_xact_lock($1)")
+            .bind(MIGRATION_ADVISORY_LOCK_KEY)
+            .execute(&mut *tx)
+            .await
+            .pg()?;
         sqlx::query(
             r#"
             create table if not exists _hub_migrations (
@@ -422,27 +451,38 @@ impl PostgresHubStore {
             )
             "#,
         )
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .pg()?;
+        tx.commit().await.pg()?;
 
         for (version, sql) in MIGRATIONS {
-            let applied: Option<String> =
-                sqlx::query_scalar("select version from _hub_migrations where version = $1")
-                    .bind(version)
-                    .fetch_optional(&self.pool)
-                    .await
-                    .pg()?;
-            if applied.is_some() {
-                continue;
-            }
-
             let mut tx = self.pool.begin().await.pg()?;
             // 迁移可能包含索引构建，远超常规语句超时；本事务内关闭超时限制
             sqlx::query("set local statement_timeout = 0")
                 .execute(&mut *tx)
                 .await
                 .pg()?;
+            // 事务级咨询锁：串行化并发进程的迁移执行。
+            // set local 必须先于锁获取，避免锁等待本身被超时打断。
+            sqlx::query("select pg_advisory_xact_lock($1)")
+                .bind(MIGRATION_ADVISORY_LOCK_KEY)
+                .execute(&mut *tx)
+                .await
+                .pg()?;
+            // 账本检查在锁内重读：拿到锁时若前一个进程已记账，此处即命中
+            let applied: Option<String> =
+                sqlx::query_scalar("select version from _hub_migrations where version = $1")
+                    .bind(version)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .pg()?;
+            if applied.is_some() {
+                // 已应用：提交空事务（同时释放 xact 锁）并跳过
+                tx.commit().await.pg()?;
+                continue;
+            }
+
             // 迁移脚本按语句顺序整体执行；DDL 幂等（if not exists）
             for stmt in split_sql_statements(sql) {
                 let trimmed = stmt.trim();
@@ -536,9 +576,11 @@ impl PostgresHubStore {
     fn entry_from_row(r: &PgRow) -> Result<MemoryEntry> {
         let kind: String = r.try_get("kind").pg()?;
         let status: String = r.try_get("status").pg()?;
-        let embedding: Option<String> = r.try_get("embedding").ok().flatten();
-        let scene_str: Option<String> = r.try_get("scene").ok().flatten();
-        let layer_str: Option<String> = r.try_get("layer").ok().flatten();
+        // 可空列一律强类型 Option<T> 解码并传播错误：SELECT 列清单一旦与
+        // schema 漂移，缺列/类型不符必须显式报错，静默变 None 等于数据丢失
+        let embedding: Option<String> = r.try_get("embedding").pg()?;
+        let scene_str: Option<String> = r.try_get("scene").pg()?;
+        let layer_str: Option<String> = r.try_get("layer").pg()?;
         let scene = match scene_str.as_deref() {
             Some(s) => Some(mapping::parse_scene(s)?),
             None => None,
@@ -547,26 +589,26 @@ impl PostgresHubStore {
             Some(s) => Some(mapping::parse_layer(s)?),
             None => None,
         };
-        let valid_from: Option<DateTime<Utc>> = r.try_get("valid_from").ok().flatten();
-        let valid_until: Option<DateTime<Utc>> = r.try_get("valid_until").ok().flatten();
-        let occurred_at: Option<DateTime<Utc>> = r.try_get("occurred_at").ok().flatten();
+        let valid_from: Option<DateTime<Utc>> = r.try_get("valid_from").pg()?;
+        let valid_until: Option<DateTime<Utc>> = r.try_get("valid_until").pg()?;
+        let occurred_at: Option<DateTime<Utc>> = r.try_get("occurred_at").pg()?;
 
         Ok(MemoryEntry {
             id: r.try_get("id").pg()?,
             namespace: r.try_get("namespace").pg()?,
-            key: r.try_get("key").ok().flatten(),
+            key: r.try_get("key").pg()?,
             kind: mapping::parse_kind(&kind)?,
             content: r.try_get("content").pg()?,
             tags: r.try_get("tags").pg()?,
             metadata: r.try_get("metadata").pg()?,
             embedding: embedding.map(|t| mapping::parse_vector(&t)),
-            embedding_model: r.try_get("embedding_model").ok().flatten(),
+            embedding_model: r.try_get("embedding_model").pg()?,
             source_agent: r.try_get("source_agent").pg()?,
             confidence: r.try_get("confidence").pg()?,
             status: mapping::parse_status(&status)?,
             version: r.try_get("version").pg()?,
-            expires_at: r.try_get("expires_at").ok().flatten(),
-            merged_into: r.try_get("merged_into").ok().flatten(),
+            expires_at: r.try_get("expires_at").pg()?,
+            merged_into: r.try_get("merged_into").pg()?,
             created_at: r.try_get("created_at").pg()?,
             updated_at: r.try_get("updated_at").pg()?,
             scene,
@@ -582,11 +624,11 @@ impl PostgresHubStore {
             id: r.try_get("id").pg()?,
             namespace: r.try_get("namespace").pg()?,
             created_by: r.try_get("created_by").pg()?,
-            note: r.try_get("note").ok().flatten(),
-            entry_count: r.try_get::<i32, _>("entry_count").unwrap_or(0) as usize,
+            note: r.try_get("note").pg()?,
+            entry_count: r.try_get::<i32, _>("entry_count").pg()? as usize,
             checksum: r.try_get("checksum").pg()?,
             payload: r.try_get("payload").pg()?,
-            retain_until: r.try_get("retain_until").ok().flatten(),
+            retain_until: r.try_get("retain_until").pg()?,
             created_at: r.try_get("created_at").pg()?,
         })
     }
@@ -598,11 +640,11 @@ impl PostgresHubStore {
             id: r.try_get("id").pg()?,
             namespace: r.try_get("namespace").pg()?,
             created_by: r.try_get("created_by").pg()?,
-            note: r.try_get("note").ok().flatten(),
-            entry_count: r.try_get::<i32, _>("entry_count").unwrap_or(0) as usize,
+            note: r.try_get("note").pg()?,
+            entry_count: r.try_get::<i32, _>("entry_count").pg()? as usize,
             checksum: r.try_get("checksum").pg()?,
             payload: serde_json::Value::Null,
-            retain_until: r.try_get("retain_until").ok().flatten(),
+            retain_until: r.try_get("retain_until").pg()?,
             created_at: r.try_get("created_at").pg()?,
         })
     }
@@ -614,12 +656,12 @@ impl PostgresHubStore {
             id: r.try_get("id").pg()?,
             namespace: r.try_get("namespace").pg()?,
             source_kind,
-            source_ref: r.try_get("source_ref").ok().flatten(),
+            source_ref: r.try_get("source_ref").pg()?,
             content_hash: r.try_get("content_hash").pg()?,
-            excerpt: r.try_get("excerpt").ok().flatten(),
-            occurred_at: r.try_get("occurred_at").ok().flatten(),
+            excerpt: r.try_get("excerpt").pg()?,
+            occurred_at: r.try_get("occurred_at").pg()?,
             created_at: r.try_get("created_at").pg()?,
-            expires_at: r.try_get("expires_at").ok().flatten(),
+            expires_at: r.try_get("expires_at").pg()?,
         })
     }
 
@@ -627,12 +669,14 @@ impl PostgresHubStore {
         let kind_str: String = r.try_get("relation_kind").pg()?;
         let relation_kind = mapping::parse_relation_kind(&kind_str)?;
         Ok(MemoryRelation {
-            namespace: r.try_get("namespace").ok(),
+            // 迁移 009 后 namespace 为 NOT NULL；领域类型保留 Option 仅为
+            // 兼容旧备份载荷的反序列化，存储行恒有值
+            namespace: Some(r.try_get("namespace").pg()?),
             from_memory_id: r.try_get("from_memory_id").pg()?,
             to_memory_id: r.try_get("to_memory_id").pg()?,
             relation_kind,
-            confidence: r.try_get::<f32, _>("confidence").unwrap_or(1.0),
-            source_evidence_id: r.try_get("source_evidence_id").ok().flatten(),
+            confidence: r.try_get::<f32, _>("confidence").pg()?,
+            source_evidence_id: r.try_get("source_evidence_id").pg()?,
             created_at: r.try_get("created_at").pg()?,
         })
     }
@@ -649,10 +693,10 @@ impl PostgresHubStore {
             task: r.try_get("task").pg()?,
             status,
             started_at: r.try_get("started_at").pg()?,
-            finished_at: r.try_get("finished_at").ok().flatten(),
-            result_summary: r.try_get("result_summary").ok().flatten(),
-            failure_reason: r.try_get("failure_reason").ok().flatten(),
-            source_evidence_id: r.try_get("source_evidence_id").ok().flatten(),
+            finished_at: r.try_get("finished_at").pg()?,
+            result_summary: r.try_get("result_summary").pg()?,
+            failure_reason: r.try_get("failure_reason").pg()?,
+            source_evidence_id: r.try_get("source_evidence_id").pg()?,
             metadata: r.try_get("metadata").pg()?,
         })
     }
@@ -670,9 +714,9 @@ impl PostgresHubStore {
             boundary_envs: r.try_get("boundary_envs").pg()?,
             failure_modes: r.try_get("failure_modes").pg()?,
             validation: r.try_get("validation").pg()?,
-            confidence: r.try_get::<f32, _>("confidence").unwrap_or(0.5),
+            confidence: r.try_get::<f32, _>("confidence").pg()?,
             status,
-            feedback_score: r.try_get::<f32, _>("feedback_score").unwrap_or(1.0),
+            feedback_score: r.try_get::<f32, _>("feedback_score").pg()?,
             created_at: r.try_get("created_at").pg()?,
             updated_at: r.try_get("updated_at").pg()?,
         })
@@ -680,7 +724,8 @@ impl PostgresHubStore {
 
     fn task_experience_from_row(r: &PgRow) -> Result<MemoryTaskExperience> {
         Ok(MemoryTaskExperience {
-            namespace: r.try_get("namespace").ok(),
+            // 迁移 009 后 namespace 为 NOT NULL；Option 仅为兼容旧载荷反序列化
+            namespace: Some(r.try_get("namespace").pg()?),
             task_id: r.try_get("task_id").pg()?,
             experience_id: r.try_get("experience_id").pg()?,
             relation_kind: r.try_get("relation_kind").pg()?,
@@ -693,10 +738,10 @@ impl PostgresHubStore {
             id: r.try_get("id").pg()?,
             namespace: r.try_get("namespace").pg()?,
             repository: r.try_get("repository").pg()?,
-            branch: r.try_get("branch").ok().flatten(),
-            task_id: r.try_get("task_id").ok().flatten(),
+            branch: r.try_get("branch").pg()?,
+            task_id: r.try_get("task_id").pg()?,
             title: r.try_get("title").pg()?,
-            description: r.try_get("description").ok().flatten(),
+            description: r.try_get("description").pg()?,
             created_at: r.try_get("created_at").pg()?,
             updated_at: r.try_get("updated_at").pg()?,
         })
@@ -707,23 +752,23 @@ impl PostgresHubStore {
         let change_kind = mapping::parse_change_kind(&change_kind_str)?;
         Ok(CodingRevision {
             id: r.try_get("id").pg()?,
-            thread_id: r.try_get("thread_id").ok().flatten(),
+            thread_id: r.try_get("thread_id").pg()?,
             namespace: r.try_get("namespace").pg()?,
             repository: r.try_get("repository").pg()?,
-            branch: r.try_get("branch").ok().flatten(),
-            commit_sha: r.try_get("commit_sha").ok().flatten(),
-            parent_sha: r.try_get("parent_sha").ok().flatten(),
+            branch: r.try_get("branch").pg()?,
+            commit_sha: r.try_get("commit_sha").pg()?,
+            parent_sha: r.try_get("parent_sha").pg()?,
             file_path: r.try_get("file_path").pg()?,
             change_kind,
             diff_content: r.try_get("diff_content").pg()?,
             diff_hash: r.try_get("diff_hash").pg()?,
-            symbol_fingerprint: r.try_get("symbol_fingerprint").ok().flatten(),
+            symbol_fingerprint: r.try_get("symbol_fingerprint").pg()?,
             is_committed: r.try_get("is_committed").pg()?,
-            author: r.try_get("author").ok().flatten(),
+            author: r.try_get("author").pg()?,
             occurred_at: r.try_get("occurred_at").pg()?,
             created_at: r.try_get("created_at").pg()?,
-            source_evidence_id: r.try_get("source_evidence_id").ok().flatten(),
-            source_task_id: r.try_get("source_task_id").ok().flatten(),
+            source_evidence_id: r.try_get("source_evidence_id").pg()?,
+            source_task_id: r.try_get("source_task_id").pg()?,
         })
     }
 
@@ -825,15 +870,62 @@ impl PostgresHubStore {
             namespace: r.try_get("namespace").pg()?,
             kind: mapping::parse_integration_kind(&kind)?,
             member_ids: r.try_get("member_ids").pg()?,
-            suggested_survivor: r.try_get("suggested_survivor").ok().flatten(),
-            similarity: r.try_get::<f32, _>("similarity").unwrap_or(0.0),
+            suggested_survivor: r.try_get("suggested_survivor").pg()?,
+            similarity: r.try_get::<f32, _>("similarity").pg()?,
             status: mapping::parse_proposal_status(&status)?,
-            resolution_note: r.try_get("resolution_note").ok().flatten(),
+            resolution_note: r.try_get("resolution_note").pg()?,
             created_at: r.try_get("created_at").pg()?,
-            resolved_at: r.try_get("resolved_at").ok().flatten(),
-            metadata: r
-                .try_get::<serde_json::Value, _>("metadata")
-                .unwrap_or(serde_json::Value::Object(Default::default())),
+            resolved_at: r.try_get("resolved_at").pg()?,
+            // 迁移 011 起 NOT NULL DEFAULT '{}'，所有 SELECT 均选出该列
+            metadata: r.try_get("metadata").pg()?,
+        })
+    }
+
+    /// 认知提案全列 SELECT（供行映射复用）：与
+    /// `cognitive_proposal_from_row` 一一对应，列漂移时强类型解码直接报错
+    const COGNITIVE_PROPOSAL_COLUMNS: &'static str =
+        "id, namespace, candidate, source_evidence_id, status, rejection_reason, \
+         resulting_memory_id, resolved_by, created_at, updated_at";
+
+    fn cognitive_proposal_from_row(r: &PgRow) -> Result<CognitiveProposalRecord> {
+        let status: String = r.try_get("status").pg()?;
+        let candidate: serde_json::Value = r.try_get("candidate").pg()?;
+        Ok(CognitiveProposalRecord {
+            id: r.try_get("id").pg()?,
+            namespace: r.try_get("namespace").pg()?,
+            candidate: serde_json::from_value(candidate).map_err(|e| {
+                HubError::Internal(anyhow::anyhow!("认知提案载荷反序列化失败: {}", e))
+            })?,
+            source_evidence_id: r.try_get("source_evidence_id").pg()?,
+            status: CognitiveProposalStatus::parse(&status).ok_or_else(|| {
+                HubError::Internal(anyhow::anyhow!("未知认知提案状态: {}", status))
+            })?,
+            rejection_reason: r.try_get("rejection_reason").pg()?,
+            resulting_memory_id: r.try_get("resulting_memory_id").pg()?,
+            resolved_by: r.try_get("resolved_by").pg()?,
+            created_at: r.try_get("created_at").pg()?,
+            updated_at: r.try_get("updated_at").pg()?,
+        })
+    }
+
+    /// agents 表行映射：所有列在迁移 002 后均 NOT NULL（或查询自身计算得出）。
+    /// `max_scopes` 中无法解析的 scope 字符串按缺失丢弃——scope 集合是授权
+    /// 白名单，未知值不可能被授权通过，丢弃比整体报错更符合降级语义。
+    fn agent_from_row(r: &PgRow) -> Result<mem_core::AgentRecord> {
+        let max_scopes: Vec<String> = r.try_get("max_scopes").pg()?;
+        Ok(mem_core::AgentRecord {
+            agent_id: r.try_get("agent_id").pg()?,
+            name: r.try_get("name").pg()?,
+            kind: r.try_get("kind").pg()?,
+            status: r.try_get("status").pg()?,
+            owner_account_id: r.try_get("owner_account_id").pg()?,
+            redirect_uris: r.try_get("redirect_uris").pg()?,
+            max_scopes: max_scopes
+                .iter()
+                .filter_map(|s| common::Scope::parse(s))
+                .collect(),
+            confidential: r.try_get("confidential").pg()?,
+            created_at: r.try_get("created_at").pg()?,
         })
     }
 
@@ -988,7 +1080,12 @@ impl mem_core::MemoryStore for PostgresHubStore {
 
     async fn save(&self, entry: &MemoryEntry) -> Result<MemoryEntry> {
         let mut conn = self.pool.acquire().await.pg()?;
-        Self::apply_update_on(&mut conn, entry, None).await?;
+        let rows = Self::apply_update_on(&mut conn, entry, None).await?;
+        // 契约：save 只保存已存在条目；条目不存在（0 行受影响）必须报
+        // NotFound，静默吞掉会变成"调用方以为写成功实则丢写"
+        if rows == 0 {
+            return Err(HubError::NotFound);
+        }
         Ok(entry.clone())
     }
 
@@ -1118,7 +1215,8 @@ impl mem_core::MemoryStore for PostgresHubStore {
         let mut out = Vec::with_capacity(rows.len());
         for r in &rows {
             let item = Self::entry_from_row(r)?;
-            let dist: f64 = r.try_get("dist").unwrap_or(1.0);
+            // dist 是本查询自身计算出的别名列，缺列属 SQL 拼装错误，直接传播
+            let dist: f64 = r.try_get("dist").pg()?;
             out.push(Scored {
                 item,
                 score: (1.0 - dist as f32).clamp(0.0, 1.0),
@@ -1179,8 +1277,8 @@ impl mem_core::MemoryStore for PostgresHubStore {
         let mut out = Vec::with_capacity(rows.len());
         for r in &rows {
             let change: String = r.try_get("change_type").pg()?;
-            let scene_str: Option<String> = r.try_get("scene").ok().flatten();
-            let layer_str: Option<String> = r.try_get("layer").ok().flatten();
+            let scene_str: Option<String> = r.try_get("scene").pg()?;
+            let layer_str: Option<String> = r.try_get("layer").pg()?;
             let scene = match scene_str.as_deref() {
                 Some(s) => Some(mapping::parse_scene(s)?),
                 None => None,
@@ -1189,9 +1287,9 @@ impl mem_core::MemoryStore for PostgresHubStore {
                 Some(s) => Some(mapping::parse_layer(s)?),
                 None => None,
             };
-            let valid_from: Option<DateTime<Utc>> = r.try_get("valid_from").ok().flatten();
-            let valid_until: Option<DateTime<Utc>> = r.try_get("valid_until").ok().flatten();
-            let occurred_at: Option<DateTime<Utc>> = r.try_get("occurred_at").ok().flatten();
+            let valid_from: Option<DateTime<Utc>> = r.try_get("valid_from").pg()?;
+            let valid_until: Option<DateTime<Utc>> = r.try_get("valid_until").pg()?;
+            let occurred_at: Option<DateTime<Utc>> = r.try_get("occurred_at").pg()?;
             out.push(MemoryVersion {
                 memory_id: r.try_get("memory_id").pg()?,
                 version: r.try_get("version").pg()?,
@@ -1441,6 +1539,118 @@ impl mem_core::IntegrationStore for PostgresHubStore {
 }
 
 #[async_trait]
+impl mem_core::CognitiveProposalStore for PostgresHubStore {
+    async fn save_cognitive_proposal(&self, p: &CognitiveProposalRecord) -> Result<()> {
+        let candidate = serde_json::to_value(&p.candidate)
+            .map_err(|e| HubError::Internal(anyhow::anyhow!("认知提案载荷序列化失败: {}", e)))?;
+        sqlx::query(
+            r#"
+            insert into cognitive_proposals
+              (id, namespace, candidate, source_evidence_id, status, rejection_reason,
+               resulting_memory_id, resolved_by, created_at, updated_at)
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            "#,
+        )
+        .bind(p.id)
+        .bind(&p.namespace)
+        .bind(&candidate)
+        .bind(p.source_evidence_id)
+        .bind(p.status.as_str())
+        .bind(&p.rejection_reason)
+        .bind(p.resulting_memory_id)
+        .bind(&p.resolved_by)
+        .bind(p.created_at)
+        .bind(p.updated_at)
+        .execute(&self.pool)
+        .await
+        .pg()?;
+        Ok(())
+    }
+
+    async fn get_cognitive_proposal(&self, id: Uuid) -> Result<CognitiveProposalRecord> {
+        let sql = format!(
+            "select {} from cognitive_proposals where id = $1",
+            Self::COGNITIVE_PROPOSAL_COLUMNS
+        );
+        let row = sqlx::query(&sql)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .pg()?
+            .ok_or(HubError::NotFound)?;
+        Self::cognitive_proposal_from_row(&row)
+    }
+
+    async fn list_cognitive_proposals(
+        &self,
+        namespace: &str,
+        status: Option<CognitiveProposalStatus>,
+    ) -> Result<Vec<CognitiveProposalRecord>> {
+        let sql = match status {
+            Some(_) => format!(
+                "select {} from cognitive_proposals where namespace = $1 and status = $2 \
+                 order by created_at desc",
+                Self::COGNITIVE_PROPOSAL_COLUMNS
+            ),
+            None => format!(
+                "select {} from cognitive_proposals where namespace = $1 \
+                 order by created_at desc",
+                Self::COGNITIVE_PROPOSAL_COLUMNS
+            ),
+        };
+        let mut q = sqlx::query(&sql).bind(namespace);
+        if let Some(s) = status {
+            q = q.bind(s.as_str());
+        }
+        let rows = q.fetch_all(&self.pool).await.pg()?;
+        rows.iter().map(Self::cognitive_proposal_from_row).collect()
+    }
+
+    async fn update_cognitive_proposal_status(
+        &self,
+        id: Uuid,
+        expected_status: CognitiveProposalStatus,
+        new_status: CognitiveProposalStatus,
+        rejection_reason: Option<&str>,
+        resulting_memory_id: Option<Uuid>,
+        resolved_by: Option<&str>,
+    ) -> Result<CognitiveProposalRecord> {
+        // 先原子推进状态（乐观前置），再回读整行
+        let result = sqlx::query(
+            r#"
+            update cognitive_proposals
+            set status = $2, rejection_reason = $3, resulting_memory_id = $4,
+                resolved_by = $5, updated_at = now()
+            where id = $1 and status = $6
+            "#,
+        )
+        .bind(id)
+        .bind(new_status.as_str())
+        .bind(rejection_reason)
+        .bind(resulting_memory_id)
+        .bind(resolved_by)
+        .bind(expected_status.as_str())
+        .execute(&self.pool)
+        .await
+        .pg()?;
+        if result.rows_affected() == 0 {
+            // 区分两种失败：提案不存在（NotFound）vs 已被别人裁决（Conflict）
+            let exists: Option<Uuid> =
+                sqlx::query_scalar("select id from cognitive_proposals where id = $1")
+                    .bind(id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .pg()?;
+            return match exists {
+                Some(_) => Err(HubError::Conflict),
+                None => Err(HubError::NotFound),
+            };
+        }
+        self.get_cognitive_proposal(id).await
+    }
+}
+
+#[async_trait]
 impl mem_core::GrantStore for PostgresHubStore {
     async fn ensure_namespace(
         &self,
@@ -1674,25 +1884,10 @@ impl mem_core::AgentStore for PostgresHubStore {
         .await
         .pg()?;
 
-        Ok(row.map(|r| {
-            let max_scopes: Vec<String> = r.try_get("max_scopes").unwrap_or_default();
-            mem_core::AgentRecord {
-                agent_id: r.get("agent_id"),
-                name: r.get("name"),
-                kind: r.get("kind"),
-                status: r.get("status"),
-                owner_account_id: r
-                    .try_get("owner_account_id")
-                    .unwrap_or(common::BOOTSTRAP_ACCOUNT_ID),
-                redirect_uris: r.try_get("redirect_uris").unwrap_or_default(),
-                max_scopes: max_scopes
-                    .iter()
-                    .filter_map(|s| common::Scope::parse(s))
-                    .collect(),
-                confidential: r.get("confidential"),
-                created_at: r.get("created_at"),
-            }
-        }))
+        match row {
+            Some(r) => Ok(Some(Self::agent_from_row(&r)?)),
+            None => Ok(None),
+        }
     }
 
     async fn list_agents(&self) -> Result<Vec<mem_core::AgentRecord>> {
@@ -1707,28 +1902,11 @@ impl mem_core::AgentStore for PostgresHubStore {
         .await
         .pg()?;
 
-        Ok(rows
-            .iter()
-            .map(|r| {
-                let max_scopes: Vec<String> = r.try_get("max_scopes").unwrap_or_default();
-                mem_core::AgentRecord {
-                    agent_id: r.get("agent_id"),
-                    name: r.get("name"),
-                    kind: r.get("kind"),
-                    status: r.get("status"),
-                    owner_account_id: r
-                        .try_get("owner_account_id")
-                        .unwrap_or(common::BOOTSTRAP_ACCOUNT_ID),
-                    redirect_uris: r.try_get("redirect_uris").unwrap_or_default(),
-                    max_scopes: max_scopes
-                        .iter()
-                        .filter_map(|s| common::Scope::parse(s))
-                        .collect(),
-                    confidential: r.get("confidential"),
-                    created_at: r.get("created_at"),
-                }
-            })
-            .collect())
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            out.push(Self::agent_from_row(r)?);
+        }
+        Ok(out)
     }
 
     async fn set_agent_status(&self, agent_id: &AgentId, status: &str) -> Result<()> {
@@ -1752,7 +1930,7 @@ impl mem_core::AgentStore for PostgresHubStore {
             .pg()?;
         let stored = match row {
             Some(r) => {
-                let h: Option<String> = r.try_get("client_secret_hash").ok().flatten();
+                let h: Option<String> = r.try_get("client_secret_hash").pg()?;
                 h
             }
             None => None,
@@ -3035,7 +3213,7 @@ mod tests {
 
     #[test]
     fn test_migrations_registered() {
-        assert_eq!(MIGRATIONS.len(), 11);
+        assert_eq!(MIGRATIONS.len(), 12);
         assert!(MIGRATIONS[0].0.starts_with("20261011"));
         // 迁移清单必须按版本号字典序排列（执行顺序依赖于此）
         for w in MIGRATIONS.windows(2) {

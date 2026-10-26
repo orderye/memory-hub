@@ -13,15 +13,17 @@
 //! 因此备份负载（内部存用户可见名）恢复往返不会二次加前缀。
 
 use crate::domain::{
-    BackupRecord, CodingRevision, CodingThread, EvidenceSourceKind, ExperienceStatus,
-    IntegrationProposal, MemoryEntry, MemoryEvidence, MemoryExperience, MemoryFilter,
-    MemoryRelation, MemoryRelationKind, MemoryTask, MemoryTaskExperience, MemoryVersion, Namespace,
-    NamespaceGrantRecord, NamespaceInfo, NewCodingRevision, NewCodingThread, NewEvidence,
-    NewMemoryExperience, NewMemoryRelation, NewMemoryTask, ProposalStatus, Scored, TaskStatus,
+    BackupRecord, CodingRevision, CodingThread, CognitiveProposalRecord, CognitiveProposalStatus,
+    EvidenceSourceKind, ExperienceStatus, IntegrationProposal, MemoryEntry, MemoryEvidence,
+    MemoryExperience, MemoryFilter, MemoryRelation, MemoryRelationKind, MemoryTask,
+    MemoryTaskExperience, MemoryVersion, Namespace, NamespaceGrantRecord, NamespaceInfo,
+    NewCodingRevision, NewCodingThread, NewEvidence, NewMemoryExperience, NewMemoryRelation,
+    NewMemoryTask, ProposalStatus, Scored, TaskStatus,
 };
 use crate::infra::{
-    AgentRecord, AgentRegistration, AgentStore, BackupStore, CodingStore, EvidenceStore,
-    ExperienceStore, GrantStore, IntegrationStore, MemoryStore, RelationStore, TaskStore,
+    AgentRecord, AgentRegistration, AgentStore, BackupStore, CodingStore, CognitiveProposalStore,
+    EvidenceStore, ExperienceStore, GrantStore, IntegrationStore, MemoryStore, RelationStore,
+    TaskStore,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -339,6 +341,70 @@ impl<S: IntegrationStore + ?Sized> IntegrationStore for AccountScopedStore<S> {
         self.inner
             .open_exists(&self.scoped(namespace), kind_member)
             .await
+    }
+}
+
+// ===== CognitiveProposalStore =====
+
+#[async_trait]
+impl<S: CognitiveProposalStore + ?Sized> CognitiveProposalStore for AccountScopedStore<S> {
+    async fn save_cognitive_proposal(&self, p: &CognitiveProposalRecord) -> Result<()> {
+        let mut scoped = p.clone();
+        scoped.namespace = self.scoped(&p.namespace);
+        self.inner.save_cognitive_proposal(&scoped).await
+    }
+
+    async fn get_cognitive_proposal(&self, id: Uuid) -> Result<CognitiveProposalRecord> {
+        let p = self.inner.get_cognitive_proposal(id).await?;
+        self.assert_owned(&p.namespace)?;
+        Ok(CognitiveProposalRecord {
+            namespace: self.unscoped(&p.namespace),
+            ..p
+        })
+    }
+
+    async fn list_cognitive_proposals(
+        &self,
+        namespace: &str,
+        status: Option<CognitiveProposalStatus>,
+    ) -> Result<Vec<CognitiveProposalRecord>> {
+        let rows = self
+            .inner
+            .list_cognitive_proposals(&self.scoped(namespace), status)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|mut p| {
+                p.namespace = self.unscoped(&p.namespace);
+                p
+            })
+            .collect())
+    }
+
+    async fn update_cognitive_proposal_status(
+        &self,
+        id: Uuid,
+        expected_status: CognitiveProposalStatus,
+        new_status: CognitiveProposalStatus,
+        rejection_reason: Option<&str>,
+        resulting_memory_id: Option<Uuid>,
+        resolved_by: Option<&str>,
+    ) -> Result<CognitiveProposalRecord> {
+        // 归属校验先于状态推进：跨账户提案 ID 不得触发任何写路径
+        self.get_cognitive_proposal(id).await?;
+        let mut updated = self
+            .inner
+            .update_cognitive_proposal_status(
+                id,
+                expected_status,
+                new_status,
+                rejection_reason,
+                resulting_memory_id,
+                resolved_by,
+            )
+            .await?;
+        updated.namespace = self.unscoped(&updated.namespace);
+        Ok(updated)
     }
 }
 

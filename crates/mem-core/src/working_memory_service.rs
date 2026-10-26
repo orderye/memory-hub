@@ -529,7 +529,10 @@ mod tests {
         let leak_candidate = ExperienceCandidate {
             task_pattern: "修复连接池泄漏".into(),
             search_keys: vec!["pool".into()],
-            solution: "使用密钥 sk-abcdef123456 连接测试服务器排查".into(),
+            solution: format!(
+                "使用密钥 {} 连接测试服务器排查",
+                concat!("sk-", "1234567890abcdefgz")
+            ),
             preconditions: serde_json::json!({"env": "staging"}),
             boundary_envs: vec!["linux".into()],
             failure_modes: vec!["timeout".into()],

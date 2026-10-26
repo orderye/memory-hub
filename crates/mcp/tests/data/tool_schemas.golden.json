@@ -256,12 +256,13 @@
             "type": "string"
           },
           "status": {
-            "description": "提案状态过滤",
+            "description": "认知提案状态过滤（对应 cognitive_chat_propose 产出的提案）",
             "enum": [
-              "open",
-              "merged",
-              "dismissed",
-              "expired"
+              "pending_review",
+              "accepted",
+              "rejected",
+              "superseded",
+              "candidate"
             ]
           }
         },

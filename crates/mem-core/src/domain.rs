@@ -183,6 +183,29 @@ pub enum CognitiveProposalStatus {
     Superseded,
 }
 
+impl CognitiveProposalStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CognitiveProposalStatus::Candidate => "candidate",
+            CognitiveProposalStatus::PendingReview => "pending_review",
+            CognitiveProposalStatus::Accepted => "accepted",
+            CognitiveProposalStatus::Rejected => "rejected",
+            CognitiveProposalStatus::Superseded => "superseded",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "candidate" => Some(CognitiveProposalStatus::Candidate),
+            "pending_review" | "pendingreview" => Some(CognitiveProposalStatus::PendingReview),
+            "accepted" => Some(CognitiveProposalStatus::Accepted),
+            "rejected" => Some(CognitiveProposalStatus::Rejected),
+            "superseded" => Some(CognitiveProposalStatus::Superseded),
+            _ => None,
+        }
+    }
+}
+
 /// 原始证据存根（P1 引入，Append-only）
 ///
 /// 「不可变」= 写入后不可悄悄改写；写入**之前**的脱敏与最小化是允许且必需的
@@ -331,6 +354,9 @@ pub struct CognitiveProposalRecord {
     pub rejection_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resulting_memory_id: Option<Uuid>,
+    /// 裁决操作者（Agent ID）；未经裁决的提案为 None
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_by: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -622,56 +648,34 @@ pub struct ExperienceCandidate {
 }
 
 /// 扫描敏感凭证（API Token、私钥、密码模式）
+///
+/// 精确模式匹配而非裸子串：纯子串会把 "task-"/"risk-"/"desk-" 里的 "sk-"、
+/// 配置讨论里的 "password=" 一律误杀——本函数是候选校验、经验校验、diff 校验
+/// 三道闸门的共用底座，误杀即整条拒收。判定规则：
+/// - 厂商 token 前缀（sk-、ghp_、xoxb- 等）：前缀在词边界上且后跟 ≥16 个 token 字符；
+/// - AWS Access Key ID：AKIA/ASIA + 16 位大写字母数字；
+/// - 私钥块头：`-----BEGIN xxx PRIVATE KEY-----`（原裸子串匹配，无误报，保留）；
+/// - 赋值类（password=、api_key: 等）：键 + `=`/`:` + ≥8 个非空白字符（空值/超短值不拦）；
+/// - Bearer 凭证：`bearer` 后跟 ≥20 个 token 字符（"bearer token 用法"不拦）。
 pub fn contains_sensitive_credentials(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    let sensitive_patterns = [
-        // Authorization & Bearer
-        "bearer ",
-        // OpenAI & LLM Providers
-        "sk-",
-        "sk_live_",
-        "sk_test_",
-        // GitHub Tokens (all variations)
-        "ghp_",
-        "gho_",
-        "ghu_",
-        "ghs_",
-        "ghr_",
-        "github_pat_",
-        // GitLab Tokens
-        "glpat-",
-        // Slack Tokens (all variations)
-        "xoxb-",
-        "xoxp-",
-        "xoxa-",
-        "xoxr-",
-        "xoxe-",
-        "xoxs-",
-        // AWS Access Keys & Secrets
-        "akia",
-        "asia",
-        "aws_secret_access_key",
-        "aws_access_key_id",
-        // Private Keys (all formats)
-        "-----begin private key-----",
-        "-----begin rsa private key-----",
-        "-----begin openssh private key-----",
-        "-----begin dsa private key-----",
-        "-----begin ec private key-----",
-        "-----begin encrypted private key-----",
-        "-----begin pgp private key-----",
-        // Generic Password / Secret Key assignments
-        "password=",
-        "password:",
-        "passwd=",
-        "passwd:",
-        "secret_key",
-        "client_secret",
-        "api_key=",
-        "apikey=",
-        "access_token=",
-    ];
-    sensitive_patterns.iter().any(|p| lower.contains(p))
+    static SENSITIVE: std::sync::OnceLock<regex::RegexSet> = std::sync::OnceLock::new();
+    SENSITIVE
+        .get_or_init(|| {
+            regex::RegexSet::new([
+                // 厂商 token 前缀：左侧须为词边界（"task-1" 的 "sk-" 前是字母 a，不算）
+                r"(?i)(?:^|[^A-Za-z0-9_])(?:sk-|sk_live_|sk_test_|ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|glpat-|xoxb-|xoxp-|xoxa-|xoxr-|xoxe-|xoxs-)[A-Za-z0-9_-]{16,}",
+                // AWS Access Key ID（真实密钥全大写，不做大小写放宽以免误伤普通词）
+                r"(?:^|[^A-Za-z0-9_])(?:AKIA|ASIA)[0-9A-Z]{16}",
+                // 私钥块头
+                r"(?i)-----begin[a-z ]*private key-----",
+                // 赋值类：键 + =/: + ≥8 个非空白字符
+                r"(?i)(?:password|passwd|api_key|apikey|access_token|secret_key|client_secret|aws_secret_access_key|aws_access_key_id)[ \t]*[:=][ \t]*[^\s]{8,}",
+                // Bearer 凭证
+                r"(?i)(?:^|[^A-Za-z0-9_])bearer[ \t]+[A-Za-z0-9._-]{20,}",
+            ])
+            .expect("敏感凭证正则必须可编译")
+        })
+        .is_match(text)
 }
 
 /// 校验文件相对路径安全性：
@@ -1501,45 +1505,91 @@ mod tests {
             "fn process_data(input: &str) -> Result<()>"
         ));
 
-        // Bearer 令牌
+        // 误报回归：普通业务文本不得被整条拒收。旧子串匹配会把
+        // "task-"/"risk-"/"desk-" 中的 "sk-" 当成 API Key，把配置讨论里的
+        // "password=" 一律拦截——本函数是候选/经验/diff 三道入库闸门的共用底座
+        assert!(!contains_sensitive_credentials("完成 task-1"));
+        assert!(!contains_sensitive_credentials("这个 risk-2 问题已关闭"));
+        assert!(!contains_sensitive_credentials("desk-top 机器已下线"));
+        // 空值 / 超短值 / 说明文字不是真凭证
+        assert!(!contains_sensitive_credentials("password= 详见部署文档"));
+        assert!(!contains_sensitive_credentials("password: (待填)"));
+        assert!(!contains_sensitive_credentials("bearer token 的用法说明"));
+        assert!(!contains_sensitive_credentials("api_key 字段应该如何配置"));
+        // 前缀后 token 不足 16 位：不像真实厂商密钥，放行
+        assert!(!contains_sensitive_credentials("sk-1234567890"));
+        assert!(!contains_sensitive_credentials("xoxe-1234567890"));
+
+        // Bearer 凭证：后跟 >=20 位 token
         assert!(contains_sensitive_credentials(concat!(
             "Authorization: Bearer ",
             "eyJhbGciOiJIUzI1NiIs..."
         )));
 
-        // OpenAI / LLM API keys
-        assert!(contains_sensitive_credentials("sk-1234567890abcdef"));
+        // OpenAI / LLM API keys：前缀后 >=16 位 token
+        assert!(contains_sensitive_credentials(concat!(
+            "sk-",
+            "1234567890abcdefgz"
+        )));
         assert!(contains_sensitive_credentials(concat!(
             "sk_live_",
-            "1234567890"
+            "1234567890abcdefg"
         )));
         assert!(contains_sensitive_credentials(concat!(
             "sk_test_",
-            "1234567890"
+            "1234567890abcdefg"
         )));
 
-        // GitHub 令牌变体
-        assert!(contains_sensitive_credentials("ghp_1234567890abcdef"));
-        assert!(contains_sensitive_credentials("gho_1234567890abcdef"));
-        assert!(contains_sensitive_credentials("ghu_1234567890abcdef"));
-        assert!(contains_sensitive_credentials("ghs_1234567890abcdef"));
-        assert!(contains_sensitive_credentials("ghr_1234567890abcdef"));
-        assert!(contains_sensitive_credentials(
-            "github_pat_1234567890abcdef"
-        ));
+        // GitHub 令牌变体（分段拼接：本仓库公开，secret scanning 不得看到连续字面量）
+        assert!(contains_sensitive_credentials(concat!(
+            "ghp_",
+            "1234567890abcdefgz"
+        )));
+        assert!(contains_sensitive_credentials(concat!(
+            "gho_",
+            "1234567890abcdefgz"
+        )));
+        assert!(contains_sensitive_credentials(concat!(
+            "ghu_",
+            "1234567890abcdefgz"
+        )));
+        assert!(contains_sensitive_credentials(concat!(
+            "ghs_",
+            "1234567890abcdefgz"
+        )));
+        assert!(contains_sensitive_credentials(concat!(
+            "ghr_",
+            "1234567890abcdefgz"
+        )));
+        assert!(contains_sensitive_credentials(concat!(
+            "github_pat_",
+            "1234567890abcdefgz"
+        )));
 
         // GitLab 令牌
         assert!(contains_sensitive_credentials("glpat-abcdef1234567890"));
 
-        // Slack 令牌变体
-        assert!(contains_sensitive_credentials("xoxb-1234567890"));
-        assert!(contains_sensitive_credentials("xoxp-1234567890"));
-        assert!(contains_sensitive_credentials("xoxa-1234567890"));
-        assert!(contains_sensitive_credentials("xoxe-1234567890"));
+        // Slack 令牌变体：前缀后 >=16 位
+        assert!(contains_sensitive_credentials(concat!(
+            "xoxb-",
+            "1234567890abcdefgz"
+        )));
+        assert!(contains_sensitive_credentials(concat!(
+            "xoxp-",
+            "1234567890abcdefgz"
+        )));
+        assert!(contains_sensitive_credentials(concat!(
+            "xoxa-",
+            "1234567890abcdefgz"
+        )));
+        assert!(contains_sensitive_credentials(concat!(
+            "xoxe-",
+            "1234567890abcdefgz"
+        )));
 
-        // AWS 访问密钥
-        // AKIA/ASIA 形态分段拼接：本仓库公开，secret scanning 会把连续字面量
-        // 当成真实凭据上报（曾误报 AWS 临时密钥）。拼接后运行时取值不变。
+        // AWS 访问密钥：AKIA/ASIA + 16 位大写字母数字。
+        // 分段拼接：本仓库公开，secret scanning 会把连续字面量当成真实凭据上报
+        // （曾误报 AWS 临时密钥）。拼接后运行时取值不变。
         assert!(contains_sensitive_credentials(concat!(
             "AKIA",
             "IOSFODNN7EXAMPLE"
@@ -1548,9 +1598,11 @@ mod tests {
             "ASIA",
             "IOSFODNN7EXAMPLE"
         )));
+        // aws_secret_access_key / aws_access_key_id 不再裸词匹配，
+        // 仅在跟随赋值 + 值时命中（并入赋值类）
         assert!(contains_sensitive_credentials(concat!(
             "aws_secret_access_key = ",
-            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+            "wJalrXUtnFEMIK7MDENG"
         )));
 
         // 各格式私钥
@@ -1567,11 +1619,20 @@ mod tests {
             "-----BEGIN EC PRIVATE KEY-----"
         ));
 
-        // 通用密码 / 敏感键分配
-        assert!(contains_sensitive_credentials("db_password=supersecret"));
+        // 通用密码 / 敏感键分配：键 + =/: + >=8 位非空白值
+        assert!(contains_sensitive_credentials(concat!(
+            "password=",
+            "s3cret-value-99"
+        )));
         assert!(contains_sensitive_credentials("password: 'mypassword'"));
-        assert!(contains_sensitive_credentials("api_key=abcdef123456"));
-        assert!(contains_sensitive_credentials("client_secret = 'secret'"));
+        assert!(contains_sensitive_credentials(concat!(
+            "api_key=",
+            "zm9uLXRlc3QtY2F1"
+        )));
+        assert!(contains_sensitive_credentials(concat!(
+            "client_secret = ",
+            "'s3cret-value-99'"
+        )));
     }
 
     #[test]

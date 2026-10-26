@@ -1097,6 +1097,41 @@ mod tests {
         }
     }
 
+    // 备份/恢复不触碰认知提案，空实现只为满足 MemoryHubStore 聚合契约
+    #[async_trait]
+    impl crate::infra::CognitiveProposalStore for TestHubStore {
+        async fn save_cognitive_proposal(
+            &self,
+            _p: &crate::domain::CognitiveProposalRecord,
+        ) -> Result<()> {
+            Ok(())
+        }
+        async fn get_cognitive_proposal(
+            &self,
+            _id: Uuid,
+        ) -> Result<crate::domain::CognitiveProposalRecord> {
+            Err(HubError::NotFound)
+        }
+        async fn list_cognitive_proposals(
+            &self,
+            _ns: &str,
+            _status: Option<crate::domain::CognitiveProposalStatus>,
+        ) -> Result<Vec<crate::domain::CognitiveProposalRecord>> {
+            Ok(vec![])
+        }
+        async fn update_cognitive_proposal_status(
+            &self,
+            _id: Uuid,
+            _expected_status: crate::domain::CognitiveProposalStatus,
+            _new_status: crate::domain::CognitiveProposalStatus,
+            _rejection_reason: Option<&str>,
+            _resulting_memory_id: Option<Uuid>,
+            _resolved_by: Option<&str>,
+        ) -> Result<crate::domain::CognitiveProposalRecord> {
+            Err(HubError::NotFound)
+        }
+    }
+
     #[async_trait]
     impl crate::infra::GrantStore for TestHubStore {
         async fn ensure_namespace(

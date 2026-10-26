@@ -446,6 +446,14 @@ pub async fn handle_jsonrpc_ext(
     }
 }
 
+/// JSON-RPC batch 请求的条数上限。
+///
+/// 防止一个 POST 塞数千条 `tools/call` 绕过按 Agent 限流（默认 256KB 请求体
+/// 可容纳约 2500 条）：超出此上限的整个 batch 以 -32602 拒绝。
+/// 32 取自 JSON-RPC 2.0 批处理常见实现的上限量级（nginx/各 JSON-RPC 框架
+/// 通常在 16~64 之间），足以覆盖正常的批量元数据操作。
+pub const MAX_BATCH_REQUESTS: usize = 32;
+
 /// 解析单条原始帧并处理（供 stdio 与 HTTP 共用）
 ///
 /// `local_auth` 只由 stdio 路径传入（见 [`stdio_local_auth_ctx`]）：
@@ -766,11 +774,53 @@ async fn handle_http_mcp(
         let batch: std::result::Result<Vec<JsonRpcRequest>, _> = serde_json::from_str(trimmed);
         match batch {
             Ok(reqs) => {
+                // batch 条数上限：无上限时一个 POST 可塞约 2500 条 tools/call
+                // 击穿按 Agent 限流的设计目标（单 Agent 突发不得影响其他 Agent）
+                if reqs.len() > MAX_BATCH_REQUESTS {
+                    return jsonrpc_http(
+                        StatusCode::BAD_REQUEST,
+                        None,
+                        INVALID_PARAMS,
+                        format!(
+                            "batch 条数超过上限 {}（当前 {} 条）",
+                            MAX_BATCH_REQUESTS,
+                            reqs.len()
+                        ),
+                    );
+                }
                 let mut out = Vec::with_capacity(reqs.len());
                 for r in reqs {
                     // MCP 标准通知帧：不向回包数组中塞入响应
                     if r.id.is_none() && r.method.starts_with("notifications/") {
                         continue;
+                    }
+                    // 每条 tools/call 单独走限流（逐条扣令牌）：整个 POST 只 check 一次
+                    // 的话，batch 就成了绕过按 Agent 限流的放大器。轻量方法
+                    // （tools/list、initialize、ping 等）不扣令牌。
+                    if r.method == "tools/call" {
+                        if let (Some(limiter), Some(ctx)) =
+                            (state.rate_limiter.as_ref(), auth.as_ref())
+                        {
+                            if let RateVerdict::Limited { retry_after_s } =
+                                limiter.check(&ctx.agent_id).await
+                            {
+                                let (code, msg, data) =
+                                    hub_error_to_jsonrpc(&HubError::RateLimited {
+                                        retry_after_s: Some(retry_after_s),
+                                    });
+                                out.push(JsonRpcResponse {
+                                    jsonrpc: "2.0",
+                                    id: r.id.clone(),
+                                    result: None,
+                                    error: Some(JsonRpcError {
+                                        code,
+                                        message: msg,
+                                        data: Some(data),
+                                    }),
+                                });
+                                continue;
+                            }
+                        }
                     }
                     out.push(handle_jsonrpc_ext(&state, auth.as_ref(), Some(&headers), r).await);
                 }
@@ -1316,6 +1366,130 @@ mod tests {
         );
         let resp = handle_http_mcp(State(Arc::new(s)), Method::POST, headers, body).await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// batch 条数上限：超出 MAX_BATCH_REQUESTS 的整个 batch 以 -32602 拒绝
+    #[tokio::test]
+    async fn test_http_batch_rejects_oversized_batch() {
+        use axum::body::Bytes;
+
+        let s = state();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "Bearer good".parse().unwrap());
+        // MAX_BATCH_REQUESTS + 1 条 ping（轻量方法也一样受限：上限是防放大，不是防贵方法）
+        let items: Vec<String> = (0..=MAX_BATCH_REQUESTS)
+            .map(|i| format!(r#"{{"jsonrpc":"2.0","id":{i},"method":"ping"}}"#))
+            .collect();
+        let body = Bytes::from(format!("[{}]", items.join(",")));
+        let resp = handle_http_mcp(State(Arc::new(s)), Method::POST, headers, body).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "超上限 batch 必须 400 而非继续处理"
+        );
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], json!(INVALID_PARAMS));
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(&MAX_BATCH_REQUESTS.to_string()),
+            "错误信息必须说明上限值：{body}"
+        );
+
+        // 恰好等于上限：放行
+        let s = state();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "Bearer good".parse().unwrap());
+        let items: Vec<String> = (0..MAX_BATCH_REQUESTS)
+            .map(|i| format!(r#"{{"jsonrpc":"2.0","id":{i},"method":"ping"}}"#))
+            .collect();
+        let body = Bytes::from(format!("[{}]", items.join(",")));
+        let resp = handle_http_mcp(State(Arc::new(s)), Method::POST, headers, body).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// batch 内每条 tools/call 逐条扣令牌：配额耗尽的那一条返回限流错误，
+    /// 其余条目继续处理（含轻量方法不受影响）
+    #[tokio::test]
+    async fn test_http_batch_per_item_rate_limiting() {
+        use axum::body::Bytes;
+
+        // 2 RPS：进入 handler 前的整批预检扣 1 个，batch 内前 1 条 tools/call
+        // 扣第 2 个，第 2 条 tools/call 即被限流
+        let limiter = RateLimiter::new(2);
+        let s = state_with_limiter(Some(limiter));
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "Bearer good".parse().unwrap());
+        let body = Bytes::from_static(
+            br#"[
+                {"jsonrpc":"2.0","id":1,"method":"ping"},
+                {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_list","arguments":{"namespace":"ns"}}},
+                {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"memory_list","arguments":{"namespace":"ns"}}},
+                {"jsonrpc":"2.0","id":4,"method":"tools/list"}
+            ]"#,
+        );
+        let resp = handle_http_mcp(State(Arc::new(s)), Method::POST, headers, body).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "batch 内单条限流不得整批 429"
+        );
+        let arr = body_json(resp).await;
+        let arr = arr.as_array().expect("batch 响应应为数组");
+
+        let find = |id: i64| -> &serde_json::Value {
+            arr.iter()
+                .find(|r| r["id"] == json!(id))
+                .unwrap_or_else(|| panic!("缺少 id={id} 的响应：{arr:?}"))
+        };
+        // ping / tools-list 不扣令牌：正常
+        assert!(
+            find(1)["error"].is_null(),
+            "轻量方法不受 tools/call 逐条限流影响"
+        );
+        assert!(find(4)["error"].is_null());
+        // 第 1 条 tools/call（id=2）扣到第 2 个令牌：放行
+        assert!(
+            find(2)["error"].is_null(),
+            "配额内的 tools/call 应正常执行：{:?}",
+            find(2)
+        );
+        // 第 2 条 tools/call（id=3）被限流：32003（RateLimited 映射码）
+        assert_eq!(
+            find(3)["error"]["code"],
+            json!(32003),
+            "超出配额的 tools/call 应逐条返回限流错误：{:?}",
+            find(3)
+        );
+    }
+
+    /// batch 内逐条限流错误须与单请求路径同形态（HubError::RateLimited 映射）
+    #[tokio::test]
+    async fn test_http_batch_rate_limit_error_shape_matches_single() {
+        use axum::body::Bytes;
+
+        // 1 RPS：整批预检已扣掉唯一令牌 → batch 内第一条 tools/call 即被限
+        let limiter = RateLimiter::new(1);
+        let s = state_with_limiter(Some(limiter));
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "Bearer good".parse().unwrap());
+        let body = Bytes::from_static(
+            br#"[
+                {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory_list","arguments":{"namespace":"ns"}}},
+                {"jsonrpc":"2.0","id":2,"method":"ping"}
+            ]"#,
+        );
+        let resp = handle_http_mcp(State(Arc::new(s)), Method::POST, headers, body).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let arr = body_json(resp).await;
+        let arr = arr.as_array().unwrap();
+        let limited = arr.iter().find(|r| r["id"] == json!(1)).unwrap();
+        assert_eq!(limited["error"]["code"], json!(32003));
+        assert!(
+            limited["error"]["data"].is_object(),
+            "限流错误须保留结构化 data（与单请求路径一致）：{limited}"
+        );
     }
 
     #[test]

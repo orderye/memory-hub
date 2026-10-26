@@ -29,8 +29,20 @@ pub struct ChatCognitiveResult {
     pub evidence_id: Uuid,
     /// 自动入库的有效记忆条目
     pub committed_entries: Vec<MemoryEntry>,
-    /// 产生的候选提案（人工待审或被拒绝）
+    /// 产生的候选提案（人工待审或被拒绝）；均已持久化，ID 可直接用于裁决
     pub proposals: Vec<CognitiveProposalRecord>,
+}
+
+/// 认知提案裁决动作
+#[derive(Debug, Clone)]
+pub enum CognitiveReviewDecision {
+    /// 驳回：提案标记 rejected，候选不入库
+    Reject {
+        /// 驳回理由（保留审计轨迹）
+        reason: Option<String>,
+    },
+    /// 采纳：候选入库为记忆条目；`modified_content` 提供时以编辑后正文入库
+    Accept { modified_content: Option<String> },
 }
 
 /// Chat 认知提炼与管理服务
@@ -117,6 +129,36 @@ impl ChatCognitiveService {
         Some(now + chrono::Duration::days(self.policy.evidence_retention_days as i64))
     }
 
+    /// 构造并持久化一条认知提案，返回落库后的记录。
+    ///
+    /// 提案是 Manual/SemiAuto 治理下人工审查的唯一凭据：不落库等于
+    /// 提炼结果直接丢失（这是链路一要修复的核心问题）。落库失败时上抛，
+    /// 不静默降级为"只存在于返回值里"。
+    async fn persist_proposal(
+        &self,
+        namespace: &str,
+        candidate: CognitiveCandidate,
+        evidence_id: Uuid,
+        status: CognitiveProposalStatus,
+        rejection_reason: Option<String>,
+        now: DateTime<Utc>,
+    ) -> Result<CognitiveProposalRecord> {
+        let record = CognitiveProposalRecord {
+            id: Uuid::new_v4(),
+            namespace: namespace.to_string(),
+            candidate,
+            source_evidence_id: evidence_id,
+            status,
+            rejection_reason,
+            resulting_memory_id: None,
+            resolved_by: None,
+            created_at: now,
+            updated_at: now,
+        };
+        self.store.save_cognitive_proposal(&record).await?;
+        Ok(record)
+    }
+
     /// 执行 Chat 会话认知提炼主流程
     pub async fn process_chat_session(
         &self,
@@ -201,33 +243,33 @@ impl ChatCognitiveService {
             let validation = validate_cognitive_candidate(&candidate);
             if let Err(e) = validation {
                 // 校验未通过：创建 Rejected 提案记录，保留原始证据溯源，不直接崩溃
-                proposals.push(CognitiveProposalRecord {
-                    id: Uuid::new_v4(),
-                    namespace: input.namespace.clone(),
-                    candidate,
-                    source_evidence_id: evidence.id,
-                    status: CognitiveProposalStatus::Rejected,
-                    rejection_reason: Some(format!("候选校验失败: {}", e)),
-                    resulting_memory_id: None,
-                    created_at: now,
-                    updated_at: now,
-                });
+                let record = self
+                    .persist_proposal(
+                        &input.namespace,
+                        candidate,
+                        evidence.id,
+                        CognitiveProposalStatus::Rejected,
+                        Some(format!("候选校验失败: {}", e)),
+                        now,
+                    )
+                    .await?;
+                proposals.push(record);
                 continue;
             }
 
             // 置信度过低过滤 (< 0.5)
             if candidate.confidence < 0.5 {
-                proposals.push(CognitiveProposalRecord {
-                    id: Uuid::new_v4(),
-                    namespace: input.namespace.clone(),
-                    candidate,
-                    source_evidence_id: evidence.id,
-                    status: CognitiveProposalStatus::Rejected,
-                    rejection_reason: Some("置信度过低 (< 0.5)".into()),
-                    resulting_memory_id: None,
-                    created_at: now,
-                    updated_at: now,
-                });
+                let record = self
+                    .persist_proposal(
+                        &input.namespace,
+                        candidate,
+                        evidence.id,
+                        CognitiveProposalStatus::Rejected,
+                        Some("置信度过低 (< 0.5)".into()),
+                        now,
+                    )
+                    .await?;
+                proposals.push(record);
                 continue;
             }
 
@@ -244,18 +286,19 @@ impl ChatCognitiveService {
             // 步骤 4：根据治理策略决定是自动接受还是生成待审提案
             match self.policy.mode {
                 CognitiveGovernanceMode::Manual => {
-                    // Manual 模式下绝不自动合并
-                    proposals.push(CognitiveProposalRecord {
-                        id: Uuid::new_v4(),
-                        namespace: input.namespace.clone(),
-                        candidate,
-                        source_evidence_id: evidence.id,
-                        status: CognitiveProposalStatus::PendingReview,
-                        rejection_reason: None,
-                        resulting_memory_id: None,
-                        created_at: now,
-                        updated_at: now,
-                    });
+                    // Manual 模式下绝不自动合并：待审提案必须落库，
+                    // 否则默认治理模式下所有提炼结果都会丢失
+                    let record = self
+                        .persist_proposal(
+                            &input.namespace,
+                            candidate,
+                            evidence.id,
+                            CognitiveProposalStatus::PendingReview,
+                            None,
+                            now,
+                        )
+                        .await?;
+                    proposals.push(record);
                 }
                 CognitiveGovernanceMode::SemiAuto | CognitiveGovernanceMode::FullAuto => {
                     // 两种自动模式都必须遵守 auto_accept_threshold：
@@ -277,29 +320,31 @@ impl ChatCognitiveService {
                         committed_entries.push(entry);
                     } else {
                         // 低于阈值的处置按模式区分：
-                        // - SemiAuto：进入待审提案队列（人工可救回）
+                        // - SemiAuto：进入待审提案队列（人工可救回），同样必须落库
                         // - FullAuto：不静默入库，落一条 Rejected 记录保留审计轨迹
                         let full_auto = self.policy.mode == CognitiveGovernanceMode::FullAuto;
-                        proposals.push(CognitiveProposalRecord {
-                            id: Uuid::new_v4(),
-                            namespace: input.namespace.clone(),
-                            candidate,
-                            source_evidence_id: evidence.id,
-                            status: if full_auto {
-                                CognitiveProposalStatus::Rejected
-                            } else {
-                                CognitiveProposalStatus::PendingReview
-                            },
-                            rejection_reason: full_auto.then(|| {
-                                format!(
-                                    "FullAuto 模式下置信度低于自动接受阈值 {}，未入库（保留审计记录）",
-                                    self.policy.auto_accept_threshold
-                                )
-                            }),
-                            resulting_memory_id: None,
-                            created_at: now,
-                            updated_at: now,
+                        let rejection_reason = full_auto.then(|| {
+                            format!(
+                                "FullAuto 模式下置信度低于自动接受阈值 {}，未入库（保留审计记录）",
+                                self.policy.auto_accept_threshold
+                            )
                         });
+                        let status = if full_auto {
+                            CognitiveProposalStatus::Rejected
+                        } else {
+                            CognitiveProposalStatus::PendingReview
+                        };
+                        let record = self
+                            .persist_proposal(
+                                &input.namespace,
+                                candidate,
+                                evidence.id,
+                                status,
+                                rejection_reason,
+                                now,
+                            )
+                            .await?;
+                        proposals.push(record);
                     }
                 }
             }
@@ -312,7 +357,123 @@ impl ChatCognitiveService {
         })
     }
 
-    /// 人工裁决/审核认知提案
+    /// 人工裁决/审核认知提案（基于持久化记录，按 ID 裁决）
+    ///
+    /// 裁决路径与存储状态机联动：
+    /// - 驳回：`pending_review → rejected`，提案保留审计轨迹；
+    /// - 采纳（可直接改写候选正文）：先校验修改后的候选合法，再入库为
+    ///   记忆条目，最后 `pending_review → accepted` 回写 resulting_memory_id。
+    ///
+    /// 状态推进带乐观前置（expected = pending_review）：提案已被裁决过或
+    /// 并发裁决时返回 `Conflict`，同一提案不会写入两条记忆。
+    /// 入库成功而状态回写失败时保留警告日志（记忆已写入，回滚需要人工介入）。
+    pub async fn review_persisted_proposal(
+        &self,
+        auth: &AuthCtx,
+        proposal_id: Uuid,
+        decision: CognitiveReviewDecision,
+    ) -> Result<Option<MemoryEntry>> {
+        if !auth.has_scope(&Scope::Write) {
+            return Err(HubError::InsufficientScope);
+        }
+
+        let proposal = self.store.get_cognitive_proposal(proposal_id).await?;
+        // 只有待审提案可裁决：已裁决（accepted/rejected）的提案再次裁决
+        // 返回 Conflict，杜绝重复采纳写入重复记忆
+        if proposal.status != CognitiveProposalStatus::PendingReview {
+            return Err(HubError::Conflict);
+        }
+        let now = Utc::now();
+
+        match decision {
+            CognitiveReviewDecision::Reject { reason } => {
+                self.store
+                    .update_cognitive_proposal_status(
+                        proposal_id,
+                        CognitiveProposalStatus::PendingReview,
+                        CognitiveProposalStatus::Rejected,
+                        reason.as_deref(),
+                        None,
+                        Some(&auth.agent_id),
+                    )
+                    .await?;
+                Ok(None)
+            }
+            CognitiveReviewDecision::Accept { modified_content } => {
+                // 编辑后合并：修改内容必须先过候选校验（长度/敏感凭证闸门），
+                // 校验失败时提案仍停留在 pending_review，可修正后重试
+                let mut candidate = proposal.candidate.clone();
+                if let Some(content) = modified_content {
+                    candidate.content = content;
+                    validate_cognitive_candidate(&candidate)?;
+                }
+
+                let existing_memories = self
+                    .store
+                    .all_in_namespace(&proposal.namespace, false)
+                    .await?
+                    .into_iter()
+                    .filter(|e| e.status == MemoryStatus::Active)
+                    .collect::<Vec<_>>();
+
+                let supersedes_target =
+                    self.detect_supersedes_target(&candidate, &existing_memories);
+
+                let entry = self
+                    .commit_candidate(
+                        &auth.agent_id,
+                        &proposal.namespace,
+                        &candidate,
+                        proposal.source_evidence_id,
+                        supersedes_target,
+                        now,
+                    )
+                    .await?;
+
+                // 入库成功后推进状态；失败不回滚已写入的记忆，但要可观测
+                if let Err(e) = self
+                    .store
+                    .update_cognitive_proposal_status(
+                        proposal_id,
+                        CognitiveProposalStatus::PendingReview,
+                        CognitiveProposalStatus::Accepted,
+                        None,
+                        Some(entry.id),
+                        Some(&auth.agent_id),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        proposal_id = %proposal_id,
+                        memory_id = %entry.id,
+                        error = %e,
+                        "认知提案采纳后状态回写失败（记忆已入库，提案状态未推进）"
+                    );
+                    return Err(e);
+                }
+                Ok(Some(entry))
+            }
+        }
+    }
+
+    /// 列出认知提案（人工审查队列；status 为 None 时列出全部）
+    pub async fn list_proposals(
+        &self,
+        auth: &AuthCtx,
+        namespace: &str,
+        status: Option<CognitiveProposalStatus>,
+    ) -> Result<Vec<CognitiveProposalRecord>> {
+        if !auth.has_scope(&Scope::Read) {
+            return Err(HubError::InsufficientScope);
+        }
+        self.store.list_cognitive_proposals(namespace, status).await
+    }
+
+    /// 人工裁决/审核认知提案（按内存中的提案对象裁决；不推进持久化状态）
+    ///
+    /// 兼容入口：早期提案只存在于 `process_chat_session` 返回值中时使用。
+    /// 新代码应使用 [`Self::review_persisted_proposal`]——那才是带乐观锁、
+    /// 状态可追溯的裁决路径。
     pub async fn review_proposal(
         &self,
         auth: &AuthCtx,
@@ -328,6 +489,7 @@ impl ChatCognitiveService {
         if !accept {
             proposal.status = CognitiveProposalStatus::Rejected;
             proposal.rejection_reason = rejection_reason;
+            proposal.resolved_by = Some(auth.agent_id.clone());
             proposal.updated_at = now;
             return Ok(None);
         }
@@ -356,6 +518,7 @@ impl ChatCognitiveService {
 
         proposal.status = CognitiveProposalStatus::Accepted;
         proposal.resulting_memory_id = Some(entry.id);
+        proposal.resolved_by = Some(auth.agent_id.clone());
         proposal.updated_at = now;
 
         Ok(Some(entry))
@@ -497,18 +660,20 @@ impl ChatCognitiveService {
         let indicates_evolution = evolution_markers.iter().any(|m| content_lower.contains(m));
 
         if indicates_evolution {
-            // 在同场景同分层的条目中查找可能被取代的旧条目
-            for old in existing.iter().rev() {
-                if old.layer == Some(candidate.layer) {
-                    // 若新内容包含旧内容的关键词，判定为针对同一实体的演化更新
-                    if old.tags.iter().any(|t| candidate.tags.contains(t))
-                        || (old.content.contains("MySQL")
-                            && candidate.content.contains("PostgreSQL"))
-                    {
-                        return Some(old.id);
-                    }
-                }
-            }
+            // 确定性地取"最近的相关旧事实"：按 occurred_at（其次 updated_at、created_at）
+            // 降序。all_in_namespace 不保证顺序，旧实现取"最后一个"导致目标选择不确定。
+            let mut candidates: Vec<&MemoryEntry> = existing
+                .iter()
+                .filter(|old| old.layer == Some(candidate.layer))
+                .filter(|old| old.tags.iter().any(|t| candidate.tags.contains(t)))
+                .collect();
+            candidates.sort_by(|a, b| {
+                b.occurred_at
+                    .cmp(&a.occurred_at)
+                    .then(b.updated_at.cmp(&a.updated_at))
+                    .then(b.created_at.cmp(&a.created_at))
+            });
+            return candidates.first().map(|e| e.id);
         }
 
         None
@@ -539,6 +704,7 @@ mod tests {
         tasks: RwLock<HashMap<(String, Uuid), MemoryTask>>,
         experiences: RwLock<HashMap<(String, Uuid), MemoryExperience>>,
         task_experiences: RwLock<Vec<MemoryTaskExperience>>,
+        cognitive_proposals: RwLock<HashMap<Uuid, CognitiveProposalRecord>>,
     }
 
     #[async_trait]
@@ -826,6 +992,59 @@ mod tests {
         }
         async fn open_exists(&self, _ns: &str, _m: &[(String, Vec<Uuid>)]) -> Result<bool> {
             Ok(false)
+        }
+    }
+    #[async_trait]
+    impl crate::infra::CognitiveProposalStore for TestHubStore {
+        async fn save_cognitive_proposal(&self, p: &CognitiveProposalRecord) -> Result<()> {
+            self.cognitive_proposals
+                .write()
+                .unwrap()
+                .insert(p.id, p.clone());
+            Ok(())
+        }
+        async fn get_cognitive_proposal(&self, id: Uuid) -> Result<CognitiveProposalRecord> {
+            self.cognitive_proposals
+                .read()
+                .unwrap()
+                .get(&id)
+                .cloned()
+                .ok_or(HubError::NotFound)
+        }
+        async fn list_cognitive_proposals(
+            &self,
+            ns: &str,
+            s: Option<CognitiveProposalStatus>,
+        ) -> Result<Vec<CognitiveProposalRecord>> {
+            Ok(self
+                .cognitive_proposals
+                .read()
+                .unwrap()
+                .values()
+                .filter(|p| p.namespace == ns && s.is_none_or(|st| p.status == st))
+                .cloned()
+                .collect())
+        }
+        async fn update_cognitive_proposal_status(
+            &self,
+            id: Uuid,
+            expected_status: CognitiveProposalStatus,
+            new_status: CognitiveProposalStatus,
+            rejection_reason: Option<&str>,
+            resulting_memory_id: Option<Uuid>,
+            resolved_by: Option<&str>,
+        ) -> Result<CognitiveProposalRecord> {
+            let mut w = self.cognitive_proposals.write().unwrap();
+            let p = w.get_mut(&id).ok_or(HubError::NotFound)?;
+            if p.status != expected_status {
+                return Err(HubError::Conflict);
+            }
+            p.status = new_status;
+            p.rejection_reason = rejection_reason.map(str::to_string);
+            p.resulting_memory_id = resulting_memory_id;
+            p.resolved_by = resolved_by.map(str::to_string);
+            p.updated_at = Utc::now();
+            Ok(p.clone())
         }
     }
     #[async_trait]
@@ -1811,5 +2030,555 @@ mod tests {
 
         let total = store.all_in_namespace("test-ns", false).await.unwrap();
         assert_eq!(total.len(), 1, "同一事实重复输入不得无限复制");
+    }
+
+    /// 负例：两条只是恰好分别提到 MySQL 和 PostgreSQL 的不相关事实，
+    /// 不得被判为 supersedes（旧实现硬编码该技术栈对，误封旧事实 valid_until）
+    #[tokio::test]
+    async fn test_unrelated_tech_mentions_do_not_supersede() {
+        let store = Arc::new(TestHubStore::default());
+        let now = Utc::now();
+
+        // 两条互不相关的事实：一条讲 MySQL 备份策略，一条是含"改用"措辞的
+        // PostgreSQL 迁移演练记录——标签无交集，不是同一主体的演化
+        let old = store
+            .insert_initial(&MemoryEntry {
+                id: Uuid::new_v4(),
+                namespace: "test-ns".to_string(),
+                key: None,
+                kind: MemoryKind::Fact,
+                content: "MySQL 备份策略为每日凌晨全量".to_string(),
+                tags: vec!["backup".to_string()],
+                metadata: serde_json::json!({}),
+                embedding: None,
+                embedding_model: None,
+                source_agent: "agent".to_string(),
+                confidence: 0.9,
+                status: MemoryStatus::Active,
+                version: 1,
+                expires_at: None,
+                merged_into: None,
+                created_at: now - chrono::Duration::days(10),
+                updated_at: now - chrono::Duration::days(10),
+                scene: Some(MemoryScene::Chat),
+                layer: Some(CognitiveLayer::Fact),
+                valid_from: Some(now - chrono::Duration::days(10)),
+                valid_until: None,
+                occurred_at: Some(now - chrono::Duration::days(10)),
+            })
+            .await
+            .unwrap();
+
+        let extractor =
+            Arc::new(
+                MockChatCognitiveExtractor::new().with_candidates(vec![CognitiveCandidate {
+                    content: "演练记录：本周把只读副本从 MySQL 改用 PostgreSQL 驱动重连"
+                        .to_string(),
+                    scene: MemoryScene::Chat,
+                    layer: CognitiveLayer::Fact,
+                    confidence: 0.95,
+                    valid_from: Some(now),
+                    valid_until: None,
+                    occurred_at: Some(now),
+                    // 标签与旧事实无交集
+                    tags: vec!["drill".to_string()],
+                    metadata: serde_json::json!({}),
+                    relation_kind: None,
+                    target_memory_id: None,
+                }]),
+            );
+
+        let service = ChatCognitiveService::new(
+            store.clone(),
+            extractor,
+            CognitivePolicy {
+                mode: CognitiveGovernanceMode::FullAuto,
+                auto_accept_threshold: 0.9,
+                ..Default::default()
+            },
+        );
+
+        let input = ChatCognitiveInput {
+            namespace: "test-ns".to_string(),
+            session_id: "sess-unrelated".to_string(),
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "演练：只读副本改用 PostgreSQL 驱动".to_string(),
+                timestamp: Some(now),
+            }],
+            occurred_at: Some(now),
+        };
+
+        let res = service.process_chat_session(&auth(), input).await.unwrap();
+        assert_eq!(res.committed_entries.len(), 1);
+
+        // 不得建立任何 Supersedes 关系
+        let relations = store
+            .list_relations_from("test-ns", res.committed_entries[0].id)
+            .await
+            .unwrap();
+        assert!(
+            relations.is_empty(),
+            "不相关事实不得被判为 supersedes：{relations:?}"
+        );
+
+        // 旧事实不得被封堵 valid_until
+        let unchanged = store.get("test-ns", old.id).await.unwrap();
+        assert!(
+            unchanged.valid_until.is_none(),
+            "无关旧事实的有效期不得被改写"
+        );
+        assert_eq!(unchanged.version, 1);
+    }
+
+    /// 确定性：同标签多条旧事实时，supersedes 目标必须是"最新"的那条
+    /// （occurred_at 优先，其次 updated_at、created_at），与 all_in_namespace
+    /// 返回顺序无关——旧实现取 `iter().rev()` 的"最后一个"，选择不确定
+    #[tokio::test]
+    async fn test_supersedes_target_picks_latest_matching_entry() {
+        let store = Arc::new(TestHubStore::default());
+        let now = Utc::now();
+
+        let mk = |days_ago: i64, content: &str| MemoryEntry {
+            id: Uuid::new_v4(),
+            namespace: "test-ns".to_string(),
+            key: None,
+            kind: MemoryKind::Fact,
+            content: content.to_string(),
+            tags: vec!["db".to_string()],
+            metadata: serde_json::json!({}),
+            embedding: None,
+            embedding_model: None,
+            source_agent: "agent".to_string(),
+            confidence: 0.9,
+            status: MemoryStatus::Active,
+            version: 1,
+            expires_at: None,
+            merged_into: None,
+            created_at: now - chrono::Duration::days(days_ago),
+            updated_at: now - chrono::Duration::days(days_ago),
+            scene: Some(MemoryScene::Chat),
+            layer: Some(CognitiveLayer::Fact),
+            valid_from: Some(now - chrono::Duration::days(days_ago)),
+            valid_until: None,
+            occurred_at: Some(now - chrono::Duration::days(days_ago)),
+        };
+        let older = store
+            .insert_initial(&mk(30, "旧款数据库为 MySQL 5.7"))
+            .await
+            .unwrap();
+        let newer = store
+            .insert_initial(&mk(5, "上一代数据库为 MySQL 8.0"))
+            .await
+            .unwrap();
+
+        let extractor =
+            Arc::new(
+                MockChatCognitiveExtractor::new().with_candidates(vec![CognitiveCandidate {
+                    content: "架构评审已通过，即日起决定改用 PostgreSQL 15 作为主数据库"
+                        .to_string(),
+                    scene: MemoryScene::Chat,
+                    layer: CognitiveLayer::Fact,
+                    confidence: 0.98,
+                    valid_from: Some(now),
+                    valid_until: None,
+                    occurred_at: Some(now),
+                    tags: vec!["db".to_string()],
+                    metadata: serde_json::json!({}),
+                    relation_kind: None,
+                    target_memory_id: None,
+                }]),
+            );
+
+        let service = ChatCognitiveService::new(
+            store.clone(),
+            extractor,
+            CognitivePolicy {
+                mode: CognitiveGovernanceMode::FullAuto,
+                auto_accept_threshold: 0.9,
+                ..Default::default()
+            },
+        );
+
+        let input = ChatCognitiveInput {
+            namespace: "test-ns".to_string(),
+            session_id: "sess-latest".to_string(),
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "决定改用 PostgreSQL 15".to_string(),
+                timestamp: Some(now),
+            }],
+            occurred_at: Some(now),
+        };
+
+        let res = service.process_chat_session(&auth(), input).await.unwrap();
+        assert_eq!(res.committed_entries.len(), 1);
+        let new_entry = &res.committed_entries[0];
+
+        let relations = store
+            .list_relations_from("test-ns", new_entry.id)
+            .await
+            .unwrap();
+        assert_eq!(relations.len(), 1, "恰好建立一条 Supersedes 关系");
+        assert_eq!(
+            relations[0].to_memory_id, newer.id,
+            "必须封堵最新的同主体旧事实"
+        );
+        assert_ne!(relations[0].to_memory_id, older.id);
+
+        let blocked = store.get("test-ns", newer.id).await.unwrap();
+        assert!(blocked.valid_until.is_some(), "最新旧事实应被封堵");
+        let untouched = store.get("test-ns", older.id).await.unwrap();
+        assert!(untouched.valid_until.is_none(), "更早的旧事实保持不变");
+    }
+
+    // ===== 认知提案持久化与裁决闭环（链路一修复的端到端验证） =====
+
+    fn candidate(content: &str, confidence: f32) -> CognitiveCandidate {
+        CognitiveCandidate {
+            content: content.to_string(),
+            scene: MemoryScene::Chat,
+            layer: CognitiveLayer::Fact,
+            confidence,
+            valid_from: None,
+            valid_until: None,
+            occurred_at: None,
+            tags: vec![],
+            metadata: serde_json::json!({}),
+            relation_kind: None,
+            target_memory_id: None,
+        }
+    }
+
+    fn manual_service(
+        store: &Arc<TestHubStore>,
+        candidates: Vec<CognitiveCandidate>,
+    ) -> ChatCognitiveService {
+        ChatCognitiveService::new(
+            store.clone(),
+            Arc::new(MockChatCognitiveExtractor::new().with_candidates(candidates)),
+            CognitivePolicy {
+                mode: CognitiveGovernanceMode::Manual,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// propose → list → 三种裁决（采纳/驳回/编辑后合并）全链路
+    #[tokio::test]
+    async fn test_cognitive_proposal_persist_list_and_resolve_roundtrip() {
+        let store = Arc::new(TestHubStore::default());
+        let service = manual_service(
+            &store,
+            vec![
+                candidate("用户主语言为 Rust", 0.95),
+                candidate("用户偏好暗黑主题", 0.9),
+                candidate("团队每周五发布", 0.85),
+            ],
+        );
+
+        let res = service
+            .process_chat_session(
+                &auth(),
+                ChatCognitiveInput {
+                    namespace: "review-ns".to_string(),
+                    session_id: "sess-review-e2e".to_string(),
+                    messages: vec![ChatMessage {
+                        role: ChatRole::User,
+                        content: "记录偏好".to_string(),
+                        timestamp: None,
+                    }],
+                    occurred_at: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Manual 模式：三候选全部生成待审提案且已持久化
+        assert_eq!(res.proposals.len(), 3);
+        assert!(res
+            .proposals
+            .iter()
+            .all(|p| p.status == CognitiveProposalStatus::PendingReview));
+        let listed = service
+            .list_proposals(
+                &auth(),
+                "review-ns",
+                Some(CognitiveProposalStatus::PendingReview),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 3);
+        // 返回值中的 ID 与存储中的 ID 一致（落库后的真实 ID）
+        for p in &res.proposals {
+            assert!(listed.iter().any(|l| l.id == p.id));
+        }
+
+        // 1. 驳回
+        let rejected_id = res.proposals[0].id;
+        let outcome = service
+            .review_persisted_proposal(
+                &auth(),
+                rejected_id,
+                CognitiveReviewDecision::Reject {
+                    reason: Some("信息不准确".into()),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(outcome.is_none());
+        let after = store.get_cognitive_proposal(rejected_id).await.unwrap();
+        assert_eq!(after.status, CognitiveProposalStatus::Rejected);
+        assert_eq!(after.rejection_reason.as_deref(), Some("信息不准确"));
+        assert_eq!(after.resolved_by.as_deref(), Some("chat-agent"));
+
+        // 2. 采纳
+        let accepted_id = res.proposals[1].id;
+        let entry = service
+            .review_persisted_proposal(
+                &auth(),
+                accepted_id,
+                CognitiveReviewDecision::Accept {
+                    modified_content: None,
+                },
+            )
+            .await
+            .unwrap()
+            .expect("采纳应生成条目");
+        assert_eq!(entry.content, "用户偏好暗黑主题");
+        let after = store.get_cognitive_proposal(accepted_id).await.unwrap();
+        assert_eq!(after.status, CognitiveProposalStatus::Accepted);
+        assert_eq!(after.resulting_memory_id, Some(entry.id));
+
+        // 3. 编辑后合并：入库正文必须是修订版
+        let modified_id = res.proposals[2].id;
+        let entry = service
+            .review_persisted_proposal(
+                &auth(),
+                modified_id,
+                CognitiveReviewDecision::Accept {
+                    modified_content: Some("团队每周五 17:00 发布（法定假日顺延）".into()),
+                },
+            )
+            .await
+            .unwrap()
+            .expect("编辑后合并应生成条目");
+        assert_eq!(entry.content, "团队每周五 17:00 发布（法定假日顺延）");
+        let after = store.get_cognitive_proposal(modified_id).await.unwrap();
+        assert_eq!(after.status, CognitiveProposalStatus::Accepted);
+
+        // 裁决后的队列：pending_review 清零，accepted 2 条 + rejected 1 条
+        let pending = service
+            .list_proposals(
+                &auth(),
+                "review-ns",
+                Some(CognitiveProposalStatus::PendingReview),
+            )
+            .await
+            .unwrap();
+        assert!(pending.is_empty());
+        let accepted = service
+            .list_proposals(
+                &auth(),
+                "review-ns",
+                Some(CognitiveProposalStatus::Accepted),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.len(), 2);
+
+        // 记忆条目：恰好 2 条（采纳 + 编辑后合并；驳回不入库）
+        let entries = store.all_in_namespace("review-ns", false).await.unwrap();
+        assert_eq!(entries.len(), 2);
+    }
+
+    /// 已裁决提案再次裁决必须 Conflict，绝不重复入库
+    #[tokio::test]
+    async fn test_double_resolution_conflicts_instead_of_duplicate_commit() {
+        let store = Arc::new(TestHubStore::default());
+        let service = manual_service(&store, vec![candidate("用户主语言为 Rust", 0.95)]);
+        let res = service
+            .process_chat_session(
+                &auth(),
+                ChatCognitiveInput {
+                    namespace: "dup-ns".to_string(),
+                    session_id: "sess-dup".to_string(),
+                    messages: vec![ChatMessage {
+                        role: ChatRole::User,
+                        content: "记录".to_string(),
+                        timestamp: None,
+                    }],
+                    occurred_at: None,
+                },
+            )
+            .await
+            .unwrap();
+        let id = res.proposals[0].id;
+
+        // 第一次采纳成功
+        service
+            .review_persisted_proposal(
+                &auth(),
+                id,
+                CognitiveReviewDecision::Accept {
+                    modified_content: None,
+                },
+            )
+            .await
+            .unwrap()
+            .expect("首次采纳应成功");
+
+        // 第二次裁决（无论动作）必须 Conflict
+        let err = service
+            .review_persisted_proposal(
+                &auth(),
+                id,
+                CognitiveReviewDecision::Accept {
+                    modified_content: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, common::HubError::Conflict), "got: {:?}", err);
+
+        // 记忆条目只有 1 条
+        let entries = store.all_in_namespace("dup-ns", false).await.unwrap();
+        assert_eq!(entries.len(), 1);
+    }
+
+    /// 编辑内容先过候选校验：非法修订不落库，提案停留在 pending_review
+    #[tokio::test]
+    async fn test_modified_content_validated_before_commit() {
+        let store = Arc::new(TestHubStore::default());
+        let service = manual_service(&store, vec![candidate("正常候选内容", 0.9)]);
+        let res = service
+            .process_chat_session(
+                &auth(),
+                ChatCognitiveInput {
+                    namespace: "mod-ns".to_string(),
+                    session_id: "sess-mod".to_string(),
+                    messages: vec![ChatMessage {
+                        role: ChatRole::User,
+                        content: "记录".to_string(),
+                        timestamp: None,
+                    }],
+                    occurred_at: None,
+                },
+            )
+            .await
+            .unwrap();
+        let id = res.proposals[0].id;
+
+        // 修订正文携带真实形态的凭证必须被拒绝
+        // （concat 拆分避免仓库级 secret scanning 误判为真实泄露）
+        let leaky = format!("泄漏的内容 {}", concat!("sk-proj-", "uxg4cgpiZt9k2mQw"));
+        let err = service
+            .review_persisted_proposal(
+                &auth(),
+                id,
+                CognitiveReviewDecision::Accept {
+                    modified_content: Some(leaky),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, common::HubError::InvalidArgument(_)),
+            "got: {:?}",
+            err
+        );
+
+        // 提案仍可裁决（未被错误推进），修订为空串同样被拒
+        let after = store.get_cognitive_proposal(id).await.unwrap();
+        assert_eq!(after.status, CognitiveProposalStatus::PendingReview);
+        let err = service
+            .review_persisted_proposal(
+                &auth(),
+                id,
+                CognitiveReviewDecision::Accept {
+                    modified_content: Some("   ".into()),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, common::HubError::InvalidArgument(_)));
+    }
+
+    /// SemiAuto 低于阈值的候选同样进入持久化待审队列
+    #[tokio::test]
+    async fn test_semiauto_below_threshold_persists_pending_proposal() {
+        let store = Arc::new(TestHubStore::default());
+        let service = ChatCognitiveService::new(
+            store.clone(),
+            Arc::new(
+                MockChatCognitiveExtractor::new()
+                    .with_candidates(vec![candidate("低置信度候选", 0.7)]),
+            ),
+            CognitivePolicy {
+                mode: CognitiveGovernanceMode::SemiAuto,
+                auto_accept_threshold: 0.9,
+                ..Default::default()
+            },
+        );
+        let res = service
+            .process_chat_session(
+                &auth(),
+                ChatCognitiveInput {
+                    namespace: "semi-ns".to_string(),
+                    session_id: "sess-semi".to_string(),
+                    messages: vec![ChatMessage {
+                        role: ChatRole::User,
+                        content: "记录".to_string(),
+                        timestamp: None,
+                    }],
+                    occurred_at: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(res.committed_entries.is_empty());
+        assert_eq!(res.proposals.len(), 1);
+        // 落库可查——人工可救回
+        let stored = store
+            .get_cognitive_proposal(res.proposals[0].id)
+            .await
+            .unwrap();
+        assert_eq!(stored.status, CognitiveProposalStatus::PendingReview);
+    }
+
+    /// FullAuto 高于阈值自动入库：不产生待审提案，行为保持既有语义
+    #[tokio::test]
+    async fn test_fullauto_high_confidence_still_autocommits() {
+        let store = Arc::new(TestHubStore::default());
+        let service = ChatCognitiveService::new(
+            store.clone(),
+            Arc::new(
+                MockChatCognitiveExtractor::new()
+                    .with_candidates(vec![candidate("确定事实", 0.99)]),
+            ),
+            CognitivePolicy {
+                mode: CognitiveGovernanceMode::FullAuto,
+                auto_accept_threshold: 0.95,
+                ..Default::default()
+            },
+        );
+        let res = service
+            .process_chat_session(
+                &auth(),
+                ChatCognitiveInput {
+                    namespace: "full-ns".to_string(),
+                    session_id: "sess-full".to_string(),
+                    messages: vec![ChatMessage {
+                        role: ChatRole::User,
+                        content: "记录".to_string(),
+                        timestamp: None,
+                    }],
+                    occurred_at: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.committed_entries.len(), 1);
+        assert!(res.proposals.is_empty());
     }
 }

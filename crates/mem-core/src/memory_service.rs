@@ -14,11 +14,13 @@ use crate::domain::{
     MemoryVersion, Page, Scored, VersionChange,
 };
 use crate::infra::{AccessChecker, Clock, Embedder, MemoryStore, Retriever, SystemClock};
-use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use common::{AgentId, AuthCtx, HubError, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
+
+use async_trait::async_trait;
 use uuid::Uuid;
 
 /// 单条内容长度上限（字符）
@@ -29,6 +31,8 @@ pub const MAX_TAGS: usize = 32;
 pub const MAX_TAG_CHARS: usize = 64;
 /// metadata 序列化后体积上限（字节）
 pub const MAX_METADATA_BYTES: usize = 16_384;
+/// ttl_seconds 上限（10 年）：防止 chrono::Duration 溢出 panic
+pub const MAX_TTL_SECONDS: i64 = 315_360_000;
 /// 游标编码分隔符（内容不会包含该控制字符）
 const CURSOR_SEP: char = '\u{1}';
 
@@ -236,6 +240,22 @@ impl DefaultMemoryService {
                 MAX_METADATA_BYTES
             )));
         }
+        if let Some(ttl) = req.ttl_seconds {
+            // 上限 10 年：挡住 i64 极值——chrono::Duration::seconds 对超大值直接
+            // 溢出 panic，一次恶意请求即可崩进程；负 TTL 无业务含义（≤0 均视为
+            // 不过期），一并拒绝以免调用方误以为已设置过期
+            if ttl < 0 {
+                return Err(HubError::InvalidArgument(
+                    "ttl_seconds 不得为负（0 表示立即过期）".to_string(),
+                ));
+            }
+            if ttl > MAX_TTL_SECONDS {
+                return Err(HubError::InvalidArgument(format!(
+                    "ttl_seconds 不得超过 {} 秒（10 年）",
+                    MAX_TTL_SECONDS
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -282,6 +302,24 @@ impl MemoryService for DefaultMemoryService {
                     updated.metadata = req.metadata.clone();
                     updated.confidence = req.confidence;
                     updated.kind = req.kind;
+                    // 更新语义与 update()/MemoryPatch 一致：Some(v) 覆盖、None 保留旧值。
+                    // 新建路径把 None 直接落成空，但更新时用 None 清空会让"只想改 content"
+                    // 的调用方意外丢掉分层/有效期，故不以 None 清空。
+                    if req.scene.is_some() {
+                        updated.scene = req.scene;
+                    }
+                    if req.layer.is_some() {
+                        updated.layer = req.layer;
+                    }
+                    if req.valid_from.is_some() {
+                        updated.valid_from = req.valid_from;
+                    }
+                    if req.valid_until.is_some() {
+                        updated.valid_until = req.valid_until;
+                    }
+                    if req.occurred_at.is_some() {
+                        updated.occurred_at = req.occurred_at;
+                    }
                     if let Some(ttl) = req.ttl_seconds {
                         updated.expires_at = if ttl > 0 {
                             Some(now + chrono::Duration::seconds(ttl))
@@ -1003,6 +1041,82 @@ mod tests {
         assert_eq!(first.id, second.id, "同 key 必须 upsert 到同一条目");
         assert_eq!(second.version, 2);
         assert_eq!(second.content, "使用 PostgreSQL 15");
+    }
+
+    /// 回归：key-upsert 分支曾静默丢弃请求中的 scene/layer/valid_from/valid_until/occurred_at
+    #[tokio::test]
+    async fn test_put_upsert_by_key_applies_cognitive_fields() {
+        let (svc, _mem, _grants) = service().await;
+        let a = auth("agent-a", vec![Scope::Read, Scope::Write, Scope::Admin]);
+        let t0 = chrono::Utc::now() - chrono::Duration::days(1);
+        let t1 = chrono::Utc::now();
+
+        let first = svc
+            .put(
+                &a,
+                PutRequest {
+                    key: Some("db:engine".to_string()),
+                    scene: Some(MemoryScene::Working),
+                    layer: Some(CognitiveLayer::Fact),
+                    valid_until: Some(t0 + chrono::Duration::days(30)),
+                    occurred_at: Some(t0),
+                    ..put_req("team-x", "使用 MySQL")
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.scene, Some(MemoryScene::Working));
+        assert_eq!(first.layer, Some(CognitiveLayer::Fact));
+
+        // 第二次 put：新 content + 新 scene/valid_from，未传 layer/valid_until/occurred_at
+        let second = svc
+            .put(
+                &a,
+                PutRequest {
+                    key: Some("db:engine".to_string()),
+                    scene: Some(MemoryScene::Chat),
+                    valid_from: Some(t1),
+                    ..put_req("team-x", "使用 PostgreSQL 15")
+                },
+            )
+            .await
+            .unwrap();
+
+        // Some(v) 生效
+        assert_eq!(second.scene, Some(MemoryScene::Chat));
+        assert_eq!(second.valid_from, Some(t1));
+        // None 保留旧值（不得清空，也不得静默丢字段）
+        assert_eq!(second.layer, Some(CognitiveLayer::Fact));
+        assert_eq!(
+            second.valid_until,
+            Some(t0 + chrono::Duration::days(30)),
+            "未传 valid_until 必须保留旧有效期"
+        );
+        assert_eq!(second.occurred_at, Some(t0));
+        assert_eq!(second.content, "使用 PostgreSQL 15");
+    }
+
+    /// 回归：超大/负 ttl 曾直接 `now + Duration::seconds(ttl)` 溢出 panic
+    #[tokio::test]
+    async fn test_put_rejects_out_of_range_ttl() {
+        let (svc, _mem, _grants) = service().await;
+        let a = auth("agent-a", vec![Scope::Read, Scope::Write, Scope::Admin]);
+
+        let mut overflow = put_req("ns", "x");
+        overflow.ttl_seconds = Some(i64::MAX);
+        let err = svc.put(&a, overflow).await.unwrap_err();
+        assert!(matches!(err, HubError::InvalidArgument(_)), "got: {err:?}");
+
+        let mut negative = put_req("ns", "x");
+        negative.ttl_seconds = Some(-1);
+        let err = svc.put(&a, negative).await.unwrap_err();
+        assert!(matches!(err, HubError::InvalidArgument(_)), "got: {err:?}");
+
+        // 边界值 10 年整可通过
+        let mut edge = put_req("ns", "x");
+        edge.ttl_seconds = Some(MAX_TTL_SECONDS);
+        let entry = svc.put(&a, edge).await.unwrap();
+        assert!(entry.expires_at.is_some());
     }
 
     #[tokio::test]

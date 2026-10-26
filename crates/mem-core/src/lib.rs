@@ -51,7 +51,9 @@ pub use backup_service::{
     grant_checker, BackupCreateRequest, BackupService, DefaultBackupService, PruneReport,
     RestoreRequest,
 };
-pub use chat_cognitive_service::{ChatCognitiveResult, ChatCognitiveService};
+pub use chat_cognitive_service::{
+    ChatCognitiveResult, ChatCognitiveService, CognitiveReviewDecision,
+};
 pub use coding_memory_service::CodingMemoryService;
 pub use domain::{
     is_intention_active, is_speculative_intention, validate_coding_revision,
@@ -69,9 +71,9 @@ pub use domain::{
 pub use fingerprint::{canonical_form, content_fingerprint, same_fingerprint};
 pub use infra::{
     AccessChecker, AccountRecord, AccountStore, AgentRecord, AgentRegistration, AgentStore,
-    BackupStore, ChatCognitiveExtractor, Clock, CodingStore, Embedder, EvidenceStore,
-    ExperienceStore, GrantStore, IntegrationStore, MemoryHubStore, MemoryStore, RelationStore,
-    Retriever, SessionRecord, SystemClock, TaskStore, TokenIntrospector,
+    BackupStore, ChatCognitiveExtractor, Clock, CodingStore, CognitiveProposalStore, Embedder,
+    EvidenceStore, ExperienceStore, GrantStore, IntegrationStore, MemoryHubStore, MemoryStore,
+    RelationStore, Retriever, SessionRecord, SystemClock, TaskStore, TokenIntrospector,
 };
 pub use integration_service::{
     IntegrationService, ResolveAction, ResolveRequest, ScanReport, ScanRequest,

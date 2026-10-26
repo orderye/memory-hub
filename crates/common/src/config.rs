@@ -4,7 +4,7 @@
 //! 非法配置必须在启动期失败（fail-fast），绝不带病进入运行态。
 
 use std::env;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use crate::profile::{DeploymentProfile, DEPLOYMENT_PROFILE_ENV};
 
@@ -183,6 +183,12 @@ pub struct AppConfig {
     pub max_request_bytes: usize,
     /// 允许的 Origin 白名单（空表示不校验，仅限本地桥接）
     pub allowed_origins: Vec<String>,
+    /// 可信反向代理列表（`TRUSTED_PROXIES`，精确 IP）。
+    ///
+    /// 仅当请求的 TCP 对端地址命中此列表时才解析 `X-Forwarded-For` 作为
+    /// 客户端 IP（用于登录/令牌/注册的 IP 维度限流）；为空（默认）时
+    /// 完全不信任 XFF，一律使用 socket 对端地址。
+    pub trusted_proxies: Vec<IpAddr>,
 
     // ===== 其他 =====
     pub log_redaction: String,
@@ -265,6 +271,29 @@ fn parse_list(key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// 解析 `TRUSTED_PROXIES`：逗号分隔的精确 IP 列表（IPv4/IPv6，不支持 CIDR）。
+///
+/// 这是"是否信任 X-Forwarded-For"的开关：列表里的地址是自家反向代理，
+/// 它们送来的 XFF 才会被解析；任何其他来源的 XFF 一律忽略。
+/// 非法值（非 IP 字面量）启动期 fail-fast——静默忽略一个写错的代理地址，
+/// 会让该代理后面的全部用户共享同一个限流桶（互相触发 429）。
+fn parse_trusted_proxies() -> anyhow::Result<Vec<IpAddr>> {
+    let Some(raw) = var("TRUSTED_PROXIES") else {
+        return Ok(Vec::new());
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<IpAddr>().map_err(|_| {
+                anyhow::anyhow!(
+                    "配置项 TRUSTED_PROXIES 含非法 IP 地址: {s}（仅支持精确 IP，不支持 CIDR）"
+                )
+            })
+        })
+        .collect()
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -322,6 +351,7 @@ impl Default for AppConfig {
             rate_limit_per_agent_rps: 50,
             max_request_bytes: 262_144,
             allowed_origins: Vec::new(),
+            trusted_proxies: Vec::new(),
             log_redaction: "always".to_string(),
         }
     }
@@ -455,6 +485,7 @@ impl AppConfig {
             parse_u32("RATE_LIMIT_PER_AGENT_RPS", cfg.rate_limit_per_agent_rps)?;
         cfg.max_request_bytes = parse_usize("MAX_REQUEST_BYTES", cfg.max_request_bytes)?;
         cfg.allowed_origins = parse_list("ALLOWED_ORIGINS");
+        cfg.trusted_proxies = parse_trusted_proxies()?;
 
         cfg.log_redaction = var_or("LOG_REDACTION", &cfg.log_redaction);
 
@@ -1089,6 +1120,47 @@ mod tests {
         assert!(!s.contains("supersecret"), "摘要不得泄露口令: {}", s);
         assert!(!s.contains("mem_app"), "摘要不得泄露用户名: {}", s);
         assert!(s.contains("db.internal:5432"));
+    }
+
+    #[test]
+    fn test_trusted_proxies_parsing() {
+        // 合法：IPv4 + IPv6 精确 IP
+        with_env(
+            &[("TRUSTED_PROXIES", Some("10.0.0.2, ::1 , 192.168.1.1"))],
+            || {
+                let cfg = AppConfig::from_env().unwrap();
+                assert_eq!(cfg.trusted_proxies.len(), 3);
+                assert!(cfg
+                    .trusted_proxies
+                    .contains(&"10.0.0.2".parse::<IpAddr>().unwrap()));
+                assert!(cfg
+                    .trusted_proxies
+                    .contains(&"::1".parse::<IpAddr>().unwrap()));
+            },
+        );
+
+        // 非法值 fail-fast：非 IP 字面量
+        with_env(&[("TRUSTED_PROXIES", Some("not-an-ip"))], || {
+            let err = AppConfig::from_env().unwrap_err();
+            assert!(
+                err.to_string().contains("TRUSTED_PROXIES"),
+                "错误信息应指明配置项：{err}"
+            );
+        });
+
+        // CIDR 不支持：必须显式拒绝，静默忽略会让代理后的用户互相挤占限流桶
+        with_env(&[("TRUSTED_PROXIES", Some("10.0.0.0/24"))], || {
+            assert!(
+                AppConfig::from_env().is_err(),
+                "CIDR 必须被拒绝（当前仅支持精确 IP）"
+            );
+        });
+
+        // 未配置 = 空列表（XFF 一律不信任）
+        with_env(&[("TRUSTED_PROXIES", None)], || {
+            let cfg = AppConfig::from_env().unwrap();
+            assert!(cfg.trusted_proxies.is_empty());
+        });
     }
 
     #[test]

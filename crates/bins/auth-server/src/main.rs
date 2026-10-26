@@ -13,6 +13,7 @@ use auth_web::oauth_router;
 use auth_web::{ensure_bootstrap_account, AccountService, AgentOAuthServer};
 use common::init_tracing;
 use mem_core::{AccountStore, MemoryHubStore};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::info;
 
@@ -105,6 +106,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         accounts,
         external_base_url: external_base,
         allowed_origins: cfg.allowed_origins.clone(),
+        trusted_proxies: cfg.trusted_proxies.clone(),
         rate_limiter: handle.rate_limiter,
     };
 
@@ -113,9 +115,15 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         .await
         .map_err(|e| anyhow!("绑定 {} 失败: {}", cfg.auth_bind, e))?;
     info!(bind = %cfg.auth_bind, "Auth Server 监听中");
-    axum::serve(listener, app)
-        .await
-        .map_err(|e| anyhow!("HTTP 服务退出: {}", e))?;
+    // ConnectInfo<SocketAddr>：让 handler 拿到真实 TCP 对端地址。
+    // IP 维度限流以它为准（TRUSTED_PROXIES 命中时才参考 XFF），
+    // 不带 connect_info 的话相关 extractor 会直接 panic。
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .map_err(|e| anyhow!("HTTP 服务退出: {}", e))?;
 
     Ok(())
 }

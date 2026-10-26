@@ -8,9 +8,10 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use common::{AccountId, AgentId, HubError, Result};
 use mem_core::{
-    AccountRecord, BackupRecord, CodingRevision, CodingStore, CodingThread, EvidenceSourceKind,
-    ExperienceStatus, IntegrationProposal, MemoryEntry, MemoryEvidence, MemoryExperience,
-    MemoryFilter, MemoryRelation, MemoryRelationKind, MemoryStats, MemoryStatus, MemoryTask,
+    AccountRecord, BackupRecord, CodingRevision, CodingStore, CodingThread,
+    CognitiveProposalRecord, CognitiveProposalStatus, EvidenceSourceKind, ExperienceStatus,
+    IntegrationProposal, MemoryEntry, MemoryEvidence, MemoryExperience, MemoryFilter,
+    MemoryRelation, MemoryRelationKind, MemoryStats, MemoryStatus, MemoryTask,
     MemoryTaskExperience, MemoryVersion, Namespace, NamespaceGrantRecord, NamespaceInfo,
     NewCodingRevision, NewCodingThread, NewEvidence, NewMemoryExperience, NewMemoryRelation,
     NewMemoryTask, ProposalStatus, Scored, SessionRecord, TaskStatus, VersionChange,
@@ -37,6 +38,7 @@ pub struct InMemoryHubStore {
     coding_revisions: RwLock<BTreeMap<(Namespace, Uuid), CodingRevision>>,
     backups: RwLock<BTreeMap<Uuid, BackupRecord>>,
     proposals: RwLock<BTreeMap<Uuid, IntegrationProposal>>,
+    cognitive_proposals: RwLock<BTreeMap<Uuid, CognitiveProposalRecord>>,
     namespaces: RwLock<BTreeMap<Namespace, NamespaceInfo>>,
     grants: RwLock<Vec<NamespaceGrantRecord>>,
     agents: RwLock<BTreeMap<AgentId, StoredAgent>>,
@@ -75,6 +77,8 @@ impl InMemoryHubStore {
 
     /// 写回条目。`expected_version` 为 `Some(v)` 时要求库中当前版本恰为 v，
     /// 否则返回 Conflict（与 PostgreSQL 实现同一语义）。`None` 为无条件写回。
+    /// 条目不存在时同样返回 Conflict：乐观锁的前提（该行存在且版本为 v）
+    /// 不成立，与 PG 侧 update 0 行 → Conflict 的行为对齐。
     async fn apply_revision(
         &self,
         entry: &MemoryEntry,
@@ -90,7 +94,7 @@ impl InMemoryHubStore {
                     Ok(entry.clone())
                 }
             },
-            None => Err(common::HubError::NotFound),
+            None => Err(common::HubError::Conflict),
         }
     }
 
@@ -246,10 +250,15 @@ impl mem_core::MemoryStore for InMemoryHubStore {
     }
 
     async fn save(&self, entry: &MemoryEntry) -> Result<MemoryEntry> {
-        self.items
-            .write()
-            .unwrap()
-            .insert((entry.namespace.clone(), entry.id), entry.clone());
+        // 契约：save 只保存已存在条目，不存在返回 NotFound（与 PostgreSQL
+        // 实现对齐——update 0 行受影响同样报 NotFound）。无条件 upsert 会
+        // 掩盖"调用方以为在更新、实则凭空新建"的分叉，内存测试验不出生产行为。
+        let mut w = self.items.write().unwrap();
+        let key = (entry.namespace.clone(), entry.id);
+        if !w.contains_key(&key) {
+            return Err(HubError::NotFound);
+        }
+        w.insert(key, entry.clone());
         Ok(entry.clone())
     }
 
@@ -598,6 +607,67 @@ impl mem_core::IntegrationStore for InMemoryHubStore {
                     s1 == s2
                 })
         }))
+    }
+}
+
+#[async_trait]
+impl mem_core::CognitiveProposalStore for InMemoryHubStore {
+    async fn save_cognitive_proposal(&self, p: &CognitiveProposalRecord) -> Result<()> {
+        let mut w = self.cognitive_proposals.write().unwrap();
+        if w.contains_key(&p.id) {
+            return Err(HubError::Conflict);
+        }
+        w.insert(p.id, p.clone());
+        Ok(())
+    }
+
+    async fn get_cognitive_proposal(&self, id: Uuid) -> Result<CognitiveProposalRecord> {
+        self.cognitive_proposals
+            .read()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .ok_or(HubError::NotFound)
+    }
+
+    async fn list_cognitive_proposals(
+        &self,
+        namespace: &str,
+        status: Option<CognitiveProposalStatus>,
+    ) -> Result<Vec<CognitiveProposalRecord>> {
+        let mut out: Vec<CognitiveProposalRecord> = self
+            .cognitive_proposals
+            .read()
+            .unwrap()
+            .values()
+            .filter(|p| p.namespace == namespace)
+            .filter(|p| status.is_none_or(|s| p.status == s))
+            .cloned()
+            .collect();
+        out.sort_by_key(|p| std::cmp::Reverse(p.created_at));
+        Ok(out)
+    }
+
+    async fn update_cognitive_proposal_status(
+        &self,
+        id: Uuid,
+        expected_status: CognitiveProposalStatus,
+        new_status: CognitiveProposalStatus,
+        rejection_reason: Option<&str>,
+        resulting_memory_id: Option<Uuid>,
+        resolved_by: Option<&str>,
+    ) -> Result<CognitiveProposalRecord> {
+        let mut w = self.cognitive_proposals.write().unwrap();
+        let p = w.get_mut(&id).ok_or(HubError::NotFound)?;
+        if p.status != expected_status {
+            return Err(HubError::Conflict);
+        }
+        p.status = new_status;
+        p.rejection_reason = rejection_reason.map(str::to_string);
+        p.resulting_memory_id = resulting_memory_id;
+        p.resolved_by = resolved_by.map(str::to_string);
+        p.updated_at = Utc::now();
+        Ok(p.clone())
     }
 }
 
@@ -1612,8 +1682,8 @@ pub fn stats_of(store: &InMemoryHubStore) -> MemoryStats {
 mod tests {
     use super::*;
     use mem_core::{
-        AccountStore, BackupStore, EvidenceStore, GrantStore, IntegrationStore, MemoryHubStore,
-        MemoryKind, MemoryScene, MemoryStore, RelationStore,
+        AccountStore, BackupStore, CognitiveProposalStore, EvidenceStore, GrantStore,
+        IntegrationStore, MemoryHubStore, MemoryKind, MemoryScene, MemoryStore, RelationStore,
     };
 
     fn entry(ns: &str, content: &str, key: Option<&str>) -> MemoryEntry {
@@ -1666,6 +1736,80 @@ mod tests {
         // 同 id 重复插入 → Conflict
         let err = store.insert(&a).await.unwrap_err();
         assert!(matches!(err, HubError::Conflict));
+    }
+
+    /// 契约锚定：save 只保存已存在条目（与 PostgreSQL 对齐，见 MemoryStore::save 文档）。
+    /// 此前内存实现是无条件 upsert，PG 是静默 no-op——双后端语义分叉，
+    /// 内存测试永远验不出生产丢写。
+    #[tokio::test]
+    async fn test_save_requires_existing_entry() {
+        let store = InMemoryHubStore::new();
+        let missing = entry("ns", "从未插入的条目", None);
+        let err = store.save(&missing).await.unwrap_err();
+        assert!(
+            matches!(err, HubError::NotFound),
+            "save 不存在 id 应返回 NotFound，实际 {err:?}"
+        );
+        // 也不得凭空新建
+        assert!(store.get("ns", missing.id).await.is_err());
+        assert_eq!(store.count_all(), 0);
+
+        // 已存在条目正常写回
+        let a = entry("ns", "初稿", None);
+        store.insert(&a).await.unwrap();
+        let mut updated = a.clone();
+        updated.content = "第二稿".to_string();
+        store.save(&updated).await.unwrap();
+        assert_eq!(store.get("ns", a.id).await.unwrap().content, "第二稿");
+    }
+
+    /// 契约锚定：revise 带乐观锁，版本不符返回 Conflict（与 PostgreSQL 对齐）；
+    /// 条目不存在同样按乐观锁前提不成立处理为 Conflict。
+    #[tokio::test]
+    async fn test_revise_conflict_contract() {
+        let store = InMemoryHubStore::new();
+        let a = entry("ns", "初稿", None);
+        store.insert(&a).await.unwrap();
+
+        // 正常修订：版本相符 → 成功并追加历史
+        let mut rev = a.clone();
+        rev.content = "第二稿".to_string();
+        rev.version += 1;
+        let saved = store
+            .revise(&rev, a.version, VersionChange::Updated)
+            .await
+            .unwrap();
+        assert_eq!(saved.version, 2);
+
+        // 版本不符（陈旧读）→ Conflict，且不留历史、不覆盖条目
+        let mut stale = a.clone();
+        stale.content = "陈旧稿".to_string();
+        stale.version += 1;
+        let err = store
+            .revise(&stale, a.version, VersionChange::Updated)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HubError::Conflict),
+            "revise 版本不符应返回 Conflict，实际 {err:?}"
+        );
+        assert_eq!(store.get("ns", a.id).await.unwrap().content, "第二稿");
+        assert_eq!(
+            store.versions(a.id).await.unwrap().len(),
+            1,
+            "冲突修订不得留下版本历史"
+        );
+
+        // 条目不存在 → Conflict（乐观锁前提不成立，与 PG update 0 行一致）
+        let missing = entry("ns", "不存在的条目", None);
+        let err = store
+            .revise(&missing, 1, VersionChange::Updated)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HubError::Conflict),
+            "revise 不存在条目应返回 Conflict，实际 {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -2188,5 +2332,131 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    // ===== 认知提案存储契约 =====
+
+    fn cognitive_proposal(ns: &str, status: CognitiveProposalStatus) -> CognitiveProposalRecord {
+        CognitiveProposalRecord {
+            id: Uuid::new_v4(),
+            namespace: ns.to_string(),
+            candidate: mem_core::CognitiveCandidate {
+                content: "候选内容".to_string(),
+                scene: mem_core::MemoryScene::Chat,
+                layer: mem_core::CognitiveLayer::Fact,
+                confidence: 0.9,
+                valid_from: None,
+                valid_until: None,
+                occurred_at: None,
+                tags: vec![],
+                metadata: serde_json::json!({}),
+                relation_kind: None,
+                target_memory_id: None,
+            },
+            source_evidence_id: Uuid::new_v4(),
+            status,
+            rejection_reason: None,
+            resulting_memory_id: None,
+            resolved_by: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// 认知提案完整生命周期：保存 → 读取 → 列表（状态过滤）→ 裁决推进 → 乐观锁
+    #[tokio::test]
+    async fn test_cognitive_proposal_lifecycle_contract() {
+        let store = InMemoryHubStore::new();
+
+        // 保存与读取（载荷 roundtrip）
+        let p1 = cognitive_proposal("cog-ns", CognitiveProposalStatus::PendingReview);
+        let p2 = cognitive_proposal("cog-ns", CognitiveProposalStatus::PendingReview);
+        let p_other_ns = cognitive_proposal("other-ns", CognitiveProposalStatus::PendingReview);
+        store.save_cognitive_proposal(&p1).await.unwrap();
+        store.save_cognitive_proposal(&p2).await.unwrap();
+        store.save_cognitive_proposal(&p_other_ns).await.unwrap();
+
+        let got = store.get_cognitive_proposal(p1.id).await.unwrap();
+        assert_eq!(got.id, p1.id);
+        assert_eq!(got.candidate, p1.candidate, "候选载荷必须无损往返");
+        assert_eq!(got.status, CognitiveProposalStatus::PendingReview);
+
+        // 读取不存在的提案 → NotFound
+        assert!(matches!(
+            store.get_cognitive_proposal(Uuid::new_v4()).await,
+            Err(HubError::NotFound)
+        ));
+
+        // 列表按命名空间过滤；状态过滤叠加
+        let all = store
+            .list_cognitive_proposals("cog-ns", None)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2);
+        let pending = store
+            .list_cognitive_proposals("cog-ns", Some(CognitiveProposalStatus::PendingReview))
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 2);
+
+        // 同 ID 重复保存 → Conflict（不做覆盖更新）
+        assert!(matches!(
+            store.save_cognitive_proposal(&p1).await,
+            Err(HubError::Conflict)
+        ));
+
+        // 裁决推进：pending_review → rejected
+        let updated = store
+            .update_cognitive_proposal_status(
+                p1.id,
+                CognitiveProposalStatus::PendingReview,
+                CognitiveProposalStatus::Rejected,
+                Some("不采用"),
+                None,
+                Some("reviewer-agent"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.status, CognitiveProposalStatus::Rejected);
+        assert_eq!(updated.rejection_reason.as_deref(), Some("不采用"));
+        assert_eq!(updated.resolved_by.as_deref(), Some("reviewer-agent"));
+
+        // 乐观锁：前置状态不匹配 → Conflict
+        assert!(matches!(
+            store
+                .update_cognitive_proposal_status(
+                    p1.id,
+                    CognitiveProposalStatus::PendingReview,
+                    CognitiveProposalStatus::Accepted,
+                    None,
+                    Some(Uuid::new_v4()),
+                    Some("reviewer-agent"),
+                )
+                .await,
+            Err(HubError::Conflict)
+        ));
+
+        // 不存在的提案 → NotFound（而不是 Conflict）
+        assert!(matches!(
+            store
+                .update_cognitive_proposal_status(
+                    Uuid::new_v4(),
+                    CognitiveProposalStatus::PendingReview,
+                    CognitiveProposalStatus::Accepted,
+                    None,
+                    None,
+                    None,
+                )
+                .await,
+            Err(HubError::NotFound)
+        ));
+
+        // 推进后列表只剩 1 条 pending
+        let pending = store
+            .list_cognitive_proposals("cog-ns", Some(CognitiveProposalStatus::PendingReview))
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, p2.id);
     }
 }
