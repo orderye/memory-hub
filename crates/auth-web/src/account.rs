@@ -101,7 +101,8 @@ impl AccountService {
             }
         }
 
-        let hash = hash_password(password)?;
+        // Argon2 为 CPU 密集计算，经 spawn_blocking 执行避免阻塞 tokio worker
+        let hash = hash_password_blocking(password.to_string()).await?;
         let account = self
             .store
             .create_account(&normalized, Some(&hash), display_name.trim())
@@ -121,7 +122,8 @@ impl AccountService {
             .password_hash_of(&account.username)
             .await?
             .ok_or_else(|| HubError::AuthRequired)?;
-        if !verify_password(password, &stored) {
+        // Argon2 为 CPU 密集计算，经 spawn_blocking 执行避免阻塞 tokio worker
+        if !verify_password_blocking(password.to_string(), stored).await {
             return Err(invalid_credentials());
         }
         if account.status != "active" {
@@ -234,7 +236,8 @@ pub async fn ensure_bootstrap_account(
         .await?;
     if let Some(password) = password.filter(|p| !p.trim().is_empty()) {
         validate_password(password)?;
-        let hash = hash_password(password)?;
+        // Argon2 为 CPU 密集计算，经 spawn_blocking 执行避免阻塞 tokio worker
+        let hash = hash_password_blocking(password.to_string()).await?;
         store.set_account_password(&account.id, &hash).await?;
         return store
             .get_account(&account.id)
@@ -293,6 +296,14 @@ pub fn hash_password(password: &str) -> Result<String> {
         .map_err(|e| HubError::Internal(anyhow::anyhow!("口令散列失败: {}", e)))
 }
 
+/// [`hash_password`] 的异步包装：Argon2 为 CPU 密集计算，
+/// 经 `spawn_blocking` 执行避免阻塞 tokio worker。参数以所有权传入满足 `Send + 'static`。
+pub async fn hash_password_blocking(password: String) -> Result<String> {
+    tokio::task::spawn_blocking(move || hash_password(&password))
+        .await
+        .expect("spawn_blocking 任务不应被取消")
+}
+
 /// 口令校验（散列结构非法一律判否）
 pub fn verify_password(password: &str, phc: &str) -> bool {
     match PasswordHash::new(phc) {
@@ -301,6 +312,13 @@ pub fn verify_password(password: &str, phc: &str) -> bool {
             .is_ok(),
         Err(_) => false,
     }
+}
+
+/// [`verify_password`] 的异步包装（同 [`hash_password_blocking`] 的理由）。
+pub async fn verify_password_blocking(password: String, phc: String) -> bool {
+    tokio::task::spawn_blocking(move || verify_password(&password, &phc))
+        .await
+        .expect("spawn_blocking 任务不应被取消")
 }
 
 /// 新会话令牌：32 字节随机 → hex（Cookie 持有原文，库中只存 sha256）

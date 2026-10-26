@@ -2744,6 +2744,345 @@ mod tests {
             )
             .await;
         assert!(!list_res.is_error, "列出意图应成功: {:?}", list_res);
+        let sc = list_res.structured_content.unwrap();
+        // 提案已持久化：list 必须能看到 propose 产出的待审提案
+        let listed = sc["proposals"].as_array().unwrap().clone();
+        assert_eq!(listed.len(), 1, "列出意图应包含待审认知提案");
+        assert_eq!(listed[0]["status"], "pending_review");
+        assert_eq!(listed[0]["id"], proposals[0]["id"]);
+
+        // 3. 带状态过滤
+        let filtered = d
+            .dispatch(
+                &auth,
+                "cognitive_intentions_list",
+                arg(json!({
+                    "namespace": "chat-ns",
+                    "status": "pending_review",
+                })),
+            )
+            .await;
+        assert!(!filtered.is_error);
+        assert_eq!(
+            filtered.structured_content.unwrap()["proposals"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let filtered_none = d
+            .dispatch(
+                &auth,
+                "cognitive_intentions_list",
+                arg(json!({
+                    "namespace": "chat-ns",
+                    "status": "accepted",
+                })),
+            )
+            .await;
+        assert!(filtered_none.structured_content.unwrap()["proposals"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    /// 端到端：propose → 裁决（采纳/驳回/编辑后合并）→ 提案状态推进
+    #[tokio::test]
+    async fn test_cognitive_proposal_resolve_accept_reject_modified() {
+        let (mut d, auth) = harness();
+        let mk_candidate = |content: &str| mem_core::CognitiveCandidate {
+            content: content.into(),
+            layer: mem_core::CognitiveLayer::Fact,
+            scene: mem_core::MemoryScene::Chat,
+            confidence: 0.9,
+            occurred_at: Some(chrono::Utc::now()),
+            valid_from: None,
+            valid_until: None,
+            tags: vec![],
+            target_memory_id: None,
+            relation_kind: None,
+            metadata: serde_json::json!({}),
+        };
+        let chat_svc = Arc::new(mem_core::ChatCognitiveService::new(
+            d.store.clone(),
+            Arc::new(
+                mem_core::testing::MockChatCognitiveExtractor::new().with_candidates(vec![
+                    mk_candidate("候选一：用户使用 Neovim"),
+                    mk_candidate("候选二：用户住在上海"),
+                    mk_candidate("候选三：团队用线性迭代"),
+                ]),
+            ),
+            mem_core::CognitivePolicy {
+                mode: mem_core::CognitiveGovernanceMode::Manual,
+                ..Default::default()
+            },
+        ));
+        d = d.with_chat_cognitive(chat_svc);
+
+        let prop_res = d
+            .dispatch(
+                &auth,
+                "cognitive_chat_propose",
+                arg(json!({
+                    "namespace": "resolve-ns",
+                    "turns": [{ "role": "user", "content": "介绍偏好" }],
+                })),
+            )
+            .await;
+        assert!(!prop_res.is_error, "{:?}", prop_res);
+        let proposals = prop_res.structured_content.unwrap()["proposals"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(proposals.len(), 3);
+        let id_of = |i: usize| proposals[i]["id"].as_str().unwrap().to_string();
+
+        // 驳回
+        let rej = d
+            .dispatch(
+                &auth,
+                "cognitive_proposal_resolve",
+                arg(json!({
+                    "proposal_id": id_of(0),
+                    "decision": "rejected",
+                    "reason": "不准确",
+                })),
+            )
+            .await;
+        assert!(!rej.is_error, "驳回应成功: {:?}", rej);
+        let sc = rej.structured_content.unwrap();
+        assert_eq!(sc["status"], "rejected");
+        assert!(sc["resulting_memory"].is_null());
+
+        // 采纳
+        let acc = d
+            .dispatch(
+                &auth,
+                "cognitive_proposal_resolve",
+                arg(json!({
+                    "proposal_id": id_of(1),
+                    "decision": "accepted",
+                })),
+            )
+            .await;
+        assert!(!acc.is_error, "采纳应成功: {:?}", acc);
+        let sc = acc.structured_content.unwrap();
+        assert_eq!(sc["status"], "accepted");
+        assert_eq!(sc["resulting_memory"]["content"], "候选二：用户住在上海");
+
+        // 编辑后合并
+        let modi = d
+            .dispatch(
+                &auth,
+                "cognitive_proposal_resolve",
+                arg(json!({
+                    "proposal_id": id_of(2),
+                    "decision": "modified",
+                    "custom_content": "团队用线性迭代（两周一个周期）",
+                })),
+            )
+            .await;
+        assert!(!modi.is_error, "编辑后合并应成功: {:?}", modi);
+        let sc = modi.structured_content.unwrap();
+        assert_eq!(sc["status"], "modified");
+        assert_eq!(
+            sc["resulting_memory"]["content"],
+            "团队用线性迭代（两周一个周期）"
+        );
+
+        // 已裁决提案再裁决 → Conflict
+        let again = d
+            .dispatch(
+                &auth,
+                "cognitive_proposal_resolve",
+                arg(json!({
+                    "proposal_id": id_of(1),
+                    "decision": "accepted",
+                })),
+            )
+            .await;
+        assert!(again.is_error, "重复裁决必须报错: {:?}", again);
+        assert_eq!(again.structured_content.unwrap()["code"], "E_CONFLICT");
+
+        // modified 缺 custom_content → InvalidArgument
+        let missing = d
+            .dispatch(
+                &auth,
+                "cognitive_proposal_resolve",
+                arg(json!({
+                    "proposal_id": id_of(2),
+                    "decision": "modified",
+                })),
+            )
+            .await;
+        assert!(missing.is_error);
+    }
+
+    /// modified 的 custom_content 未过候选校验（敏感凭证闸门）时：
+    /// 记忆不入库、提案停留 pending_review，修正后同一提案仍可合法裁决。
+    /// 这是 #18 原子性缺口的端到端守卫——校验失败绝不能让提案被
+    /// 错误推进成 accepted（那会造成"已入库但无法追溯"或重试 Conflict）。
+    #[tokio::test]
+    async fn test_cognitive_resolve_invalid_custom_content_keeps_proposal_pending() {
+        let (mut d, auth) = harness();
+        let mk_candidate = |content: &str| mem_core::CognitiveCandidate {
+            content: content.into(),
+            layer: mem_core::CognitiveLayer::Fact,
+            scene: mem_core::MemoryScene::Chat,
+            confidence: 0.9,
+            occurred_at: Some(chrono::Utc::now()),
+            valid_from: None,
+            valid_until: None,
+            tags: vec![],
+            target_memory_id: None,
+            relation_kind: None,
+            metadata: serde_json::json!({}),
+        };
+        let chat_svc = Arc::new(mem_core::ChatCognitiveService::new(
+            d.store.clone(),
+            Arc::new(
+                mem_core::testing::MockChatCognitiveExtractor::new()
+                    .with_candidates(vec![mk_candidate("候选：用户使用 Zed 编辑器")]),
+            ),
+            mem_core::CognitivePolicy {
+                mode: mem_core::CognitiveGovernanceMode::Manual,
+                ..Default::default()
+            },
+        ));
+        d = d.with_chat_cognitive(chat_svc);
+
+        let prop = d
+            .dispatch(
+                &auth,
+                "cognitive_chat_propose",
+                arg(json!({
+                    "namespace": "invalid-mod-ns",
+                    "turns": [{ "role": "user", "content": "介绍编辑器" }],
+                })),
+            )
+            .await;
+        assert!(!prop.is_error, "{:?}", prop);
+        let proposal_id = prop.structured_content.unwrap()["proposals"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // 修订正文携带真实形态的凭证：必须被候选校验拒绝
+        // （concat 拆分避免仓库级 secret scanning 误判为真实泄露）
+        let leaky = format!("密钥 {}", concat!("sk-proj-", "uxg4cgpiZt9k2mQw"));
+        let bad = d
+            .dispatch(
+                &auth,
+                "cognitive_proposal_resolve",
+                arg(json!({
+                    "proposal_id": proposal_id,
+                    "decision": "modified",
+                    "custom_content": leaky,
+                })),
+            )
+            .await;
+        assert!(bad.is_error, "敏感凭证修订必须被拒绝: {:?}", bad);
+        assert_eq!(
+            bad.structured_content.unwrap()["code"],
+            "E_INVALID_ARGUMENT"
+        );
+
+        // 提案必须停留待审（未被错误推进），且记忆未入库
+        let list = d
+            .dispatch(
+                &auth,
+                "cognitive_intentions_list",
+                arg(json!({ "namespace": "invalid-mod-ns", "status": "pending_review" })),
+            )
+            .await;
+        let pending = list.structured_content.unwrap()["proposals"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(pending.len(), 1, "校验失败后提案必须停留 pending_review");
+        assert_eq!(pending[0]["id"].as_str().unwrap(), proposal_id);
+
+        // 修正后的同一提案仍可正常走 modified 入库——不因上次失败而 Conflict
+        let fixed = d
+            .dispatch(
+                &auth,
+                "cognitive_proposal_resolve",
+                arg(json!({
+                    "proposal_id": proposal_id,
+                    "decision": "modified",
+                    "custom_content": "用户使用 Zed 编辑器（已修订）",
+                })),
+            )
+            .await;
+        assert!(!fixed.is_error, "修正后裁决应成功: {:?}", fixed);
+        let sc = fixed.structured_content.unwrap();
+        assert_eq!(sc["status"], "modified");
+        assert_eq!(
+            sc["resulting_memory"]["content"],
+            "用户使用 Zed 编辑器（已修订）"
+        );
+    }
+
+    /// ID 混用：整合提案 ID 传给 cognitive 裁决必须得到明确错误而非 NotFound
+    #[tokio::test]
+    async fn test_cognitive_resolve_rejects_integration_proposal_id_with_clear_error() {
+        let (d, auth) = harness();
+
+        // 制造一条真实存在的整合提案：写入两条同内容条目后扫描
+        for _ in 0..2 {
+            d.dispatch(
+                &auth,
+                "memory_put",
+                arg(json!({ "namespace": "mix-ns", "kind": "fact", "content": "完全相同的重复内容" })),
+            )
+            .await;
+        }
+        let scan = d
+            .dispatch(
+                &auth,
+                "memory_integrate_scan",
+                arg(json!({ "namespace": "mix-ns", "dry_run": false })),
+            )
+            .await;
+        assert!(!scan.is_error, "扫描应成功: {:?}", scan);
+        let integration_id = scan.structured_content.unwrap()["proposals"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // 拿整合提案 ID 调认知裁决：必须得到明确错误
+        let res = d
+            .dispatch(
+                &auth,
+                "cognitive_proposal_resolve",
+                arg(json!({
+                    "proposal_id": integration_id,
+                    "decision": "accepted",
+                })),
+            )
+            .await;
+        assert!(res.is_error, "整合 ID 调认知裁决必须报错: {:?}", res);
+        let sc = res.structured_content.unwrap();
+        assert_eq!(sc["code"], "E_INVALID_ARGUMENT");
+        let msg = sc["message_zh"].as_str().unwrap();
+        assert!(
+            msg.contains("整合提案") && msg.contains("memory_integration_resolve"),
+            "错误信息须指明提案类型与正确入口: {msg}"
+        );
+
+        // 纯随机 ID（两套空间都不存在）仍是 NotFound
+        let ghost = d
+            .dispatch(
+                &auth,
+                "cognitive_proposal_resolve",
+                arg(json!({
+                    "proposal_id": uuid::Uuid::new_v4().to_string(),
+                    "decision": "accepted",
+                })),
+            )
+            .await;
+        assert!(ghost.is_error);
+        assert_eq!(ghost.structured_content.unwrap()["code"], "E_NOT_FOUND");
     }
 
     // ===== 整合模式：MCP 兼容性与覆盖闸门 =====

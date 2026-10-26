@@ -357,6 +357,144 @@ impl DefaultBackupService {
         store.save_backup(&record).await?;
         Ok(Some(record))
     }
+
+    /// 系统级 v4 快照构建：定时备份作业（worker）不经 AuthCtx、无请求账户，
+    /// 按存储层内部命名空间键（`{account}/{namespace}`）解析出归属账户，
+    /// 经 `AccountScopedStore` 收集全部实体。由此产出的载荷与 `create` 手工备份
+    /// 同构（实体为用户可见命名空间名），可原样走服务层 restore；校验和复用
+    /// v4 算法。无账户前缀的裸命名空间（生产不应出现；测试/遗留数据）退化为
+    /// 原始存储直读，保持与旧 v1 定时快照一致的可见性边界。
+    pub async fn system_snapshot(
+        store: &Arc<dyn MemoryHubStore>,
+        namespace: &str,
+        created_by: &common::AgentId,
+        note: Option<String>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<BackupRecord> {
+        // 内部键形态：`{account}/{ns}`；用户可见名不含 `/`，split_once 不会切错
+        let scoped_account = namespace
+            .split_once(crate::account_scope::SCOPE_SEPARATOR)
+            .and_then(|(acct, _)| Uuid::parse_str(acct).ok());
+
+        match scoped_account {
+            Some(account) => {
+                let visible_ns = crate::account_scope::unscope_name(&account, namespace);
+                let scoped = crate::account_scope::AccountScopedStore::new(store.clone(), account);
+                let entries = scoped.all_in_namespace(&visible_ns, true).await?;
+                let evidences = scoped.all_evidence_in_namespace(&visible_ns).await?;
+                let relations = scoped.all_relations_in_namespace(&visible_ns).await?;
+                let tasks = scoped.all_tasks_in_namespace(&visible_ns).await?;
+                let experiences = scoped.all_experiences_in_namespace(&visible_ns).await?;
+                let task_experiences = scoped
+                    .all_task_experiences_in_namespace(&visible_ns)
+                    .await?;
+                let coding_threads = scoped.all_threads_in_namespace(&visible_ns).await?;
+                let coding_revisions = scoped.all_revisions_in_namespace(&visible_ns).await?;
+                let record = BackupRecord {
+                    id: Uuid::new_v4(),
+                    namespace: visible_ns.clone(),
+                    created_by: created_by.clone(),
+                    note,
+                    entry_count: entries.len(),
+                    checksum: Self::checksum_v4(
+                        &entries,
+                        &evidences,
+                        &relations,
+                        &tasks,
+                        &experiences,
+                        &task_experiences,
+                        &coding_threads,
+                        &coding_revisions,
+                    ),
+                    payload: Self::payload_of(
+                        &visible_ns,
+                        &entries,
+                        &evidences,
+                        &relations,
+                        &tasks,
+                        &experiences,
+                        &task_experiences,
+                        &coding_threads,
+                        &coding_revisions,
+                    ),
+                    retain_until: None,
+                    created_at: now,
+                };
+                // 经作用域包装器落库：存储键回到内部形态，与手工备份同一存放规则
+                scoped.save_backup(&record).await?;
+                Ok(record)
+            }
+            None => {
+                let entries = store.all_in_namespace(namespace, true).await?;
+                let evidences = store.all_evidence_in_namespace(namespace).await?;
+                let relations = store.all_relations_in_namespace(namespace).await?;
+                let tasks = store.all_tasks_in_namespace(namespace).await?;
+                let experiences = store.all_experiences_in_namespace(namespace).await?;
+                let task_experiences = store.all_task_experiences_in_namespace(namespace).await?;
+                let coding_threads = store.all_threads_in_namespace(namespace).await?;
+                let coding_revisions = store.all_revisions_in_namespace(namespace).await?;
+                let record = BackupRecord {
+                    id: Uuid::new_v4(),
+                    namespace: namespace.to_string(),
+                    created_by: created_by.clone(),
+                    note,
+                    entry_count: entries.len(),
+                    checksum: Self::checksum_v4(
+                        &entries,
+                        &evidences,
+                        &relations,
+                        &tasks,
+                        &experiences,
+                        &task_experiences,
+                        &coding_threads,
+                        &coding_revisions,
+                    ),
+                    payload: Self::payload_of(
+                        namespace,
+                        &entries,
+                        &evidences,
+                        &relations,
+                        &tasks,
+                        &experiences,
+                        &task_experiences,
+                        &coding_threads,
+                        &coding_revisions,
+                    ),
+                    retain_until: None,
+                    created_at: now,
+                };
+                store.save_backup(&record).await?;
+                Ok(record)
+            }
+        }
+    }
+
+    /// 记一次恢复失败：计数并保留首条错误（作汇总日志摘要）
+    fn tally_failure(count: &mut usize, first_err: &mut Option<HubError>, e: HubError) {
+        if first_err.is_none() {
+            *first_err = Some(e);
+        }
+        *count += 1;
+    }
+
+    /// 每类实体恢复完成后输出一条汇总告警（不逐条打日志刷屏）
+    fn warn_restore_failures(
+        kind: &str,
+        namespace: &str,
+        failed: usize,
+        first_err: &Option<HubError>,
+    ) {
+        if failed == 0 {
+            return;
+        }
+        tracing::warn!(
+            entity = kind,
+            namespace = %namespace,
+            failed,
+            first_error = ?first_err.as_ref().map(|e| e.to_string()),
+            "恢复部分实体失败（已跳过并继续，详见 RestoreReport 失败计数）"
+        );
+    }
 }
 
 #[async_trait]
@@ -557,6 +695,14 @@ impl BackupService for DefaultBackupService {
             updated: 0,
             unchanged: 0,
             safety_backup_id: None,
+            safety_backup_ids: Vec::new(),
+            failed_evidences: 0,
+            failed_relations: 0,
+            failed_tasks: 0,
+            failed_experiences: 0,
+            failed_task_links: 0,
+            failed_threads: 0,
+            failed_revisions: 0,
         };
 
         if req.mode == RestoreMode::DryRun {
@@ -564,7 +710,10 @@ impl BackupService for DefaultBackupService {
                 match store.get(&e.namespace, e.id).await {
                     Ok(cur) if cur == *e => report.unchanged += 1,
                     Ok(_) => report.updated += 1,
-                    Err(_) => report.created += 1,
+                    // 只有 NotFound 计为"将新建"；其他存储错误是真实故障，不应
+                    // 被预演报告伪装成 created，上抛让调用方感知
+                    Err(HubError::NotFound) => report.created += 1,
+                    Err(e) => return Err(e),
                 }
             }
             return Ok(report);
@@ -587,11 +736,15 @@ impl BackupService for DefaultBackupService {
         namespaces.dedup();
 
         if req.mode == RestoreMode::Replace {
-            // 先为每个受影响的命名空间创建安全备份
+            // 先为每个受影响的命名空间创建安全备份（逐个记录，多命名空间时不互相覆盖）
             for ns in &namespaces {
                 self.require_write(auth, ns).await?;
                 if let Some(safety) = self.create_safety_backup(auth, ns).await? {
-                    report.safety_backup_id = Some(safety.id);
+                    if report.safety_backup_id.is_none() {
+                        // 兼容旧消费方：单数形式保留第一个
+                        report.safety_backup_id = Some(safety.id);
+                    }
+                    report.safety_backup_ids.push(safety.id);
                 }
             }
             // 清空当前状态：按外键依赖逆序由子表到父表深度清空，保证无脏数据且无外键阻塞
@@ -654,9 +807,15 @@ impl BackupService for DefaultBackupService {
             }
         }
 
+        // 以下各实体的恢复遵循同一取舍：**单条失败不中止恢复**。
+        // 部分恢复优于全不恢复——replace 模式在清空前已创建安全备份，
+        // 即使恢复结果不完整，也能按安全备份重放找回现场；失败只计数、
+        // 每类实体汇总一条告警（namespace + 失败数 + 首条错误摘要），避免逐条刷屏。
+
         // 恢复证据存根
+        let mut first_err: Option<HubError> = None;
         for ev in &evidences {
-            let _ = store
+            if let Err(e) = store
                 .append_evidence(&NewEvidence {
                     id: Some(ev.id),
                     namespace: ev.namespace.clone(),
@@ -667,8 +826,17 @@ impl BackupService for DefaultBackupService {
                     occurred_at: ev.occurred_at,
                     expires_at: ev.expires_at,
                 })
-                .await;
+                .await
+            {
+                Self::tally_failure(&mut report.failed_evidences, &mut first_err, e);
+            }
         }
+        Self::warn_restore_failures(
+            "evidences",
+            &backup.namespace,
+            report.failed_evidences,
+            &first_err,
+        );
 
         for mut e in entries.clone() {
             match store.get(&e.namespace, e.id).await {
@@ -697,6 +865,7 @@ impl BackupService for DefaultBackupService {
         }
 
         // 恢复实体关系网
+        let mut first_err: Option<HubError> = None;
         for rel in &relations {
             let rel_ns = if let Some(ref ns) = rel.namespace {
                 ns.clone()
@@ -709,7 +878,7 @@ impl BackupService for DefaultBackupService {
                     .map(|e| e.namespace.clone())
                     .unwrap_or_else(|| backup.namespace.clone())
             };
-            let _ = store
+            if let Err(e) = store
                 .add_relation(
                     &rel_ns,
                     &NewMemoryRelation {
@@ -720,12 +889,22 @@ impl BackupService for DefaultBackupService {
                         source_evidence_id: rel.source_evidence_id,
                     },
                 )
-                .await;
+                .await
+            {
+                Self::tally_failure(&mut report.failed_relations, &mut first_err, e);
+            }
         }
+        Self::warn_restore_failures(
+            "relations",
+            &backup.namespace,
+            report.failed_relations,
+            &first_err,
+        );
 
         // 恢复任务事实
+        let mut first_err: Option<HubError> = None;
         for t in &tasks {
-            let _ = store
+            if let Err(e) = store
                 .create_task(&NewMemoryTask {
                     id: Some(t.id),
                     namespace: t.namespace.clone(),
@@ -739,12 +918,17 @@ impl BackupService for DefaultBackupService {
                     source_evidence_id: t.source_evidence_id,
                     metadata: t.metadata.clone(),
                 })
-                .await;
+                .await
+            {
+                Self::tally_failure(&mut report.failed_tasks, &mut first_err, e);
+            }
         }
+        Self::warn_restore_failures("tasks", &backup.namespace, report.failed_tasks, &first_err);
 
         // 恢复经验记忆
+        let mut first_err: Option<HubError> = None;
         for exp in &experiences {
-            let _ = store
+            if let Err(e) = store
                 .save_experience(&NewMemoryExperience {
                     id: Some(exp.id),
                     namespace: exp.namespace.clone(),
@@ -759,10 +943,20 @@ impl BackupService for DefaultBackupService {
                     status: exp.status,
                     feedback_score: exp.feedback_score,
                 })
-                .await;
+                .await
+            {
+                Self::tally_failure(&mut report.failed_experiences, &mut first_err, e);
+            }
         }
+        Self::warn_restore_failures(
+            "experiences",
+            &backup.namespace,
+            report.failed_experiences,
+            &first_err,
+        );
 
         // 恢复任务-经验关联映射
+        let mut first_err: Option<HubError> = None;
         for mut te in task_experiences {
             if te.namespace.is_none() {
                 let inferred = tasks
@@ -774,12 +968,21 @@ impl BackupService for DefaultBackupService {
                     });
                 te.namespace = inferred;
             }
-            let _ = store.link_task_experience(&te).await;
+            if let Err(e) = store.link_task_experience(&te).await {
+                Self::tally_failure(&mut report.failed_task_links, &mut first_err, e);
+            }
         }
+        Self::warn_restore_failures(
+            "task_experiences",
+            &backup.namespace,
+            report.failed_task_links,
+            &first_err,
+        );
 
         // 恢复代码演进线程
+        let mut first_err: Option<HubError> = None;
         for th in &coding_threads {
-            let _ = store
+            if let Err(e) = store
                 .create_thread(&NewCodingThread {
                     id: Some(th.id),
                     namespace: th.namespace.clone(),
@@ -789,12 +992,22 @@ impl BackupService for DefaultBackupService {
                     title: th.title.clone(),
                     description: th.description.clone(),
                 })
-                .await;
+                .await
+            {
+                Self::tally_failure(&mut report.failed_threads, &mut first_err, e);
+            }
         }
+        Self::warn_restore_failures(
+            "coding_threads",
+            &backup.namespace,
+            report.failed_threads,
+            &first_err,
+        );
 
         // 恢复代码修订记录
+        let mut first_err: Option<HubError> = None;
         for rev in &coding_revisions {
-            let _ = store
+            if let Err(e) = store
                 .save_revision(
                     &NewCodingRevision {
                         id: Some(rev.id),
@@ -816,8 +1029,17 @@ impl BackupService for DefaultBackupService {
                     },
                     &rev.diff_hash,
                 )
-                .await;
+                .await
+            {
+                Self::tally_failure(&mut report.failed_revisions, &mut first_err, e);
+            }
         }
+        Self::warn_restore_failures(
+            "coding_revisions",
+            &backup.namespace,
+            report.failed_revisions,
+            &first_err,
+        );
 
         Ok(report)
     }
@@ -2605,6 +2827,719 @@ mod tests {
             matches!(err, HubError::Internal(_)),
             "校验和篡改必须直接拒绝"
         );
+    }
+
+    #[tokio::test]
+    async fn test_restore_counts_partial_failures_and_continues() {
+        // 替身 store：第一条 relation 的 add_relation 返回 Err，
+        // 其余操作全部透传内层存储——验证恢复不中止、失败计数准确。
+        #[derive(Default)]
+        struct FailingRelationStore {
+            inner: crate::testing::TestHubStore,
+            fail_relation_payloads: std::sync::Mutex<std::collections::HashSet<String>>,
+        }
+
+        #[async_trait]
+        impl MemoryStore for FailingRelationStore {
+            async fn insert(&self, e: &MemoryEntry) -> Result<MemoryEntry> {
+                self.inner.insert(e).await
+            }
+            async fn insert_initial(&self, e: &MemoryEntry) -> Result<MemoryEntry> {
+                self.inner.insert_initial(e).await
+            }
+            async fn get(&self, ns: &str, id: Uuid) -> Result<MemoryEntry> {
+                self.inner.get(ns, id).await
+            }
+            async fn get_by_key(&self, ns: &str, key: &str) -> Result<Option<MemoryEntry>> {
+                self.inner.get_by_key(ns, key).await
+            }
+            async fn save(&self, e: &MemoryEntry) -> Result<MemoryEntry> {
+                self.inner.save(e).await
+            }
+            async fn delete(&self, ns: &str, id: Uuid) -> Result<()> {
+                self.inner.delete(ns, id).await
+            }
+            async fn list(&self, filter: &MemoryFilter) -> Result<Vec<MemoryEntry>> {
+                self.inner.list(filter).await
+            }
+            async fn count(&self, filter: &MemoryFilter) -> Result<usize> {
+                self.inner.count(filter).await
+            }
+            async fn similar(
+                &self,
+                filter: &MemoryFilter,
+                qv: &[f32],
+                k: usize,
+            ) -> Result<Vec<crate::domain::Scored<MemoryEntry>>> {
+                self.inner.similar(filter, qv, k).await
+            }
+            async fn all_in_namespace(
+                &self,
+                ns: &str,
+                include_merged: bool,
+            ) -> Result<Vec<MemoryEntry>> {
+                self.inner.all_in_namespace(ns, include_merged).await
+            }
+            async fn list_namespaces(&self) -> Result<Vec<String>> {
+                self.inner.list_namespaces().await
+            }
+            async fn record_version(&self, v: &MemoryVersion) -> Result<()> {
+                self.inner.record_version(v).await
+            }
+            async fn versions(&self, id: Uuid) -> Result<Vec<MemoryVersion>> {
+                self.inner.versions(id).await
+            }
+            async fn archive_expired(&self, _now: chrono::DateTime<chrono::Utc>) -> Result<usize> {
+                Ok(0)
+            }
+            async fn ping(&self) -> Result<()> {
+                self.inner.ping().await
+            }
+            async fn save_if_version(
+                &self,
+                entry: &MemoryEntry,
+                expected_version: i64,
+            ) -> Result<MemoryEntry> {
+                self.inner.save_if_version(entry, expected_version).await
+            }
+            async fn revise(
+                &self,
+                entry: &MemoryEntry,
+                expected_version: i64,
+                change: VersionChange,
+            ) -> Result<MemoryEntry> {
+                self.inner.revise(entry, expected_version, change).await
+            }
+        }
+
+        #[async_trait]
+        impl crate::infra::BackupStore for FailingRelationStore {
+            async fn save_backup(&self, b: &BackupRecord) -> Result<()> {
+                self.inner.save_backup(b).await
+            }
+            async fn get_backup(&self, id: Uuid) -> Result<BackupRecord> {
+                self.inner.get_backup(id).await
+            }
+            async fn list_backups(&self, ns: Option<&str>) -> Result<Vec<BackupRecord>> {
+                self.inner.list_backups(ns).await
+            }
+            async fn delete_backup(&self, id: Uuid) -> Result<()> {
+                self.inner.delete_backup(id).await
+            }
+        }
+
+        #[async_trait]
+        impl crate::infra::IntegrationStore for FailingRelationStore {
+            async fn save_proposal(&self, p: &IntegrationProposal) -> Result<()> {
+                self.inner.save_proposal(p).await
+            }
+            async fn get_proposal(&self, id: Uuid) -> Result<IntegrationProposal> {
+                self.inner.get_proposal(id).await
+            }
+            async fn list_proposals(
+                &self,
+                ns: &str,
+                status: Option<ProposalStatus>,
+            ) -> Result<Vec<IntegrationProposal>> {
+                self.inner.list_proposals(ns, status).await
+            }
+            async fn open_exists(&self, ns: &str, members: &[(String, Vec<Uuid>)]) -> Result<bool> {
+                self.inner.open_exists(ns, members).await
+            }
+        }
+
+        #[async_trait]
+        impl crate::infra::CognitiveProposalStore for FailingRelationStore {
+            async fn save_cognitive_proposal(
+                &self,
+                p: &crate::domain::CognitiveProposalRecord,
+            ) -> Result<()> {
+                self.inner.save_cognitive_proposal(p).await
+            }
+            async fn get_cognitive_proposal(
+                &self,
+                id: Uuid,
+            ) -> Result<crate::domain::CognitiveProposalRecord> {
+                self.inner.get_cognitive_proposal(id).await
+            }
+            async fn list_cognitive_proposals(
+                &self,
+                ns: &str,
+                status: Option<crate::domain::CognitiveProposalStatus>,
+            ) -> Result<Vec<crate::domain::CognitiveProposalRecord>> {
+                self.inner.list_cognitive_proposals(ns, status).await
+            }
+            async fn update_cognitive_proposal_status(
+                &self,
+                id: Uuid,
+                expected_status: crate::domain::CognitiveProposalStatus,
+                new_status: crate::domain::CognitiveProposalStatus,
+                rejection_reason: Option<&str>,
+                resulting_memory_id: Option<Uuid>,
+                resolved_by: Option<&str>,
+            ) -> Result<crate::domain::CognitiveProposalRecord> {
+                self.inner
+                    .update_cognitive_proposal_status(
+                        id,
+                        expected_status,
+                        new_status,
+                        rejection_reason,
+                        resulting_memory_id,
+                        resolved_by,
+                    )
+                    .await
+            }
+        }
+
+        #[async_trait]
+        impl crate::infra::GrantStore for FailingRelationStore {
+            async fn ensure_namespace(
+                &self,
+                ns: &str,
+                owner: &AgentId,
+            ) -> Result<(NamespaceInfo, bool)> {
+                self.inner.ensure_namespace(ns, owner).await
+            }
+            async fn get_namespace(&self, ns: &str) -> Result<Option<NamespaceInfo>> {
+                self.inner.get_namespace(ns).await
+            }
+            async fn list_namespace_infos(&self) -> Result<Vec<NamespaceInfo>> {
+                self.inner.list_namespace_infos().await
+            }
+            async fn grant(&self, r: &NamespaceGrantRecord) -> Result<()> {
+                self.inner.grant(r).await
+            }
+            async fn revoke(&self, ns: &str, agent: &AgentId) -> Result<()> {
+                self.inner.revoke(ns, agent).await
+            }
+            async fn grants_for(&self, agent: &AgentId) -> Result<Vec<NamespaceGrantRecord>> {
+                self.inner.grants_for(agent).await
+            }
+            async fn can_read(&self, ns: &str, agent: &AgentId) -> Result<bool> {
+                self.inner.can_read(ns, agent).await
+            }
+            async fn can_write(&self, ns: &str, agent: &AgentId) -> Result<bool> {
+                self.inner.can_write(ns, agent).await
+            }
+            async fn owned_namespaces(&self, agent: &AgentId) -> Result<Vec<String>> {
+                self.inner.owned_namespaces(agent).await
+            }
+        }
+
+        #[async_trait]
+        impl crate::infra::AgentStore for FailingRelationStore {
+            async fn register_agent(
+                &self,
+                reg: &crate::infra::AgentRegistration,
+            ) -> Result<crate::infra::AgentRecord> {
+                self.inner.register_agent(reg).await
+            }
+            async fn get_agent(
+                &self,
+                agent_id: &AgentId,
+            ) -> Result<Option<crate::infra::AgentRecord>> {
+                self.inner.get_agent(agent_id).await
+            }
+            async fn list_agents(&self) -> Result<Vec<crate::infra::AgentRecord>> {
+                self.inner.list_agents().await
+            }
+            async fn set_agent_status(&self, agent_id: &AgentId, status: &str) -> Result<()> {
+                self.inner.set_agent_status(agent_id, status).await
+            }
+            async fn verify_agent_secret(&self, agent_id: &AgentId, secret: &str) -> Result<bool> {
+                self.inner.verify_agent_secret(agent_id, secret).await
+            }
+        }
+
+        #[async_trait]
+        impl EvidenceStore for FailingRelationStore {
+            async fn append_evidence(&self, ev: &NewEvidence) -> Result<MemoryEvidence> {
+                self.inner.append_evidence(ev).await
+            }
+            async fn get_evidence(&self, ns: &str, id: Uuid) -> Result<MemoryEvidence> {
+                self.inner.get_evidence(ns, id).await
+            }
+            async fn list_evidence(
+                &self,
+                ns: &str,
+                source_kind: Option<EvidenceSourceKind>,
+                source_ref: Option<&str>,
+                limit: usize,
+            ) -> Result<Vec<MemoryEvidence>> {
+                self.inner
+                    .list_evidence(ns, source_kind, source_ref, limit)
+                    .await
+            }
+            async fn all_evidence_in_namespace(&self, ns: &str) -> Result<Vec<MemoryEvidence>> {
+                self.inner.all_evidence_in_namespace(ns).await
+            }
+            async fn delete_evidence(&self, ns: &str, id: Uuid) -> Result<()> {
+                self.inner.delete_evidence(ns, id).await
+            }
+            async fn purge_expired_evidence(
+                &self,
+                ns: &str,
+                now: chrono::DateTime<chrono::Utc>,
+            ) -> Result<usize> {
+                self.inner.purge_expired_evidence(ns, now).await
+            }
+        }
+
+        #[async_trait]
+        impl RelationStore for FailingRelationStore {
+            async fn add_relation(
+                &self,
+                ns: &str,
+                rel: &NewMemoryRelation,
+            ) -> Result<MemoryRelation> {
+                let key = format!(
+                    "{}|{}|{}|{:?}",
+                    ns, rel.from_memory_id, rel.to_memory_id, rel.relation_kind
+                );
+                if self.fail_relation_payloads.lock().unwrap().contains(&key) {
+                    return Err(HubError::Unavailable);
+                }
+                self.inner.add_relation(ns, rel).await
+            }
+            async fn list_relations_from(
+                &self,
+                ns: &str,
+                from_memory_id: Uuid,
+            ) -> Result<Vec<MemoryRelation>> {
+                self.inner.list_relations_from(ns, from_memory_id).await
+            }
+            async fn list_relations_to(
+                &self,
+                ns: &str,
+                to_memory_id: Uuid,
+            ) -> Result<Vec<MemoryRelation>> {
+                self.inner.list_relations_to(ns, to_memory_id).await
+            }
+            async fn delete_relation(
+                &self,
+                ns: &str,
+                from_memory_id: Uuid,
+                to_memory_id: Uuid,
+                relation_kind: MemoryRelationKind,
+            ) -> Result<()> {
+                self.inner
+                    .delete_relation(ns, from_memory_id, to_memory_id, relation_kind)
+                    .await
+            }
+            async fn all_relations_in_namespace(&self, ns: &str) -> Result<Vec<MemoryRelation>> {
+                self.inner.all_relations_in_namespace(ns).await
+            }
+        }
+
+        #[async_trait]
+        impl TaskStore for FailingRelationStore {
+            async fn create_task(&self, task: &NewMemoryTask) -> Result<MemoryTask> {
+                self.inner.create_task(task).await
+            }
+            async fn update_task(&self, task: &MemoryTask) -> Result<MemoryTask> {
+                self.inner.update_task(task).await
+            }
+            async fn get_task(&self, namespace: &str, id: Uuid) -> Result<Option<MemoryTask>> {
+                self.inner.get_task(namespace, id).await
+            }
+            async fn list_tasks(
+                &self,
+                namespace: &str,
+                status: Option<TaskStatus>,
+                limit: usize,
+            ) -> Result<Vec<MemoryTask>> {
+                self.inner.list_tasks(namespace, status, limit).await
+            }
+            async fn all_tasks_in_namespace(&self, namespace: &str) -> Result<Vec<MemoryTask>> {
+                self.inner.all_tasks_in_namespace(namespace).await
+            }
+            async fn delete_task(&self, namespace: &str, id: Uuid) -> Result<()> {
+                self.inner.delete_task(namespace, id).await
+            }
+        }
+
+        #[async_trait]
+        impl ExperienceStore for FailingRelationStore {
+            async fn save_experience(
+                &self,
+                experience: &NewMemoryExperience,
+            ) -> Result<MemoryExperience> {
+                self.inner.save_experience(experience).await
+            }
+            async fn update_experience(
+                &self,
+                experience: &MemoryExperience,
+            ) -> Result<MemoryExperience> {
+                self.inner.update_experience(experience).await
+            }
+            async fn get_experience(
+                &self,
+                namespace: &str,
+                id: Uuid,
+            ) -> Result<Option<MemoryExperience>> {
+                self.inner.get_experience(namespace, id).await
+            }
+            async fn list_experiences(
+                &self,
+                namespace: &str,
+                status: Option<ExperienceStatus>,
+                limit: usize,
+                offset: usize,
+            ) -> Result<Vec<MemoryExperience>> {
+                self.inner
+                    .list_experiences(namespace, status, limit, offset)
+                    .await
+            }
+            async fn link_task_experience(&self, link: &MemoryTaskExperience) -> Result<()> {
+                self.inner.link_task_experience(link).await
+            }
+            async fn list_experiences_for_task(
+                &self,
+                task_id: Uuid,
+            ) -> Result<Vec<MemoryTaskExperience>> {
+                self.inner.list_experiences_for_task(task_id).await
+            }
+            async fn all_experiences_in_namespace(
+                &self,
+                namespace: &str,
+            ) -> Result<Vec<MemoryExperience>> {
+                self.inner.all_experiences_in_namespace(namespace).await
+            }
+            async fn all_task_experiences_in_namespace(
+                &self,
+                namespace: &str,
+            ) -> Result<Vec<MemoryTaskExperience>> {
+                self.inner
+                    .all_task_experiences_in_namespace(namespace)
+                    .await
+            }
+            async fn delete_experience(&self, namespace: &str, id: Uuid) -> Result<()> {
+                self.inner.delete_experience(namespace, id).await
+            }
+        }
+
+        #[async_trait]
+        impl CodingStore for FailingRelationStore {
+            async fn create_thread(&self, thread: &NewCodingThread) -> Result<CodingThread> {
+                self.inner.create_thread(thread).await
+            }
+            async fn get_thread(&self, namespace: &str, id: Uuid) -> Result<Option<CodingThread>> {
+                self.inner.get_thread(namespace, id).await
+            }
+            async fn list_threads(
+                &self,
+                namespace: &str,
+                repository: Option<&str>,
+                limit: usize,
+            ) -> Result<Vec<CodingThread>> {
+                self.inner.list_threads(namespace, repository, limit).await
+            }
+            async fn save_revision(
+                &self,
+                revision: &NewCodingRevision,
+                diff_hash: &str,
+            ) -> Result<CodingRevision> {
+                self.inner.save_revision(revision, diff_hash).await
+            }
+            async fn get_revision(
+                &self,
+                namespace: &str,
+                id: Uuid,
+            ) -> Result<Option<CodingRevision>> {
+                self.inner.get_revision(namespace, id).await
+            }
+            async fn get_revision_by_hash(
+                &self,
+                namespace: &str,
+                repository: &str,
+                diff_hash: &str,
+            ) -> Result<Option<CodingRevision>> {
+                self.inner
+                    .get_revision_by_hash(namespace, repository, diff_hash)
+                    .await
+            }
+            async fn list_revisions_for_thread(
+                &self,
+                namespace: &str,
+                thread_id: Uuid,
+                limit: usize,
+            ) -> Result<Vec<CodingRevision>> {
+                self.inner
+                    .list_revisions_for_thread(namespace, thread_id, limit)
+                    .await
+            }
+            async fn list_revisions_for_file(
+                &self,
+                namespace: &str,
+                repository: &str,
+                file_path: &str,
+                limit: usize,
+            ) -> Result<Vec<CodingRevision>> {
+                self.inner
+                    .list_revisions_for_file(namespace, repository, file_path, limit)
+                    .await
+            }
+            async fn all_threads_in_namespace(&self, namespace: &str) -> Result<Vec<CodingThread>> {
+                self.inner.all_threads_in_namespace(namespace).await
+            }
+            async fn all_revisions_in_namespace(
+                &self,
+                namespace: &str,
+            ) -> Result<Vec<CodingRevision>> {
+                self.inner.all_revisions_in_namespace(namespace).await
+            }
+            async fn delete_thread(&self, namespace: &str, id: Uuid) -> Result<()> {
+                self.inner.delete_thread(namespace, id).await
+            }
+            async fn delete_revision(&self, namespace: &str, id: Uuid) -> Result<()> {
+                self.inner.delete_revision(namespace, id).await
+            }
+        }
+
+        let inner_store = Arc::new(FailingRelationStore {
+            inner: crate::testing::TestHubStore::default(),
+            fail_relation_payloads: std::sync::Mutex::new(std::collections::HashSet::new()),
+        });
+        let svc = DefaultBackupService::new(
+            inner_store.clone(),
+            Arc::new(GrantChecker::new(inner_store.clone())),
+        );
+        let a = admin("admin-agent");
+        let ns = "partial-fail-ns";
+
+        inner_store
+            .inner
+            .ensure_namespace(&scoped_ns(ns), &"admin-agent".to_string())
+            .await
+            .unwrap();
+        inner_store
+            .inner
+            .grant(&NamespaceGrantRecord {
+                namespace: scoped_ns(ns),
+                agent_id: "admin-agent".to_string(),
+                can_read: true,
+                can_write: true,
+                granted_by: "admin-agent".to_string(),
+                created_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        // 快照：1 条记忆 + 1 个任务 + 2 条关系（一条将被 store 拒绝）
+        // 实体命名空间用用户可见名，与服务层 create 产出的 v4 载荷同构
+        let mut entry = inner_store
+            .inner
+            .seed(&scoped_ns(ns), "admin-agent", "记忆");
+        entry.namespace = ns.to_string();
+        let task = MemoryTask {
+            id: Uuid::new_v4(),
+            namespace: ns.to_string(),
+            scene: crate::domain::MemoryScene::Working,
+            task: "关系失败后仍要恢复的任务".to_string(),
+            status: TaskStatus::Completed,
+            started_at: chrono::Utc::now(),
+            finished_at: Some(chrono::Utc::now()),
+            result_summary: None,
+            failure_reason: None,
+            source_evidence_id: None,
+            metadata: serde_json::json!({}),
+        };
+        let rel_ok = MemoryRelation {
+            namespace: Some(ns.to_string()),
+            from_memory_id: entry.id,
+            to_memory_id: entry.id,
+            relation_kind: MemoryRelationKind::DerivedFrom,
+            confidence: 0.9,
+            source_evidence_id: None,
+            created_at: chrono::Utc::now(),
+        };
+        let rel_fail = MemoryRelation {
+            namespace: Some(ns.to_string()),
+            from_memory_id: entry.id,
+            to_memory_id: entry.id,
+            relation_kind: MemoryRelationKind::Supersedes,
+            confidence: 0.8,
+            source_evidence_id: None,
+            created_at: chrono::Utc::now(),
+        };
+        let checksum = DefaultBackupService::checksum_v4(
+            &[entry.clone()],
+            &[],
+            &[rel_ok.clone(), rel_fail.clone()],
+            std::slice::from_ref(&task),
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let backup = BackupRecord {
+            payload: serde_json::json!({
+                "version": BACKUP_PAYLOAD_VERSION,
+                "namespace": ns,
+                "entries": [entry],
+                "evidences": [],
+                "relations": [rel_ok, rel_fail],
+                "tasks": [task],
+                "experiences": [],
+                "task_experiences": [],
+                "coding_threads": [],
+                "coding_revisions": [],
+            }),
+            checksum,
+            ..make_record(scoped_ns(ns))
+        };
+        inner_store.save_backup(&backup).await.unwrap();
+
+        // 删掉当前记忆，让恢复必须真正写回（而不是 unchanged）
+        inner_store
+            .inner
+            .delete(&scoped_ns(ns), entry.id)
+            .await
+            .unwrap();
+
+        // 预置失败：指定那条 Supersedes 关系在恢复时被 store 拒绝
+        {
+            let failing_key = format!(
+                "{}|{}|{}|{:?}",
+                scoped_ns(ns),
+                entry.id,
+                entry.id,
+                MemoryRelationKind::Supersedes
+            );
+            inner_store
+                .fail_relation_payloads
+                .lock()
+                .unwrap()
+                .insert(failing_key);
+        }
+
+        let report = svc
+            .restore(
+                &a,
+                RestoreRequest {
+                    backup_id: backup.id,
+                    mode: RestoreMode::Merge,
+                },
+            )
+            .await
+            .expect("单条关系失败不得中止恢复");
+        assert_eq!(report.failed_relations, 1, "失败的关系应被准确计数");
+        assert_eq!(report.failed_evidences, 0);
+        assert_eq!(report.created, 1, "记忆条目仍应恢复成功");
+
+        // 成功的那条关系确实恢复了
+        let relations = inner_store
+            .inner
+            .all_relations_in_namespace(&scoped_ns(ns))
+            .await
+            .unwrap();
+        assert_eq!(relations.len(), 1, "另一条关系恢复成功，仅失败那条被跳过");
+        assert_eq!(relations[0].relation_kind, MemoryRelationKind::DerivedFrom);
+
+        // 关系失败之后恢复的任务也落库了：证明失败不中止后续实体恢复
+        let restored_task = inner_store
+            .inner
+            .get_task(&scoped_ns(ns), task.id)
+            .await
+            .unwrap();
+        assert!(
+            restored_task.is_some(),
+            "关系失败后，排在后面的任务实体仍应恢复"
+        );
+    }
+
+    fn make_record(ns: String) -> BackupRecord {
+        BackupRecord {
+            id: Uuid::new_v4(),
+            namespace: ns,
+            created_by: "admin-agent".to_string(),
+            note: None,
+            entry_count: 0,
+            checksum: String::new(),
+            payload: serde_json::json!({}),
+            retain_until: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_replace_multi_namespace_records_all_safety_backup_ids() {
+        let (svc, store) = setup();
+        let a = admin("admin-agent");
+
+        // 两个命名空间，各有数据；全量快照 namespace = "*"
+        for ns in ["multi-a", "multi-b"] {
+            store
+                .ensure_namespace(&scoped_ns(ns), &"admin-agent".to_string())
+                .await
+                .unwrap();
+            store
+                .grant(&NamespaceGrantRecord {
+                    namespace: scoped_ns(ns),
+                    agent_id: "admin-agent".to_string(),
+                    can_read: true,
+                    can_write: true,
+                    granted_by: "admin-agent".to_string(),
+                    created_at: chrono::Utc::now(),
+                })
+                .await
+                .unwrap();
+            store.seed(&scoped_ns(ns), "admin-agent", &format!("{ns} 数据"));
+        }
+
+        let backup = svc
+            .create(
+                &a,
+                BackupCreateRequest {
+                    namespace: ALL_NAMESPACES.to_string(),
+                    note: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let report = svc
+            .restore(
+                &a,
+                RestoreRequest {
+                    backup_id: backup.id,
+                    mode: RestoreMode::Replace,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            report.safety_backup_ids.len(),
+            2,
+            "两个受影响命名空间都应各有一条安全备份 ID"
+        );
+        assert_eq!(
+            report.safety_backup_id,
+            Some(report.safety_backup_ids[0]),
+            "旧单数字段取第一个，避免下游消费方断裂"
+        );
+        // 两条安全备份都真实存在且可读取
+        for id in &report.safety_backup_ids {
+            assert!(store.get_backup(*id).await.is_ok());
+        }
+    }
+
+    #[test]
+    fn test_restore_report_deserializes_legacy_json_without_new_fields() {
+        // 旧版本报告没有失败计数与 safety_backup_ids 字段，反序列化必须兼容
+        let legacy = serde_json::json!({
+            "backup_id": Uuid::new_v4().to_string(),
+            "mode": "merge",
+            "total": 3,
+            "created": 1,
+            "updated": 1,
+            "unchanged": 1,
+            "safety_backup_id": Uuid::new_v4().to_string(),
+        });
+        let report: RestoreReport = serde_json::from_value(legacy).unwrap();
+        assert_eq!(report.failed_relations, 0);
+        assert!(report.safety_backup_ids.is_empty());
     }
 
     // 编译期检查：Embedder trait 对象可用

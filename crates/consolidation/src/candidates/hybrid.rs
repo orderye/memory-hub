@@ -269,7 +269,7 @@ fn vector_candidates_with(
                 .unwrap_or(true)
         })
         .collect();
-    for (i, j) in candidate_pairs(entries, &unkeyed) {
+    for (i, j) in candidate_pairs(entries, &unkeyed, overrides) {
         if entries[i].kind != entries[j].kind {
             continue;
         }
@@ -313,7 +313,14 @@ fn vector_candidates_with(
 }
 
 /// 候选对生成：小规模全量两两比较，大规模走 LSH 分桶
-fn candidate_pairs(entries: &[MemoryEntry], indices: &[usize]) -> Vec<(usize, usize)> {
+///
+/// `overrides` 与 [`vector_candidates_with`] 的语义一致：新算出的向量
+/// 覆盖条目自带向量参与分桶，保证 LSH 与重复带用的向量完全同源。
+fn candidate_pairs(
+    entries: &[MemoryEntry],
+    indices: &[usize],
+    overrides: &HashMap<usize, Vec<f32>>,
+) -> Vec<(usize, usize)> {
     let n = indices.len();
     if n <= EXHAUSTIVE_MAX_ENTRIES {
         let mut pairs = Vec::with_capacity(n * n.saturating_sub(1) / 2);
@@ -325,7 +332,7 @@ fn candidate_pairs(entries: &[MemoryEntry], indices: &[usize]) -> Vec<(usize, us
         return pairs;
     }
 
-    let buckets = lsh_buckets(entries, indices);
+    let buckets = lsh_buckets(entries, indices, overrides);
     let mut seen: HashSet<(usize, usize)> = HashSet::new();
     let mut pairs = Vec::new();
     for members in buckets.values() {
@@ -342,16 +349,24 @@ fn candidate_pairs(entries: &[MemoryEntry], indices: &[usize]) -> Vec<(usize, us
 }
 
 /// 确定性随机投影的多表 LSH 分桶
-fn lsh_buckets(entries: &[MemoryEntry], indices: &[usize]) -> HashMap<(usize, u64), Vec<usize>> {
+///
+/// 分桶向量优先取 `overrides`（通道 2 新算出的），回落到条目自带向量——
+/// 与 [`vector_candidates_with`] 的 `vector_of` 完全同源，两路行为一致。
+fn lsh_buckets(
+    entries: &[MemoryEntry],
+    indices: &[usize],
+    overrides: &HashMap<usize, Vec<f32>>,
+) -> HashMap<(usize, u64), Vec<usize>> {
     let mut buckets: HashMap<(usize, u64), Vec<usize>> = HashMap::new();
     let projections = deterministic_projections();
     for &idx in indices {
-        let Some(embedding) = entries[idx].embedding.as_ref() else {
+        let embedding = overrides
+            .get(&idx)
+            .or_else(|| entries[idx].embedding.as_ref())
+            .filter(|v| !v.is_empty());
+        let Some(embedding) = embedding else {
             continue;
         };
-        if embedding.is_empty() {
-            continue;
-        }
         for table in 0..LSH_TABLES {
             let mut key: u64 = 0;
             for bit in 0..LSH_BITS_PER_TABLE {
@@ -511,5 +526,68 @@ mod tests {
                 .any(|p| p.relation == CandidateRelation::Conflict),
             "大规模下 LSH 候选生成仍必须找到近重复冲突对：{pairs:#?}"
         );
+    }
+
+    #[test]
+    fn test_lsh_buckets_honors_overrides() {
+        // 两条条目自带"指向完全相反方向"的旧向量；overrides 提供的新向量
+        // 才是真实语义。LSH 分桶必须用 overrides——否则这对条目永远不落进
+        // 同一桶，冲突带在大规模下（>256 条）漏检。
+        let mut entries: Vec<MemoryEntry> = (0..300)
+            .map(|i| entry(&format!("噪声 {}", i), Some(vec![0.0, 1.0, 0.0])))
+            .collect();
+        let idx_a = entries.len();
+        entries.push(entry("主库部署在上海可用区 A", Some(vec![1.0, 0.0, 0.0])));
+        let idx_b = entries.len();
+        entries.push(entry(
+            "主库部署在深圳且无只读副本",
+            Some(vec![0.0, 1.0, 0.0]),
+        ));
+
+        // 候选空间必须超过穷举规模（256）才真正走 LSH 分桶
+        let indices: Vec<usize> = (0..entries.len()).collect();
+        assert!(indices.len() > EXHAUSTIVE_MAX_ENTRIES);
+
+        // 不带 overrides（修复前的行为）：a 与 b 的旧向量方向相反，
+        // 不可能落进同一桶，这对冲突在大规模下被漏检
+        let plain = lsh_buckets(&entries, &indices, &HashMap::new());
+        assert!(
+            !buckets_colocate(&plain, idx_a, idx_b),
+            "自带相反向量的两条条目不应在 LSH 下同桶"
+        );
+
+        // 带 overrides（embed_missing 新算的向量）：两向量同向近邻，
+        // 必须被分进同一桶
+        let mut overrides = HashMap::new();
+        overrides.insert(idx_a, vec![1.0, 0.0, 0.0]);
+        overrides.insert(idx_b, vec![0.9, 0.43589, 0.0]);
+        let overridden = lsh_buckets(&entries, &indices, &overrides);
+        assert!(
+            buckets_colocate(&overridden, idx_a, idx_b),
+            "overrides 向量必须参与 LSH 分桶"
+        );
+
+        // vector_candidates_with 全链路（冲突带）：噪声条目与 a/b 不同桶，
+        // a/b 同桶且相似度落在冲突带 → 必须产出冲突候选对
+        let thresholds = CandidateThresholds::default();
+        let usable: Vec<usize> = indices.clone();
+        let pairs = vector_candidates_with(&entries, &usable, &overrides, thresholds, None);
+        let pair_ids = (
+            entries[idx_a].id.min(entries[idx_b].id),
+            entries[idx_a].id.max(entries[idx_b].id),
+        );
+        assert!(
+            pairs
+                .iter()
+                .any(|p| p.relation == CandidateRelation::Conflict && (p.a, p.b) == pair_ids),
+            "LSH + overrides 全链路必须产出 a/b 冲突候选：{pairs:#?}"
+        );
+    }
+
+    /// 两条目是否在任一 LSH 表中落进同一桶
+    fn buckets_colocate(buckets: &HashMap<(usize, u64), Vec<usize>>, a: usize, b: usize) -> bool {
+        buckets
+            .values()
+            .any(|members| members.contains(&a) && members.contains(&b))
     }
 }

@@ -316,6 +316,8 @@ pub struct TestHubStore {
     pub task_experiences: RwLock<Vec<MemoryTaskExperience>>,
     pub coding_threads: RwLock<HashMap<(String, Uuid), CodingThread>>,
     pub coding_revisions: RwLock<HashMap<(String, Uuid), CodingRevision>>,
+    /// 错误注入：置位后 add_relation 一律失败（测试次要写失败时的降级行为）
+    pub fail_add_relation: std::sync::atomic::AtomicBool,
 }
 
 impl TestHubStore {
@@ -846,6 +848,12 @@ impl EvidenceStore for TestHubStore {
 #[async_trait]
 impl RelationStore for TestHubStore {
     async fn add_relation(&self, ns: &str, rel: &NewMemoryRelation) -> Result<MemoryRelation> {
+        if self
+            .fail_add_relation
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(HubError::Unavailable);
+        }
         let record = MemoryRelation {
             namespace: Some(ns.to_string()),
             from_memory_id: rel.from_memory_id,

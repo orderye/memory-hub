@@ -26,6 +26,10 @@ use uuid::Uuid;
 /// 授权码有效期（OAuth 2.1 建议 ≤ 10 分钟）
 const AUTH_CODE_TTL_SECONDS: i64 = 300;
 
+/// auth_codes 写入路径惰性淘汰阈值：条目数超过它时顺带清理已过期记录
+/// （与 `common::rate_limit` 内存令牌桶的做法一致）
+const AUTH_CODES_LAZY_PRUNE_THRESHOLD: usize = 10_000;
+
 /// 动态注册请求（RFC 7591 风格）
 #[derive(Debug, Clone, Deserialize)]
 pub struct RegisterAgentRequest {
@@ -179,6 +183,11 @@ impl AgentOAuthServer {
     /// 确认令牌管理器引用
     pub fn confirm_manager(&self) -> &ConfirmTokenManager {
         &self.confirm
+    }
+
+    /// 清理刷新令牌族中的过期历史记录（代理到 TokenFamilyManager）
+    pub fn prune_refresh_families(&self, now: DateTime<Utc>) -> usize {
+        self.families.prune_expired(now)
     }
 
     /// 签发方标识
@@ -509,20 +518,39 @@ impl AgentOAuthServer {
         }
         let code = format!("ac_{}", Uuid::new_v4().simple());
         let grants = self.resolve_grants(agent).await?;
-        self.auth_codes.write().unwrap().insert(
-            code.clone(),
-            AuthorizationCode {
-                agent_id: agent.agent_id.clone(),
-                account_id: agent.owner_account_id,
-                redirect_uri: params.redirect_uri.clone(),
-                code_challenge: params.code_challenge.clone(),
-                scopes,
-                grants,
-                expires_at: Utc::now() + Duration::seconds(AUTH_CODE_TTL_SECONDS),
-                used: false,
-            },
-        );
+        {
+            let mut w = self.auth_codes.write().unwrap();
+            if w.len() > AUTH_CODES_LAZY_PRUNE_THRESHOLD {
+                let now = Utc::now();
+                w.retain(|_, rec| rec.expires_at > now);
+            }
+            w.insert(
+                code.clone(),
+                AuthorizationCode {
+                    agent_id: agent.agent_id.clone(),
+                    account_id: agent.owner_account_id,
+                    redirect_uri: params.redirect_uri.clone(),
+                    code_challenge: params.code_challenge.clone(),
+                    scopes,
+                    grants,
+                    expires_at: Utc::now() + Duration::seconds(AUTH_CODE_TTL_SECONDS),
+                    used: false,
+                },
+            );
+        }
         Ok(code)
+    }
+
+    /// 清理已过期的授权码，返回清理条数
+    ///
+    /// 授权码 TTL 仅 5 分钟；这里清理的是"签发后从未兑换"的滞留码
+    /// （已兑换的 `used=true` 记录也一并过期清除——重放检测只需在 TTL
+    /// 窗口内生效，过期码本来就无法通过校验）。
+    pub fn prune_auth_codes(&self, now: DateTime<Utc>) -> usize {
+        let mut w = self.auth_codes.write().unwrap();
+        let before = w.len();
+        w.retain(|_, rec| rec.expires_at > now);
+        before - w.len()
     }
 
     // ===== 内省与撤销 =====
@@ -1403,5 +1431,84 @@ mod tests {
     fn test_store_contract() {
         fn assert_impl<T: MemoryHubStore>() {}
         assert_impl::<InMemoryHubStore>();
+    }
+
+    /// 直接种入指定过期时间的授权码（TTL 是真实时钟，测试用内部结构构造混合状态）
+    fn seed_auth_code(srv: &AgentOAuthServer, code: &str, expires_at: DateTime<Utc>) {
+        srv.auth_codes.write().unwrap().insert(
+            code.to_string(),
+            AuthorizationCode {
+                agent_id: "agent-seed".to_string(),
+                account_id: test_account(),
+                redirect_uri: "https://app.example.com/cb".to_string(),
+                code_challenge: String::new(),
+                scopes: vec![],
+                grants: vec![],
+                expires_at,
+                used: false,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prune_auth_codes_removes_only_expired() {
+        let (srv, _store) = server().await;
+        let now = Utc::now();
+        seed_auth_code(&srv, "ac_expired", now - Duration::seconds(1));
+        seed_auth_code(&srv, "ac_alive", now + Duration::minutes(4));
+
+        assert_eq!(srv.prune_auth_codes(now), 1);
+        assert_eq!(srv.prune_auth_codes(now), 0, "二次清扫应无残留");
+
+        // 过期码兑换失败，未过期码仍占位（可正常进入校验流程）
+        let expired = srv
+            .token(TokenRequest {
+                grant_type: "authorization_code".to_string(),
+                code: Some("ac_expired".to_string()),
+                code_verifier: Some(OK_VERIFIER.to_string()),
+                redirect_uri: Some("https://app.example.com/cb".to_string()),
+                client_id: None,
+                client_secret: None,
+                refresh_token: None,
+                scope: None,
+                resource: None,
+            })
+            .await;
+        assert!(expired.is_err(), "过期授权码不得兑换令牌");
+        assert!(
+            srv.auth_codes.read().unwrap().contains_key("ac_alive"),
+            "未过期授权码不受清扫影响"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_issue_code_prunes_lazily_above_threshold() {
+        let (srv, _store) = server().await;
+        let now = Utc::now();
+        for i in 0..=AUTH_CODES_LAZY_PRUNE_THRESHOLD {
+            seed_auth_code(&srv, &format!("ac_stale_{i}"), now - Duration::seconds(1));
+        }
+
+        let agent = srv
+            .register(register_req("agent-lazy", false), test_account())
+            .await
+            .unwrap();
+        let params = AuthorizeParams {
+            response_type: "code".to_string(),
+            client_id: "agent-lazy".to_string(),
+            redirect_uri: "https://app.example.com/cb".to_string(),
+            code_challenge: compute_code_challenge_s256(OK_VERIFIER),
+            code_challenge_method: "S256".to_string(),
+            state: None,
+            scope: None,
+        };
+        let code = srv
+            .issue_authorization_code(&params, &agent, vec![Scope::Read])
+            .await
+            .unwrap();
+
+        // 超阈值触发惰性清理：过期全清，只剩新签发的一条
+        assert_eq!(srv.auth_codes.read().unwrap().len(), 1);
+        assert!(srv.auth_codes.read().unwrap().contains_key(&code));
     }
 }

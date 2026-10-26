@@ -14,6 +14,24 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
+/// 生成新摘要（Argon2id，PHC 字符串）的异步包装。
+///
+/// Argon2 是 64MiB/t=3 的纯 CPU 计算，直接跑在 async fn 里会占死一个 tokio
+/// worker 线程；这里丢进 `spawn_blocking` 线程池。参数用 `String` 拥有所有权
+/// 传入以满足 `Send + 'static`，避免借用进闭包。
+pub async fn hash_secret_blocking(agent_id: String, secret: String) -> String {
+    tokio::task::spawn_blocking(move || hash_secret(&agent_id, &secret))
+        .await
+        .expect("spawn_blocking 任务不应被取消")
+}
+
+/// 校验凭据的异步包装（同 [`hash_secret_blocking`] 的理由）。
+pub async fn verify_secret_blocking(agent_id: String, secret: String, stored: String) -> bool {
+    tokio::task::spawn_blocking(move || verify_secret(&agent_id, &secret, &stored))
+        .await
+        .expect("spawn_blocking 任务不应被取消")
+}
+
 /// OWASP 基准参数的 Argon2id 实例：64MiB 内存硬度、3 轮迭代、1 并行度
 pub fn owasp_argon2() -> Argon2<'static> {
     let params = Params::new(65536, 3, 1, None).expect("Valid OWASP Argon2 parameters");
@@ -111,6 +129,39 @@ mod tests {
     fn test_malformed_stored_hash_is_rejected_not_panic() {
         for junk in ["", "x", "$argon2id$garbage", "not-a-hash"] {
             assert!(!verify_secret("agent-a", "s3cret", junk));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_blocking_wrappers_preserve_semantics() {
+        let stored = hash_secret_blocking("agent-a".to_string(), "s3cret-value".to_string()).await;
+        assert!(stored.starts_with("$argon2id$"));
+        assert!(
+            verify_secret_blocking(
+                "agent-a".to_string(),
+                "s3cret-value".to_string(),
+                stored.clone()
+            )
+            .await
+        );
+        assert!(!verify_secret_blocking("agent-a".to_string(), "wrong".to_string(), stored).await);
+    }
+
+    /// 并发多个 verify 不死锁：spawn_blocking 闭包不持锁、不回进 async 上下文，
+    /// 池容量耗尽时也只是排队而不是互等。
+    #[tokio::test]
+    async fn test_concurrent_verify_no_deadlock() {
+        let stored = hash_secret("agent-a", "s3cret-value");
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            handles.push(tokio::spawn(verify_secret_blocking(
+                "agent-a".to_string(),
+                "s3cret-value".to_string(),
+                stored.clone(),
+            )));
+        }
+        for h in handles {
+            assert!(h.await.unwrap());
         }
     }
 }

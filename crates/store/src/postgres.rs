@@ -223,6 +223,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "20261025000012_cognitive_proposals",
         include_str!("../migrations/20261025000012_cognitive_proposals.sql"),
     ),
+    (
+        "20261025000013_fts_retokenize_marker",
+        include_str!("../migrations/20261025000013_fts_retokenize_marker.sql"),
+    ),
 ];
 
 /// PostgreSQL 四合一存储
@@ -309,6 +313,24 @@ fn parse_dollar_tag(b: &[u8], i: usize) -> Option<&[u8]> {
     }
 }
 
+/// 统一的 tsv_tokens 生成入口。
+///
+/// 写路径（insert / insert_initial / apply_update_on）与存量回填
+/// （retokenized_updates）都必须经由此函数取词，禁止各自直连分词器——
+/// 一旦某处绕开，索引词法就会与写路径漂移（迁移 005 的教训）。
+fn tsv_tokens_for(content: &str) -> String {
+    mem_core::tokenize_for_fts(content)
+}
+
+/// FTS 回填纯逻辑：待重分词行 (id, content) → (id, 与写路径同源的重算词元流)。
+/// 单独成函数以便无库单测：构造迁移 005 受害行（tsv_tokens=原文），
+/// 断言重算结果与写路径对同 content 的产出完全一致。
+fn retokenized_updates(rows: Vec<(Uuid, String)>) -> Vec<(Uuid, String)> {
+    rows.into_iter()
+        .map(|(id, content)| (id, tsv_tokens_for(&content)))
+        .collect()
+}
+
 impl PostgresHubStore {
     /// 连接并执行迁移
     ///
@@ -391,6 +413,7 @@ impl PostgresHubStore {
 
         let store = Self { pool };
         store.run_migrations().await?;
+        store.backfill_fts_tokens().await?;
 
         // 迁移可能刚创建 vector 扩展：再探测一次并置位（对之后新建的连接生效）
         if !hnsw_iterative.load(std::sync::atomic::Ordering::Relaxed)
@@ -498,6 +521,75 @@ impl PostgresHubStore {
                 .pg()?;
             tx.commit().await.pg()?;
         }
+        Ok(())
+    }
+
+    /// FTS 存量重分词回填（迁移 013 的配套步骤）。
+    ///
+    /// 迁移 005 曾把原文直接回填进 tsv_tokens，迁移 013 已把受害行标记为
+    /// `fts_retokenize_pending`；本方法在 connect() 迁移完成后分批重分词：
+    /// 每批 500 行、键集分页（id > 游标）、批内单事务——短事务行级锁，
+    /// 回填期间服务读写不受影响。批处理中断可续跑：已完成的行标记被清除，
+    /// 剩余行下次启动重新处理。
+    async fn backfill_fts_tokens(&self) -> Result<()> {
+        let pending: i64 =
+            sqlx::query_scalar("select count(*) from memories where fts_retokenize_pending")
+                .fetch_one(&self.pool)
+                .await
+                .pg()?;
+        if pending == 0 {
+            tracing::info!("FTS 回填：0 行待处理，跳过");
+            return Ok(());
+        }
+        tracing::info!("FTS 回填：{pending} 行待处理，开始分批重分词");
+
+        let mut cursor: Option<Uuid> = None;
+        let mut done: usize = 0;
+        loop {
+            let rows: Vec<(Uuid, String)> = match cursor {
+                Some(c) => sqlx::query_as(
+                    "select id, content from memories \
+                     where fts_retokenize_pending and id > $1 \
+                     order by id limit 500",
+                )
+                .bind(c)
+                .fetch_all(&self.pool)
+                .await
+                .pg()?,
+                None => sqlx::query_as(
+                    "select id, content from memories \
+                     where fts_retokenize_pending \
+                     order by id limit 500",
+                )
+                .fetch_all(&self.pool)
+                .await
+                .pg()?,
+            };
+            if rows.is_empty() {
+                break;
+            }
+            let updates = retokenized_updates(rows);
+            let mut tx = self.pool.begin().await.pg()?;
+            for (id, tokens) in &updates {
+                // guard on fts_retokenize_pending：SELECT 到 UPDATE 之间该行若已被
+                // apply_update_on 重写（含清标记），此处跳过，避免用旧 content
+                // 的分词覆盖新 content 的词元流；两写者取锁有先有后，后到者
+                // 的值总是基于更新后的 content，最终一致。
+                sqlx::query(
+                    "update memories set tsv_tokens = $2, fts_retokenize_pending = false \
+                     where id = $1 and fts_retokenize_pending",
+                )
+                .bind(id)
+                .bind(tokens)
+                .execute(&mut *tx)
+                .await
+                .pg()?;
+            }
+            tx.commit().await.pg()?;
+            done += updates.len();
+            cursor = updates.last().map(|(id, _)| *id);
+        }
+        tracing::info!("FTS 回填完成：共重分词 {done} 行");
         Ok(())
     }
 
@@ -779,7 +871,7 @@ impl PostgresHubStore {
         expected_version: Option<i64>,
     ) -> Result<u64> {
         let embedding_literal = entry.embedding.as_ref().map(|v| mapping::vector_literal(v));
-        let tsv_tokens = mem_core::tokenize_for_fts(&entry.content);
+        let tsv_tokens = tsv_tokens_for(&entry.content);
         let guard = if expected_version.is_some() {
             " and version = $23"
         } else {
@@ -792,6 +884,7 @@ impl PostgresHubStore {
               embedding = $8::vector, embedding_model = $9, source_agent = $10,
               confidence = $11, status = $12, version = $13, expires_at = $14,
               merged_into = $15, updated_at = $16, tsv_tokens = $17,
+              fts_retokenize_pending = false,
               scene = $18, layer = $19, valid_from = $20, valid_until = $21, occurred_at = $22
             where namespace = $1 and id = $2{guard}
             "#,
@@ -940,7 +1033,7 @@ impl PostgresHubStore {
 impl mem_core::MemoryStore for PostgresHubStore {
     async fn insert(&self, entry: &MemoryEntry) -> Result<MemoryEntry> {
         let embedding_literal = entry.embedding.as_ref().map(|v| mapping::vector_literal(v));
-        let tsv_tokens = mem_core::tokenize_for_fts(&entry.content);
+        let tsv_tokens = tsv_tokens_for(&entry.content);
         sqlx::query(
             r#"
             insert into memories
@@ -984,7 +1077,7 @@ impl mem_core::MemoryStore for PostgresHubStore {
     async fn insert_initial(&self, entry: &MemoryEntry) -> Result<MemoryEntry> {
         let mut tx = self.pool.begin().await.pg()?;
         let embedding_literal = entry.embedding.as_ref().map(|v| mapping::vector_literal(v));
-        let tsv_tokens = mem_core::tokenize_for_fts(&entry.content);
+        let tsv_tokens = tsv_tokens_for(&entry.content);
         sqlx::query(
             r#"
             insert into memories
@@ -1832,10 +1925,13 @@ impl mem_core::AgentStore for PostgresHubStore {
         &self,
         reg: &mem_core::AgentRegistration,
     ) -> Result<mem_core::AgentRecord> {
-        let secret_hash: Option<String> = reg
-            .client_secret
-            .as_ref()
-            .map(|s| crate::secret::hash_secret(&reg.agent_id, s));
+        // Argon2 为 CPU 密集计算，经 spawn_blocking 执行避免阻塞 tokio worker
+        let secret_hash: Option<String> = match &reg.client_secret {
+            Some(s) => {
+                Some(crate::secret::hash_secret_blocking(reg.agent_id.clone(), s.clone()).await)
+            }
+            None => None,
+        };
         let max_scopes: Vec<String> = reg
             .max_scopes
             .iter()
@@ -1939,10 +2035,17 @@ impl mem_core::AgentStore for PostgresHubStore {
             Some(h) => h,
             None => return Ok(false),
         };
-        let ok = crate::secret::verify_secret(agent_id, secret, &stored);
+        // Argon2 为 CPU 密集计算，经 spawn_blocking 执行避免阻塞 tokio worker
+        let ok = crate::secret::verify_secret_blocking(
+            agent_id.to_string(),
+            secret.to_string(),
+            stored.clone(),
+        )
+        .await;
         // 存量旧摘要（无盐 sha256）在首次校验成功后就地升级为 Argon2id
         if ok && crate::secret::is_legacy_digest(&stored) {
-            let upgraded = crate::secret::hash_secret(agent_id, secret);
+            let upgraded =
+                crate::secret::hash_secret_blocking(agent_id.to_string(), secret.to_string()).await;
             sqlx::query("update agents set client_secret_hash = $2 where agent_id = $1")
                 .bind(agent_id)
                 .bind(&upgraded)
@@ -3213,7 +3316,7 @@ mod tests {
 
     #[test]
     fn test_migrations_registered() {
-        assert_eq!(MIGRATIONS.len(), 12);
+        assert_eq!(MIGRATIONS.len(), 13);
         assert!(MIGRATIONS[0].0.starts_with("20261011"));
         // 迁移清单必须按版本号字典序排列（执行顺序依赖于此）
         for w in MIGRATIONS.windows(2) {
@@ -3345,6 +3448,52 @@ mod tests {
         // 无法在无库环境构造 Database 错误，这里只验证映射函数的存在性与签名
         let err: Result<()> = Err(HubError::NotFound);
         assert!(err.is_err());
+    }
+
+    /// 迁移 005 受害行的重分词回填：重算结果必须与写路径对同 content 的
+    /// 产出完全一致（同源），且受害特征（tsv_tokens=原文）被消除。
+    #[test]
+    fn test_backfill_retokenize_matches_write_path() {
+        // 中文整句：迁移 005 后 tsv_tokens 是未分词原文（FTS 失效的形态）
+        let victim_content = "服务部署在东京区域";
+        let updates = retokenized_updates(vec![(Uuid::new_v4(), victim_content.to_string())]);
+        assert_eq!(updates.len(), 1);
+        let (_, tokens) = &updates[0];
+        assert_eq!(tokens, &tsv_tokens_for(victim_content));
+        assert_eq!(tokens, &mem_core::tokenize_for_fts(victim_content));
+        // 与原文相等即是受害特征；重分词后必须是 bigram 词元流
+        assert_ne!(tokens, victim_content);
+        assert!(tokens.split_whitespace().any(|t| t == "东京"));
+        assert!(tokens.split_whitespace().any(|t| t == "区域"));
+
+        // 混排与英文：误标记无害——重分词幂等，英文原词保持
+        let mixed = "PostgreSQL 15 数据库在 Tokyo 部署";
+        let updates = retokenized_updates(vec![(Uuid::new_v4(), mixed.to_string())]);
+        assert_eq!(updates[0].1, tsv_tokens_for(mixed));
+        assert!(updates[0].1.split_whitespace().any(|t| t == "postgresql"));
+
+        // 空行/批次多行：保持顺序与 id 对应
+        let rows = vec![
+            (Uuid::new_v4(), "记忆中枢".to_string()),
+            (Uuid::new_v4(), "memory hub".to_string()),
+        ];
+        let updates = retokenized_updates(rows.clone());
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].0, rows[0].0);
+        assert_eq!(updates[1].0, rows[1].0);
+        assert_ne!(updates[0].1, updates[1].1);
+    }
+
+    /// 迁移 013 脚本：幂等写法与关键语句必须存在（对齐 sql_validation 风格）。
+    #[test]
+    fn test_fts_retokenize_migration_script() {
+        let sql = include_str!("../migrations/20261025000013_fts_retokenize_marker.sql");
+        assert!(sql.contains("add column if not exists fts_retokenize_pending"));
+        // 标记条件必须精确对齐迁移 005 的回填特征
+        assert!(sql.contains("tsv_tokens = content and content <> ''"));
+        // 部分索引让回填的键集分页走索引
+        assert!(sql.contains("create index if not exists idx_memories_fts_retokenize_pending"));
+        assert!(sql.contains("where fts_retokenize_pending;"));
     }
 }
 
@@ -3564,6 +3713,75 @@ mod pg_integration {
 
         store.delete_backup(backup.id).await.unwrap();
         assert!(store.get_backup(backup.id).await.is_err());
+        store.delete(ns, e.id).await.unwrap();
+    }
+
+    /// 迁移 013 + 启动回填的端到端验证：手工制造迁移 005 形态的受害行
+    /// （tsv_tokens = 原文、fts_retokenize_pending = true），跑回填，
+    /// 断言词元被写路径同源重写、标记清零、FTS 可命中中文子串。
+    #[tokio::test]
+    #[ignore = "需要 DATABASE_URL"]
+    async fn pg_fts_backfill_retokenizes_legacy_rows() {
+        let store = store().await;
+        let ns = "it-ns-fts-backfill";
+        store
+            .ensure_namespace(ns, &AgentId::from("it-agent"))
+            .await
+            .unwrap();
+
+        let content = "服务部署在东京区域";
+        let e = entry(ns, "it-agent", content);
+        store.insert(&e).await.unwrap();
+        // 正常写路径产出的就是分词流：不该被回填动到
+        let expected = tsv_tokens_for(content);
+        let pool = store.pool();
+
+        // 还原受害形态（模拟迁移 005 执行后的存量行）
+        sqlx::query(
+            "update memories set tsv_tokens = $2, fts_retokenize_pending = true \
+                     where namespace = $1 and id = $3",
+        )
+        .bind(ns)
+        .bind(content)
+        .bind(e.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // 跑真实回填入口（connect() 内部调用的同一方法，含分批与清标记）
+        store.backfill_fts_tokens().await.unwrap();
+
+        let (tokens, pending): (String, bool) = sqlx::query_as(
+            "select tsv_tokens, fts_retokenize_pending from memories \
+             where namespace = $1 and id = $2",
+        )
+        .bind(ns)
+        .bind(e.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(tokens, expected, "回填结果必须与写路径分词同源");
+        assert!(!pending, "回填完成后标记必须清除");
+
+        let pending_left: i64 =
+            sqlx::query_scalar("select count(*) from memories where fts_retokenize_pending")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(pending_left, 0, "全部待处理行应被清零");
+
+        // 中文子串经 FTS 召回（修复前 tsv_tokens=原文时不可命中）
+        let hits: i64 = sqlx::query_scalar(
+            "select count(*) from memories \
+             where namespace = $1 and to_tsvector('simple', tsv_tokens) \
+                   @@ to_tsquery('simple', '东京 | 区域')",
+        )
+        .bind(ns)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(hits >= 1, "重分词后中文子串应可经 FTS 命中");
+
         store.delete(ns, e.id).await.unwrap();
     }
 }

@@ -110,6 +110,12 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         rate_limiter: handle.rate_limiter,
     };
 
+    // 定期清扫内存令牌结构（auth_codes / 刷新令牌族 / 确认令牌）。
+    // 它们只增不删时会被纯 HTTP 请求无界撑大；写入路径已有惰性淘汰，
+    // 这里兜低频流量下永远踩不到阈值的场景。错开整点分钟数，避免
+    // 与其他整点任务尖峰重叠。
+    tokio::spawn(prune_token_structures(state.oauth.clone()));
+
     let app = oauth_router(state);
     let listener = tokio::net::TcpListener::bind(cfg.auth_bind)
         .await
@@ -126,6 +132,31 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     .map_err(|e| anyhow!("HTTP 服务退出: {}", e))?;
 
     Ok(())
+}
+
+/// 每小时清理三个内存令牌管理器中的过期条目
+///
+/// 与写入路径的惰性淘汰互补：低流量部署可能长期达不到淘汰阈值，
+/// 定时清扫保证过期条目最终被回收。
+async fn prune_token_structures(oauth: Arc<AgentOAuthServer>) {
+    // 首个整点后的第 7 分钟启动，此后每小时一次
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+    interval.reset_at(tokio::time::Instant::now() + std::time::Duration::from_secs(7 * 60));
+    loop {
+        interval.tick().await;
+        let now = chrono::Utc::now();
+        let confirm = oauth.confirm_manager().prune_expired(now);
+        let families = oauth.prune_refresh_families(now);
+        let codes = oauth.prune_auth_codes(now);
+        if confirm + families + codes > 0 {
+            info!(
+                confirm_tokens = confirm,
+                refresh_families = families,
+                auth_codes = codes,
+                "内存令牌结构定期清扫完成"
+            );
+        }
+    }
 }
 
 /// 构建存储：PostgreSQL 优先；开发模式可退回内存

@@ -600,8 +600,12 @@ impl ChatCognitiveService {
         // 2. 处理事实演化（supersedes）：如果取代了旧事实
         if let Some(old_id) = supersedes_target {
             if old_id != saved.id {
-                // 建立 Supersedes 关系 (new -> old)
-                let _ = self
+                // 建立 Supersedes 关系 (new -> old)。
+                //
+                // 失败不上抛：新事实已落库，主流程因次要写失败整体回滚/报错
+                // 会让"新事实入库"这件主要的事也失败；这里选择可观测性优先——
+                // warn 带上命名空间与新旧 id，运维可据此人工补链。
+                if let Err(e) = self
                     .store
                     .add_relation(
                         namespace,
@@ -613,18 +617,39 @@ impl ChatCognitiveService {
                             source_evidence_id: Some(evidence_id),
                         },
                     )
-                    .await;
+                    .await
+                {
+                    tracing::warn!(
+                        namespace,
+                        new_memory_id = %saved.id,
+                        old_memory_id = %old_id,
+                        error = %e,
+                        "supersedes 关系写入失败：溯源链缺失，新事实已入库"
+                    );
+                }
 
-                // 限制旧事实的时间有效期上限为新事实发生时间，防止旧事实在当前时刻继续被作为有效事实召回
+                // 限制旧事实的时间有效期上限为新事实发生时间，防止旧事实在当前时刻继续被作为有效事实召回。
+                //
+                // 失败不上抛（理由同上）：旧事实会暂时继续被召回，与该 warn 一起
+                // 构成可观测的中间态；上抛则连新事实都不可用，损失更大。
                 if let Ok(mut old_entry) = self.store.get(namespace, old_id).await {
                     let old_version = old_entry.version;
                     old_entry.valid_until = candidate.occurred_at.or(Some(now));
                     old_entry.version += 1;
                     old_entry.updated_at = now;
-                    let _ = self
+                    if let Err(e) = self
                         .store
                         .revise(&old_entry, old_version, VersionChange::Updated)
-                        .await;
+                        .await
+                    {
+                        tracing::warn!(
+                            namespace,
+                            new_memory_id = %saved.id,
+                            old_memory_id = %old_id,
+                            error = %e,
+                            "旧事实 valid_until 封堵失败：旧事实暂仍作为有效事实召回"
+                        );
+                    }
                 }
             }
         }
@@ -705,6 +730,10 @@ mod tests {
         experiences: RwLock<HashMap<(String, Uuid), MemoryExperience>>,
         task_experiences: RwLock<Vec<MemoryTaskExperience>>,
         cognitive_proposals: RwLock<HashMap<Uuid, CognitiveProposalRecord>>,
+        /// 错误注入：置位后 revise 一律失败（验证 supersedes 封堵失败不拖垮主流程）
+        fail_revise: std::sync::atomic::AtomicBool,
+        /// 错误注入：置位后 add_relation 一律失败
+        fail_add_relation: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait]
@@ -763,6 +792,9 @@ mod tests {
             _expected_version: i64,
             change: VersionChange,
         ) -> Result<MemoryEntry> {
+            if self.fail_revise.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(HubError::Unavailable);
+            }
             self.items
                 .write()
                 .unwrap()
@@ -907,6 +939,12 @@ mod tests {
     #[async_trait]
     impl RelationStore for TestHubStore {
         async fn add_relation(&self, ns: &str, rel: &NewMemoryRelation) -> Result<MemoryRelation> {
+            if self
+                .fail_add_relation
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(HubError::Unavailable);
+            }
             let record = MemoryRelation {
                 namespace: Some(ns.to_string()),
                 from_memory_id: rel.from_memory_id,
@@ -1614,6 +1652,105 @@ mod tests {
         let updated_old = store.get("test-ns", old_entry.id).await.unwrap();
         assert!(updated_old.valid_until.is_some());
         assert_eq!(updated_old.version, 2);
+    }
+
+    /// supersedes 的次要写（关系建立 / 旧事实封堵）失败时不得拖垮主流程：
+    /// 新事实必须已入库并返回成功。日志 warn 断言受限于测试基建（无日志捕获），
+    /// 以错误注入 + 主流程结果作为替代验证。
+    #[tokio::test]
+    async fn test_supersedes_secondary_write_failure_does_not_fail_main_flow() {
+        let store = Arc::new(TestHubStore::default());
+        let old_entry = store
+            .insert_initial(&MemoryEntry {
+                id: Uuid::new_v4(),
+                namespace: "test-ns".to_string(),
+                key: None,
+                kind: MemoryKind::Fact,
+                content: "过去系统采用 MySQL 数据库".to_string(),
+                tags: vec!["db".to_string()],
+                metadata: serde_json::json!({}),
+                embedding: None,
+                embedding_model: None,
+                source_agent: "agent".to_string(),
+                confidence: 0.9,
+                status: MemoryStatus::Active,
+                version: 1,
+                expires_at: None,
+                merged_into: None,
+                created_at: Utc::now() - chrono::Duration::days(10),
+                updated_at: Utc::now() - chrono::Duration::days(10),
+                scene: Some(MemoryScene::Chat),
+                layer: Some(CognitiveLayer::Fact),
+                valid_from: Some(Utc::now() - chrono::Duration::days(10)),
+                valid_until: None,
+                occurred_at: Some(Utc::now() - chrono::Duration::days(10)),
+            })
+            .await
+            .unwrap();
+
+        // 注入两类次要写失败
+        store
+            .fail_add_relation
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        store
+            .fail_revise
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let extractor =
+            Arc::new(
+                MockChatCognitiveExtractor::new().with_candidates(vec![CognitiveCandidate {
+                    content: "即日起决定改用 PostgreSQL 15 作为主数据库".to_string(),
+                    scene: MemoryScene::Chat,
+                    layer: CognitiveLayer::Fact,
+                    confidence: 0.98,
+                    valid_from: None,
+                    valid_until: None,
+                    occurred_at: Some(Utc::now()),
+                    tags: vec!["db".to_string()],
+                    metadata: serde_json::json!({}),
+                    relation_kind: Some(MemoryRelationKind::Supersedes),
+                    target_memory_id: Some(old_entry.id),
+                }]),
+            );
+
+        let service = ChatCognitiveService::new(
+            store.clone(),
+            extractor,
+            CognitivePolicy {
+                mode: CognitiveGovernanceMode::FullAuto,
+                auto_accept_threshold: 0.9,
+                ..Default::default()
+            },
+        );
+
+        let input = ChatCognitiveInput {
+            namespace: "test-ns".to_string(),
+            session_id: "sess-supersede-fail".to_string(),
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "我们决定从 MySQL 改用 PostgreSQL 15".to_string(),
+                timestamp: Some(Utc::now()),
+            }],
+            occurred_at: Some(Utc::now()),
+        };
+
+        // 主流程成功返回，新事实已入库（次要失败只降级为 warn）
+        let res = service.process_chat_session(&auth(), input).await.unwrap();
+        assert_eq!(res.committed_entries.len(), 1);
+        let new_entry = &res.committed_entries[0];
+        assert_eq!(
+            new_entry.content,
+            "即日起决定改用 PostgreSQL 15 作为主数据库"
+        );
+
+        // 关系确实没建立、旧事实确实没被封堵（失败被吞但不假装成功）
+        let relations = store
+            .list_relations_from("test-ns", new_entry.id)
+            .await
+            .unwrap();
+        assert!(relations.is_empty());
+        let old_after = store.get("test-ns", old_entry.id).await.unwrap();
+        assert!(old_after.valid_until.is_none());
     }
 
     #[tokio::test]

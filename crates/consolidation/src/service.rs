@@ -199,7 +199,7 @@ mod tests {
         account_scope::scope_name,
         algorithm::l2_normalize,
         domain::{IntegrationKind, MemoryKind, MemoryStatus, NamespaceGrantRecord, ProposalStatus},
-        infra::{GrantStore, MemoryStore},
+        infra::{GrantStore, MemoryStore, RelationStore},
         ResolveAction,
     };
     use store::InMemoryHubStore;
@@ -456,6 +456,94 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, HubError::Conflict));
+    }
+
+    #[tokio::test]
+    async fn test_merge_relation_failure_warns_but_merge_succeeds() {
+        // 用 mem-core 的 TestHubStore 以便注入 add_relation 失败
+        let store = Arc::new(mem_core::testing::TestHubStore::new());
+        store
+            .ensure_namespace(&scoped_ns("ns"), &AgentId::from("agent-a"))
+            .await
+            .unwrap();
+        store
+            .grant(&NamespaceGrantRecord {
+                namespace: scoped_ns("ns"),
+                agent_id: AgentId::from("agent-a"),
+                can_read: true,
+                can_write: true,
+                granted_by: AgentId::from("agent-a"),
+                created_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        // 合并时的 Supersedes 关系写入将被注入失败
+        store
+            .fail_add_relation
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let e1 = store
+            .insert(&make_entry(
+                &scoped_ns("ns"),
+                "数据库用 MySQL",
+                Some("db:engine"),
+            ))
+            .await
+            .unwrap();
+        let e2 = store
+            .insert(&make_entry(
+                &scoped_ns("ns"),
+                "数据库用 PostgreSQL",
+                Some("db:engine"),
+            ))
+            .await
+            .unwrap();
+
+        let svc = DefaultIntegrationService::new(
+            store.clone(),
+            Arc::new(GrantChecker::new(store.clone())),
+            0.99,
+            100,
+        );
+        let scan = svc
+            .scan(
+                &writer(),
+                ScanRequest {
+                    namespace: "ns".to_string(),
+                    dry_run: false,
+                    sim_threshold: None,
+                    mode: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // 关系写失败只降级为 warn：合并主流程必须成功
+        let survivor = svc
+            .resolve(
+                &writer(),
+                ResolveRequest {
+                    proposal_id: scan.proposals[0].id,
+                    action: ResolveAction::Merge,
+                    survivor_id: Some(e2.id),
+                    note: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(survivor.id, e2.id);
+
+        // 归档照常发生（合并本体不受次要写失败影响）
+        let archived = store.get(&scoped_ns("ns"), e1.id).await.unwrap();
+        assert_eq!(archived.status, MemoryStatus::Merged);
+        assert_eq!(archived.merged_into, Some(e2.id));
+        // 关系确实缺失（失败被观测而非假装成功；日志 warn 断言受限于
+        // 测试基建无日志捕获，以注入 + 主流程结果为替代验证）
+        let relations = store
+            .all_relations_in_namespace(&scoped_ns("ns"))
+            .await
+            .unwrap();
+        assert!(relations.is_empty());
     }
 
     #[tokio::test]

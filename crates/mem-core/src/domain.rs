@@ -1353,9 +1353,27 @@ pub struct RestoreReport {
     pub created: usize,
     pub updated: usize,
     pub unchanged: usize,
-    /// Replace 模式下自动创建的安全备份 ID
+    /// Replace 模式下自动创建的安全备份 ID（多命名空间时取第一个，完整列表见 `safety_backup_ids`）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub safety_backup_id: Option<Uuid>,
+    /// Replace 模式下按受影响命名空间逐一创建的全部安全备份 ID
+    #[serde(default)]
+    pub safety_backup_ids: Vec<Uuid>,
+    /// 单条实体恢复失败计数：失败不中止恢复（部分恢复优于全不恢复），只在此可见化
+    #[serde(default)]
+    pub failed_evidences: usize,
+    #[serde(default)]
+    pub failed_relations: usize,
+    #[serde(default)]
+    pub failed_tasks: usize,
+    #[serde(default)]
+    pub failed_experiences: usize,
+    #[serde(default)]
+    pub failed_task_links: usize,
+    #[serde(default)]
+    pub failed_threads: usize,
+    #[serde(default)]
+    pub failed_revisions: usize,
 }
 
 // ===== 整合 =====

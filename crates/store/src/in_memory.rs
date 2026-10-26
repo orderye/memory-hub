@@ -765,6 +765,14 @@ impl mem_core::AgentStore for InMemoryHubStore {
         &self,
         reg: &mem_core::AgentRegistration,
     ) -> Result<mem_core::AgentRecord> {
+        // Argon2 为 CPU 密集计算，经 spawn_blocking 执行避免阻塞 tokio worker；
+        // 先算散列再拿写锁，避免 RwLockGuard 跨 await（会破坏 future 的 Send）
+        let secret_hash = match &reg.client_secret {
+            Some(secret) => Some(
+                crate::secret::hash_secret_blocking(reg.agent_id.clone(), secret.clone()).await,
+            ),
+            None => None,
+        };
         let mut w = self.agents.write().unwrap();
         let entry = w
             .entry(reg.agent_id.clone())
@@ -784,8 +792,8 @@ impl mem_core::AgentStore for InMemoryHubStore {
         entry.owner_account_id = Some(reg.owner_account_id);
         entry.redirect_uris = reg.redirect_uris.clone();
         entry.max_scopes = reg.max_scopes.clone();
-        if let Some(secret) = &reg.client_secret {
-            entry.secret_hash = Some(crate::secret::hash_secret(&reg.agent_id, secret));
+        if let Some(hash) = secret_hash {
+            entry.secret_hash = Some(hash);
         }
         Ok(agent_record(&reg.agent_id, entry))
     }
@@ -821,14 +829,21 @@ impl mem_core::AgentStore for InMemoryHubStore {
     }
 
     async fn verify_agent_secret(&self, agent_id: &AgentId, secret: &str) -> Result<bool> {
-        let w = self.agents.read().unwrap();
-        Ok(match w.get(agent_id) {
-            Some(a) => match &a.secret_hash {
-                Some(h) => crate::secret::verify_secret(agent_id, secret, h),
-                None => false,
-            },
-            None => false,
-        })
+        // 读锁作用域内取出散列副本，锁不跨 await（否则 future 非 Send）
+        let stored = {
+            let w = self.agents.read().unwrap();
+            w.get(agent_id).and_then(|a| a.secret_hash.clone())
+        };
+        match stored {
+            // Argon2 为 CPU 密集计算，经 spawn_blocking 执行避免阻塞 tokio worker
+            Some(h) => Ok(crate::secret::verify_secret_blocking(
+                agent_id.to_string(),
+                secret.to_string(),
+                h,
+            )
+            .await),
+            None => Ok(false),
+        }
     }
 }
 

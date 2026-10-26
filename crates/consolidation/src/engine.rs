@@ -742,8 +742,14 @@ impl ConsolidationEngine {
                 archived.valid_until = Some(now);
             }
 
-            // 建立事实演化关系 (survivor supersedes archived)
-            let _ = self
+            // 建立事实演化关系 (survivor supersedes archived)。
+            //
+            // 失败不上抛（warn 可观测）：此关系是合并的溯源补充，不是合并本身；
+            // 幸存者 revise 已在上方成功提交，若因关系写失败整体报错，
+            // 提案会保持 Open 等待重试，而重试会把已合并的正文再走一遍合并
+            // （版本号再度递增），代价大于缺失一条溯源边。此权衡与
+            // mem-core::chat_cognitive_service 的 supersedes 处理保持一致。
+            if let Err(e) = self
                 .store
                 .add_relation(
                     namespace,
@@ -755,7 +761,16 @@ impl ConsolidationEngine {
                         source_evidence_id: None,
                     },
                 )
-                .await;
+                .await
+            {
+                tracing::warn!(
+                    namespace,
+                    survivor_id = %survivor_id,
+                    archived_id = %archived.id,
+                    error = %e,
+                    "合并时 Supersedes 关系写入失败：溯源链缺失，归档继续"
+                );
+            }
 
             self.store
                 .revise(&archived, expected_member, VersionChange::Merged)
