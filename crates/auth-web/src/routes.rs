@@ -15,6 +15,7 @@
 //! | GET | `/account/login` `POST` | 账户登录（建立会话 Cookie） |
 //! | POST | `/account/logout` | 退出登录 |
 //! | POST | `/account/token` | 签发注册令牌（DCR 的 initial access token） |
+//! | GET | `/` | 入口页：重定向到 `/console` |
 //! | GET | `/console` | 账户控制台（本账户 Agent / 命名空间 / 授权） |
 //! | POST | `/console/agents` | 注册 Agent 到本账户 |
 //! | POST | `/console/agents/status` | 停用/恢复 Agent |
@@ -114,6 +115,8 @@ pub fn oauth_router(state: AsWebState) -> Router {
         )
         .route("/account/logout", post(handle_logout))
         .route("/account/token", post(handle_account_token))
+        // 入口页：预览页/直接访问根路径时送到控制台；未登录由控制台跳登录页
+        .route("/", get(handle_root))
         .route("/console", get(handle_console))
         .route("/console/agents", post(handle_console_register_agent))
         .route("/console/agents/status", post(handle_console_agent_status))
@@ -877,6 +880,13 @@ async fn handle_account_token(State(s): State<AsWebState>, headers: HeaderMap) -
     }
 }
 
+// ===== 入口页 =====
+
+/// GET /：根路径直接送到账户控制台（未登录时控制台再跳登录页）
+async fn handle_root() -> Response {
+    redirect("/console")
+}
+
 // ===== 控制台 =====
 
 /// GET /console：账户控制台（需登录；只展示本账户数据）
@@ -1470,6 +1480,13 @@ mod tests {
             .await
             .unwrap();
         session
+    }
+
+    #[tokio::test]
+    async fn test_root_redirects_to_console() {
+        let resp = handle_root().await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(resp.headers()[header::LOCATION], "/console");
     }
 
     #[tokio::test]
