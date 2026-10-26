@@ -10,10 +10,11 @@
 
 use crate::account_scope::AccountScopedStore;
 use crate::domain::{
-    is_intention_active, validate_cognitive_candidate, ChatCognitiveInput, CognitiveCandidate,
-    CognitiveGovernanceMode, CognitiveLayer, CognitivePolicy, CognitiveProposalRecord,
-    CognitiveProposalStatus, EvidenceSourceKind, MemoryEntry, MemoryKind, MemoryRelationKind,
-    MemoryScene, MemoryStatus, NewEvidence, NewMemoryRelation, VersionChange,
+    indicates_fact_evolution, is_intention_active, validate_cognitive_candidate,
+    ChatCognitiveInput, CognitiveCandidate, CognitiveGovernanceMode, CognitiveLayer,
+    CognitivePolicy, CognitiveProposalRecord, CognitiveProposalStatus, EvidenceSourceKind,
+    MemoryEntry, MemoryKind, MemoryRelationKind, MemoryScene, MemoryStatus, NewEvidence,
+    NewMemoryRelation, VersionChange,
 };
 use crate::infra::{ChatCognitiveExtractor, MemoryHubStore};
 use chrono::{DateTime, Utc};
@@ -680,16 +681,7 @@ impl ChatCognitiveService {
         }
 
         // 语义演化启发式识别（如新事实描述 "改用/不再使用/决定使用"，匹配相同主体旧条目）
-        let content_lower = candidate.content.to_lowercase();
-        let evolution_markers = [
-            "决定改用",
-            "改用",
-            "切换至",
-            "不再使用",
-            "supersede",
-            "replace",
-        ];
-        let indicates_evolution = evolution_markers.iter().any(|m| content_lower.contains(m));
+        let indicates_evolution = indicates_fact_evolution(&candidate.content);
 
         if indicates_evolution {
             // 确定性地取"最近的相关旧事实"：按 occurred_at（其次 updated_at、created_at）
