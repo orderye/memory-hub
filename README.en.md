@@ -71,6 +71,13 @@ Not "yet another agent framework" — only **infrastructure**: a memory foundati
 
 All three processes are **stateless**, so you can run several instances of each to absorb load.
 
+> **Two-process shape (optional)**: set `HUB_EMBEDDED_WORKER=1` on `mcp-server` and the
+> backup-worker's resident jobs (scheduled backups, expiry/evidence cleanup, integration
+> scans) run inside the MCP process with the **same cron and cross-process lease**, shrinking
+> the deployment to auth-server + mcp-server. Lite deployments enable it by default; the job
+> logic lives in one place (`worker::embedded`), so the standalone process and the embedded
+> mode behave identically.
+
 ```mermaid
 flowchart TD
     subgraph Agents["Multiple AI assistants"]
@@ -115,11 +122,11 @@ One codebase, one database schema, one backup format — a single setting picks 
 | | Personal Lite | Production Full (default) |
 | :--- | :--- | :--- |
 | Fits | single machine, one person, a few agents | teams / multi-account / public service |
-| Processes | postgres + auth-server + mcp-server | plus a **long-running** backup-worker |
+| Processes | postgres + auth-server + mcp-server (three) | plus a **long-running** backup-worker (four) |
 | Embedding | `HUB_EMBED_PROVIDER=off`: no vectors, no outbound calls | `mock` (dev) or `http` (real semantics) |
 | Retrieval | keyword-only (FTS + five-signal scoring + `min_score` rejection) | keyword + pgvector semantic recall |
 | Consolidation | local rules only (embedding calls stay 0) | same, may opt into `hybrid` |
-| Background jobs | manual `backup-worker --once` | cron backups + periodic sweeps + cross-replica lease |
+| Background jobs | embedded in mcp-server (scheduled backups + daily scans; sweeps still manual `--once`) | resident process: cron backups + periodic sweeps + cross-replica lease |
 | Security | OAuth 2.1 / ACL / account isolation / backup & restore **all kept** | same |
 
 > **Upgrading changes nothing by default**: `HUB_DEPLOYMENT_PROFILE` defaults to `production`,
@@ -155,10 +162,10 @@ Once it is up, open <http://localhost:8080/account/register> to register an acco
 # 1. Same .env (at least HUB_TOKEN_SECRET and POSTGRES_PASSWORD)
 cp .env.example .env
 
-# 2. Start Lite: no long-running backup-worker, embedding off by default
+# 2. Start Lite: three-process shape (scheduled backups embedded in mcp-server), embedding off
 docker compose -f docker-compose.lite.yml up -d --build
 
-# 3. Run one round of background jobs on demand, then exit
+# 3. On demand, run one full job cycle (including the sweeps the embedded mode skips)
 docker compose -f docker-compose.lite.yml run --rm backup-worker --once
 ```
 

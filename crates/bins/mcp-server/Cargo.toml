@@ -21,6 +21,7 @@ auth-core = { workspace = true }
 authz = { workspace = true }
 consolidation = { workspace = true }
 mcp = { workspace = true }
+worker = { workspace = true }
 axum.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true

@@ -79,6 +79,13 @@ pub struct AppConfig {
     // ===== 部署形态 =====
     /// 部署模式：只影响**默认值**，显式环境变量永远优先（见 `common::profile`）
     pub deployment_profile: DeploymentProfile,
+    /// 是否在 mcp-server 进程内嵌后台作业调度（`HUB_EMBEDDED_WORKER`，默认关）
+    ///
+    /// 开启后 backup-worker 的常驻作业（定时备份 / 过期清理 / 证据清理 / 整合扫描）
+    /// 改在 MCP 进程内按同一 cron 与租约运行，部署从三进程收敛为两进程。
+    /// 这**不是**绕开 lite"不养空转进程"的约束——内嵌不新增任何进程；
+    /// lite 默认的 `EXPIRY_SWEEP_INTERVAL_H=0` 照常生效（内嵌循环同样跳过清扫）。
+    pub embedded_worker: bool,
 
     // ===== 存储与模型 =====
     pub db_url: String,
@@ -299,6 +306,7 @@ impl Default for AppConfig {
         Self {
             // 默认完整生产部署：升级不得改变既有实例的行为
             deployment_profile: DeploymentProfile::Production,
+            embedded_worker: false,
             db_url: "postgresql://mem_app:secret@localhost:5432/memory_hub".to_string(),
             db_max_connections: 10,
             db_statement_timeout_ms: 30_000,
@@ -488,6 +496,8 @@ impl AppConfig {
         cfg.trusted_proxies = parse_trusted_proxies()?;
 
         cfg.log_redaction = var_or("LOG_REDACTION", &cfg.log_redaction);
+
+        cfg.embedded_worker = parse_bool("HUB_EMBEDDED_WORKER", cfg.embedded_worker)?;
 
         cfg.validate()?;
         Ok(cfg)
@@ -709,7 +719,7 @@ impl AppConfig {
             .unwrap_or("<unknown>")
             .to_string();
         format!(
-            "profile={} db_host={} embed_dim={} embed_provider={} embed_model={} embed_enabled={} semantic_ready={} mcp_bind={} auth_bind={} backup_cron={} integrate_threshold={} sweep_h={} origins={} min_score={} invite={} bootstrap_pwd={} consolidation_mode={} consolidation_fallback={} consolidation_override={} embed_top_k={} scan_max_entries={} job_lease_h={} stats_ttl_s={}",
+            "profile={} db_host={} embed_dim={} embed_provider={} embed_model={} embed_enabled={} semantic_ready={} mcp_bind={} auth_bind={} backup_cron={} integrate_threshold={} sweep_h={} origins={} min_score={} invite={} bootstrap_pwd={} consolidation_mode={} consolidation_fallback={} consolidation_override={} embed_top_k={} scan_max_entries={} job_lease_h={} stats_ttl_s={} embedded_worker={}",
             self.deployment_profile.as_str(),
             db_host,
             self.embed_dim,
@@ -741,6 +751,7 @@ impl AppConfig {
             self.integration_scan_max_entries,
             self.job_lease_h,
             self.consolidation_stats_ttl_s,
+            self.embedded_worker,
         )
     }
 }
@@ -1301,6 +1312,39 @@ mod tests {
                 err.to_string().contains("production | lite"),
                 "未知模式必须启动失败：{err}"
             );
+        });
+    }
+
+    #[test]
+    fn test_embedded_worker_switch_parses_and_defaults_off() {
+        // production 显式开启
+        with_env(&[("HUB_EMBEDDED_WORKER", Some("true"))], || {
+            let cfg = AppConfig::from_env().unwrap();
+            assert!(cfg.embedded_worker);
+        });
+
+        // 缺省关闭（升级不改变既有实例行为）
+        with_env(&[], || {
+            assert!(!AppConfig::from_env().unwrap().embedded_worker);
+        });
+
+        // lite 下同样可开（内嵌不新增进程，不违背"不养空转进程"），
+        // 且 lite 的清扫关闭默认值不被内嵌开关改写
+        with_env(
+            &[
+                ("HUB_DEPLOYMENT_PROFILE", Some("lite")),
+                ("HUB_EMBEDDED_WORKER", Some("true")),
+            ],
+            || {
+                let cfg = AppConfig::from_env().unwrap();
+                assert!(cfg.embedded_worker);
+                assert_eq!(cfg.expiry_sweep_interval_h, 0, "lite 清扫默认仍关闭");
+            },
+        );
+
+        // 非法布尔值 fail-fast（parse_bool 语义）
+        with_env(&[("HUB_EMBEDDED_WORKER", Some("yes?"))], || {
+            assert!(AppConfig::from_env().is_err());
         });
     }
 

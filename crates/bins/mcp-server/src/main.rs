@@ -52,6 +52,17 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let (store, shared_rate_store) = build_store(&cfg).await?;
     info!(mode = %store::storage_mode_label(cfg_is_pg(&cfg)), "存储已就绪");
 
+    // ===== 内嵌后台作业（可选，HUB_EMBEDDED_WORKER=1）=====
+    // backup-worker 的常驻作业改在本进程内按同一 cron 与租约运行，
+    // 部署从三进程收敛为两进程；不新增任何进程，lite 的清扫关闭默认值照常生效。
+    // 内存存储由 EmbeddedJobs::new 拒绝（没有备份意义）。
+    if cfg.embedded_worker {
+        let rate_store = shared_rate_store.clone().ok_or_else(|| {
+            anyhow!("内嵌作业需要 PostgreSQL 租约存储；内存模式不支持 HUB_EMBEDDED_WORKER=1")
+        })?;
+        let _jobs_handle = worker::embedded::spawn_embedded(store.clone(), rate_store, &cfg)?;
+    }
+
     // ===== 嵌入器 =====
     let embedder: Arc<dyn Embedder> = embed::build_from_config(&cfg)?;
     info!(provider = %cfg.embed_provider, dim = cfg.embed_dim, "嵌入器已就绪");

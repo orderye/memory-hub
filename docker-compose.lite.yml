@@ -5,12 +5,14 @@
 #   docker compose -f docker-compose.lite.yml up -d
 #
 # 与 docker-compose.yml（Production Full）的区别：
-#   1. 不常驻 backup-worker（个人部署不该养一个空转的定时进程）；
+#   1. mcp-server 默认内嵌后台作业（HUB_EMBEDDED_WORKER=1，不新增进程）：
+#      定时备份与每日整合扫描自动运行；过期/证据清扫仍按 lite 默认关闭；
 #   2. 固定 HUB_DEPLOYMENT_PROFILE=lite → 嵌入默认关闭、检索纯关键词、整合零嵌入调用；
 #   3. 资源配额按单机收敛。
 #
-# 手动触发后台作业（整合扫描 / 过期清理 / 证据清理 / 备份），各执行一次后退出：
+# 手动执行完整一轮作业（含过期清理 / 证据清理，内嵌模式不覆盖的部分）：
 #   docker compose -f docker-compose.lite.yml run --rm backup-worker --once
+# 想改回"不内嵌"：在 .env 里设 HUB_EMBEDDED_WORKER=0 后重启 mcp-server。
 #
 # 想启用真实向量检索：在 .env 里设置
 #   HUB_EMBED_PROVIDER=http
@@ -92,6 +94,9 @@ services:
       HUB_DB_URL: "postgresql://hub_app:${POSTGRES_PASSWORD:?必须在 .env 中设置 POSTGRES_PASSWORD}@postgres:5432/memory_hub"
       # 个人部署：默认零嵌入调用（.env 里显式设 http 才会启用向量）
       HUB_EMBED_PROVIDER: ${HUB_EMBED_PROVIDER:-off}
+      # 内嵌后台作业：定时备份 / 每日整合扫描在本进程运行，不再需要常驻 backup-worker。
+      # 过期与证据清扫按 lite 默认关闭（EXPIRY_SWEEP_INTERVAL_H=0），需要时用 --once 手动跑。
+      HUB_EMBEDDED_WORKER: ${HUB_EMBEDDED_WORKER:-1}
       TOKIO_WORKER_THREADS: 2
       HUB_DB_MAX_CONNECTIONS: 8
       # 保留默认限流（50 RPS/Agent）：stdio 本地代理与个人部署同样需要速率上限，

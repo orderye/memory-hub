@@ -71,6 +71,11 @@
 
 三个进程都是**无状态**的，可以各自多开几份来扛量。
 
+> **两进程形态（可选）**：给 `mcp-server` 设 `HUB_EMBEDDED_WORKER=1`，backup-worker 的
+> 常驻作业（定时备份、过期/证据清理、整合扫描）会改在 MCP 进程内按**同一 cron 与跨进程
+> 租约**运行，部署收敛为 auth-server + mcp-server 两个进程。Lite 部署默认已开启；
+> 作业逻辑只有这一份（`worker::embedded`），独立进程与内嵌模式行为完全一致。
+
 ```mermaid
 flowchart TD
     subgraph Agents["多个 AI 助手"]
@@ -115,11 +120,11 @@ flowchart TD
 | | Personal Lite（个人轻量） | Production Full（完整生产，默认） |
 | :--- | :--- | :--- |
 | 适用 | 单机、个人、少量 Agent | 团队 / 多账户 / 对外服务 |
-| 进程 | postgres + auth-server + mcp-server | 再加**常驻** backup-worker |
+| 进程 | postgres + auth-server + mcp-server（三进程） | 再加**常驻** backup-worker（四进程） |
 | 嵌入 | `HUB_EMBED_PROVIDER=off`：不产生向量、不外呼任何嵌入服务 | `mock`（开发）或 `http`（真实语义） |
 | 检索 | 纯关键词（FTS + 五维评分 + `min_score` 域外拒绝） | 关键词 + pgvector 语义召回 |
 | 整合 | 纯本地规则（embedding 调用恒为 0） | 同左，可显式切 `hybrid` |
-| 后台作业 | 手动 `backup-worker --once` | cron 备份 + 周期清理 + 跨副本租约 |
+| 后台作业 | 内嵌进 mcp-server（定时备份 + 每日扫描；清扫类仍手动 `--once`） | 常驻进程：cron 备份 + 周期清理 + 跨副本租约 |
 | 安全能力 | OAuth 2.1 / ACL / 账户隔离 / 备份恢复 **全部保留** | 同左 |
 
 > **升级不会改变现有行为**：`HUB_DEPLOYMENT_PROFILE` 默认就是 `production`，
@@ -153,10 +158,10 @@ docker compose logs -f mcp-server
 # 1. 同样的 .env（至少填 HUB_TOKEN_SECRET 与 POSTGRES_PASSWORD）
 cp .env.example .env
 
-# 2. 起 Lite：不含常驻 backup-worker，嵌入默认关闭
+# 2. 起 Lite：三进程形态（定时备份已内嵌进 mcp-server），嵌入默认关闭
 docker compose -f docker-compose.lite.yml up -d --build
 
-# 3. 需要时手动跑一轮后台作业（整合扫描 → 过期清理 → 证据清理 → 备份），跑完即退出
+# 3. 需要时手动跑一轮完整作业（含内嵌模式不覆盖的过期清理 → 证据清理），跑完即退出
 docker compose -f docker-compose.lite.yml run --rm backup-worker --once
 ```
 

@@ -10,6 +10,7 @@
 
 pub mod backup_job;
 pub mod cognitive_job;
+pub mod embedded;
 pub mod evidence_job;
 pub mod experience_job;
 pub mod integration_job;
@@ -19,6 +20,7 @@ pub mod scheduler;
 
 pub use backup_job::{BackupJob, BackupJobReport};
 pub use cognitive_job::{ChatCognitiveJob, ChatCognitiveJobReport};
+pub use embedded::{spawn_embedded, EmbeddedJobs};
 pub use evidence_job::EvidenceRetentionJob;
 pub use experience_job::{ExperienceDistillJob, ExperienceDistillReport};
 pub use integration_job::{IntegrationScanJob, IntegrationScanReport};
