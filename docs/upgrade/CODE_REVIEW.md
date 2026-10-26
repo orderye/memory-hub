@@ -218,7 +218,7 @@ cargo test --test consolidation_eval  # 整合指标不退化（涉及整合时�
 | 批次 1（P0） | ✅ 完成（2026-10-25） | #1–#9 全部 | #5 采用独立表 `cognitive_proposals`（迁移 012）；#7 顺带修正审校事实：内存 revise 本就返回 Conflict；#8 新增 `TRUSTED_PROXIES` 配置；验证全绿：fmt/clippy/496 测试 + eval_bench 门禁（指标零退化）+ consolidation_eval 门禁；提交 `e934321` |
 | 批次 2（P1） | ✅ 完成（2026-10-25） | #10–#18 全部 | #12 采用迁移 013 标记列 + 启动回填（分词与写路径收敛到同一入口 `tsv_tokens_for`，pg-integration 端到端测试由 CI 执行）；#17 新增 `system_snapshot` 走系统特权主体，定时快照与手工 v4 同构；#18 核实批次 1 已基本覆盖，补 MCP 端到端守卫测试；验证全绿：fmt/clippy/517 测试 + 双评测门禁零退化；提交 `8f9d6e8` |
 | 批次 3（P2） | ✅ 完成（2026-10-26） | #19–#26 全部 | #19 双列清单（瘦版省 embedding）；#20 stats 下推 `count()`；#21 MCP schema `OnceLock` 缓存 + scope 常量查找；#22 认知查重走 `all_in_namespace_limited`；#23 重复带接入 LSH；#24 冲突组预缓存分词；#25 IDF 闭包改 HashMap；#26 版本历史改 BTreeMap；fmt 通过，完整测试/评测待环境空闲后复跑；本报告随批次 3 提交 |
-| 批次 4（P3+轻微） | ⬜ 未开始 | — | — |
+| 批次 4（P3+轻微） | 🟡 部分完成（2026-10-26） | #27 / #28 / #29 / #31 | #28 `coding_revisions` 列清单与 `memories` INSERT 收敛为常量/单一 helper；#29 事实演化 marker 统一到 `domain::FACT_EVOLUTION_MARKERS`（chat 与 conflict 共用，含糊意图 marker 同址收敛）；#31 删除三份内嵌 `TestHubStore`，统一 `testing::TestHubStore` 并补齐 `list`/`count` 过滤契约；#27 `postgres`/`in_memory` 按 trait 拆分，`backup_service`/`chat_cognitive_service`/`hybrid` 测试外移；提交 `e70572b`→`304e7eb`→`5a4331d`→`be57466`→`7397567`→`537ed48`；验证全绿：fmt/clippy/517 测试（4 ignored）+ eval_bench 与 consolidation_eval 门禁零退化（同时复跑批次 3 的完整测试）；其余轻微项（§6）未开始 |
 
 <!-- kimi-badge -->
 [![powered by KimiCode](../../.github/assets/kimi-badge.svg)](https://www.kimi.com/code)
