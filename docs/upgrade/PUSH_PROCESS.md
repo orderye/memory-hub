@@ -347,9 +347,10 @@ git ls-remote cnb refs/heads/main
 ```
 
 > CNB 侧是**镜像**，只保留 `main` 一条分支：功能分支、实验分支一律只推 GitHub，
-> 不要往 CNB 推分支（推了也不会触发流水线，只会在镜像上留垃圾 ref）。
+> 不要往 CNB 推分支——`.cnb.yml` 的 `$` 兜底流水线会让分支 push 跑一遍质量门禁（不部署），
+> 但那属于额外的构建开销，且会在镜像上留垃圾 ref。
 >
-> ⚠️ **推 `cnb/main` 会触发 `.cnb.yml`：构建镜像 → 推制品库 → SSH 部署到生产主机 → 探活回滚。**
+> ⚠️ **推 `cnb/main` 会触发 `.cnb.yml` 的发布流水线：构建镜像 → 推制品库 → SSH 部署到生产主机 → 探活回滚。**
 > 推之前确认 GitHub 侧的质量门禁已经绿灯。
 
 推完对照两端：
@@ -363,9 +364,10 @@ git ls-remote cnb refs/heads/main
 | 平台 | 触发条件 | 查看方式 |
 | :--- | :--- | :--- |
 | GitHub | 任意分支 push、PR、手动触发 | `gh run list --workflow ci.yml --limit 5` |
-| CNB | 仅 `main` 分支 push | CNB 仓库页面的流水线列表 |
+| CNB | `main` 分支 push（发布）；其它分支 push（`$` 兜底，只跑质量门禁）；Tag 详情页「部署」→ production（手动上线/回滚） | CNB 仓库页面的流水线列表 / Tag 详情页 |
 
-推分支到 CNB 不会触发流水线——这是正常现象，CNB 侧只在 Step 4 合入 `main` 时验证。
+推分支到 CNB **不会部署**，只会跑一遍质量门禁流水线；生产默认在 Step 4 合入 `main` 时变，
+也可在 Tag 详情页手动部署或回滚（见 §5.2）。
 
 ### Step 6 · 记录 SHA 对照
 
@@ -379,7 +381,7 @@ git ls-remote cnb refs/heads/main
 
 ## 五、发版 SOP
 
-本仓库的发布**由 tag 触发 CI 构建镜像**，不产出 `dist/*.zip` 这类安装包，
+本仓库的发布**由 tag 触发 CI 构建定版镜像**，不产出 `dist/*.zip` 这类安装包，
 因此通用手册的「GitHub Release 挂分发包」与「CNB Release 附件挂载」两节**不适用**。
 本仓库对应的发版动作是：
 
@@ -408,6 +410,10 @@ git -C .cnb-worktree tag -a v0.1.0 cnb-main -m "v0.1.0"
 git -C .cnb-worktree push cnb v0.1.0
 ```
 
+推 tag 到 CNB 会触发 `.cnb.yml` 里的 `tag_push`：把该 tag 指向的提交构建成定版镜像
+`docker.cnb.cool/toroyxxx/memory-hub:vX.Y.Z` 推入制品库，流水线带 `RELEASE` 标签。
+这一步**只入库、不上线**——部署由 `main` push 那条流水线负责，`latest` 也不会被 tag 改动。
+
 ### 5.3 发布完成核对清单
 
 ```bash
@@ -427,7 +433,8 @@ git ls-remote --tags cnb "v0.1.0"
 - [ ] GitHub 与 CNB 两端分支最新 commit 内容一致，作者身份各自独立且自足；
 - [ ] 双端均存在对应的 `vX.Y.Z` 标签；
 - [ ] GitHub 侧 `ci.yml` 四个 job 全绿；
-- [ ] CNB 侧流水线完成"部署到 tx-cloud 与探活回滚"，`/readyz` 探活通过。
+- [ ] CNB 侧 `main` push 流水线完成"部署到 tx-cloud 与探活回滚"，`/readyz` 探活通过；
+- [ ] CNB 制品库出现本次 tag 的定版镜像 `memory-hub:vX.Y.Z`（`tag_push` 流水线，标签 `RELEASE`）。
 
 ---
 
@@ -494,7 +501,7 @@ chmod +x .git/hooks/pre-push
 | `pre-push` 拦下推送 | 待推提交署名与目标平台不符 | 主工作区推 GitHub 前应是 `orderye@qq.com`；推 CNB 前应先在 `.cnb-worktree` 用 §四 Step 3 重放 |
 | 重放时报 `nothing to commit` | 用 SHA 区间比对导致已同步提交被重复重放 | 改用 `--right-only --cherry-pick --no-merges`（patch-id 口径）筛选待同步提交；`scripts/push-cnb.sh` 已内建该口径 |
 | 两端 `diff --stat` 有输出 | CNB 侧漏同步或同步时改了内容 | 重跑 §四 Step 3 的重放循环；必要时 `git -C .cnb-worktree reset --hard cnb/main` 后重来 |
-| CNB 流水线没跑 | CNB 只在 `main` push 时触发 | 推分支不触发是正常的；合入 `main` 才会跑 |
+| CNB 发布流水线没跑 | 发布只在 `main` push 时触发 | 推分支只会跑质量门禁、不部署；合入 `main` 才会发布 |
 | GitHub 流水线没跑 | 触发的是 `push` / `pull_request` / 手动 | `gh run list --workflow ci.yml` 确认；`workflow_dispatch` 的 job 需手动选后端并配好 secret |
 | tag 冲突 `already exists` | 同名 tag 已在远端 | 确认没发错版本后 `git push --delete origin v0.3.6` 再打；不要用 `git push -f` 覆盖已发布 tag |
 | CNB 部署后没起来 | 探活失败会自动回滚到上一稳定版本 | 看 CNB 流水线日志；`curl -fsS http://127.0.0.1:3000/readyz` 在主机上复核 |

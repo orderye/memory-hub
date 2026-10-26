@@ -819,6 +819,8 @@ feature 组合要点：
 
 部署行为要点：**只在 main push 时**触发；部署机是 ubuntu 用户下的 `~/memory-hub`；回滚是「换回上一份 current_release.env 再 docker compose up -d」，不是镜像层回滚。当前分支 `feat/lightweight-deployment` 不会触发 CNB 部署。
 
+> 注：本节是审计当时的快照（74 行）。此后 `.cnb.yml` 已扩为：main 部署加流水线锁、新增 `$` 兜底键（其它分支 push 只跑质量门禁）、以及 `$` 下的 `tag_push`（打 tag 构建 `:<tag 名>` 定版镜像入库，不部署、不动 `latest`）。表格中的行号对应旧版，查当前配置请直接读文件。
+
 ### 11.3 本机无法执行的 CI 项
 
 | 项 | 原因（实测） |

@@ -530,7 +530,7 @@ A standard Rust workspace, layered by responsibility:
 ├── Cargo.toml                  # Workspace and shared dependencies
 ├── Dockerfile                  # Multi-stage production image
 ├── docker-compose.yml          # One-command orchestration (DB + three services)
-├── .cnb.yml                    # CNB cloud build: image → artifact registry → deploy with health probe and rollback
+├── .cnb.yml                    # CNB cloud build: main push ships and deploys; tag push ships a versioned image
 ├── .github/workflows/ci.yml    # GitHub Actions: quality gate / PG integration / dependency audit / release build
 ├── scripts/push-cnb.sh         # Dual-platform push: replay and push the mirror under the CNB identity (patch-id based)
 ├── docs/                       # Design and specification documents (see section 11)
@@ -582,7 +582,29 @@ CI runs on two platforms:
 - **GitHub Actions** (`.github/workflows/ci.yml`): ① quality gate (fmt / clippy `--all-features` / tests / doc build);
   ② integration tests against a real PostgreSQL + pgvector database (serialized); ③ dependency admission and security audit (cargo-deny + cargo-audit); ④ release build of the three binaries.
 - **CNB cloud build** (`.cnb.yml`): a push to `main` triggers it — build the image in the cloud → push to the artifact registry → SSH-deploy to the server →
-  probe `/readyz`, rolling back to the previous stable version on failure.
+  probe `/readyz`, rolling back to the previous stable version on failure. A push to any other branch hits the `$` fallback pipeline instead:
+  quality gate only (fmt / clippy / test), no image build and no deployment. Repeated pushes queue behind a pipeline lock instead of deploying concurrently.
+  A tag push runs `tag_push` under the same `$` fallback key: the tagged commit is built as a `:<tag name>` versioned image and pushed to the
+  registry — no deployment, and `latest` is left untouched (shipping stays tied to `main` pushes).
+
+### Cloud-native dev environment (CNB)
+
+No local toolchain required: open the CNB repository page → "Cloud-native development" / IDE and pick a branch
+(`$: vscode` event; the base image lives in `.ide/Dockerfile`). The first launch builds the image
+(`rust:1-bookworm` + code-server), roughly 5–10 minutes; later launches hit the layer cache.
+
+- **Preinstalled**: Rust toolchain (stable) with `cargo clippy` / `cargo fmt`, `build-essential` + `pkg-config`
+  (`tikv-jemalloc-sys` needs a C compiler), `psql`, `jq` / `ripgrep`, Docker CLI, plus `code-server`
+  and extensions such as rust-analyzer. Because code-server is in the image, CNB runs single-container mode:
+  the browser terminal *is* this image.
+- **Caches**: `/usr/local/cargo/registry` and `target/` are mounted as data volumes, valid only on the current
+  build node; switching nodes drops them.
+- **Configuration**: the startup stage copies `.env.example` to `.env` when `.env` is missing (never overwrites);
+  you still fill in `POSTGRES_PASSWORD` / `HUB_TOKEN_SECRET` yourself.
+- **Real database**: `docker compose up -d postgres` starts `pgvector/pgvector:pg15`; set `HUB_DB_URL` as in
+  "Way B" and run `cargo test -p store --features pg-integration -- --ignored`.
+- **Changing the environment**: edit `.ide/Dockerfile` or the `$: vscode` block in `.cnb.yml`, then
+  `./scripts/push-cnb.sh --push`. `build.by` only tracks `.ide/Dockerfile`, so source changes never rebuild the image.
 
 ### Rollback (application version / deployment shape)
 

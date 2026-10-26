@@ -531,9 +531,11 @@ HUB_EMBED_MODEL=bge-m3
 ├── Cargo.toml                  # Workspace 与统一依赖
 ├── Dockerfile                  # 多阶段构建的生产镜像
 ├── docker-compose.yml          # 一键编排（DB + 三个服务）
-├── .cnb.yml                    # CNB 云构建：出镜像 → 推制品库 → 部署并探活回滚
+├── .cnb.yml                    # CNB 云构建：main push 出镜像并部署；tag push 出定版镜像；tag 部署触发器
+├── .cnb/tag_deploy.yml         # CNB 自定义部署环境：Tag 详情页「部署」选 production
 ├── .github/workflows/ci.yml    # GitHub Actions：质量门禁 / PG 集成 / 依赖审计 / Release 构建
 ├── scripts/push-cnb.sh         # 双平台推送：以 CNB 身份重放并推送镜像（patch-id 口径）
+├── scripts/ci/deploy-production.sh  # 生产部署阶段（切镜像 / 探活 / 失败回滚），CNB 两条流水线共用
 ├── docs/                       # 设计与规范文档（见第十一节）
 └── crates/
     ├── common/                 # 公共部件：配置强校验、脱敏日志、限流、Cron、整合模式枚举
@@ -582,7 +584,45 @@ CI 分两条：
 - **GitHub Actions**（`.github/workflows/ci.yml`）：① 质量门禁（fmt / clippy `--all-features` / 测试 / 文档构建）；
   ② PostgreSQL + pgvector 真实库集成测试（串行执行）；③ 依赖准入与安全审计（cargo-deny + cargo-audit）；④ Release 构建三个二进制。
 - **CNB 云构建**（`.cnb.yml`）：push 到 `main` 触发——云端构建镜像 → 推制品库 → SSH 部署到服务器 →
-  探活 `/readyz`，失败自动回滚到上一稳定版本。
+  探活 `/readyz`，失败自动回滚到上一稳定版本。其它分支 push 走 `$` 兜底流水线，只跑质量门禁
+  （fmt / clippy / test），不构建镜像、不碰生产；连续多次 push 由流水线锁排队，不会并发部署。
+  打 tag 走同一条 `$` 兜底键下的 `tag_push`：把该 tag 的提交打成 `:<tag 名>` 定版镜像入库，
+  不部署、也不改动 `latest`（上线仍只由 `main` push 负责）。
+  另外可在 **Tag 详情页 →「部署」→ 选 `production`** 手动上线或回滚到某个已发布的 tag
+  （`tag_deploy.production`，环境与权限在 `.cnb/tag_deploy.yml`）。
+
+### 手动部署 / 按 tag 回滚（CNB 部署触发器）
+
+`main` push 仍是默认上线方式；需要**指定版本上线或回滚**时走部署页：
+
+1. 先让目标版本有定版镜像：推 tag（双端分别打，见 [`docs/upgrade/PUSH_PROCESS.md`](docs/upgrade/PUSH_PROCESS.md) §5.2），
+   `tag_push` 会产出 `memory-hub:<tag 名>`；
+2. CNB 仓库页 → Tag 列表 → 打开该 tag →「部署」→ 选 `production` → 确认；
+3. 流水线依次执行：取定版镜像并固化 digest → 部署 → `/readyz` 探活，失败自动回滚到上一稳定版本。
+
+三条边界：
+
+- 流水线配置来自**该 tag 提交里的** `.cnb.yml` / `.cnb/tag_deploy.yml`，早于本功能的老 tag 没有部署入口；
+- 定版镜像不存在时部署直接失败并提示，不会现场重新构建——避免部署的镜像与发布制品不是同一个 digest；
+- 部署与 `main` 发布共用一把锁（`deploy-main`）；两条入口都会改写服务器的
+  `current_release.env` / `previous_release.env`，并发执行会让回滚基准指向错的镜像。
+
+### 云原生开发环境（CNB）
+
+不装本地工具链也能开工：CNB 仓库页 →「云原生开发」/ IDE，选分支启动即可（`$: vscode` 事件，
+基础镜像定义在 `.ide/Dockerfile`）。首次启动要构建镜像（拉 `rust:1-bookworm` + code-server），
+约 5–10 分钟；之后命中镜像层缓存。
+
+- **镜像里已有**：Rust 工具链（stable）与 `cargo clippy` / `cargo fmt`、`build-essential` + `pkg-config`
+  （`tikv-jemalloc-sys` 需要 C 编译）、`psql`、`jq` / `ripgrep`、Docker CLI，以及 `code-server`
+  与 rust-analyzer 等插件。镜像装了 code-server，所以是单容器模式：浏览器里的终端就是本镜像。
+- **依赖缓存**：`/usr/local/cargo/registry` 与 `target/` 走数据卷，只在当前构建节点内有效，换节点自动失效。
+- **配置**：启动阶段会在缺少时把 `.env.example` 复制成 `.env`（已存在则不动），仍需自己填
+  `POSTGRES_PASSWORD` / `HUB_TOKEN_SECRET`。
+- **真库联调**：`docker compose up -d postgres` 起 `pgvector/pgvector:pg15`，
+  再按「方式 B」设置 `HUB_DB_URL` 后跑 `cargo test -p store --features pg-integration -- --ignored`。
+- **改环境**：改 `.ide/Dockerfile` 或 `.cnb.yml` 的 `$: vscode` 段，提交后用
+  `./scripts/push-cnb.sh --push` 同步到 CNB。`build.by` 只认 `.ide/Dockerfile`，源码改动不会触发镜像重建。
 
 ### 回滚（应用版本 / 部署形态）
 

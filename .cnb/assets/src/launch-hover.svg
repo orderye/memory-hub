@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="990" height="120" viewBox="0 0 990 120">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="990" y2="120" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#070D19"/>
+      <stop offset="0.55" stop-color="#0A1424"/>
+      <stop offset="1" stop-color="#101E36"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="28" y1="0" x2="260" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#56D4FF"/>
+      <stop offset="1" stop-color="#A78BFA"/>
+    </linearGradient>
+    <linearGradient id="ring" x1="640" y1="12" x2="966" y2="108" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#56D4FF"/>
+      <stop offset="1" stop-color="#A78BFA"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#4F7CFF" stop-opacity="0.30"/>
+      <stop offset="1" stop-color="#4F7CFF" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glow2" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#A78BFA" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#A78BFA" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="990" height="120" fill="url(#bg)"/>
+
+  <g stroke="#8FA3BF" stroke-opacity="0.06" stroke-width="1">
+    <line x1="0" y1="24" x2="990" y2="24"/>
+    <line x1="0" y1="48" x2="990" y2="48"/>
+    <line x1="0" y1="72" x2="990" y2="72"/>
+    <line x1="0" y1="96" x2="990" y2="96"/>
+  </g>
+
+  <circle cx="900" cy="20" r="130" fill="url(#glow)"/>
+  <circle cx="700" cy="130" r="120" fill="url(#glow2)"/>
+
+  <rect x="0.5" y="0.5" width="989" height="119" rx="12" fill="none" stroke="#56D4FF" stroke-opacity="0.16"/>
+
+  <text x="28" y="30" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, sans-serif" font-size="9.5" letter-spacing="2.4" fill="#7FE3FF">MEMORY HUB / CLOUD DEV</text>
+
+  <text x="28" y="66" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, sans-serif" font-size="28" font-weight="700" fill="#EAF2FF">启动记忆中枢</text>
+
+  <text x="28" y="88" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, sans-serif" font-size="13" fill="#A9C1DD">三个进程 · 一本长期记忆账本</text>
+
+  <rect x="28" y="96" width="84" height="2" rx="1" fill="url(#accent)"/>
+
+  <line x1="620" y1="18" x2="620" y2="102" stroke="#8FA3BF" stroke-opacity="0.12"/>
+
+  <rect x="656" y="16" width="306" height="88" rx="12" fill="#0B1628" fill-opacity="0.9" stroke="url(#ring)" stroke-opacity="0.4"/>
+
+  <g font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, sans-serif">
+    <circle cx="676" cy="36" r="3.5" fill="#56D4FF"/>
+    <text x="688" y="40" font-size="11.5" fill="#EAF2FF">mcp-server</text>
+    <text x="946" y="40" font-size="9.5" text-anchor="end" fill="#8FA3BF">:3000 /mcp</text>
+
+    <circle cx="676" cy="62" r="3.5" fill="#A78BFA"/>
+    <text x="688" y="66" font-size="11.5" fill="#EAF2FF">auth-server</text>
+    <text x="946" y="66" font-size="9.5" text-anchor="end" fill="#8FA3BF">:8080</text>
+
+    <circle cx="676" cy="88" r="3.5" fill="#FFB454"/>
+    <text x="688" y="92" font-size="11.5" fill="#EAF2FF">backup-worker</text>
+    <text x="946" y="92" font-size="9.5" text-anchor="end" fill="#8FA3BF">cron</text>
+  </g>
+</svg>

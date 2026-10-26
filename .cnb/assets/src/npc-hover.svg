@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="990" height="120" viewBox="0 0 990 120">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="990" y2="120" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#070D19"/>
+      <stop offset="0.55" stop-color="#0A1424"/>
+      <stop offset="1" stop-color="#101E36"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="28" y1="0" x2="260" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#56D4FF"/>
+      <stop offset="1" stop-color="#A78BFA"/>
+    </linearGradient>
+    <linearGradient id="ring" x1="660" y1="12" x2="940" y2="108" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#56D4FF"/>
+      <stop offset="1" stop-color="#A78BFA"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#4F7CFF" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#4F7CFF" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glow2" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#A78BFA" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#A78BFA" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="990" height="120" fill="url(#bg)"/>
+
+  <g stroke="#8FA3BF" stroke-opacity="0.06" stroke-width="1">
+    <line x1="0" y1="24" x2="990" y2="24"/>
+    <line x1="0" y1="48" x2="990" y2="48"/>
+    <line x1="0" y1="72" x2="990" y2="72"/>
+    <line x1="0" y1="96" x2="990" y2="96"/>
+  </g>
+
+  <circle cx="900" cy="24" r="130" fill="url(#glow)"/>
+  <circle cx="690" cy="120" r="120" fill="url(#glow2)"/>
+
+  <rect x="0.5" y="0.5" width="989" height="119" rx="12" fill="none" stroke="#56D4FF" stroke-opacity="0.16"/>
+
+  <text x="28" y="30" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, sans-serif" font-size="9.5" letter-spacing="2.4" fill="#7FE3FF">NPC / MEMORY BUTLER</text>
+
+  <text x="28" y="66" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, sans-serif" font-size="28" font-weight="700" fill="#EAF2FF">问问记忆管家</text>
+
+  <text x="28" y="88" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, sans-serif" font-size="13" fill="#A9C1DD">存取 · 检索 · 整合 · 备份</text>
+
+  <rect x="28" y="96" width="84" height="2" rx="1" fill="url(#accent)"/>
+
+  <line x1="620" y1="18" x2="620" y2="102" stroke="#8FA3BF" stroke-opacity="0.12"/>
+
+  <circle cx="795" cy="58" r="50" fill="none" stroke="url(#ring)" stroke-opacity="0.14" stroke-dasharray="3 7"/>
+
+  <g stroke="#8FA3BF" stroke-opacity="0.18" stroke-width="1">
+    <line x1="648" y1="22" x2="692" y2="34"/>
+    <line x1="936" y1="26" x2="898" y2="40"/>
+    <line x1="944" y1="96" x2="896" y2="84"/>
+    <line x1="652" y1="100" x2="714" y2="94"/>
+  </g>
+  <circle cx="648" cy="22" r="4" fill="#56D4FF"/>
+  <circle cx="938" cy="24" r="3.5" fill="#A78BFA"/>
+  <circle cx="946" cy="98" r="4" fill="#FFB454"/>
+  <circle cx="650" cy="102" r="3.5" fill="#4F7CFF"/>
+
+  <path d="M704 24 H886 A14 14 0 0 1 900 38 V74 A14 14 0 0 1 886 88 H742 L716 108 V88 H704 A14 14 0 0 1 690 74 V38 A14 14 0 0 1 704 24 Z" fill="#0B1628" fill-opacity="0.95" stroke="url(#ring)" stroke-opacity="0.5"/>
+
+  <text x="706" y="42" font-family="PingFang SC, Hiragino Sans GB, Microsoft YaHei, sans-serif" font-size="8.5" letter-spacing="1.8" fill="#7FE3FF">MEMORY BUTLER</text>
+  <circle cx="740" cy="64" r="4.5" fill="#56D4FF"/>
+  <circle cx="768" cy="64" r="4.5" fill="#A78BFA"/>
+  <circle cx="796" cy="64" r="4.5" fill="#FFB454"/>
+  <line x1="706" y1="78" x2="868" y2="78" stroke="#8FA3BF" stroke-opacity="0.18" stroke-width="1.5" stroke-linecap="round"/>
+</svg>
