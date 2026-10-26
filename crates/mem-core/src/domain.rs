@@ -437,24 +437,48 @@ pub fn validate_cognitive_candidate(candidate: &CognitiveCandidate) -> common::R
     Ok(())
 }
 
+/// 含糊猜测 marker：不能作为确定前瞻意图（唯一维护点）
+pub const SPECULATIVE_INTENTION_MARKERS: &[&str] = &[
+    "可能会考虑",
+    "可能考虑",
+    "或许会",
+    "也许会",
+    "还没想好",
+    "待定",
+    "说不定",
+    "maybe consider",
+    "might consider",
+    "possibly",
+    "tentatively",
+    "not decided",
+];
+
 /// 检查是否为含糊猜测表述（不能作为确定前瞻意图）
 pub fn is_speculative_intention(text: &str) -> bool {
     let lower = text.to_lowercase();
-    let speculative_markers = [
-        "可能会考虑",
-        "可能考虑",
-        "或许会",
-        "也许会",
-        "还没想好",
-        "待定",
-        "说不定",
-        "maybe consider",
-        "might consider",
-        "possibly",
-        "tentatively",
-        "not decided",
-    ];
-    speculative_markers.iter().any(|m| lower.contains(m))
+    SPECULATIVE_INTENTION_MARKERS
+        .iter()
+        .any(|m| lower.contains(m))
+}
+
+/// 事实演化/取代措辞：识别 supersedes 候选的唯一 marker 清单
+pub const FACT_EVOLUTION_MARKERS: &[&str] = &[
+    "决定改用",
+    "改用",
+    "切换至",
+    "不再使用",
+    "过去使用",
+    "以前使用",
+    "supersede",
+    "replace",
+    "now use",
+    "deprecated",
+];
+
+/// 正文是否呈现事实演化/取代措辞（大小写不敏感）
+pub fn indicates_fact_evolution(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    FACT_EVOLUTION_MARKERS.iter().any(|m| lower.contains(m))
 }
 
 /// 检查意图是否在指定时刻处于有效期内

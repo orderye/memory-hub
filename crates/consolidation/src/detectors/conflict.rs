@@ -185,19 +185,8 @@ impl ConflictDetector {
 
     /// 判断两段事实正文是否呈现事实演化/取代模式 (supersedes)
     pub fn is_fact_evolution(c1: &str, c2: &str) -> bool {
-        let markers = [
-            "改用",
-            "决定改用",
-            "切换至",
-            "不再使用",
-            "过去使用",
-            "以前使用",
-            "supersede",
-            "replace",
-            "now use",
-            "deprecated",
-        ];
-        markers.iter().any(|m| c1.contains(m) || c2.contains(m))
+        mem_core::domain::indicates_fact_evolution(c1)
+            || mem_core::domain::indicates_fact_evolution(c2)
     }
 }
 
