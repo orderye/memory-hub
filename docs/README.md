@@ -27,6 +27,7 @@
 | **轻量化审计** | [`upgrade/LIGHTWEIGHT_AUDIT.md`](./upgrade/LIGHTWEIGHT_AUDIT.md) | 轻量化升级 P0 源码审计：Workspace/Features/Embedding/Retrieval/Consolidation/Cognitive/Storage/Worker/MCP(28 工具)/Backup/CI/迁移逐项结论与缺口清单 | 架构师 / 审计者 | **现行规范 (Active)** |
 | **性能基线** | [`upgrade/LIGHTWEIGHT_BASELINE.md`](./upgrade/LIGHTWEIGHT_BASELINE.md) | 优化前后实测对比：二进制体积、启动耗时、空闲 RSS、内存库延迟；明确标注 NOT MEASURED 项（真实 PG / 真实嵌入） | 运维 / 性能工程师 | **现行规范 (Active)** |
 | **轻量化执行报告** | [`upgrade/LIGHTWEIGHT_EXECUTION_REPORT.md`](./upgrade/LIGHTWEIGHT_EXECUTION_REPORT.md) | P0–P5 逐阶段实施记录、19 项验收勾选（PASS/BLOCKED/NOT RUN）、已知局限、回滚与复现命令 | 全体 | **现行规范 (Active)** |
+| **轻量化任务书** | [`Memory-Hub-轻量化升级完整执行任务书.md`](./Memory-Hub-轻量化升级完整执行任务书.md) | 轻量化升级原始执行任务书：P0–P5 阶段目标、不可违反约束、验收命令与交付清单 | 架构师 / Agent 执行者 | **归档任务书 (Reference)** |
 | **代码审校** | [`upgrade/CODE_REVIEW.md`](./upgrade/CODE_REVIEW.md) | 2026-10 全量代码审校：三条危险链路、P0–P3 共 32 项精选问题与 34 项轻微项（含位置与修复方向）、分批执行方案与进度跟踪表 | 全体 | **归档报告 (Reference)** |
 | **业务集成** | [`创界山智能接入层实施方案.md`](./创界山智能接入层实施方案.md) | 零侵入防腐中间层实施方案：特征指纹探测、虚拟双路召回、数据法规水印与角色视角整合策略 | 外部业务集成人员 | **集成方案 (Active)** |
 
