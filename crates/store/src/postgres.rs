@@ -1001,6 +1001,40 @@ impl PostgresHubStore {
         Ok(())
     }
 
+    /// 在给定连接上插入新条目（INSERT 列清单与参数顺序的唯一来源）
+    async fn insert_memory_on(conn: &mut PgConnection, entry: &MemoryEntry) -> Result<()> {
+        let embedding_literal = entry.embedding.as_ref().map(|v| mapping::vector_literal(v));
+        let tsv_tokens = tsv_tokens_for(&entry.content);
+        sqlx::query(Self::MEMORY_INSERT_SQL)
+            .bind(entry.id)
+            .bind(&entry.namespace)
+            .bind(&entry.key)
+            .bind(entry.kind.as_str())
+            .bind(&entry.content)
+            .bind(&entry.tags)
+            .bind(&entry.metadata)
+            .bind(&embedding_literal)
+            .bind(&entry.embedding_model)
+            .bind(&entry.source_agent)
+            .bind(entry.confidence)
+            .bind(entry.status.as_str())
+            .bind(entry.version)
+            .bind(entry.expires_at)
+            .bind(entry.merged_into)
+            .bind(entry.created_at)
+            .bind(entry.updated_at)
+            .bind(&tsv_tokens)
+            .bind(entry.scene.map(|s| s.as_str()))
+            .bind(entry.layer.map(|l| l.as_str()))
+            .bind(entry.valid_from)
+            .bind(entry.valid_until)
+            .bind(entry.occurred_at)
+            .execute(&mut *conn)
+            .await
+            .pg()?;
+        Ok(())
+    }
+
     fn proposal_from_row(r: &PgRow) -> Result<IntegrationProposal> {
         let kind: String = r.try_get("kind").pg()?;
         let status: String = r.try_get("status").pg()?;
@@ -1081,93 +1115,40 @@ impl PostgresHubStore {
          embedding_model, source_agent, confidence, status, \
          version, expires_at, merged_into, created_at, updated_at, \
          scene, layer, valid_from, valid_until, occurred_at";
+
+    /// 新条目 INSERT：`insert` 与 `insert_initial` 共用同一列清单与参数顺序
+    const MEMORY_INSERT_SQL: &'static str = r#"
+        insert into memories
+          (id, namespace, key, kind, content, tags, metadata, embedding, embedding_model,
+           source_agent, confidence, status, version, expires_at, merged_into,
+           created_at, updated_at, tsv_tokens, scene, layer, valid_from, valid_until, occurred_at)
+        values
+          ($1, $2, $3, $4, $5, $6, $7, $8::vector, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
+        "#;
+
+    /// `coding_revisions` 全列清单（INSERT / RETURNING / SELECT 共用）
+    const REVISION_COLUMNS: &'static str = "id, thread_id, namespace, repository, branch, \
+         commit_sha, parent_sha, file_path, change_kind, diff_content, diff_hash, \
+         symbol_fingerprint, is_committed, author, occurred_at, created_at, \
+         source_evidence_id, source_task_id";
+
+    /// `coding_revisions` 的 18 个占位符，与 [`Self::REVISION_COLUMNS`] 一一对应
+    const REVISION_INSERT_VALUES: &'static str =
+        "$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18";
 }
 
 #[async_trait]
 impl mem_core::MemoryStore for PostgresHubStore {
     async fn insert(&self, entry: &MemoryEntry) -> Result<MemoryEntry> {
-        let embedding_literal = entry.embedding.as_ref().map(|v| mapping::vector_literal(v));
-        let tsv_tokens = tsv_tokens_for(&entry.content);
-        sqlx::query(
-            r#"
-            insert into memories
-              (id, namespace, key, kind, content, tags, metadata, embedding, embedding_model,
-               source_agent, confidence, status, version, expires_at, merged_into,
-               created_at, updated_at, tsv_tokens, scene, layer, valid_from, valid_until, occurred_at)
-            values
-              ($1, $2, $3, $4, $5, $6, $7, $8::vector, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
-            "#,
-        )
-        .bind(entry.id)
-        .bind(&entry.namespace)
-        .bind(&entry.key)
-        .bind(entry.kind.as_str())
-        .bind(&entry.content)
-        .bind(&entry.tags)
-        .bind(&entry.metadata)
-        .bind(&embedding_literal)
-        .bind(&entry.embedding_model)
-        .bind(&entry.source_agent)
-        .bind(entry.confidence)
-        .bind(entry.status.as_str())
-        .bind(entry.version)
-        .bind(entry.expires_at)
-        .bind(entry.merged_into)
-        .bind(entry.created_at)
-        .bind(entry.updated_at)
-        .bind(&tsv_tokens)
-        .bind(entry.scene.map(|s| s.as_str()))
-        .bind(entry.layer.map(|l| l.as_str()))
-        .bind(entry.valid_from)
-        .bind(entry.valid_until)
-        .bind(entry.occurred_at)
-        .execute(&self.pool)
-        .await
-        .pg()?;
+        let mut conn = self.pool.acquire().await.pg()?;
+        Self::insert_memory_on(&mut conn, entry).await?;
         Ok(entry.clone())
     }
 
     /// 原子插入新条目并追加初始版本历史（VersionChange::Created）
     async fn insert_initial(&self, entry: &MemoryEntry) -> Result<MemoryEntry> {
         let mut tx = self.pool.begin().await.pg()?;
-        let embedding_literal = entry.embedding.as_ref().map(|v| mapping::vector_literal(v));
-        let tsv_tokens = tsv_tokens_for(&entry.content);
-        sqlx::query(
-            r#"
-            insert into memories
-              (id, namespace, key, kind, content, tags, metadata, embedding, embedding_model,
-               source_agent, confidence, status, version, expires_at, merged_into,
-               created_at, updated_at, tsv_tokens, scene, layer, valid_from, valid_until, occurred_at)
-            values
-              ($1, $2, $3, $4, $5, $6, $7, $8::vector, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
-            "#,
-        )
-        .bind(entry.id)
-        .bind(&entry.namespace)
-        .bind(&entry.key)
-        .bind(entry.kind.as_str())
-        .bind(&entry.content)
-        .bind(&entry.tags)
-        .bind(&entry.metadata)
-        .bind(&embedding_literal)
-        .bind(&entry.embedding_model)
-        .bind(&entry.source_agent)
-        .bind(entry.confidence)
-        .bind(entry.status.as_str())
-        .bind(entry.version)
-        .bind(entry.expires_at)
-        .bind(entry.merged_into)
-        .bind(entry.created_at)
-        .bind(entry.updated_at)
-        .bind(&tsv_tokens)
-        .bind(entry.scene.map(|s| s.as_str()))
-        .bind(entry.layer.map(|l| l.as_str()))
-        .bind(entry.valid_from)
-        .bind(entry.valid_until)
-        .bind(entry.occurred_at)
-        .execute(&mut *tx)
-        .await
-        .pg()?;
+        Self::insert_memory_on(&mut tx, entry).await?;
 
         let row = MemoryVersion {
             memory_id: entry.id,
@@ -3171,59 +3152,48 @@ impl CodingStore for PostgresHubStore {
         let id = revision.id.unwrap_or_else(Uuid::new_v4);
         let now = Utc::now();
         let occurred_at = revision.occurred_at.unwrap_or(now);
-        let row = sqlx::query(
-            r#"
-            insert into coding_revisions (
-                id, thread_id, namespace, repository, branch, commit_sha, parent_sha,
-                file_path, change_kind, diff_content, diff_hash, symbol_fingerprint,
-                is_committed, author, occurred_at, created_at, source_evidence_id, source_task_id
-            )
-            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
-            returning id, thread_id, namespace, repository, branch, commit_sha, parent_sha,
-                      file_path, change_kind, diff_content, diff_hash, symbol_fingerprint,
-                      is_committed, author, occurred_at, created_at, source_evidence_id, source_task_id
-            "#,
-        )
-        .bind(id)
-        .bind(revision.thread_id)
-        .bind(&revision.namespace)
-        .bind(&revision.repository)
-        .bind(&revision.branch)
-        .bind(&revision.commit_sha)
-        .bind(&revision.parent_sha)
-        .bind(&revision.file_path)
-        .bind(revision.change_kind.as_str())
-        .bind(&revision.diff_content)
-        .bind(diff_hash)
-        .bind(&revision.symbol_fingerprint)
-        .bind(revision.is_committed)
-        .bind(&revision.author)
-        .bind(occurred_at)
-        .bind(now)
-        .bind(revision.source_evidence_id)
-        .bind(revision.source_task_id)
-        .fetch_one(&self.pool)
-        .await
-        .pg()?;
+        let sql = format!(
+            "insert into coding_revisions ({columns}) values ({values}) returning {columns}",
+            columns = Self::REVISION_COLUMNS,
+            values = Self::REVISION_INSERT_VALUES
+        );
+        let row = sqlx::query(&sql)
+            .bind(id)
+            .bind(revision.thread_id)
+            .bind(&revision.namespace)
+            .bind(&revision.repository)
+            .bind(&revision.branch)
+            .bind(&revision.commit_sha)
+            .bind(&revision.parent_sha)
+            .bind(&revision.file_path)
+            .bind(revision.change_kind.as_str())
+            .bind(&revision.diff_content)
+            .bind(diff_hash)
+            .bind(&revision.symbol_fingerprint)
+            .bind(revision.is_committed)
+            .bind(&revision.author)
+            .bind(occurred_at)
+            .bind(now)
+            .bind(revision.source_evidence_id)
+            .bind(revision.source_task_id)
+            .fetch_one(&self.pool)
+            .await
+            .pg()?;
 
         Self::revision_from_row(&row)
     }
 
     async fn get_revision(&self, namespace: &str, id: Uuid) -> Result<Option<CodingRevision>> {
-        let row = sqlx::query(
-            r#"
-            select id, thread_id, namespace, repository, branch, commit_sha, parent_sha,
-                   file_path, change_kind, diff_content, diff_hash, symbol_fingerprint,
-                   is_committed, author, occurred_at, created_at, source_evidence_id, source_task_id
-            from coding_revisions
-            where namespace = $1 and id = $2
-            "#,
-        )
-        .bind(namespace)
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await
-        .pg()?;
+        let sql = format!(
+            "select {} from coding_revisions where namespace = $1 and id = $2",
+            Self::REVISION_COLUMNS
+        );
+        let row = sqlx::query(&sql)
+            .bind(namespace)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .pg()?;
 
         row.as_ref().map(Self::revision_from_row).transpose()
     }
@@ -3234,22 +3204,18 @@ impl CodingStore for PostgresHubStore {
         repository: &str,
         diff_hash: &str,
     ) -> Result<Option<CodingRevision>> {
-        let row = sqlx::query(
-            r#"
-            select id, thread_id, namespace, repository, branch, commit_sha, parent_sha,
-                   file_path, change_kind, diff_content, diff_hash, symbol_fingerprint,
-                   is_committed, author, occurred_at, created_at, source_evidence_id, source_task_id
-            from coding_revisions
-            where namespace = $1 and repository = $2 and diff_hash = $3
-            limit 1
-            "#,
-        )
-        .bind(namespace)
-        .bind(repository)
-        .bind(diff_hash)
-        .fetch_optional(&self.pool)
-        .await
-        .pg()?;
+        let sql = format!(
+            "select {} from coding_revisions \
+             where namespace = $1 and repository = $2 and diff_hash = $3 limit 1",
+            Self::REVISION_COLUMNS
+        );
+        let row = sqlx::query(&sql)
+            .bind(namespace)
+            .bind(repository)
+            .bind(diff_hash)
+            .fetch_optional(&self.pool)
+            .await
+            .pg()?;
 
         row.as_ref().map(Self::revision_from_row).transpose()
     }
@@ -3260,23 +3226,18 @@ impl CodingStore for PostgresHubStore {
         thread_id: Uuid,
         limit: usize,
     ) -> Result<Vec<CodingRevision>> {
-        let rows = sqlx::query(
-            r#"
-            select id, thread_id, namespace, repository, branch, commit_sha, parent_sha,
-                   file_path, change_kind, diff_content, diff_hash, symbol_fingerprint,
-                   is_committed, author, occurred_at, created_at, source_evidence_id, source_task_id
-            from coding_revisions
-            where namespace = $1 and thread_id = $2
-            order by occurred_at desc, id asc
-            limit $3
-            "#,
-        )
-        .bind(namespace)
-        .bind(thread_id)
-        .bind(limit as i64)
-        .fetch_all(&self.pool)
-        .await
-        .pg()?;
+        let sql = format!(
+            "select {} from coding_revisions where namespace = $1 and thread_id = $2 \
+             order by occurred_at desc, id asc limit $3",
+            Self::REVISION_COLUMNS
+        );
+        let rows = sqlx::query(&sql)
+            .bind(namespace)
+            .bind(thread_id)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .pg()?;
 
         rows.iter().map(Self::revision_from_row).collect()
     }
@@ -3288,24 +3249,20 @@ impl CodingStore for PostgresHubStore {
         file_path: &str,
         limit: usize,
     ) -> Result<Vec<CodingRevision>> {
-        let rows = sqlx::query(
-            r#"
-            select id, thread_id, namespace, repository, branch, commit_sha, parent_sha,
-                   file_path, change_kind, diff_content, diff_hash, symbol_fingerprint,
-                   is_committed, author, occurred_at, created_at, source_evidence_id, source_task_id
-            from coding_revisions
-            where namespace = $1 and repository = $2 and file_path = $3
-            order by occurred_at desc, id asc
-            limit $4
-            "#,
-        )
-        .bind(namespace)
-        .bind(repository)
-        .bind(file_path)
-        .bind(limit as i64)
-        .fetch_all(&self.pool)
-        .await
-        .pg()?;
+        let sql = format!(
+            "select {} from coding_revisions \
+             where namespace = $1 and repository = $2 and file_path = $3 \
+             order by occurred_at desc, id asc limit $4",
+            Self::REVISION_COLUMNS
+        );
+        let rows = sqlx::query(&sql)
+            .bind(namespace)
+            .bind(repository)
+            .bind(file_path)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .pg()?;
 
         rows.iter().map(Self::revision_from_row).collect()
     }
@@ -3328,20 +3285,16 @@ impl CodingStore for PostgresHubStore {
     }
 
     async fn all_revisions_in_namespace(&self, namespace: &str) -> Result<Vec<CodingRevision>> {
-        let rows = sqlx::query(
-            r#"
-            select id, thread_id, namespace, repository, branch, commit_sha, parent_sha,
-                   file_path, change_kind, diff_content, diff_hash, symbol_fingerprint,
-                   is_committed, author, occurred_at, created_at, source_evidence_id, source_task_id
-            from coding_revisions
-            where namespace = $1
-            order by occurred_at asc, id asc
-            "#,
-        )
-        .bind(namespace)
-        .fetch_all(&self.pool)
-        .await
-        .pg()?;
+        let sql = format!(
+            "select {} from coding_revisions where namespace = $1 \
+             order by occurred_at asc, id asc",
+            Self::REVISION_COLUMNS
+        );
+        let rows = sqlx::query(&sql)
+            .bind(namespace)
+            .fetch_all(&self.pool)
+            .await
+            .pg()?;
 
         rows.iter().map(Self::revision_from_row).collect()
     }
