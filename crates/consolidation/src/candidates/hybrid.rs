@@ -66,7 +66,7 @@ impl CandidateFinder for HybridCandidateFinder {
         let rules_outcome = self.rules.find_candidates(ctx).await?;
         let mut pairs = rules_outcome.pairs;
 
-        // ===== 通道 1：复用已存向量 =====
+        // ===== 通道 1：复用已存向量（零出站） =====
         let usable: Vec<usize> = ctx
             .entries
             .iter()
@@ -74,43 +74,54 @@ impl CandidateFinder for HybridCandidateFinder {
             .filter(|(_, e)| embedding_usable(e, self.embedder.model_id()))
             .map(|(i, _)| i)
             .collect();
-        pairs.extend(vector_candidates(
-            ctx.entries,
-            &usable,
-            ctx.thresholds,
-            Some(self.embedder.model_id().to_string()),
-        ));
+        let usable_mask: Vec<bool> = {
+            let mut mask = vec![false; ctx.entries.len()];
+            for &i in &usable {
+                mask[i] = true;
+            }
+            mask
+        };
 
-        // ===== 通道 2 + 3：缺失向量时按需嵌入并 ANN 召回 =====
+        // ===== 通道 2：缺失向量时按需嵌入（有界） =====
         let missing: Vec<usize> = ctx
             .entries
             .iter()
             .enumerate()
-            .filter(|(i, e)| !usable.contains(i) && !e.content.trim().is_empty())
+            .filter(|(i, e)| !usable_mask[*i] && !e.content.trim().is_empty())
             .map(|(i, _)| i)
             .collect();
         let take = missing.len().min(ctx.limits.max_embed_entries);
         let mut embedding_calls = 0usize;
         let mut embedded_entries = 0usize;
+        let mut overrides: HashMap<usize, Vec<f32>> = HashMap::new();
         if take > 0 {
             let selected: Vec<usize> = missing.into_iter().take(take).collect();
             let (fresh, calls) = self.embed_missing(ctx, &selected).await?;
             embedding_calls += calls;
-            embedded_entries += fresh.len();
-            if !fresh.is_empty() {
-                // 新算出的向量与已存向量一起参与比对
-                let mut all_usable = usable.clone();
-                all_usable.extend(fresh.iter().map(|(idx, _)| *idx));
-                let overrides: HashMap<usize, Vec<f32>> =
-                    fresh.iter().map(|(i, v)| (*i, v.clone())).collect();
-                pairs.extend(vector_candidates_with(
-                    ctx.entries,
-                    &all_usable,
-                    &overrides,
-                    ctx.thresholds,
-                    Some(self.embedder.model_id().to_string()),
-                ));
-            }
+            embedded_entries = fresh.len();
+            overrides = fresh.into_iter().collect();
+        }
+
+        // 向量比对只跑一轮：候选集 = 已存向量 ∪ 新算向量（新算的带 overrides）。
+        // 此前分两轮各做一遍全量两两比对——已存向量对被重复计算，重复候选
+        // 靠 dedup_pairs 丢弃；单轮的候选集覆盖两轮的并集，结果一致。
+        if overrides.is_empty() {
+            pairs.extend(vector_candidates(
+                ctx.entries,
+                &usable,
+                ctx.thresholds,
+                Some(self.embedder.model_id().to_string()),
+            ));
+        } else {
+            let mut all_usable = usable;
+            all_usable.extend(overrides.keys().copied());
+            pairs.extend(vector_candidates_with(
+                ctx.entries,
+                &all_usable,
+                &overrides,
+                ctx.thresholds,
+                Some(self.embedder.model_id().to_string()),
+            ));
         }
 
         Ok(CandidateOutcome {

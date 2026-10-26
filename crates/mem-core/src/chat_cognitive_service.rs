@@ -13,8 +13,8 @@ use crate::domain::{
     indicates_fact_evolution, is_intention_active, validate_cognitive_candidate,
     ChatCognitiveInput, CognitiveCandidate, CognitiveGovernanceMode, CognitiveLayer,
     CognitivePolicy, CognitiveProposalRecord, CognitiveProposalStatus, EvidenceSourceKind,
-    MemoryEntry, MemoryKind, MemoryRelationKind, MemoryScene, MemoryStatus, NewEvidence,
-    NewMemoryRelation, VersionChange,
+    MemoryEntry, MemoryFilter, MemoryKind, MemoryRelationKind, MemoryScene, MemoryStatus,
+    NewEvidence, NewMemoryRelation, VersionChange,
 };
 use crate::infra::{ChatCognitiveExtractor, MemoryHubStore};
 use chrono::{DateTime, Utc};
@@ -540,6 +540,10 @@ impl ChatCognitiveService {
     }
 
     /// 查询当前有效意图（自动排除已过期意图）
+    ///
+    /// scene/layer/状态过滤**下推到存储层**（走 `idx_memories_scene_layer` 索引）：
+    /// 此前全扫命名空间前 256 条再在内存过滤，大命名空间下无关条目会挤占窗口。
+    /// 过期意图（valid_until 已过）仍在此处过滤——它依赖查询时刻，无法下推。
     pub async fn list_active_intentions(
         &self,
         auth: &AuthCtx,
@@ -552,14 +556,17 @@ impl ChatCognitiveService {
         let now = Utc::now();
         let items = self
             .store
-            .all_in_namespace_limited(namespace, false, SCAN_LIMIT)
+            .list(&MemoryFilter {
+                namespace: Some(namespace.to_string()),
+                statuses: Some(vec![MemoryStatus::Active]),
+                scene: Some(MemoryScene::Chat),
+                layer: Some(CognitiveLayer::Intention),
+                limit: Some(SCAN_LIMIT),
+                ..Default::default()
+            })
             .await?;
         let active = items
             .into_iter()
-            .filter(|e| e.status == MemoryStatus::Active)
-            .filter(|e| {
-                e.scene == Some(MemoryScene::Chat) && e.layer == Some(CognitiveLayer::Intention)
-            })
             .filter(|e| is_intention_active(CognitiveLayer::Intention, e.valid_until, now))
             .collect();
 

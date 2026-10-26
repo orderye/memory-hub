@@ -557,19 +557,26 @@ impl ConsolidationEngine {
             return Ok(report);
         }
 
-        // 落库前调用 open_exists 进行幂等查重
+        // 幂等查重：一次拉回该命名空间全部 open 提案，在内存按 (kind, 成员集合) 比对。
+        // 旧实现每个提案单独发一次 open_exists 查询（N+1）；与 `open_exists` 的
+        // SQL 语义（kind 相同 + cardinality 相等 + 超集）等价于集合相等。
+        // 本批刚保存的提案同样进入签名集——同批出现相同签名时第二个也要跳过。
+        let mut open_signatures: std::collections::HashSet<(String, Vec<Uuid>)> = self
+            .store
+            .list_proposals(namespace, Some(ProposalStatus::Open))
+            .await?
+            .into_iter()
+            .map(|p| {
+                let mut members = p.member_ids;
+                members.sort();
+                (p.kind.as_str().to_string(), members)
+            })
+            .collect();
         for proposal in new_proposals {
-            let exists = self
-                .store
-                .open_exists(
-                    namespace,
-                    &[(
-                        proposal.kind.as_str().to_string(),
-                        proposal.member_ids.clone(),
-                    )],
-                )
-                .await?;
-            if exists {
+            let mut members = proposal.member_ids.clone();
+            members.sort();
+            let signature = (proposal.kind.as_str().to_string(), members);
+            if !open_signatures.insert(signature) {
                 report.skipped_existing += 1;
                 continue;
             }
