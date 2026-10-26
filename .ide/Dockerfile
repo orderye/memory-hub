@@ -1,8 +1,10 @@
 # ==============================================================================
-# CNB 云原生开发环境（VSCode Web / Remote-SSH）
+# CNB 云原生开发环境（仅预览模式：账户控制台；保留 SSH 客户端接入）
 #
-# 由 .cnb.yml 的 `$: vscode:` 事件通过 build: .ide/Dockerfile 构建。
-# 镜像里装了 code-server，CNB 会用单容器模式——浏览器终端就是本镜像。
+# 由 .cnb.yml 的 .vscode_preview 片段（main / `$` 两处引用）通过
+# build: .ide/Dockerfile 构建；启动脚本是 .ide/preview.sh。
+# 镜像里保留 code-server 与 openssh-server：仅预览模式本身不支持 WebIDE，
+# 但「头像 → 我的云原生开发」里的客户端/SSH 接入仍然可用。
 #
 # 与仓库根 Dockerfile 的分工：那个是生产运行时（只编译、不带开发工具）；
 # 这里用 rust:1-bookworm（buildpack-deps 已含 gcc/git/curl），装齐开发期工具。

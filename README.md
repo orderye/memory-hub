@@ -531,11 +531,14 @@ HUB_EMBED_MODEL=bge-m3
 ├── Cargo.toml                  # Workspace 与统一依赖
 ├── Dockerfile                  # 多阶段构建的生产镜像
 ├── docker-compose.yml          # 一键编排（DB + 三个服务）
-├── .cnb.yml                    # CNB 云构建：main push 出镜像并部署；tag push 出定版镜像；tag 部署触发器
+├── .cnb.yml                    # CNB 云构建：PR / 分支 push 跑质量门禁；main push 出镜像并部署；tag push 出定版镜像；tag 部署触发器；分支页手动按钮事件
 ├── .cnb/tag_deploy.yml         # CNB 自定义部署环境：Tag 详情页「部署」选 production
+├── .cnb/settings.yml           # CNB 页面 UI 定制：NPC 角色（记忆管家 / 审查员）、按钮文案与悬浮图
+├── .cnb/web_trigger.yml        # CNB 分支详情页自定义按钮：部署生产 / 回滚上一版本 / 仅构建镜像 / 问问记忆管家
 ├── .github/workflows/ci.yml    # GitHub Actions：质量门禁 / PG 集成 / 依赖审计 / Release 构建
 ├── scripts/push-cnb.sh         # 双平台推送：以 CNB 身份重放并推送镜像（patch-id 口径）
-├── scripts/ci/deploy-production.sh  # 生产部署阶段（切镜像 / 探活 / 失败回滚），CNB 两条流水线共用
+├── scripts/ci/deploy-production.sh  # 生产部署阶段（切镜像 / 探活 / 失败回滚），CNB 三条流水线共用
+├── scripts/ci/rollback-production.sh  # 生产回滚阶段：切回远端 previous_release.env 的镜像并探活
 ├── docs/                       # 设计与规范文档（见第十一节）
 └── crates/
     ├── common/                 # 公共部件：配置强校验、脱敏日志、限流、Cron、整合模式枚举
@@ -583,13 +586,56 @@ CI 分两条：
 
 - **GitHub Actions**（`.github/workflows/ci.yml`）：① 质量门禁（fmt / clippy `--all-features` / 测试 / 文档构建）；
   ② PostgreSQL + pgvector 真实库集成测试（串行执行）；③ 依赖准入与安全审计（cargo-deny + cargo-audit）；④ Release 构建三个二进制。
-- **CNB 云构建**（`.cnb.yml`）：push 到 `main` 触发——云端构建镜像 → 推制品库 → SSH 部署到服务器 →
-  探活 `/readyz`，失败自动回滚到上一稳定版本。其它分支 push 走 `$` 兜底流水线，只跑质量门禁
-  （fmt / clippy / test），不构建镜像、不碰生产；连续多次 push 由流水线锁排队，不会并发部署。
+- **CNB 云构建**（`.cnb.yml`）：① PR（目标 `main`）创建 / 重新打开 / 源分支 push 触发 `pull_request`
+  质量门禁（fmt / clippy / test，与分支兜底同口径，不构建镜像、不部署）；② push 到 `main` 触发发布——
+  云端构建镜像 → 推制品库 → SSH 部署到服务器 → 探活 `/readyz`，失败自动回滚到上一稳定版本。
+  其它分支 push 走 `$` 兜底流水线，只跑质量门禁（fmt / clippy / test），不构建镜像、不碰生产；
+  连续多次 push 由流水线锁排队，不会并发部署。
   打 tag 走同一条 `$` 兜底键下的 `tag_push`：把该 tag 的提交打成 `:<tag 名>` 定版镜像入库，
   不部署、也不改动 `latest`（上线仍只由 `main` push 负责）。
   另外可在 **Tag 详情页 →「部署」→ 选 `production`** 手动上线或回滚到某个已发布的 tag
-  （`tag_deploy.production`，环境与权限在 `.cnb/tag_deploy.yml`）。
+  （`tag_deploy.production`，环境与权限在 `.cnb/tag_deploy.yml`）；
+  **`main` 分支详情页**则有四个一键按钮（部署生产 / 回滚上一版本 / 仅构建镜像 / 问问记忆管家），见下一节。
+
+### 分支页一键按钮（CNB Web Trigger）
+
+配置在 `.cnb/web_trigger.yml`，只在 **`main` 分支详情页**出现（`reg: ^main$`）；
+按钮点下去触发 `.cnb.yml` 里 `main` 下同名事件，流水线与 `main` push 共用同一份 stages 和同一把 `deploy-main` 锁：
+
+| 按钮 | 事件 | 行为 | 谁能点 | 需要密钥仓 |
+|---|---|---|---|---|
+| 部署生产 | `web_trigger_deploy` | 当前提交构建镜像 → 推制品库 → 部署 → `/readyz` 探活，失败自动回滚 | master（含 owner） | 是 |
+| 回滚上一版本 | `web_trigger_rollback` | 把服务器切回 `previous_release.env` 里的上一稳定镜像并探活 | master（含 owner） | 是 |
+| 仅构建镜像 | `web_trigger_build` | 只构建并推镜像入库，不碰线上 | 仓库写权限 | 否 |
+| 问问记忆管家 | `web_trigger_npc` | 弹窗输入任务 → `npc:go` 读仓库后回复，不构建、不部署 | 仓库写权限 | 否 |
+
+两条边界：
+
+- 部署 / 回滚要读密钥仓 `toroyxxx/ci-secrets/deploy-key.yml`；该文件若声明了 `allow_events`，
+  需覆盖 `web_trigger*` 与 `tag_deploy.*`，`allow_branches` 要包含 `main` 与 tag 名（如 `v*`），
+  否则会在 prepare 阶段因文件引用鉴权被拒（只有「仅构建镜像」不受影响）；
+- 回滚读的是服务器上的 `previous_release.env`（每次部署写入，保留上一稳定版本），
+  它不随回滚变化，所以可以重复点；机器没成功部署过时会直接报错退出。
+
+### NPC 助手（记忆管家 / 审查员）
+
+NPC 角色定义在 `.cnb/settings.yml`（`npc.roles`），执行流水线在 `.cnb.yml`。本仓有两个角色：
+
+| 角色 | 定位 | 怎么叫 |
+|---|---|---|
+| 记忆管家（默认） | 本仓常驻助手：存取、检索、整合、备份与工程约束 | `@toroyxxx/memory-hub(记忆管家)`，或 `main` 分支页「问问记忆管家」 |
+| 审查员 | 代码审查：正确性 / 安全隔离 / 兼容演进 / 可测试性，按严重度输出 | `@toroyxxx/memory-hub(审查员)` |
+
+两个入口：
+
+- **评论 `@` 提及**：`issue.comment@npc` / `pull_request.comment@npc` 事件，提示词由平台按角色注入；评论里贴的截图也能读（`supportImage: true`）。需要它直接改代码时，在评论区勾选「替我上班」开启工作模式（需仓库开发者及以上权限）。
+- **分支页按钮**：`main` 分支详情页 →「AI 助手」→「问问记忆管家」，在弹窗里写任务（`userPrompt` 必填）。这个入口没有评论上下文，提示词只来自 `userPrompt` 与角色人格段。
+
+三条边界：
+
+- 两个评论事件必须在 `main` 与 `$` 各声明一次：`main` 是精确分支键，命中后不会走 `$`，漏配会表现为「按钮点了没反应」或「PR 评论不触发」。
+- 运行镜像是平台默认的 `cnbcool/default-npc:latest`，仓库不自建 NPC 镜像；要预装额外 CLI / Skill 时再按官方文档补 Dockerfile 与构建流水线。
+- NPC 计费归**云原生开发用量**；代理权限上限为 Developer，超出角色上限的操作会被拒。
 
 ### 手动部署 / 按 tag 回滚（CNB 部署触发器）
 
@@ -607,22 +653,29 @@ CI 分两条：
 - 部署与 `main` 发布共用一把锁（`deploy-main`）；两条入口都会改写服务器的
   `current_release.env` / `previous_release.env`，并发执行会让回滚基准指向错的镜像。
 
-### 云原生开发环境（CNB）
+### 云原生开发环境（CNB，仅预览模式）
 
-不装本地工具链也能开工：CNB 仓库页 →「云原生开发」/ IDE，选分支启动即可（`$: vscode` 事件，
-基础镜像定义在 `.ide/Dockerfile`）。首次启动要构建镜像（拉 `rust:1-bookworm` + code-server），
-约 5–10 分钟；之后命中镜像层缓存。
+不装本地工具链也能看效果：CNB 仓库页 →「云原生开发」→ 环境起来后**直接进入预览页**，不再是 WebIDE
+（`vscode.options.onlyPreview`；片段定义在 `.cnb.yml` 的 `.vscode_preview`，`main` 与 `$` 各自引用一次，
+因为 `$` 只是兜底分支键、main 命中精确键后不会再走它；基础镜像在 `.ide/Dockerfile`，启动脚本在 `.ide/preview.sh`）。
 
+- **预览起来的是什么**：`auth-server` 编译后监听 `8686`，用内存存储（`HUB_DB_URL=memory://preview`），
+  落地页直接进账户控制台：登录 / 自助注册 → 管理本账户的 Agent、命名空间与授权。
+- **不会起来什么**：PostgreSQL 与 `mcp-server`。内存存储是进程内的，两个进程各拿一份数据，
+  起一个「能连但数据对不上」的 MCP 端点比不起更误导；要真库联调请走 SSH 接入。
+- **数据是临时的**：环境回收或进程重启即清空；`HUB_TOKEN_SECRET` 每次启动随机生成，不落仓库。
+- **耗时**：首次点开要构建镜像（`rust:1-bookworm` + code-server，约 5–10 分钟）并 `cargo build -p auth-server`；
+  之后命中镜像层缓存与 `target/` 数据卷，只剩增量编译。默认静置 10 分钟回收。
 - **镜像里已有**：Rust 工具链（stable）与 `cargo clippy` / `cargo fmt`、`build-essential` + `pkg-config`
   （`tikv-jemalloc-sys` 需要 C 编译）、`psql`、`jq` / `ripgrep`、Docker CLI，以及 `code-server`
-  与 rust-analyzer 等插件。镜像装了 code-server，所以是单容器模式：浏览器里的终端就是本镜像。
+  与 rust-analyzer 等插件。仅预览模式用不到 WebIDE，但「头像 → 我的云原生开发」里的客户端 / SSH 接入仍可用。
 - **依赖缓存**：`/usr/local/cargo/registry` 与 `target/` 走数据卷，只在当前构建节点内有效，换节点自动失效。
-- **配置**：启动阶段会在缺少时把 `.env.example` 复制成 `.env`（已存在则不动），仍需自己填
-  `POSTGRES_PASSWORD` / `HUB_TOKEN_SECRET`。
-- **真库联调**：`docker compose up -d postgres` 起 `pgvector/pgvector:pg15`，
-  再按「方式 B」设置 `HUB_DB_URL` 后跑 `cargo test -p store --features pg-integration -- --ignored`。
-- **改环境**：改 `.ide/Dockerfile` 或 `.cnb.yml` 的 `$: vscode` 段，提交后用
-  `./scripts/push-cnb.sh --push` 同步到 CNB。`build.by` 只认 `.ide/Dockerfile`，源码改动不会触发镜像重建。
+- **真库联调**（SSH 进环境后）：`cp .env.example .env` 并填好 `POSTGRES_PASSWORD` / `HUB_TOKEN_SECRET`，
+  `docker compose up -d postgres` 起 `pgvector/pgvector:pg15`，再按「方式 B」设置 `HUB_DB_URL` 后跑
+  `cargo test -p store --features pg-integration -- --ignored`。
+- **改环境**：改 `.ide/Dockerfile` / `.ide/preview.sh` / `.cnb.yml` 的 `.vscode_preview` 段，提交后用
+  `./scripts/push-cnb.sh --push` 同步到 CNB。`build.by` 只认 `.ide/Dockerfile`，源码改动不会触发镜像重建
+  （预览服务的编译放在 stages 里）。
 
 ### 回滚（应用版本 / 部署形态）
 

@@ -1,7 +1,7 @@
 # 自定义部署流程的环境定义（CNB「Tag 详情页 → 部署」读取本文件）
 #
 # 点击某个环境的部署按钮会触发 .cnb.yml 中 tag_deploy.<name> 事件的流水线，
-# 流水线按该 tag 对应的代码构建镜像并部署。详见 https://docs.cnb.cool/zh/build/deploy.html
+# 流水线取该 tag 的定版镜像（由 tag_push 产出）并部署。详见 https://docs.cnb.cool/zh/build/deploy.html
 #
 # 权限：roles 为向上包含语义，配 master 时 owner 自动具备；developer 不能部署生产。
 # 若要加人工审批，在环境里追加：
@@ -10,7 +10,7 @@
 #         roles: [master]
 environments:
   - name: production
-    description: 生产环境（tx-cloud）：按 tag 代码构建镜像，探活失败自动回滚
+    description: 生产环境（tx-cloud）：部署该 tag 的定版镜像，探活失败自动回滚
     permissions:
       roles:
         - master

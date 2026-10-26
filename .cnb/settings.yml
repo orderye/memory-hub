@@ -1,12 +1,13 @@
 # 记忆中枢 · Memory Hub — CNB 仓库页面 UI 定制
 # 文档：https://docs.cnb.cool/zh/repo/settings.html
 # workspace 读取按钮所在分支的配置；其余分类读取默认分支。
+# 悬浮图按 CNB 悬浮层上限 990×120 设计，源文件在 .cnb/assets/src/。
 
 workspace:
   launch:
     button:
-      name: 启动记忆中枢开发环境
-      description: 在云端打开这个 Rust 仓库，改代码、跑测试
+      name: 预览记忆中枢控制台
+      description: 云端编译并启动 auth-server，直接打开账户控制台（数据在内存，重启即清空）
       hoverImage: .cnb/assets/launch-hover.png
 
 issue:
@@ -52,6 +53,9 @@ npc:
 
         输出格式：按严重度排序（阻断 / 重要 / 建议），每条给出 `文件:行号`、问题、最小修改建议；不确定的判断要标注「待确认」，不要整文件重写，也不要只给风格意见。
       enableThinking: true
+  # 知识库弹窗默认仓库：指向本仓，页面 AI 对话默认基于本仓文档回答（知识库由
+  # .cnb.yml 的 knowledge:update 流水线构建）
+  defaultRepo: "toroyxxx/memory-hub"
   defaultRole: 记忆管家
   button:
     name: 问问记忆管家

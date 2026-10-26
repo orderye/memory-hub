@@ -47,6 +47,7 @@
 
   <line x1="620" y1="18" x2="620" y2="102" stroke="#8FA3BF" stroke-opacity="0.12"/>
 
+  <g transform="translate(26 0)">
   <path d="M822 60 L842 60 M842 60 C854 60 852 36 866 36 M842 60 C854 60 852 84 866 84" stroke="url(#ring)" stroke-width="2" fill="none" stroke-linecap="round"/>
   <circle cx="868" cy="36" r="7" fill="#0B1628" stroke="#56D4FF" stroke-width="2"/>
   <circle cx="868" cy="84" r="7" fill="#0B1628" stroke="#A78BFA" stroke-width="2"/>
@@ -58,4 +59,5 @@
   <line x1="724" y1="68" x2="790" y2="68" stroke="#8FA3BF" stroke-opacity="0.18" stroke-width="1.5" stroke-linecap="round"/>
   <line x1="724" y1="82" x2="800" y2="82" stroke="#8FA3BF" stroke-opacity="0.14" stroke-width="1.5" stroke-linecap="round"/>
   <path d="M786 20 L786 52 L777 45 L768 52 L768 20 Z" fill="#FFB454" fill-opacity="0.8"/>
+  </g>
 </svg>

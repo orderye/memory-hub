@@ -530,9 +530,14 @@ A standard Rust workspace, layered by responsibility:
 ├── Cargo.toml                  # Workspace and shared dependencies
 ├── Dockerfile                  # Multi-stage production image
 ├── docker-compose.yml          # One-command orchestration (DB + three services)
-├── .cnb.yml                    # CNB cloud build: main push ships and deploys; tag push ships a versioned image
+├── .cnb.yml                    # CNB cloud build: PR / branch push runs the quality gate; main push ships and deploys; tag push ships a versioned image; tag deploy trigger; branch-page button events
+├── .cnb/tag_deploy.yml         # CNB custom deploy environment: Tag page → Deploy → production
+├── .cnb/settings.yml           # CNB page UI customisation: NPC roles (memory steward / reviewer), button copy and hover images
+├── .cnb/web_trigger.yml        # CNB branch-page custom buttons: deploy production / roll back one version / build image only / ask the memory steward
 ├── .github/workflows/ci.yml    # GitHub Actions: quality gate / PG integration / dependency audit / release build
 ├── scripts/push-cnb.sh         # Dual-platform push: replay and push the mirror under the CNB identity (patch-id based)
+├── scripts/ci/deploy-production.sh  # Production deploy stage (switch image / probe / rollback), shared by all CNB pipelines
+├── scripts/ci/rollback-production.sh  # Production rollback stage: switch back to the image in the server's previous_release.env, then probe
 ├── docs/                       # Design and specification documents (see section 11)
 └── crates/
     ├── common/                 # Shared parts: strict config validation, redacted logging, rate limiting, cron, consolidation mode enums
@@ -581,30 +586,102 @@ CI runs on two platforms:
 
 - **GitHub Actions** (`.github/workflows/ci.yml`): ① quality gate (fmt / clippy `--all-features` / tests / doc build);
   ② integration tests against a real PostgreSQL + pgvector database (serialized); ③ dependency admission and security audit (cargo-deny + cargo-audit); ④ release build of the three binaries.
-- **CNB cloud build** (`.cnb.yml`): a push to `main` triggers it — build the image in the cloud → push to the artifact registry → SSH-deploy to the server →
-  probe `/readyz`, rolling back to the previous stable version on failure. A push to any other branch hits the `$` fallback pipeline instead:
-  quality gate only (fmt / clippy / test), no image build and no deployment. Repeated pushes queue behind a pipeline lock instead of deploying concurrently.
+- **CNB cloud build** (`.cnb.yml`): ① a PR targeting `main` (created / reopened / source branch pushed) runs the
+  `pull_request` quality gate (fmt / clippy / test, same commands as the branch fallback — no image build, no deploy);
+  ② a push to `main` ships — build the image in the cloud → push to the artifact registry → SSH-deploy to the server →
+  probe `/readyz`, rolling back to the previous stable version on failure. A push to any other branch hits the `$`
+  fallback pipeline instead: quality gate only (fmt / clippy / test), no image build and no deployment.
+  Repeated pushes queue behind a pipeline lock instead of deploying concurrently.
   A tag push runs `tag_push` under the same `$` fallback key: the tagged commit is built as a `:<tag name>` versioned image and pushed to the
   registry — no deployment, and `latest` is left untouched (shipping stays tied to `main` pushes).
+  You can also ship or roll back to a published tag by hand from **Tag page → Deploy → `production`**
+  (`tag_deploy.production`; environment and permissions live in `.cnb/tag_deploy.yml`).
+  The **`main` branch page** additionally carries four one-click buttons (deploy / roll back one version / build image only / ask the memory steward) — see the next section.
 
-### Cloud-native dev environment (CNB)
+### One-click buttons on the branch page (CNB Web Trigger)
 
-No local toolchain required: open the CNB repository page → "Cloud-native development" / IDE and pick a branch
-(`$: vscode` event; the base image lives in `.ide/Dockerfile`). The first launch builds the image
-(`rust:1-bookworm` + code-server), roughly 5–10 minutes; later launches hit the layer cache.
+Configured in `.cnb/web_trigger.yml` and shown only on the **`main` branch page** (`reg: ^main$`). A button click runs the
+same-named event under `main` in `.cnb.yml`, so the pipelines share one set of stages and one `deploy-main` lock with regular `main` pushes:
 
+| Button | Event | What it does | Who can click | Needs the secret repo |
+|---|---|---|---|---|
+| Deploy production | `web_trigger_deploy` | build the current commit → push to the registry → deploy → probe `/readyz`, auto-rollback on failure | master (owner included) | yes |
+| Roll back one version | `web_trigger_rollback` | switch the server back to the previous stable image in `previous_release.env`, then probe | master (owner included) | yes |
+| Build image only | `web_trigger_build` | build and push the image, never touching production | any repo write access | no |
+| Ask the memory steward | `web_trigger_npc` | type a task in the dialog → `npc:go` reads the repo and replies; no build, no deploy | any repo write access | no |
+
+Two boundaries:
+
+- Deploy and rollback read the secret repo `toroyxxx/ci-secrets/deploy-key.yml`. If that file declares `allow_events`, it must cover
+  `web_trigger*` and `tag_deploy.*`, and `allow_branches` must include `main` and the tag pattern (e.g. `v*`);
+  otherwise the reference is rejected in the prepare stage (only "build image only" is unaffected).
+- Rollback reads `previous_release.env` on the server (written by every deploy, holding the previous stable version). Rollback never
+  rewrites it, so clicking again is idempotent; on a machine that never deployed successfully it fails fast.
+
+### NPC assistants (memory steward / reviewer)
+
+NPC roles live in `.cnb/settings.yml` (`npc.roles`); their pipelines live in `.cnb.yml`. This repo defines two roles:
+
+| Role | Focus | How to call it |
+|---|---|---|
+| Memory steward (default) | Resident repo assistant: storage, retrieval, consolidation, backup and engineering constraints | `@toroyxxx/memory-hub(记忆管家)`, or **Ask the memory steward** on the `main` branch page |
+| Reviewer | Code review: correctness, security isolation, compatibility, testability — reported by severity | `@toroyxxx/memory-hub(审查员)` |
+
+Two entry points:
+
+- **Comment `@` mentions**: the `issue.comment@npc` / `pull_request.comment@npc` events; the platform injects the role prompt. Screenshots pasted into the comment are readable (`supportImage: true`). Tick **替我上班** (work mode) in the comment box to let it change code directly — that requires developer access or above.
+- **Branch-page button**: `main` branch page → **AI 助手** → **问问记忆管家**, then type the task in the dialog (`userPrompt` is required). This entry has no comment context, so the prompt is just `userPrompt` plus the role's persona paragraph.
+
+Three boundaries:
+
+- Both comment events are declared under `main` and `$` separately: `main` is an exact branch key and will not fall through to `$`. A missing copy shows up as "the button does nothing" or "PR comments never trigger".
+- The runtime image is the platform default `cnbcool/default-npc:latest`; the repo does not build its own NPC image. Add a Dockerfile and build pipeline only when extra CLIs / Skills must be preinstalled.
+- NPC usage is billed as **cloud-native development** consumption; delegated authority is capped at Developer, so operations beyond that role are rejected.
+
+### Manual deploy / roll back by tag (CNB deploy trigger)
+
+`main` pushes remain the default way to ship. When you need a **specific version** (manual release or rollback), use the deploy page:
+
+1. Make sure the target version has a versioned image: push the tag (one per platform, see `docs/upgrade/PUSH_PROCESS.md` §5.2);
+   `tag_push` produces `memory-hub:<tag name>`.
+2. CNB repository page → Tags → open the tag → **Deploy** → pick `production` → confirm.
+3. The pipeline pulls that exact image and pins its digest → deploys → probes `/readyz`, rolling back to the previous stable
+   version on failure.
+
+Three boundaries:
+
+- Pipeline config is read from **that tag's commit** (`.cnb.yml` / `.cnb/tag_deploy.yml`); tags older than this feature have no deploy entry.
+- If the versioned image is missing the deploy fails fast instead of rebuilding — so the deployed image is always the released artifact.
+- Deploy and `main` shipping share one lock (`deploy-main`), because both rewrite `current_release.env` /
+  `previous_release.env` on the server and a concurrent run would corrupt the rollback baseline.
+
+### Cloud-native dev environment (CNB, preview-only)
+
+No local toolchain needed to see it running: CNB repository page → "Cloud-native development" → the environment opens the
+**preview page directly** instead of WebIDE (`vscode.options.onlyPreview`; the fragment lives in `.cnb.yml` as
+`.vscode_preview` and is referenced from both `main` and `$`, because `$` is only a fallback branch key — `main` matches an
+exact key and never falls through to it. Base image: `.ide/Dockerfile`; launch script: `.ide/preview.sh`).
+
+- **What the preview runs**: `auth-server` listens on `8686` with in-memory storage (`HUB_DB_URL=memory://preview`); the
+  landing page goes straight to the account console — sign in or self-register, then manage that account's agents,
+  namespaces and grants.
+- **What it does not run**: PostgreSQL and `mcp-server`. In-memory storage is per-process, so the two processes would hold
+  different data; an MCP endpoint that connects but disagrees is worse than none. Use SSH access for real-database work.
+- **Data is temporary**: it is wiped when the environment is recycled or the process restarts; `HUB_TOKEN_SECRET` is
+  generated randomly per launch and never committed.
+- **Timing**: the first launch builds the image (`rust:1-bookworm` + code-server, roughly 5–10 minutes) and runs
+  `cargo build -p auth-server`; later launches hit the layer cache and the `target/` volume, leaving only incremental
+  compilation. Idle environments are recycled after 10 minutes by default.
 - **Preinstalled**: Rust toolchain (stable) with `cargo clippy` / `cargo fmt`, `build-essential` + `pkg-config`
-  (`tikv-jemalloc-sys` needs a C compiler), `psql`, `jq` / `ripgrep`, Docker CLI, plus `code-server`
-  and extensions such as rust-analyzer. Because code-server is in the image, CNB runs single-container mode:
-  the browser terminal *is* this image.
-- **Caches**: `/usr/local/cargo/registry` and `target/` are mounted as data volumes, valid only on the current
-  build node; switching nodes drops them.
-- **Configuration**: the startup stage copies `.env.example` to `.env` when `.env` is missing (never overwrites);
-  you still fill in `POSTGRES_PASSWORD` / `HUB_TOKEN_SECRET` yourself.
-- **Real database**: `docker compose up -d postgres` starts `pgvector/pgvector:pg15`; set `HUB_DB_URL` as in
-  "Way B" and run `cargo test -p store --features pg-integration -- --ignored`.
-- **Changing the environment**: edit `.ide/Dockerfile` or the `$: vscode` block in `.cnb.yml`, then
-  `./scripts/push-cnb.sh --push`. `build.by` only tracks `.ide/Dockerfile`, so source changes never rebuild the image.
+  (`tikv-jemalloc-sys` needs a C compiler), `psql`, `jq` / `ripgrep`, Docker CLI, plus `code-server` and extensions such as
+  rust-analyzer. Preview mode does not use WebIDE, but client/SSH access from "avatar → My cloud-native dev" still works.
+- **Caches**: `/usr/local/cargo/registry` and `target/` are mounted as data volumes, valid only on the current build node.
+- **Real database** (after SSH-ing in): `cp .env.example .env` and fill in `POSTGRES_PASSWORD` / `HUB_TOKEN_SECRET`, run
+  `docker compose up -d postgres` for `pgvector/pgvector:pg15`, then set `HUB_DB_URL` as in "Way B" and run
+  `cargo test -p store --features pg-integration -- --ignored`.
+- **Changing the environment**: edit `.ide/Dockerfile`, `.ide/preview.sh`, or the `.vscode_preview` fragment in `.cnb.yml`,
+  then `./scripts/push-cnb.sh --push`. `build.by` only tracks `.ide/Dockerfile`, so source changes never rebuild the image
+  (the preview service is compiled in `stages`).
 
 ### Rollback (application version / deployment shape)
 

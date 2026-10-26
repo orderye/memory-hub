@@ -1,0 +1,40 @@
+# 分支详情页的自定义按钮（只对 main 生效）
+# 文档：https://docs.cnb.cool/zh/build/web-trigger.html
+#
+# 按钮点下去触发的是 .cnb.yml 中 main 下的同名 web_trigger_* 事件；本文件只负责
+# 按钮长什么样、谁能点，流水线内容一律写在 .cnb.yml 里。
+# 未配置 permissions 的按钮：有仓库写权限即可触发；配了 roles 则还需命中其中之一
+# （roles 向上包含，声明 master 时 owner 同样可以点）。
+branch:
+  - reg: ^main$
+    buttons:
+      - name: 部署生产
+        description: 用当前提交构建镜像并部署 tx-cloud，探活失败自动回滚
+        event: web_trigger_deploy
+        groupName: 生产
+        permissions:
+          roles:
+            - master
+      - name: 回滚上一版本
+        description: 把 tx-cloud 切回上一稳定镜像并探活（读远端 previous_release.env）
+        event: web_trigger_rollback
+        groupName: 生产
+        permissions:
+          roles:
+            - master
+      - name: 仅构建镜像
+        description: 只构建并推送镜像入库，不部署、不改动线上
+        event: web_trigger_build
+        groupName: 构建
+      # NPC 入口：角色定义在 .cnb/settings.yml，流水线见 .cnb.yml 的 web_trigger_npc。
+      # 不配 permissions：有仓库写权限即可点（角色上限仍是 Developer）。
+      - name: 问问记忆管家
+        description: 把问题或任务写清楚，记忆管家在云端读完仓库后回复
+        event: web_trigger_npc
+        groupName: AI 助手
+        inputs:
+          userPrompt:
+            name: 任务描述
+            type: textarea
+            required: true
+            placeholder: 例如：解释 retrieval 双路检索在语义服务不可用时的降级路径，并指出最可能出问题的一处

@@ -59,8 +59,8 @@ git -C .cnb-worktree log --right-only --cherry-pick --no-merges --reverse --form
 | 主线分支 | `main`（本地 `main` 跟踪 `origin/main`） | 远端只保留 `main`；本地 `cnb-main` 跟踪 `cnb/main`，实际检出在 `.cnb-worktree/` |
 | 提交身份 | `orderye <orderye@qq.com>` | `orderye <3WJRP74JzJLZlOYQ8b7VcB+cnb.dgyOUWMigHA@noreply.cnb.cool>` |
 | CI 入口 | `.github/workflows/ci.yml` | `.cnb.yml` |
-| CI 触发 | `push` / `pull_request` / 手动 `workflow_dispatch` | `main` 分支 `push` |
-| CI 覆盖 | 质量门禁 / PG 集成 / 依赖审计 / Release 构建（4 个 job） | 构建镜像 → 推制品库 → SSH 部署 → 探活回滚 |
+| CI 触发 | `push` / `pull_request` / 手动 `workflow_dispatch` | PR（目标 `main`）· `main` 分支 push（发布）· 其它分支 push（`$` 兜底门禁）· Tag 详情页「部署」 |
+| CI 覆盖 | 质量门禁 / PG 集成 / 依赖审计 / Release 构建（4 个 job） | PR 与分支：质量门禁（fmt / clippy / test）；`main` / Tag 发布：构建镜像 → 推制品库 → SSH 部署 → 探活回滚 |
 | 发布物 | 容器镜像（`docker build`） | 同左（CNB 侧推 `docker.cnb.cool` 制品库） |
 | 额外影响 | — | **推 `main` 会触发生产部署**（`tx-cloud` 主机） |
 
@@ -364,9 +364,10 @@ git ls-remote cnb refs/heads/main
 | 平台 | 触发条件 | 查看方式 |
 | :--- | :--- | :--- |
 | GitHub | 任意分支 push、PR、手动触发 | `gh run list --workflow ci.yml --limit 5` |
-| CNB | `main` 分支 push（发布）；其它分支 push（`$` 兜底，只跑质量门禁）；Tag 详情页「部署」→ production（手动上线/回滚） | CNB 仓库页面的流水线列表 / Tag 详情页 |
+| CNB | PR（目标 `main`，`pull_request`，只跑质量门禁）；`main` 分支 push（发布）；其它分支 push（`$` 兜底，只跑质量门禁）；Tag 详情页「部署」→ production（手动上线/回滚） | CNB 仓库页面的流水线列表 / PR 页面 / Tag 详情页 |
 
-推分支到 CNB **不会部署**，只会跑一遍质量门禁流水线；生产默认在 Step 4 合入 `main` 时变，
+推分支到 CNB **不会部署**，只会跑一遍质量门禁流水线；PR 也一样——PR 上的 `pull_request`
+流水线只做门禁，合并进 `main` 才发布。生产默认在 Step 4 合入 `main` 时变，
 也可在 Tag 详情页手动部署或回滚（见 §5.2）。
 
 ### Step 6 · 记录 SHA 对照
@@ -412,7 +413,12 @@ git -C .cnb-worktree push cnb v0.1.0
 
 推 tag 到 CNB 会触发 `.cnb.yml` 里的 `tag_push`：把该 tag 指向的提交构建成定版镜像
 `docker.cnb.cool/toroyxxx/memory-hub:vX.Y.Z` 推入制品库，流水线带 `RELEASE` 标签。
-这一步**只入库、不上线**——部署由 `main` push 那条流水线负责，`latest` 也不会被 tag 改动。
+这一步**只入库、不上线**——默认上线仍由 `main` push 那条流水线负责，`latest` 也不会被 tag 改动。
+
+需要**指定版本上线或回滚**时，在该 Tag 详情页点「部署」→ 选 `production`（环境定义在
+`.cnb/tag_deploy.yml`）：流水线取这个 tag 的定版镜像（不重新构建）→ 部署 → `/readyz` 探活回滚，
+与 `main` 发布共用一把部署锁。注意流水线配置读的是**该 tag 提交里的** `.cnb.yml`，
+老 tag（早于该功能的提交）没有部署入口。
 
 ### 5.3 发布完成核对清单
 

@@ -1,6 +1,7 @@
 # ==============================================================================
 # CNB 云原生构建流水线
 #
+# pull_request（目标 main）触发：PR 创建 / 重新打开 / 源分支 push → 质量门禁，不部署
 # push 到 main 触发：云端构建生产镜像 → 推送 CNB 制品库 → ssh 部署到 tx-cloud
 # 制品镜像：docker.cnb.cool/toroyxxx/memory-hub:${CNB_COMMIT:0:8} 及 latest
 #
@@ -10,50 +11,328 @@
 # .cnb/tag_deploy.yml）：取 tag_push 产出的定版镜像 → ssh 部署到 tx-cloud，与 main 发布共用部署锁
 #
 # 其它分支 push（兜底分支键 `$`）只跑质量门禁 fmt / clippy / test，不构建镜像、不部署。
-# 同一分支键下的 `vscode` 事件是云原生开发环境，镜像定义见 .ide/Dockerfile。
+#
+# `vscode` 事件是云原生开发环境，走「仅预览模式」：点按钮不再进 WebIDE，而是编译并
+# 起 auth-server（内存存储）到 8686，直接打开账户控制台预览页。镜像见 .ide/Dockerfile，
+# 启动脚本见 .ide/preview.sh。
+# 注意：`$` 只是兜底分支键，main 精确命中后不会再走 `$`，所以 main 与 `$` 都要声明
+# `vscode`（共用下方 .vscode_preview 片段）；否则在 main 上点按钮拿不到预览配置。
+#
+# main 分支详情页的自定义按钮（配置在 .cnb/web_trigger.yml）：部署生产 / 回滚上一版本 /
+# 仅构建镜像 / 问问记忆管家，分别对应下方 main 下的 web_trigger_deploy /
+# web_trigger_rollback / web_trigger_build / web_trigger_npc 事件。
+#
+# NPC（角色定义在 .cnb/settings.yml）：两个入口共用 .npc_comment / .npc_web 片段——
+# ① Issue / PR 评论里 @toroyxxx/memory-hub(记忆管家)，提示词由平台按角色注入；
+# ② main 分支页「问问记忆管家」按钮，提示词由弹窗输入的 userPrompt 提供。
+# 镜像用平台默认 cnbcool/default-npc:latest；NPC 计费归云原生开发用量。
+#
+# 仓库知识库（knowledge:update）：main push 且改动含 Markdown / .cnb.yml 时，把仓库文档
+# 切片、向量化后写入 CNB 知识库；Issue 新建 / 编辑 / 评论走 `$` 下的就地增量同步。
+# 产物供仓库页 AI 对话（.cnb/settings.yml 的 NPC）与 Open API 检索，不参与镜像与部署，
+# 因此不与「生产发布」共用 deploy-main 锁。
 #
 # 部署依赖的 SSH 私钥与部署主机地址均来自密钥仓 toroyxxx/ci-secrets 的 deploy-key.yml
-# （文件内 allow_slugs/allow_events/allow_branches 限定仅本仓 main push 可引用；
+# （文件内 allow_slugs/allow_events/allow_branches 限定引用范围；若声明了 allow_events，
+#  需覆盖 push 与 web_trigger*，否则跨事件引用会在 prepare 阶段被拒。
 #  DEPLOY_HOST 即部署主机，不在流水线内硬编码）。
+#
+# PR 流水线不引用任何密钥仓文件：PR 属「不可信事件」，配置与代码都可能来自源分支，
+# 引用侧 deploy-key.yml 的 allow_events 也不覆盖 pull_request。加 PR 步骤时不要加 imports。
 # ==============================================================================
+# ==============================================================================
+# 可复用片段（dot 开头的顶层键不会被当成分支名）
+#
+# main push 与分支页「部署生产」共用同一份构建 / 推送 / 部署定义：手动部署若另抄一份，
+# 两边迟早漂移，而它们改的是同一台机器上的同一个 current_release.env。
+# ==============================================================================
+.build_image: &build_image
+  name: 构建镜像
+  # 节点在腾讯云内网，apt 走 tencentyun 镜像；crates 走 rsproxy 稀疏索引
+  script: |
+    TAG="${CNB_COMMIT:0:8}"
+    IMAGE_BASE="${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}"
+    docker build \
+      --build-arg APT_MIRROR=mirrors.tencentyun.com \
+      --build-arg CRATES_MIRROR=sparse+https://rsproxy.cn/index/ \
+      -t ${IMAGE_BASE}:${TAG} \
+      -t ${IMAGE_BASE}:latest .
+
+.push_image: &push_image
+  name: 推送制品库与固化 Digest
+  # services: [docker] 已内置触发者凭据，免手动 docker login
+  script: |
+    TAG="${CNB_COMMIT:0:8}"
+    IMAGE_BASE="${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}"
+    docker push ${IMAGE_BASE}:${TAG}
+    docker push ${IMAGE_BASE}:latest
+    DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${IMAGE_BASE}:${TAG} 2>/dev/null || echo "${IMAGE_BASE}:${TAG}")
+    echo "DEPLOY_IMAGE=${DIGEST}" > /tmp/release.env
+    echo "RELEASE_TAG=${TAG}" >> /tmp/release.env
+
+.deploy_stage: &deploy_stage
+  name: 部署到 tx-cloud 与探活回滚
+  # 部署细节（切镜像 / 探活 / 失败回滚）收敛在脚本里，Tag 手动部署复用同一份
+  script: |
+    bash scripts/ci/deploy-production.sh
+
+.deploy_pipeline: &deploy_pipeline
+  runner:
+    cpus: 8
+  services:
+    - docker
+  imports: https://cnb.cool/toroyxxx/ci-secrets/-/blob/main/deploy-key.yml
+  stages:
+    - *build_image
+    - *push_image
+    - *deploy_stage
+
+.build_pipeline: &build_pipeline
+  runner:
+    cpus: 8
+  services:
+    - docker
+  stages:
+    - *build_image
+    - *push_image
+
+# 所有部署入口共用一把锁：并发部署会互写远端 current_release.env，
+# 让回滚基准指向错的镜像
+.deploy_lock: &deploy_lock
+  key: deploy-main
+  wait: true
+  timeout: 1800
+
+# Issue 事件只做就地增量同步（不拉插件镜像、不占 Runner），三种事件共用同一份定义
+.knowledge_issue: &knowledge_issue
+  stages:
+    - name: build knowledge base
+      type: knowledge:update
+      options:
+        issueSyncEnabled: true
+
+# ==============================================================================
+# 质量门禁（PR 与其它分支 push 共用）
+#
+# 命令与 .github/workflows/ci.yml 的「质量门禁」job 一致；PG 集成测试与依赖审计
+# 仍需真库 / 审计库，仍归 GitHub Actions。官方 rust 镜像默认 profile 不含 clippy /
+# rustfmt，环境准备里按需补装（已存在则跳过，不重复联网）。
+# ==============================================================================
+.quality_gate: &quality_gate
+  runner:
+    cpus: 8
+  docker:
+    image: rust:1-slim-bookworm
+    volumes:
+      # 只缓存依赖下载与编译产物；缓存仅在当前构建节点内有效，路径之间不得存在包含关系
+      - /usr/local/cargo/registry
+      - ./target
+  env:
+    CARGO_TERM_COLOR: always
+    RUSTFLAGS: -D warnings
+  stages:
+    - name: 环境准备
+      timeout: 20m
+      script: |
+        # 节点在腾讯云内网，apt 走 tencentyun 镜像；crates 走 rsproxy 稀疏索引
+        sed -i 's|deb.debian.org|mirrors.tencentyun.com|g; s|security.debian.org|mirrors.tencentyun.com|g' \
+          /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
+        apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+          pkg-config ca-certificates build-essential
+        command -v rustfmt >/dev/null 2>&1 || rustup component add rustfmt
+        command -v cargo-clippy >/dev/null 2>&1 || rustup component add clippy
+        mkdir -p /usr/local/cargo
+        printf '%s\n' \
+          '[source.crates-io]' \
+          'replace-with = "mirror"' \
+          '[source.mirror]' \
+          'registry = "sparse+https://rsproxy.cn/index/"' \
+          > /usr/local/cargo/config.toml
+    - name: 格式检查
+      timeout: 20m
+      script: cargo fmt --all -- --check
+    # 必须带 --all-features：否则 adapter-cjs 与 pg-integration 里的代码
+    # 从头到尾不参与编译，编译错误要到发布构建甚至线上才暴露
+    - name: 静态检查（零警告）
+      timeout: 60m
+      script: cargo clippy --all-targets --all-features -- -D warnings
+    - name: 单元与集成测试
+      timeout: 60m
+      script: cargo test --workspace --all-features
+
+# ==============================================================================
+# 云原生开发环境（仅预览模式，main 与 `$` 共用）
+#
+# 点「云原生开发」不再进 WebIDE，而是编译并起 auth-server 到 8686，直接打开账户控制台。
+# 预览用内存存储（HUB_DB_URL 非 postgres:// 即内存）：不接真库，环境回收或进程重启
+# 数据即清空。mcp-server 不在这里起 —— 内存存储是进程内的，两个进程无法共享数据，
+# 起一个「能连但数据对不上」的 MCP 端点比不起更误导。
+# 编译放在 stages（launch 必须 5 分钟内退出，只负责起进程 + 探活）；细节见 .ide/preview.sh。
+# ==============================================================================
+.vscode_preview: &vscode_preview
+  - name: 业务预览
+    runner:
+      cpus: 8
+    docker:
+      build:
+        dockerfile: .ide/Dockerfile
+        # 构建上下文只认这一个文件：源码改动不该让镜像重建（编译在 stages 里做）
+        by:
+          - .ide/Dockerfile
+        versionBy:
+          - .ide/Dockerfile
+      # 构建失败时的兜底（没有 Rust，但至少能进环境改 Dockerfile）
+      image: cnbcool/default-dev-env:latest
+      volumes:
+        # 数据卷只在当前构建节点有效；只挂 registry 子目录，
+        # 避免遮蔽镜像里 /usr/local/cargo/config.toml 的镜像源配置
+        - /usr/local/cargo/registry
+        - ./target
+    services:
+      - name: vscode
+        options:
+          # 仅预览：点按钮直接进预览页，不展示 WebIDE / 客户端选择页
+          onlyPreview: true
+          launch: bash .ide/preview.sh
+      # 保留 docker：SSH 进环境后可用 compose 起 postgres 做真库联调
+      - docker
+    env:
+      CARGO_TERM_COLOR: always
+    stages:
+      - name: 编译预览服务
+        # 平台 200 秒探活窗口内只够起进程，编译放在这里
+        timeout: 30m
+        script: cargo build -p auth-server
+      - name: 环境自检
+        script: |
+          rustc --version && cargo --version
+          cargo clippy --version && cargo fmt --version
+          psql --version && code-server --version
+          docker --version
+      - name: 初始化 .env
+        script: |
+          if [ -f .env ]; then
+            echo '.env 已存在，保持不动'
+          else
+            cp .env.example .env
+            echo '已生成 .env：SSH 进环境做真库联调时用；预览本身走内存存储'
+          fi
+
+# ==============================================================================
+# NPC：记忆管家（角色定义见 .cnb/settings.yml）
+#
+# 两个入口共用一份 npc:go 配置：
+#   - 评论事件（issue / pull_request.comment@npc）由平台按角色注入提示词，options 只调能力开关；
+#   - web_trigger_npc 不是 NPC 事件，提示词不会自动带上，userPrompt 必须由网页输入框提供。
+# 镜像用平台默认 cnbcool/default-npc:latest：本仓不需要额外装 CLI / Skill。
+# 注意：main 是精确分支键，命中后不会再走 `$`，所以 main 与 `$` 都要声明评论事件。
+# ==============================================================================
+.npc_comment: &npc_comment
+  docker:
+    image: cnbcool/default-npc:latest
+  stages:
+    - name: npc go
+      type: npc:go
+      options:
+        # 评论里常贴截图；默认镜像内置 ffmpeg，会先压到 512 KiB 再交给模型
+        supportImage: true
+
+.npc_web: &npc_web
+  docker:
+    image: cnbcool/default-npc:latest
+  stages:
+    - name: npc go
+      type: npc:go
+      options:
+        # 角色人格段由 settings.yml 注入；userPrompt 来自 .cnb/web_trigger.yml 的输入框
+        role: 记忆管家
+        userPrompt: $userPrompt
+
 main:
   push:
-    - name: 生产发布
-      # 并发部署会互写远端 current_release.env，让回滚基准指向错的镜像：排队而不是并行
-      lock:
-        key: deploy-main
-        wait: true
-        timeout: 1800
+    - <<: *deploy_pipeline
+      name: 生产发布
+      lock: *deploy_lock
+
+    # 知识库：Markdown 切片 / 向量化后写入 CNB 知识库（说明见文件头）。
+    # 只在 Markdown 或本文件变化时跑：纯代码提交不重复构建；把 .cnb.yml 列入是为了
+    # 「启用知识库」这一条提交本身就能触发首次构建。
+    # 与「生产发布」并行且不共用 deploy-main 锁——它不碰线上，只写知识库。
+    - name: 更新知识库
+      ifModify:
+        - "**/*.md"
+        - ".cnb.yml"
+      stages:
+        - name: build knowledge base
+          timeout: 30m
+          type: knowledge:update
+          options:
+            include: "**/*.md"
+            issueSyncEnabled: true
+
+  # ----------------------------------------------------------------------------
+  # PR 校验：PR 创建 / 重新打开 / 源分支 push 时触发（目标分支 main）
+  #
+  # 只做质量门禁，不构建镜像、不碰生产：
+  #   - 不 imports 任何密钥（见文件头）：PR 属不可信事件，配置与代码都可能来自源分支
+  #   - sandbox: true 让内置 CNB_TOKEN 失效，脚本即使想跨仓访问也没有凭据
+  #   - 不声明 services: [docker]：PR 阶段不需要 build / push 镜像
+  #   - 不设 ifModify：PR 每次都要上报状态，纯文档改动也照跑一遍（命中 target 缓存后
+  #     接近空转），否则「需要通过状态检查」的保护分支会因为没有状态而卡住合并
+  # ----------------------------------------------------------------------------
+  pull_request:
+    - <<: *quality_gate
+      name: PR 质量门禁
+      label:
+        type: PR
+      sandbox: true
+
+  # ----------------------------------------------------------------------------
+  # 分支详情页手动按钮（配置在 .cnb/web_trigger.yml，只对 main 展示）
+  #
+  # 手动部署与 push 共用同一份 stages 和同一把 deploy-main 锁：两条入口同时写远端
+  # current_release.env 会让回滚基准指向错的镜像，所以排队而不是并行。
+  # ----------------------------------------------------------------------------
+  web_trigger_deploy:
+    - <<: *deploy_pipeline
+      name: 手动部署生产
+      lock: *deploy_lock
+
+  # 只构建并推送入库，不碰线上：用于验证 Dockerfile / 依赖改动，不引用密钥仓
+  web_trigger_build:
+    - <<: *build_pipeline
+      name: 手动构建镜像（不部署）
+
+  # 把 tx-cloud 切回上一稳定版本：读远端 previous_release.env（由每次部署写入），
+  # 切回去后同样探活，失败则报错留给人工介入
+  web_trigger_rollback:
+    - name: 回滚到上一稳定版本
+      lock: *deploy_lock
       runner:
-        cpus: 8
-      services:
-        - docker
+        cpus: 1
       imports: https://cnb.cool/toroyxxx/ci-secrets/-/blob/main/deploy-key.yml
       stages:
-        - name: 构建镜像
-          # 节点在腾讯云内网，apt 走 tencentyun 镜像；crates 走 rsproxy 稀疏索引
+        - name: 回滚并探活
           script: |
-            TAG="${CNB_COMMIT:0:8}"
-            IMAGE_BASE="${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}"
-            docker build \
-              --build-arg APT_MIRROR=mirrors.tencentyun.com \
-              --build-arg CRATES_MIRROR=sparse+https://rsproxy.cn/index/ \
-              -t ${IMAGE_BASE}:${TAG} \
-              -t ${IMAGE_BASE}:latest .
-        - name: 推送制品库与固化 Digest
-          # services: [docker] 已内置触发者凭据，免手动 docker login
-          script: |
-            TAG="${CNB_COMMIT:0:8}"
-            IMAGE_BASE="${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}"
-            docker push ${IMAGE_BASE}:${TAG}
-            docker push ${IMAGE_BASE}:latest
-            DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${IMAGE_BASE}:${TAG} 2>/dev/null || echo "${IMAGE_BASE}:${TAG}")
-            echo "DEPLOY_IMAGE=${DIGEST}" > /tmp/release.env
-            echo "RELEASE_TAG=${TAG}" >> /tmp/release.env
-        - name: 部署到 tx-cloud 与探活回滚
-          # 部署细节（切镜像 / 探活 / 失败回滚）收敛在脚本里，Tag 手动部署复用同一份
-          script: |
-            bash scripts/ci/deploy-production.sh
+            bash scripts/ci/rollback-production.sh
+
+  # 云原生开发环境（仅预览模式）：main 是精确分支键，命中后不会再走 `$` 兜底，
+  # 所以这里必须显式声明一次，与 `$:` 下的配置共用 .vscode_preview 片段
+  vscode: *vscode_preview
+
+  # ----------------------------------------------------------------------------
+  # NPC：评论 @ 与分支页按钮
+  #
+  # main 是精确分支键，命中后不会再走 `$`，所以评论事件这里必须显式声明。
+  # web_trigger_npc 只服务 main 页的「问问记忆管家」按钮（按钮也只在 ^main$ 配置）。
+  # ----------------------------------------------------------------------------
+  issue.comment@npc:
+    - *npc_comment
+  pull_request.comment@npc:
+    - *npc_comment
+  web_trigger_npc:
+    - <<: *npc_web
+      name: 问问记忆管家
 
 # ==============================================================================
 # 其它分支 push（兜底分支键 `$`，不会与上面的 main 重复触发）
@@ -63,99 +342,36 @@ main:
 # ==============================================================================
 $:
   push:
-    - name: 分支质量门禁
-      runner:
-        cpus: 8
-      docker:
-        image: rust:1-slim-bookworm
-        volumes:
-          # 只缓存依赖下载与编译产物；缓存仅在当前构建节点内有效，路径之间不得存在包含关系
-          - /usr/local/cargo/registry
-          - ./target
+    - <<: *quality_gate
+      name: 分支质量门禁
       ifModify:
         # 纯文档改动不值得占 8 核：反向匹配排除 docs/ 与所有 Markdown
         - "**"
         - "!(docs/**)"
         - "!(**/*.md)"
         - "!*.md"
-      env:
-        CARGO_TERM_COLOR: always
-        RUSTFLAGS: -D warnings
-      stages:
-        - name: 环境准备
-          timeout: 20m
-          script: |
-            # 节点在腾讯云内网，apt 走 tencentyun 镜像；crates 走 rsproxy 稀疏索引
-            sed -i 's|deb.debian.org|mirrors.tencentyun.com|g; s|security.debian.org|mirrors.tencentyun.com|g' \
-              /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
-            apt-get update -qq && apt-get install -y -qq --no-install-recommends \
-              pkg-config ca-certificates build-essential
-            mkdir -p /usr/local/cargo
-            printf '%s\n' \
-              '[source.crates-io]' \
-              'replace-with = "mirror"' \
-              '[source.mirror]' \
-              'registry = "sparse+https://rsproxy.cn/index/"' \
-              > /usr/local/cargo/config.toml
-        - name: 格式检查
-          timeout: 20m
-          script: cargo fmt --all -- --check
-        # 必须带 --all-features：否则 adapter-cjs 与 pg-integration 里的代码
-        # 从头到尾不参与编译，编译错误要到发布构建甚至线上才暴露
-        - name: 静态检查（零警告）
-          timeout: 60m
-          script: cargo clippy --all-targets --all-features -- -D warnings
-        - name: 单元与集成测试
-          timeout: 60m
-          script: cargo test --workspace --all-features
 
-  # ----------------------------------------------------------------------------
-  # 云原生开发环境：浏览器 VSCode Web / Remote-SSH，基础镜像见 .ide/Dockerfile
-  #
-  # 由 IDE 入口按需启动，与 push 无关。镜像里装了 code-server，因此是单容器模式：
-  # 浏览器里的终端就是本镜像（Rust + clippy/rustfmt + psql + docker cli 都在）。
-  # ----------------------------------------------------------------------------
-  vscode:
-    - name: 开发环境
-      runner:
-        cpus: 8
-      docker:
-        build:
-          dockerfile: .ide/Dockerfile
-          # 构建上下文只认这一个文件：源码改动不该让镜像重建
-          by:
-            - .ide/Dockerfile
-          versionBy:
-            - .ide/Dockerfile
-        # 构建失败时的兜底（没有 Rust，但至少能进环境改 Dockerfile）
-        image: cnbcool/default-dev-env:latest
-        volumes:
-          # 数据卷只在当前构建节点有效；只挂 registry 子目录，
-          # 避免遮蔽镜像里 /usr/local/cargo/config.toml 的镜像源配置
-          - /usr/local/cargo/registry
-          - ./target
-      services:
-        - vscode
-        - docker
-      env:
-        CARGO_TERM_COLOR: always
-      stages:
-        - name: 环境自检
-          script: |
-            rustc --version && cargo --version
-            cargo clippy --version && cargo fmt --version
-            psql --version && code-server --version
-            docker --version
-            docker compose version || echo 'compose 插件缺失：改用 docker-compose 或跳过'
-        - name: 初始化 .env
-          script: |
-            if [ -f .env ]; then
-              echo '.env 已存在，保持不动'
-            else
-              cp .env.example .env
-              echo '已生成 .env：请填写 POSTGRES_PASSWORD / HUB_TOKEN_SECRET，并确认 HUB_DB_URL 里的口令一致'
-            fi
-            echo '真库联调：docker compose up -d postgres'
+  # 知识库：Issue 新建 / 编辑 / 评论后就地增量同步（只同步上次同步时间之后的变更）。
+  # Issue 事件没有分支概念，按文档要求挂在兜底键 `$` 下。
+  issue.open:
+    - <<: *knowledge_issue
+      name: 知识库增量同步（Issue 新建）
+  issue.update:
+    - <<: *knowledge_issue
+      name: 知识库增量同步（Issue 编辑）
+  issue.comment:
+    - <<: *knowledge_issue
+      name: 知识库增量同步（Issue 评论）
+
+  # 云原生开发环境（仅预览模式）：与 main 共用 .vscode_preview 片段。
+  # `$` 只服务未被 glob 命中的分支，main 不会走到这里，两处都要声明。
+  vscode: *vscode_preview
+
+  # NPC 评论事件：PR 目标是其它分支时走这里（目标是 main 时由上面 main 键命中）
+  issue.comment@npc:
+    - *npc_comment
+  pull_request.comment@npc:
+    - *npc_comment
 
   # ============================================================================
   # tag push：把 tag 指向的提交构建成定版镜像入库（不部署）
@@ -164,8 +380,8 @@ $:
   #   main push → 最新提交打成 :latest → 部署 tx-cloud → 探活回滚
   #   tag push  → 同一提交打成 :<tag 名> → 仅入库，作为可回溯的发布制品
   #
-  # 不在此处部署：deploy-key.yml 的 allow_events/allow_branches 只允许本仓 main
-  # push 引用，跨事件引用会在 prepare 阶段被拒绝；且 main push 已负责上线。
+  # 不在此处部署：tag_push 本身不引用密钥仓；上线入口是 main 的 web_trigger 按钮
+  # 与 Tag 详情页的 tag_deploy.production，二者复用同一份部署脚本与同一把锁。
   # tag 也不更新 :latest，避免打 tag 意外改写 latest 指向。
   # ============================================================================
   tag_push:
@@ -215,10 +431,7 @@ $:
   # ============================================================================
   tag_deploy.production:
     - name: 生产部署 $CNB_BRANCH
-      lock:
-        key: deploy-main
-        wait: true
-        timeout: 1800
+      lock: *deploy_lock
       runner:
         cpus: 2
       services:
@@ -239,6 +452,4 @@ $:
             echo "DEPLOY_IMAGE=${DIGEST}" > /tmp/release.env
             echo "RELEASE_TAG=${TAG}" >> /tmp/release.env
             echo "部署镜像：${DIGEST}"
-        - name: 部署到 tx-cloud 与探活回滚
-          script: |
-            bash scripts/ci/deploy-production.sh
+        - *deploy_stage
