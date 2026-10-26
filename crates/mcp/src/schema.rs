@@ -39,8 +39,18 @@ fn ns_prop() -> Value {
     })
 }
 
-pub fn get_tool_definitions() -> Vec<ToolDefinition> {
-    vec![
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
+/// 全局缓存：28 个 ToolDefinition 仅构建一次
+static TOOL_DEFINITIONS: OnceLock<Vec<ToolDefinition>> = OnceLock::new();
+
+/// 全局缓存：工具名 → 作用域的快速查找表
+pub(crate) static TOOL_SCOPE_MAP: OnceLock<HashMap<&'static str, common::Scope>> = OnceLock::new();
+
+pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
+    TOOL_DEFINITIONS.get_or_init(|| {
+        vec![
         // ===== 存储 =====
         ToolDefinition {
             name: "memory_put",
@@ -994,6 +1004,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
     ]
+    })
 }
 
 #[cfg(test)]

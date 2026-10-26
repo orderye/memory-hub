@@ -223,36 +223,33 @@ fn vector_candidates_with(
             .or_else(|| entries[idx].embedding.as_ref())
     };
 
-    // ===== 重复带：同 kind 全量比对（与既有 DuplicateDetector 一致） =====
+    // ===== 重复带：同 kind 比对（>256 时走 LSH，避免 O(n²) 爆炸） =====
     let mut by_kind: HashMap<MemoryKind, Vec<usize>> = HashMap::new();
     for &i in usable {
         by_kind.entry(entries[i].kind).or_default().push(i);
     }
     for (_kind, indices) in by_kind {
-        for a_pos in 0..indices.len() {
-            for b_pos in (a_pos + 1)..indices.len() {
-                let i = indices[a_pos];
-                let j = indices[b_pos];
-                let (Some(va), Some(vb)) = (vector_of(i), vector_of(j)) else {
-                    continue;
-                };
-                if va.len() != vb.len() {
-                    continue;
-                }
-                let sim = cosine_similarity(va, vb).max(0.0);
-                if sim >= thresholds.duplicate_sim_threshold {
-                    out.push(
-                        CandidatePair::new(
-                            entries[i].id,
-                            entries[j].id,
-                            CandidateRelation::SemanticNearDuplicate,
-                            CandidateSource::Embedding,
-                            sim,
-                            REASON_SEMANTIC_CANDIDATE_REQUIRES_REVIEW,
-                        )
-                        .with_embedding_model(model.clone()),
-                    );
-                }
+        // candidate_pairs 内部已实现 LSH 分桶：≤256 条穷举，>256 走 LSH 召回
+        for (i, j) in candidate_pairs(entries, &indices, overrides) {
+            let (Some(va), Some(vb)) = (vector_of(i), vector_of(j)) else {
+                continue;
+            };
+            if va.len() != vb.len() {
+                continue;
+            }
+            let sim = cosine_similarity(va, vb).max(0.0);
+            if sim >= thresholds.duplicate_sim_threshold {
+                out.push(
+                    CandidatePair::new(
+                        entries[i].id,
+                        entries[j].id,
+                        CandidateRelation::SemanticNearDuplicate,
+                        CandidateSource::Embedding,
+                        sim,
+                        REASON_SEMANTIC_CANDIDATE_REQUIRES_REVIEW,
+                    )
+                    .with_embedding_model(model.clone()),
+                );
             }
         }
     }

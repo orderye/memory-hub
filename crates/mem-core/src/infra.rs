@@ -145,6 +145,22 @@ pub trait MemoryStore: Send + Sync {
         include_merged: bool,
     ) -> Result<Vec<MemoryEntry>>;
 
+    /// 有上限的命名空间条目扫描（认知查重用）：最多返回 `limit` 条，
+    /// 避免命名空间条目爆炸时全量加载。默认实现调用 `all_in_namespace` 截断，
+    /// PostgreSQL 等生产存储应覆盖为 SQL 层 `LIMIT`。
+    async fn all_in_namespace_limited(
+        &self,
+        namespace: &str,
+        include_merged: bool,
+        limit: usize,
+    ) -> Result<Vec<MemoryEntry>> {
+        let mut all = self.all_in_namespace(namespace, include_merged).await?;
+        if all.len() > limit {
+            all.truncate(limit);
+        }
+        Ok(all)
+    }
+
     /// 全部命名空间清单（定时全量备份用）
     async fn list_namespaces(&self) -> Result<Vec<Namespace>>;
 

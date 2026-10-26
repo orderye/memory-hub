@@ -29,7 +29,7 @@ fn golden_path() -> PathBuf {
 /// 排序固定（按名称），确保同一份代码每次生成的字节内容完全一致。
 fn snapshot() -> Value {
     let mut defs: Vec<Value> = mcp::get_tool_definitions()
-        .into_iter()
+        .iter()
         .map(|d| {
             // 必填参数单独列出：客户端最容易踩的就是"以前不传也行，现在必填了"
             let required = d

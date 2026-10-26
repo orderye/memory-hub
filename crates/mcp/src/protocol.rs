@@ -72,7 +72,7 @@ pub fn handle_discover() -> ServerDiscoverResponse {
 pub fn handle_tools_list() -> Value {
     let defs = get_tool_definitions();
     let tools_json: Vec<Value> = defs
-        .into_iter()
+        .iter()
         .map(|d| {
             json!({
                 "name": d.name,

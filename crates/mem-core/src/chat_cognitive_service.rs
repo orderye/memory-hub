@@ -45,6 +45,10 @@ pub enum CognitiveReviewDecision {
     Accept { modified_content: Option<String> },
 }
 
+/// 认知查重最大扫描条目数：避免命名空间条目爆炸时全量加载到内存
+///（整合引擎的 scan_limit 类似约束，这里同步加上）
+const SCAN_LIMIT: usize = 256;
+
 /// Chat 认知提炼与管理服务
 pub struct ChatCognitiveService {
     store: Arc<dyn MemoryHubStore>,
@@ -233,7 +237,7 @@ impl ChatCognitiveService {
         // 查询当前活跃事实用于冲突/重复与演化比对
         let existing_memories = self
             .store
-            .all_in_namespace(&input.namespace, false)
+            .all_in_namespace_limited(&input.namespace, false, SCAN_LIMIT)
             .await?
             .into_iter()
             .filter(|e| e.status == MemoryStatus::Active)
@@ -410,7 +414,7 @@ impl ChatCognitiveService {
 
                 let existing_memories = self
                     .store
-                    .all_in_namespace(&proposal.namespace, false)
+                    .all_in_namespace_limited(&proposal.namespace, false, SCAN_LIMIT)
                     .await?
                     .into_iter()
                     .filter(|e| e.status == MemoryStatus::Active)
@@ -496,7 +500,7 @@ impl ChatCognitiveService {
 
         let existing_memories = self
             .store
-            .all_in_namespace(&proposal.namespace, false)
+            .all_in_namespace_limited(&proposal.namespace, false, SCAN_LIMIT)
             .await?
             .into_iter()
             .filter(|e| e.status == MemoryStatus::Active)
@@ -535,7 +539,10 @@ impl ChatCognitiveService {
         }
 
         let now = Utc::now();
-        let items = self.store.all_in_namespace(namespace, false).await?;
+        let items = self
+            .store
+            .all_in_namespace_limited(namespace, false, SCAN_LIMIT)
+            .await?;
         let active = items
             .into_iter()
             .filter(|e| e.status == MemoryStatus::Active)

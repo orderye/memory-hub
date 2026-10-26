@@ -711,6 +711,52 @@ impl PostgresHubStore {
         })
     }
 
+    /// 瘦版行映射：与 [`Self::entry_from_row`] 相同，但跳过 `embedding` 列解析
+    ///（对应 [`Self::ENTRY_COLUMNS_NO_EMBEDDING`]）。读路径大多不需要向量，
+    /// 避免 ~4KB/行 的 embedding 文本传输与 float 解析开销。
+    fn entry_from_row_slim(r: &PgRow) -> Result<MemoryEntry> {
+        let kind: String = r.try_get("kind").pg()?;
+        let status: String = r.try_get("status").pg()?;
+        let scene_str: Option<String> = r.try_get("scene").pg()?;
+        let layer_str: Option<String> = r.try_get("layer").pg()?;
+        let scene = match scene_str.as_deref() {
+            Some(s) => Some(mapping::parse_scene(s)?),
+            None => None,
+        };
+        let layer = match layer_str.as_deref() {
+            Some(s) => Some(mapping::parse_layer(s)?),
+            None => None,
+        };
+        let valid_from: Option<DateTime<Utc>> = r.try_get("valid_from").pg()?;
+        let valid_until: Option<DateTime<Utc>> = r.try_get("valid_until").pg()?;
+        let occurred_at: Option<DateTime<Utc>> = r.try_get("occurred_at").pg()?;
+
+        Ok(MemoryEntry {
+            id: r.try_get("id").pg()?,
+            namespace: r.try_get("namespace").pg()?,
+            key: r.try_get("key").pg()?,
+            kind: mapping::parse_kind(&kind)?,
+            content: r.try_get("content").pg()?,
+            tags: r.try_get("tags").pg()?,
+            metadata: r.try_get("metadata").pg()?,
+            embedding: None,
+            embedding_model: r.try_get("embedding_model").pg()?,
+            source_agent: r.try_get("source_agent").pg()?,
+            confidence: r.try_get("confidence").pg()?,
+            status: mapping::parse_status(&status)?,
+            version: r.try_get("version").pg()?,
+            expires_at: r.try_get("expires_at").pg()?,
+            merged_into: r.try_get("merged_into").pg()?,
+            created_at: r.try_get("created_at").pg()?,
+            updated_at: r.try_get("updated_at").pg()?,
+            scene,
+            layer,
+            valid_from,
+            valid_until,
+            occurred_at,
+        })
+    }
+
     fn backup_from_row(r: &PgRow) -> Result<BackupRecord> {
         Ok(BackupRecord {
             id: r.try_get("id").pg()?,
@@ -1027,6 +1073,14 @@ impl PostgresHubStore {
          embedding::text as embedding, embedding_model, source_agent, confidence, status, \
          version, expires_at, merged_into, created_at, updated_at, \
          scene, layer, valid_from, valid_until, occurred_at";
+
+    /// 瘦版列清单：省略 embedding，适用于 list / count / get / 备份摘要等
+    /// 不需要向量的读路径。single 条目获取也走瘦版——如需 embedding 再单次查询。
+    const ENTRY_COLUMNS_NO_EMBEDDING: &'static str =
+        "id, namespace, key, kind, content, tags, metadata, \
+         embedding_model, source_agent, confidence, status, \
+         version, expires_at, merged_into, created_at, updated_at, \
+         scene, layer, valid_from, valid_until, occurred_at";
 }
 
 #[async_trait]
@@ -1139,7 +1193,7 @@ impl mem_core::MemoryStore for PostgresHubStore {
     async fn get(&self, namespace: &str, id: Uuid) -> Result<MemoryEntry> {
         let sql = format!(
             "select {} from memories where namespace = $1 and id = $2",
-            Self::ENTRY_COLUMNS
+            Self::ENTRY_COLUMNS_NO_EMBEDDING
         );
         let row = sqlx::query(&sql)
             .bind(namespace)
@@ -1148,7 +1202,7 @@ impl mem_core::MemoryStore for PostgresHubStore {
             .await
             .pg()?
             .ok_or(HubError::NotFound)?;
-        Self::entry_from_row(&row)
+        Self::entry_from_row_slim(&row)
     }
 
     async fn get_by_key(&self, namespace: &str, key: &str) -> Result<Option<MemoryEntry>> {
@@ -1160,7 +1214,7 @@ impl mem_core::MemoryStore for PostgresHubStore {
                      updated_at desc
             limit 1
             "#,
-            Self::ENTRY_COLUMNS
+            Self::ENTRY_COLUMNS_NO_EMBEDDING
         );
         let row = sqlx::query(&sql)
             .bind(namespace)
@@ -1168,7 +1222,7 @@ impl mem_core::MemoryStore for PostgresHubStore {
             .fetch_optional(&self.pool)
             .await
             .pg()?;
-        row.map(|r| Self::entry_from_row(&r)).transpose()
+        row.map(|r| Self::entry_from_row_slim(&r)).transpose()
     }
 
     async fn save(&self, entry: &MemoryEntry) -> Result<MemoryEntry> {
@@ -1243,7 +1297,7 @@ impl mem_core::MemoryStore for PostgresHubStore {
     async fn list(&self, filter: &MemoryFilter) -> Result<Vec<MemoryEntry>> {
         let mut qb = sqlx::QueryBuilder::<sqlx::Postgres>::new(format!(
             "select {} from memories where 1 = 1",
-            Self::ENTRY_COLUMNS
+            Self::ENTRY_COLUMNS_NO_EMBEDDING
         ));
         Self::push_memory_filters(&mut qb, filter);
 
@@ -1270,7 +1324,7 @@ impl mem_core::MemoryStore for PostgresHubStore {
         }
 
         let rows = qb.build().fetch_all(&self.pool).await.pg()?;
-        rows.iter().map(Self::entry_from_row).collect()
+        rows.iter().map(Self::entry_from_row_slim).collect()
     }
 
     async fn count(&self, filter: &MemoryFilter) -> Result<usize> {
@@ -1325,7 +1379,7 @@ impl mem_core::MemoryStore for PostgresHubStore {
     ) -> Result<Vec<MemoryEntry>> {
         let sql = format!(
             "select {} from memories where namespace = $1 {} order by created_at, id",
-            Self::ENTRY_COLUMNS,
+            Self::ENTRY_COLUMNS_NO_EMBEDDING,
             if include_merged {
                 ""
             } else {
@@ -1337,7 +1391,32 @@ impl mem_core::MemoryStore for PostgresHubStore {
             .fetch_all(&self.pool)
             .await
             .pg()?;
-        rows.iter().map(Self::entry_from_row).collect()
+        rows.iter().map(Self::entry_from_row_slim).collect()
+    }
+
+    /// 有上限的命名空间条目扫描：SQL 层 LIMIT，避免传输超大结果集
+    async fn all_in_namespace_limited(
+        &self,
+        namespace: &str,
+        include_merged: bool,
+        limit: usize,
+    ) -> Result<Vec<MemoryEntry>> {
+        let sql = format!(
+            "select {} from memories where namespace = $1 {} order by created_at, id limit {}",
+            Self::ENTRY_COLUMNS_NO_EMBEDDING,
+            if include_merged {
+                ""
+            } else {
+                "and status <> 'merged'"
+            },
+            limit as i64,
+        );
+        let rows = sqlx::query(&sql)
+            .bind(namespace)
+            .fetch_all(&self.pool)
+            .await
+            .pg()?;
+        rows.iter().map(Self::entry_from_row_slim).collect()
     }
 
     async fn list_namespaces(&self) -> Result<Vec<Namespace>> {

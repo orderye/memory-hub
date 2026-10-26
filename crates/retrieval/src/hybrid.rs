@@ -18,6 +18,7 @@ use mem_core::{
     validity_filter_time, Clock, Embedder, MemoryEntry, MemoryFilter, MemoryScene, MemoryStatus,
     MemoryStore, Retriever, SceneMode, Scored, SearchQuery, SystemClock, SCENE_PREFER_BONUS,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -358,11 +359,16 @@ impl HybridRetriever {
                     .count()
             })
             .collect();
+        // 构建 term -> 索引的 HashMap，避免 idf 闭包内 O(n) 线性查找
+        let term_index: HashMap<&str, usize> = terms
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.as_str(), i))
+            .collect();
         let idf = |term: &str| -> f32 {
-            terms
-                .iter()
-                .position(|t| t == term)
-                .map(|i| inverse_document_frequency(pool_size, doc_freq[i]))
+            term_index
+                .get(term)
+                .map(|&i| inverse_document_frequency(pool_size, doc_freq[i]))
                 .unwrap_or(1.0)
         };
 

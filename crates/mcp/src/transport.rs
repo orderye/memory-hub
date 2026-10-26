@@ -8,7 +8,7 @@
 //!   随后按工具的 `required_scope` 做范围强制校验（设计规范 5.9 节）。
 
 use crate::protocol::{handle_discover, handle_tools_list};
-use crate::schema::get_tool_definitions;
+use crate::schema::{get_tool_definitions, TOOL_SCOPE_MAP};
 use crate::tools::{McpContentItem, ToolCallResult, ToolDispatcher};
 use axum::body::Bytes;
 use axum::extract::State;
@@ -19,7 +19,7 @@ use axum::Router;
 use common::{AuthCtx, HubError, Result, Scope};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 /// MCP 标准协议版本（设计规范 5.2 节）
@@ -108,16 +108,24 @@ pub fn hub_error_to_jsonrpc(err: &HubError) -> (i64, String, Value) {
 }
 
 /// 按工具名查找其声明的作用域
+/// 缓存的工具名 → 作用域查找表（OnceLock 初始化一次）
 pub fn required_scope_for_tool(tool: &str) -> Option<Scope> {
-    get_tool_definitions()
-        .into_iter()
-        .find(|d| d.name == tool)
-        .and_then(|d| match d.required_scope {
-            "memory:read" => Some(Scope::Read),
-            "memory:write" => Some(Scope::Write),
-            "memory:admin" => Some(Scope::Admin),
-            _ => None,
+    TOOL_SCOPE_MAP
+        .get_or_init(|| {
+            let mut m = HashMap::new();
+            for d in get_tool_definitions() {
+                let scope = match d.required_scope {
+                    "memory:read" => Scope::Read,
+                    "memory:write" => Scope::Write,
+                    "memory:admin" => Scope::Admin,
+                    _ => continue,
+                };
+                m.insert(d.name, scope);
+            }
+            m
         })
+        .get(tool)
+        .cloned()
 }
 
 /// 从 Authorization 头提取 Bearer 令牌

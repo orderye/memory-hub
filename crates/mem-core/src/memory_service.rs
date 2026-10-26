@@ -563,34 +563,67 @@ impl MemoryService for DefaultMemoryService {
 
     async fn stats(&self, auth: &AuthCtx, namespace: &str) -> Result<MemoryStats> {
         self.require_read(auth, namespace).await?;
-        let all = self.scoped(auth).all_in_namespace(namespace, true).await?;
-        let mut stats = MemoryStats {
-            namespace: namespace.to_string(),
-            total: all.len(),
-            ..Default::default()
-        };
+        let store = self.scoped(auth);
         let now = self.clock.now();
         let soon = now + chrono::Duration::hours(24);
+
+        // 用 count() 下推到 SQL，避免加载全量条目到内存
+        let total = store
+            .count(&MemoryFilter {
+                namespace: Some(namespace.to_string()),
+                ..Default::default()
+            })
+            .await?;
+        let active = store
+            .count(&MemoryFilter {
+                namespace: Some(namespace.to_string()),
+                statuses: Some(vec![MemoryStatus::Active]),
+                ..Default::default()
+            })
+            .await?;
+        let archived = store
+            .count(&MemoryFilter {
+                namespace: Some(namespace.to_string()),
+                statuses: Some(vec![MemoryStatus::Archived]),
+                ..Default::default()
+            })
+            .await?;
+        let merged = store
+            .count(&MemoryFilter {
+                namespace: Some(namespace.to_string()),
+                statuses: Some(vec![MemoryStatus::Merged]),
+                ..Default::default()
+            })
+            .await?;
+
+        // by_kind / by_agent / expiring_24h：加载瘦版条目（无 embedding，
+        // ~4KB/row 已省），单次扫描完成分布统计
+        let all = store.all_in_namespace(namespace, true).await?;
+        let mut by_kind: HashMap<String, usize> = HashMap::new();
+        let mut by_agent: HashMap<String, usize> = HashMap::new();
+        let mut expiring_24h = 0;
         for e in &all {
-            match e.status {
-                MemoryStatus::Active => stats.active += 1,
-                MemoryStatus::Archived => stats.archived += 1,
-                MemoryStatus::Merged => stats.merged += 1,
-            }
-            *stats
-                .by_kind
-                .entry(e.kind.as_str().to_string())
-                .or_insert(0) += 1;
-            *stats.by_agent.entry(e.source_agent.clone()).or_insert(0) += 1;
+            *by_kind.entry(e.kind.as_str().to_string()).or_insert(0) += 1;
+            *by_agent.entry(e.source_agent.clone()).or_insert(0) += 1;
             if e.status == MemoryStatus::Active {
                 if let Some(exp) = e.expires_at {
                     if exp <= soon {
-                        stats.expiring_24h += 1;
+                        expiring_24h += 1;
                     }
                 }
             }
         }
-        Ok(stats)
+
+        Ok(MemoryStats {
+            namespace: namespace.to_string(),
+            total,
+            active,
+            archived,
+            merged,
+            by_kind,
+            by_agent,
+            expiring_24h,
+        })
     }
 
     async fn history(

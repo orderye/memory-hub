@@ -127,18 +127,33 @@ impl ConflictDetector {
             let divergence = if kind == ConflictKind::Key {
                 1.0
             } else {
-                members
+                // 预缓存每成员的分词 HashSet，避免 O(k²) 重复调用 content_divergence
+                // 导致的重复分词（每次调用都重新建 HashSet）。50 人冲突组 = 1225 对 × 2 次分词。
+                let tokenized: Vec<HashSet<String>> = members
                     .iter()
-                    .enumerate()
-                    .flat_map(|(x, &i)| {
-                        members[(x + 1)..].iter().map(move |&j| {
-                            crate::candidates::hybrid::content_divergence(
-                                &entries[i].content,
-                                &entries[j].content,
-                            )
-                        })
+                    .map(|&i| {
+                        mem_core::fts_doc_tokens(&entries[i].content)
+                            .into_iter()
+                            .collect::<HashSet<String>>()
                     })
-                    .fold(0.0f32, f32::max)
+                    .collect();
+                let mut max_div = 0.0f32;
+                for a_pos in 0..tokenized.len() {
+                    for b_pos in (a_pos + 1)..tokenized.len() {
+                        let t1 = &tokenized[a_pos];
+                        let t2 = &tokenized[b_pos];
+                        if t1.is_empty() && t2.is_empty() {
+                            continue;
+                        }
+                        let inter = t1.intersection(t2).count() as f32;
+                        let union = t1.union(t2).count() as f32;
+                        if union > 0.0 {
+                            let div = 1.0 - (inter / union);
+                            max_div = max_div.max(div);
+                        }
+                    }
+                }
+                max_div
             };
 
             let similarity = pairs.iter().map(|c| c.confidence).fold(0.0f32, f32::max);

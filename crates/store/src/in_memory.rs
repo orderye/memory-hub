@@ -28,7 +28,7 @@ type RelationEntry = (Namespace, MemoryRelation);
 pub struct InMemoryHubStore {
     /// (namespace, id) → 条目
     items: RwLock<BTreeMap<(Namespace, Uuid), MemoryEntry>>,
-    versions: RwLock<Vec<MemoryVersion>>,
+    versions: RwLock<BTreeMap<(Uuid, i64), MemoryVersion>>,
     evidences: RwLock<BTreeMap<(Namespace, Uuid), MemoryEvidence>>,
     relations: RwLock<BTreeMap<RelationKey, RelationEntry>>,
     tasks: RwLock<BTreeMap<(Namespace, Uuid), MemoryTask>>,
@@ -215,7 +215,10 @@ impl mem_core::MemoryStore for InMemoryHubStore {
             valid_until: entry.valid_until,
             occurred_at: entry.occurred_at,
         };
-        self.versions.write().unwrap().push(version);
+        self.versions
+            .write()
+            .unwrap()
+            .insert((entry.id, entry.version), version);
         Ok(entry.clone())
     }
 
@@ -442,26 +445,20 @@ impl mem_core::MemoryStore for InMemoryHubStore {
 
     async fn record_version(&self, v: &MemoryVersion) -> Result<()> {
         let mut w = self.versions.write().unwrap();
-        // 同 (memory_id, version) 只保留首条（幂等重放保护）
-        if w.iter()
-            .any(|x| x.memory_id == v.memory_id && x.version == v.version)
-        {
-            return Ok(());
-        }
-        w.push(v.clone());
+        // 同 (memory_id, version) 只保留首条（幂等重放保护）；BTreeMap 天然保证唯一性
+        w.entry((v.memory_id, v.version))
+            .or_insert_with(|| v.clone());
         Ok(())
     }
 
     async fn versions(&self, id: Uuid) -> Result<Vec<MemoryVersion>> {
-        let mut out: Vec<MemoryVersion> = self
+        let out: Vec<MemoryVersion> = self
             .versions
             .read()
             .unwrap()
-            .iter()
-            .filter(|v| v.memory_id == id)
-            .cloned()
+            .range((id, i64::MIN)..(id, i64::MAX))
+            .map(|(_, v)| v.clone())
             .collect();
-        out.sort_by_key(|v| v.version);
         Ok(out)
     }
 
