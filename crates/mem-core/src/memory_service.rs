@@ -674,249 +674,8 @@ mod tests {
         crate::account_scope::scope_name(&common::BOOTSTRAP_ACCOUNT_ID, ns)
     }
     use crate::infra::{GrantStore, MemoryHubStore};
+    use crate::testing::TestHubStore;
     use common::Scope;
-    use std::collections::HashMap as StdHashMap;
-    use std::sync::RwLock;
-
-    /// 内存 Grant 存储（测试用）
-    #[derive(Default)]
-    struct TestGrants {
-        namespaces: RwLock<StdHashMap<String, crate::domain::NamespaceInfo>>,
-        grants: RwLock<Vec<crate::domain::NamespaceGrantRecord>>,
-    }
-
-    #[async_trait]
-    impl GrantStore for TestGrants {
-        async fn ensure_namespace(
-            &self,
-            ns: &str,
-            owner: &AgentId,
-        ) -> Result<(crate::domain::NamespaceInfo, bool)> {
-            let mut g = self.namespaces.write().unwrap();
-            let mut created = false;
-            let info = g
-                .entry(ns.to_string())
-                .or_insert_with(|| {
-                    created = true;
-                    crate::domain::NamespaceInfo {
-                        namespace: ns.to_string(),
-                        owner_agent: owner.clone(),
-                        created_at: chrono::Utc::now(),
-                    }
-                })
-                .clone();
-            Ok((info, created))
-        }
-        async fn get_namespace(&self, ns: &str) -> Result<Option<crate::domain::NamespaceInfo>> {
-            Ok(self.namespaces.read().unwrap().get(ns).cloned())
-        }
-        async fn list_namespace_infos(&self) -> Result<Vec<crate::domain::NamespaceInfo>> {
-            Ok(self.namespaces.read().unwrap().values().cloned().collect())
-        }
-        async fn grant(&self, record: &crate::domain::NamespaceGrantRecord) -> Result<()> {
-            let mut g = self.grants.write().unwrap();
-            g.retain(|x| !(x.namespace == record.namespace && x.agent_id == record.agent_id));
-            g.push(record.clone());
-            Ok(())
-        }
-        async fn revoke(&self, ns: &str, agent: &AgentId) -> Result<()> {
-            let mut g = self.grants.write().unwrap();
-            g.retain(|x| !(x.namespace == ns && *agent == x.agent_id));
-            Ok(())
-        }
-        async fn grants_for(
-            &self,
-            agent: &AgentId,
-        ) -> Result<Vec<crate::domain::NamespaceGrantRecord>> {
-            Ok(self
-                .grants
-                .read()
-                .unwrap()
-                .iter()
-                .filter(|x| &x.agent_id == agent)
-                .cloned()
-                .collect())
-        }
-        async fn can_read(&self, ns: &str, agent: &AgentId) -> Result<bool> {
-            Ok(self.grants.read().unwrap().iter().any(|x| {
-                (x.namespace == ns || x.namespace == "*") && x.agent_id == *agent && x.can_read
-            }))
-        }
-        async fn can_write(&self, ns: &str, agent: &AgentId) -> Result<bool> {
-            Ok(self.grants.read().unwrap().iter().any(|x| {
-                (x.namespace == ns || x.namespace == "*") && x.agent_id == *agent && x.can_write
-            }))
-        }
-        async fn owned_namespaces(&self, agent: &AgentId) -> Result<Vec<String>> {
-            Ok(self
-                .namespaces
-                .read()
-                .unwrap()
-                .values()
-                .filter(|n| &n.owner_agent == agent)
-                .map(|n| n.namespace.clone())
-                .collect())
-        }
-    }
-
-    type TestStore = RwLock<StdHashMap<(String, Uuid), MemoryEntry>>;
-
-    /// 内存 MemoryStore（测试用，仅覆盖本测试所需路径）
-    #[derive(Default)]
-    struct TestMemoryStore {
-        items: TestStore,
-        versions: RwLock<Vec<MemoryVersion>>,
-    }
-
-    #[async_trait]
-    impl MemoryStore for TestMemoryStore {
-        async fn insert(&self, entry: &MemoryEntry) -> Result<MemoryEntry> {
-            self.items
-                .write()
-                .unwrap()
-                .insert((entry.namespace.clone(), entry.id), entry.clone());
-            Ok(entry.clone())
-        }
-        async fn get(&self, ns: &str, id: Uuid) -> Result<MemoryEntry> {
-            self.items
-                .read()
-                .unwrap()
-                .get(&(ns.to_string(), id))
-                .cloned()
-                .ok_or(HubError::NotFound)
-        }
-        async fn get_by_key(&self, ns: &str, key: &str) -> Result<Option<MemoryEntry>> {
-            Ok(self
-                .items
-                .read()
-                .unwrap()
-                .values()
-                .find(|e| e.namespace == ns && e.key.as_deref() == Some(key))
-                .cloned())
-        }
-        async fn save(&self, entry: &MemoryEntry) -> Result<MemoryEntry> {
-            self.items
-                .write()
-                .unwrap()
-                .insert((entry.namespace.clone(), entry.id), entry.clone());
-            Ok(entry.clone())
-        }
-        async fn delete(&self, ns: &str, id: Uuid) -> Result<()> {
-            self.items.write().unwrap().remove(&(ns.to_string(), id));
-            Ok(())
-        }
-        async fn list(&self, filter: &MemoryFilter) -> Result<Vec<MemoryEntry>> {
-            let mut out: Vec<MemoryEntry> = self
-                .items
-                .read()
-                .unwrap()
-                .values()
-                .filter(|e| filter.namespace.as_deref().is_none_or(|ns| e.namespace == ns))
-                .filter(|e| filter.kinds.as_ref().is_none_or(|ks| ks.contains(&e.kind)))
-                .filter(|e| filter.statuses.as_ref().is_none_or(|ss| ss.contains(&e.status)))
-                .filter(|e| {
-                    filter
-                        .source_agent
-                        .as_ref()
-                        .is_none_or(|a| &e.source_agent == a)
-                })
-                .filter(|e| {
-                    filter.text_contains.as_ref().is_none_or(|t| {
-                        e.content.to_lowercase().contains(&t.to_lowercase())
-                    })
-                })
-                // 游标分页：严格位于 (updated_at, id) 复合键之前
-                .filter(|e| match &filter.before {
-                    Some((ts, id)) => {
-                        (e.updated_at, e.id) < (*ts, *id)
-                    }
-                    None => true,
-                })
-                .cloned()
-                .collect();
-            out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(b.id.cmp(&a.id)));
-            if let Some(limit) = filter.limit {
-                out.truncate(limit);
-            }
-            Ok(out)
-        }
-        async fn count(&self, filter: &MemoryFilter) -> Result<usize> {
-            Ok(self.list(filter).await?.len())
-        }
-        async fn similar(
-            &self,
-            filter: &MemoryFilter,
-            qv: &[f32],
-            k: usize,
-        ) -> Result<Vec<Scored<MemoryEntry>>> {
-            let mut out: Vec<Scored<MemoryEntry>> = self
-                .items
-                .read()
-                .unwrap()
-                .values()
-                .filter(|e| {
-                    filter
-                        .namespace
-                        .as_deref()
-                        .is_none_or(|ns| e.namespace == ns)
-                        && e.status == MemoryStatus::Active
-                })
-                .filter_map(|e| {
-                    e.embedding.as_ref().map(|iv| Scored {
-                        item: e.clone(),
-                        score: crate::algorithm::cosine_similarity(qv, iv),
-                    })
-                })
-                .collect();
-            out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
-            out.truncate(k);
-            Ok(out)
-        }
-        async fn all_in_namespace(
-            &self,
-            ns: &str,
-            include_merged: bool,
-        ) -> Result<Vec<MemoryEntry>> {
-            Ok(self
-                .items
-                .read()
-                .unwrap()
-                .values()
-                .filter(|e| e.namespace == ns)
-                .filter(|e| include_merged || e.status != MemoryStatus::Merged)
-                .cloned()
-                .collect())
-        }
-        async fn list_namespaces(&self) -> Result<Vec<String>> {
-            let mut ns: Vec<String> = self
-                .items
-                .read()
-                .unwrap()
-                .values()
-                .map(|e| e.namespace.clone())
-                .collect();
-            ns.sort();
-            ns.dedup();
-            Ok(ns)
-        }
-        async fn record_version(&self, v: &MemoryVersion) -> Result<()> {
-            self.versions.write().unwrap().push(v.clone());
-            Ok(())
-        }
-        async fn versions(&self, id: Uuid) -> Result<Vec<MemoryVersion>> {
-            Ok(self
-                .versions
-                .read()
-                .unwrap()
-                .iter()
-                .filter(|v| v.memory_id == id)
-                .cloned()
-                .collect())
-        }
-        async fn archive_expired(&self, _now: chrono::DateTime<chrono::Utc>) -> Result<usize> {
-            Ok(0)
-        }
-    }
 
     use crate::access::GrantChecker;
 
@@ -933,9 +692,9 @@ mod tests {
         }
     }
 
-    async fn service() -> (DefaultMemoryService, Arc<TestMemoryStore>, Arc<TestGrants>) {
-        let grants = Arc::new(TestGrants::default());
-        let mem = Arc::new(TestMemoryStore::default());
+    async fn service() -> (DefaultMemoryService, Arc<TestHubStore>, Arc<TestHubStore>) {
+        let grants = Arc::new(TestHubStore::default());
+        let mem = Arc::new(TestHubStore::default());
         let svc = DefaultMemoryService::new(
             mem.clone(),
             test_embedder(),
@@ -987,8 +746,8 @@ mod tests {
     /// 关闭嵌入后：写入不产生向量（embedding=None），其余语义（版本、历史、检索可见）不变
     #[tokio::test]
     async fn test_put_with_disabled_embedder_stores_no_vector() {
-        let grants = Arc::new(TestGrants::default());
-        let mem = Arc::new(TestMemoryStore::default());
+        let grants = Arc::new(TestHubStore::default());
+        let mem = Arc::new(TestHubStore::default());
         let svc = DefaultMemoryService::new(
             mem.clone(),
             Arc::new(DisabledTestEmbedder),
@@ -1340,8 +1099,8 @@ mod tests {
     async fn test_search_requires_injected_retriever() {
         // 回归：此前未注入检索器会静默退化为另一套内置打分实现，
         // 使 MCP 层测试看起来通过、实际从未覆盖生产检索路径
-        let grants = Arc::new(TestGrants::default());
-        let mem = Arc::new(TestMemoryStore::default());
+        let grants = Arc::new(TestHubStore::default());
+        let mem = Arc::new(TestHubStore::default());
         let svc = DefaultMemoryService::new(
             mem.clone(),
             test_embedder(),

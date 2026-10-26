@@ -318,6 +318,8 @@ pub struct TestHubStore {
     pub coding_revisions: RwLock<HashMap<(String, Uuid), CodingRevision>>,
     /// 错误注入：置位后 add_relation 一律失败（测试次要写失败时的降级行为）
     pub fail_add_relation: std::sync::atomic::AtomicBool,
+    /// 错误注入：置位后 revise 一律失败（测试 supersedes 封堵失败不拖垮主流程）
+    pub fail_revise: std::sync::atomic::AtomicBool,
 }
 
 impl TestHubStore {
@@ -446,6 +448,9 @@ impl MemoryStore for TestHubStore {
         expected_version: i64,
         change: VersionChange,
     ) -> Result<MemoryEntry> {
+        if self.fail_revise.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(HubError::Unavailable);
+        }
         // 契约对齐（infra.rs）：版本不符返回 Conflict 而非静默覆盖
         {
             let mut w = self.items.write().unwrap();
@@ -492,14 +497,75 @@ impl MemoryStore for TestHubStore {
                     .as_deref()
                     .is_none_or(|ns| e.namespace == ns)
             })
+            .filter(|e| filter.kinds.as_ref().is_none_or(|ks| ks.contains(&e.kind)))
+            .filter(|e| {
+                filter
+                    .statuses
+                    .as_ref()
+                    .is_none_or(|ss| ss.contains(&e.status))
+            })
+            .filter(|e| {
+                filter
+                    .tags
+                    .as_ref()
+                    .is_none_or(|tags| tags.iter().all(|t| e.tags.contains(t)))
+            })
+            .filter(|e| {
+                filter
+                    .source_agent
+                    .as_ref()
+                    .is_none_or(|a| &e.source_agent == a)
+            })
+            .filter(|e| {
+                filter
+                    .key
+                    .as_ref()
+                    .is_none_or(|k| e.key.as_deref() == Some(k))
+            })
+            .filter(|e| {
+                filter
+                    .text_contains
+                    .as_ref()
+                    .is_none_or(|t| crate::fts_query_hits(&e.content, t) > 0)
+            })
+            .filter(|e| {
+                filter
+                    .scene
+                    .as_ref()
+                    .is_none_or(|s| e.scene.as_ref() == Some(s))
+            })
+            .filter(|e| {
+                filter
+                    .layer
+                    .as_ref()
+                    .is_none_or(|l| e.layer.as_ref() == Some(l))
+            })
+            .filter(|e| match &filter.valid_at {
+                Some(at) => {
+                    e.valid_from.is_none_or(|from| *at >= from)
+                        && e.valid_until.is_none_or(|until| *at < until)
+                }
+                None => true,
+            })
+            .filter(|e| match &filter.before {
+                Some((ts, id)) => (e.updated_at, e.id) < (*ts, *id),
+                None => true,
+            })
             .cloned()
             .collect();
         out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(b.id.cmp(&a.id)));
+        if let Some(limit) = filter.limit {
+            out.truncate(limit);
+        }
         Ok(out)
     }
 
     async fn count(&self, filter: &MemoryFilter) -> Result<usize> {
-        Ok(self.list(filter).await?.len())
+        let no_limit = MemoryFilter {
+            limit: None,
+            ..filter.clone()
+        };
+        Ok(self.list(&no_limit).await?.len())
     }
 
     async fn similar(
