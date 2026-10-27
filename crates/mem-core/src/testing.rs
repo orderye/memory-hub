@@ -256,7 +256,7 @@ impl ChatCognitiveExtractor for MockChatCognitiveExtractor {
 use crate::domain::*;
 use crate::infra::*;
 use chrono::{DateTime, Utc};
-use common::AgentId;
+use common::{AccountId, AgentId};
 use std::collections::HashMap;
 use std::sync::RwLock;
 use uuid::Uuid;
@@ -294,9 +294,12 @@ pub struct TestHubStore {
     pub relations: RwLock<Vec<MemoryRelation>>,
     pub tasks: RwLock<HashMap<(String, Uuid), MemoryTask>>,
     pub experiences: RwLock<HashMap<(String, Uuid), MemoryExperience>>,
+    pub experience_versions: RwLock<Vec<ExperienceVersion>>,
     pub task_experiences: RwLock<Vec<MemoryTaskExperience>>,
     pub coding_threads: RwLock<HashMap<(String, Uuid), CodingThread>>,
     pub coding_revisions: RwLock<HashMap<(String, Uuid), CodingRevision>>,
+    pub collections: RwLock<Vec<MemoryCollection>>,
+    pub collection_bindings: RwLock<Vec<CollectionBinding>>,
     /// 错误注入：置位后 add_relation 一律失败（测试次要写失败时的降级行为）
     pub fail_add_relation: std::sync::atomic::AtomicBool,
     /// 错误注入：置位后 revise 一律失败（测试 supersedes 封堵失败不拖垮主流程）
@@ -1087,6 +1090,13 @@ impl ExperienceStore for TestHubStore {
             confidence: experience.confidence,
             status: experience.status,
             feedback_score: experience.feedback_score,
+            version: 1,
+            superseded_by: None,
+            verified_at: None,
+            verified_by: None,
+            verification_note: None,
+            status_reason: None,
+            source_count: 0,
             created_at: now,
             updated_at: now,
         };
@@ -1103,6 +1113,81 @@ impl ExperienceStore for TestHubStore {
             experience.clone(),
         );
         Ok(experience.clone())
+    }
+
+    async fn update_experience_if_version(
+        &self,
+        experience: &MemoryExperience,
+        expected_version: i64,
+    ) -> Result<MemoryExperience> {
+        let mut w = self.experiences.write().unwrap();
+        let key = (experience.namespace.clone(), experience.id);
+        match w.get(&key) {
+            Some(current) if current.version == expected_version => {
+                w.insert(key, experience.clone());
+                Ok(experience.clone())
+            }
+            Some(_) => Err(HubError::Conflict),
+            None => Err(HubError::NotFound),
+        }
+    }
+
+    async fn append_experience_version(
+        &self,
+        version: &NewExperienceVersion,
+    ) -> Result<ExperienceVersion> {
+        let mut w = self.experience_versions.write().unwrap();
+        if let Some(existing) = w
+            .iter()
+            .find(|v| v.experience_id == version.experience_id && v.version == version.version)
+        {
+            return Ok(existing.clone());
+        }
+        let record = ExperienceVersion {
+            id: version.id.unwrap_or_else(Uuid::new_v4),
+            experience_id: version.experience_id,
+            namespace: version.namespace.clone(),
+            version: version.version,
+            snapshot: version.snapshot.clone(),
+            change_kind: version.change_kind,
+            changed_by: version.changed_by.clone(),
+            status: version.status,
+            note: version.note.clone(),
+            changed_at: version.changed_at,
+        };
+        w.push(record.clone());
+        Ok(record)
+    }
+
+    async fn list_experience_versions(
+        &self,
+        namespace: &str,
+        experience_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<ExperienceVersion>> {
+        let r = self.experience_versions.read().unwrap();
+        let mut list: Vec<ExperienceVersion> = r
+            .iter()
+            .filter(|v| v.namespace == namespace && v.experience_id == experience_id)
+            .cloned()
+            .collect();
+        list.sort_by_key(|v| std::cmp::Reverse(v.version));
+        list.truncate(limit.max(1));
+        Ok(list)
+    }
+
+    async fn all_experience_versions_in_namespace(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<ExperienceVersion>> {
+        let r = self.experience_versions.read().unwrap();
+        let mut list: Vec<ExperienceVersion> = r
+            .iter()
+            .filter(|v| v.namespace == namespace)
+            .cloned()
+            .collect();
+        list.sort_by_key(|v| (v.experience_id, v.version));
+        Ok(list)
     }
 
     async fn get_experience(&self, namespace: &str, id: Uuid) -> Result<Option<MemoryExperience>> {
@@ -1176,6 +1261,8 @@ impl ExperienceStore for TestHubStore {
         if r.remove(&(namespace.to_string(), id)).is_some() {
             let mut te = self.task_experiences.write().unwrap();
             te.retain(|l| l.experience_id != id);
+            let mut versions = self.experience_versions.write().unwrap();
+            versions.retain(|v| v.experience_id != id);
             Ok(())
         } else {
             Err(HubError::NotFound)
@@ -1365,6 +1452,118 @@ impl CodingStore for TestHubStore {
         } else {
             Err(HubError::NotFound)
         }
+    }
+}
+
+#[async_trait]
+impl CollectionStore for TestHubStore {
+    async fn upsert_collection(&self, collection: &MemoryCollection) -> Result<MemoryCollection> {
+        let mut w = self.collections.write().unwrap();
+        if let Some(existing) = w
+            .iter_mut()
+            .find(|c| c.account_id == collection.account_id && c.name == collection.name)
+        {
+            existing.description = collection.description.clone();
+            existing.filter = collection.filter.clone();
+            existing.updated_at = Utc::now();
+            return Ok(existing.clone());
+        }
+        w.push(collection.clone());
+        Ok(collection.clone())
+    }
+
+    async fn get_collection(
+        &self,
+        account_id: AccountId,
+        id: Uuid,
+    ) -> Result<Option<MemoryCollection>> {
+        Ok(self
+            .collections
+            .read()
+            .unwrap()
+            .iter()
+            .find(|c| c.account_id == account_id && c.id == id)
+            .cloned())
+    }
+
+    async fn get_collection_by_name(
+        &self,
+        account_id: AccountId,
+        name: &str,
+    ) -> Result<Option<MemoryCollection>> {
+        Ok(self
+            .collections
+            .read()
+            .unwrap()
+            .iter()
+            .find(|c| c.account_id == account_id && c.name == name)
+            .cloned())
+    }
+
+    async fn list_collections(&self, account_id: AccountId) -> Result<Vec<MemoryCollection>> {
+        Ok(self
+            .collections
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|c| c.account_id == account_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn delete_collection(&self, account_id: AccountId, id: Uuid) -> Result<()> {
+        let mut w = self.collections.write().unwrap();
+        let before = w.len();
+        w.retain(|c| !(c.account_id == account_id && c.id == id));
+        if w.len() == before {
+            return Err(HubError::NotFound);
+        }
+        self.collection_bindings
+            .write()
+            .unwrap()
+            .retain(|b| b.collection_id != id);
+        Ok(())
+    }
+
+    async fn bind_collection(&self, binding: &CollectionBinding) -> Result<()> {
+        let mut w = self.collection_bindings.write().unwrap();
+        if !w
+            .iter()
+            .any(|b| b.collection_id == binding.collection_id && b.agent_id == binding.agent_id)
+        {
+            w.push(binding.clone());
+        }
+        Ok(())
+    }
+
+    async fn unbind_collection(&self, collection_id: Uuid, agent_id: &AgentId) -> Result<()> {
+        let mut w = self.collection_bindings.write().unwrap();
+        let before = w.len();
+        w.retain(|b| !(b.collection_id == collection_id && b.agent_id == *agent_id));
+        if w.len() == before {
+            return Err(HubError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn list_bindings(&self, collection_id: Uuid) -> Result<Vec<CollectionBinding>> {
+        Ok(self
+            .collection_bindings
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|b| b.collection_id == collection_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn is_bound(&self, collection_id: Uuid, agent_id: &AgentId) -> Result<bool> {
+        Ok(self
+            .collection_bindings
+            .read()
+            .unwrap()
+            .iter()
+            .any(|b| b.collection_id == collection_id && b.agent_id == *agent_id))
     }
 }
 

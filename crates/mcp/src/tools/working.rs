@@ -137,7 +137,9 @@ impl ToolDispatcher {
                         Arc::new(mem_core::WorkingMemoryService::new(self.store.clone()))
                     })
                     .scoped(auth.account_id);
-                // 若未指定关联任务，则自动生成一个已完成的工作事实任务
+                // 若未指定关联任务，则自动生成一个**仍在进行中**的任务事实。
+                // 不得自动标记为 completed：那会把“工具调用”伪造成“任务成功”，
+                // 而完成事实是经验验证的必要证据（任务书 3.4 / 4.3）。
                 let source_task_id = match req.task_id {
                     Some(tid) => tid,
                     None => {
@@ -151,22 +153,18 @@ impl ToolDispatcher {
                             )
                             .await
                         {
-                            Ok(t) => {
-                                let _ = service
-                                    .finish_task(
-                                        auth,
-                                        t.id,
-                                        &req.namespace,
-                                        mem_core::TaskStatus::Completed,
-                                        Some("由工作经验提炼工具自动创建的关联任务事实".into()),
-                                        None,
-                                        None,
-                                    )
-                                    .await;
-                                t.id
-                            }
+                            Ok(t) => t.id,
                             Err(e) => return ToolCallResult::error(&e),
                         }
+                    }
+                };
+                let validation = match req.validation {
+                    Some(ref v) if !v.trim().is_empty() => json!(v),
+                    _ => {
+                        return ToolCallResult::error(&HubError::InvalidArgument(
+                            "validation 必填：经验必须给出可验证结果或验证方法，不得由服务端代填"
+                                .into(),
+                        ));
                     }
                 };
                 let candidate = mem_core::ExperienceCandidate {
@@ -178,10 +176,7 @@ impl ToolDispatcher {
                         .unwrap_or_else(|_| json!([])),
                     boundary_envs: req.boundary_envs.unwrap_or_default(),
                     failure_modes: req.failure_modes.unwrap_or_default(),
-                    validation: match req.validation {
-                        Some(ref v) if !v.trim().is_empty() => json!(v),
-                        _ => json!("通过自动化测试与回归验证"),
-                    },
+                    validation,
                     confidence: req.confidence.unwrap_or(1.0),
                 };
                 match service
@@ -214,6 +209,15 @@ impl ToolDispatcher {
         }
         match serde_json::from_value::<Req>(args) {
             Ok(req) => {
+                // 旧的 `status` 直写通道会绕过状态机与验证门槛（任意状态随意改写），
+                // 已关闭。状态流转必须走 `working_experience_transition`。
+                if req.status.is_some() {
+                    return ToolCallResult::error(&HubError::InvalidArgument(
+                        "working_experience_feedback 不再接受 status 参数；状态流转请调用 \
+                         working_experience_transition（verify / reject / deprecate / restore）"
+                            .into(),
+                    ));
+                }
                 let service = self
                     .working_memory
                     .clone()
@@ -226,35 +230,111 @@ impl ToolDispatcher {
                     .record_feedback(auth, &req.namespace, req.experience_id, is_success, None)
                     .await
                 {
-                    Ok(mut exp) => {
-                        if let Some(st) = req.status {
-                            let parsed = match st.to_lowercase().as_str() {
-                                "candidate" => mem_core::ExperienceStatus::Candidate,
-                                "active" => mem_core::ExperienceStatus::Active,
-                                "deprecated" => mem_core::ExperienceStatus::Deprecated,
-                                "archived" => mem_core::ExperienceStatus::Archived,
-                                other => {
-                                    return ToolCallResult::error(&HubError::InvalidArgument(
-                                        format!("不支持的经验状态: {}", other),
-                                    ));
-                                }
-                            };
-                            exp.status = parsed;
-                            let scoped_store = mem_core::AccountScopedStore::new(
-                                self.store.clone(),
-                                auth.account_id,
-                            );
-                            if let Err(e) = scoped_store.update_experience(&exp).await {
-                                return ToolCallResult::error(&e);
-                            }
-                        }
-                        ToolCallResult::success(json!({ "experience": exp }))
-                    }
+                    Ok(exp) => ToolCallResult::success(json!({ "experience": exp })),
                     Err(e) => ToolCallResult::error(&e),
                 }
             }
             Err(e) => ToolCallResult::error(&HubError::InvalidArgument(format!(
                 "参数不符合 working_experience_feedback schema: {}",
+                e
+            ))),
+        }
+    }
+
+    /// 经验资产状态流转（任务书 4.3）
+    pub(super) async fn working_experience_transition(
+        &self,
+        auth: &AuthCtx,
+        args: Value,
+    ) -> ToolCallResult {
+        #[derive(Deserialize)]
+        struct Req {
+            namespace: String,
+            experience_id: uuid::Uuid,
+            action: String,
+            #[serde(default)]
+            reason: Option<String>,
+        }
+        match serde_json::from_value::<Req>(args) {
+            Ok(req) => {
+                let action = match mem_core::ExperienceTransition::parse(&req.action) {
+                    Some(a) => a,
+                    None => {
+                        return ToolCallResult::error(&HubError::InvalidArgument(format!(
+                            "不支持的状态流转动作: {}（可选 verify / reject / deprecate / restore）",
+                            req.action
+                        )));
+                    }
+                };
+                let service = self
+                    .working_memory
+                    .clone()
+                    .unwrap_or_else(|| {
+                        Arc::new(mem_core::WorkingMemoryService::new(self.store.clone()))
+                    })
+                    .scoped(auth.account_id);
+                match service
+                    .transition(
+                        auth,
+                        &req.namespace,
+                        req.experience_id,
+                        action,
+                        req.reason.as_deref(),
+                        self.experience_verify_min_sources,
+                    )
+                    .await
+                {
+                    Ok(exp) => ToolCallResult::success(json!({ "experience": exp })),
+                    Err(e) => ToolCallResult::error(&e),
+                }
+            }
+            Err(e) => ToolCallResult::error(&HubError::InvalidArgument(format!(
+                "参数不符合 working_experience_transition schema: {}",
+                e
+            ))),
+        }
+    }
+
+    /// 经验版本历史（任务书 4.6：版本变化不丢历史）
+    pub(super) async fn working_experience_history(
+        &self,
+        auth: &AuthCtx,
+        args: Value,
+    ) -> ToolCallResult {
+        #[derive(Deserialize)]
+        struct Req {
+            namespace: String,
+            experience_id: uuid::Uuid,
+            #[serde(default = "default_experience_history_limit")]
+            limit: usize,
+        }
+        fn default_experience_history_limit() -> usize {
+            20
+        }
+        match serde_json::from_value::<Req>(args) {
+            Ok(req) => {
+                let service = self
+                    .working_memory
+                    .clone()
+                    .unwrap_or_else(|| {
+                        Arc::new(mem_core::WorkingMemoryService::new(self.store.clone()))
+                    })
+                    .scoped(auth.account_id);
+                match service
+                    .list_versions(
+                        auth,
+                        &req.namespace,
+                        req.experience_id,
+                        req.limit.clamp(1, 100),
+                    )
+                    .await
+                {
+                    Ok(versions) => ToolCallResult::success(json!({ "versions": versions })),
+                    Err(e) => ToolCallResult::error(&e),
+                }
+            }
+            Err(e) => ToolCallResult::error(&HubError::InvalidArgument(format!(
+                "参数不符合 working_experience_history schema: {}",
                 e
             ))),
         }
@@ -267,60 +347,127 @@ impl ToolDispatcher {
     ) -> ToolCallResult {
         #[derive(Deserialize)]
         struct Req {
-            namespace: String,
+            #[serde(default)]
+            namespace: Option<String>,
+            #[serde(default)]
+            collection: Option<String>,
             query: String,
             #[serde(default)]
             env: Option<String>,
             /// 严格环境边界：环境不匹配的经验直接不返回（默认 false = 降权 + 告警）
             #[serde(default)]
             strict_env: bool,
+            /// 显式限定状态集合（审计用）；缺省 = 排除 rejected/archived
+            #[serde(default)]
+            include_statuses: Option<Vec<String>>,
             #[serde(default = "default_experience_top_k")]
             top_k: usize,
         }
         fn default_experience_top_k() -> usize {
             10
         }
-        match serde_json::from_value::<Req>(args) {
-            Ok(req) => {
-                let service = self
-                    .working_memory
-                    .clone()
-                    .unwrap_or_else(|| {
-                        Arc::new(mem_core::WorkingMemoryService::new(self.store.clone()))
-                    })
-                    .scoped(auth.account_id);
-                match service
-                    .search_experiences_with(
-                        auth,
-                        &req.namespace,
-                        &req.query,
-                        req.env.as_deref(),
-                        req.top_k.clamp(1, 50),
-                        req.strict_env,
-                    )
-                    .await
-                {
-                    Ok(results) => {
-                        let items: Vec<Value> = results
-                            .into_iter()
-                            .map(|r| {
-                                json!({
-                                    "score": r.score,
-                                    "env_mismatch": r.env_mismatch,
-                                    "boundary_warning": r.boundary_warning,
-                                    "experience": r.experience,
-                                })
-                            })
-                            .collect();
-                        ToolCallResult::success(json!({ "results": items }))
-                    }
-                    Err(e) => ToolCallResult::error(&e),
+        let req = match serde_json::from_value::<Req>(args) {
+            Ok(req) => req,
+            Err(e) => {
+                return ToolCallResult::error(&HubError::InvalidArgument(format!(
+                    "参数不符合 working_experience_search schema: {}",
+                    e
+                )));
+            }
+        };
+
+        let mut statuses: Vec<mem_core::ExperienceStatus> = Vec::new();
+        for raw in req.include_statuses.clone().unwrap_or_default() {
+            match mem_core::ExperienceStatus::parse(&raw) {
+                Some(s) => statuses.push(s),
+                None => {
+                    return ToolCallResult::error(&HubError::InvalidArgument(format!(
+                        "不支持的经验状态: {}",
+                        raw
+                    )));
                 }
             }
-            Err(e) => ToolCallResult::error(&HubError::InvalidArgument(format!(
-                "参数不符合 working_experience_search schema: {}",
-                e
-            ))),
         }
+
+        let (namespaces, collection_statuses) =
+            match (req.namespace.clone(), req.collection.clone()) {
+                (Some(ns), None) => (vec![ns], Vec::new()),
+                (None, Some(name)) => match self.collections().resolve(auth, &name).await {
+                    Ok(resolved) => (
+                        resolved.resolved_namespaces,
+                        resolved.collection.filter.experience_statuses,
+                    ),
+                    Err(e) => return ToolCallResult::error(&e),
+                },
+                _ => {
+                    return ToolCallResult::error(&HubError::InvalidArgument(
+                        "namespace 与 collection 必须且只能提供一个".into(),
+                    ));
+                }
+            };
+
+        if statuses.is_empty() && !collection_statuses.is_empty() {
+            statuses = collection_statuses;
+        }
+        let include = if statuses.is_empty() {
+            None
+        } else {
+            Some(statuses.as_slice())
+        };
+
+        let service = self
+            .working_memory
+            .clone()
+            .unwrap_or_else(|| Arc::new(mem_core::WorkingMemoryService::new(self.store.clone())))
+            .scoped(auth.account_id);
+
+        let mut skipped: Vec<String> = Vec::new();
+        let mut all: Vec<(f32, Value)> = Vec::new();
+        // 单命名空间请求必须 fail closed；只有集合扇出才降级为 skipped
+        let fan_out = req.collection.is_some();
+        for ns in &namespaces {
+            match service
+                .search_experiences_governed(
+                    auth,
+                    ns,
+                    &req.query,
+                    mem_core::ExperienceSearchOptions {
+                        current_env: req.env.as_deref(),
+                        limit: req.top_k.clamp(1, 50),
+                        strict_env: req.strict_env,
+                        include_statuses: include,
+                    },
+                )
+                .await
+            {
+                Ok(results) => {
+                    for r in results {
+                        all.push((
+                            r.score,
+                            json!({
+                                "namespace": ns,
+                                "score": r.score,
+                                "env_mismatch": r.env_mismatch,
+                                "boundary_warning": r.boundary_warning,
+                                "experience": r.experience,
+                            }),
+                        ));
+                    }
+                }
+                Err(HubError::InsufficientScope) if fan_out => skipped.push(ns.clone()),
+                Err(e) => return ToolCallResult::error(&e),
+            }
+        }
+
+        all.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        all.truncate(req.top_k.clamp(1, 50));
+        ToolCallResult::success(json!({
+            "results": all.into_iter().map(|(_, v)| v).collect::<Vec<_>>(),
+            "scope": {
+                "namespaces": namespaces,
+                "skipped_namespaces": skipped,
+                "collection": req.collection,
+            }
+        }))
     }
 }

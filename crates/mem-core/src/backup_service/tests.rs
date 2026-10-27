@@ -599,6 +599,13 @@ async fn test_v1_to_v4_historical_sample_restore_and_checksum_verification() {
         confidence: 1.0,
         status: ExperienceStatus::Active,
         feedback_score: 1.0,
+        version: 1,
+        superseded_by: None,
+        verified_at: None,
+        verified_by: None,
+        verification_note: None,
+        status_reason: None,
+        source_count: 0,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -1226,6 +1233,48 @@ async fn test_restore_counts_partial_failures_and_continues() {
         ) -> Result<Vec<MemoryTaskExperience>> {
             self.inner.list_experiences_for_task(task_id).await
         }
+        async fn list_links_for_experience(
+            &self,
+            namespace: &str,
+            experience_id: Uuid,
+        ) -> Result<Vec<MemoryTaskExperience>> {
+            self.inner
+                .list_links_for_experience(namespace, experience_id)
+                .await
+        }
+        async fn update_experience_if_version(
+            &self,
+            experience: &MemoryExperience,
+            expected_version: i64,
+        ) -> Result<MemoryExperience> {
+            self.inner
+                .update_experience_if_version(experience, expected_version)
+                .await
+        }
+        async fn append_experience_version(
+            &self,
+            version: &crate::domain::NewExperienceVersion,
+        ) -> Result<crate::domain::ExperienceVersion> {
+            self.inner.append_experience_version(version).await
+        }
+        async fn list_experience_versions(
+            &self,
+            namespace: &str,
+            experience_id: Uuid,
+            limit: usize,
+        ) -> Result<Vec<crate::domain::ExperienceVersion>> {
+            self.inner
+                .list_experience_versions(namespace, experience_id, limit)
+                .await
+        }
+        async fn all_experience_versions_in_namespace(
+            &self,
+            namespace: &str,
+        ) -> Result<Vec<crate::domain::ExperienceVersion>> {
+            self.inner
+                .all_experience_versions_in_namespace(namespace)
+                .await
+        }
         async fn all_experiences_in_namespace(
             &self,
             namespace: &str,
@@ -1242,6 +1291,54 @@ async fn test_restore_counts_partial_failures_and_continues() {
         }
         async fn delete_experience(&self, namespace: &str, id: Uuid) -> Result<()> {
             self.inner.delete_experience(namespace, id).await
+        }
+    }
+
+    #[async_trait]
+    impl crate::infra::CollectionStore for FailingRelationStore {
+        async fn upsert_collection(
+            &self,
+            collection: &crate::domain::MemoryCollection,
+        ) -> Result<crate::domain::MemoryCollection> {
+            self.inner.upsert_collection(collection).await
+        }
+        async fn get_collection(
+            &self,
+            account_id: common::AccountId,
+            id: Uuid,
+        ) -> Result<Option<crate::domain::MemoryCollection>> {
+            self.inner.get_collection(account_id, id).await
+        }
+        async fn get_collection_by_name(
+            &self,
+            account_id: common::AccountId,
+            name: &str,
+        ) -> Result<Option<crate::domain::MemoryCollection>> {
+            self.inner.get_collection_by_name(account_id, name).await
+        }
+        async fn list_collections(
+            &self,
+            account_id: common::AccountId,
+        ) -> Result<Vec<crate::domain::MemoryCollection>> {
+            self.inner.list_collections(account_id).await
+        }
+        async fn delete_collection(&self, account_id: common::AccountId, id: Uuid) -> Result<()> {
+            self.inner.delete_collection(account_id, id).await
+        }
+        async fn bind_collection(&self, binding: &crate::domain::CollectionBinding) -> Result<()> {
+            self.inner.bind_collection(binding).await
+        }
+        async fn unbind_collection(&self, collection_id: Uuid, agent_id: &String) -> Result<()> {
+            self.inner.unbind_collection(collection_id, agent_id).await
+        }
+        async fn list_bindings(
+            &self,
+            collection_id: Uuid,
+        ) -> Result<Vec<crate::domain::CollectionBinding>> {
+            self.inner.list_bindings(collection_id).await
+        }
+        async fn is_bound(&self, collection_id: Uuid, agent_id: &String) -> Result<bool> {
+            self.inner.is_bound(collection_id, agent_id).await
         }
     }
 

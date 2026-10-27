@@ -1,6 +1,6 @@
 //! MCP 工具执行器与双模输出生成
 //!
-//! 28 个工具全部围绕三件事：**存储**（put/get/update/delete/search/list/stats/history）、
+//! 38 个工具覆盖**存储**（put/get/update/delete/search/list/stats/history）、
 //! **备份**（backup_create/backup_list/restore）、**整合**（integrate_scan/
 //! integration_list/integration_resolve），外加命名空间共享（grant/revoke）。
 //!
@@ -8,7 +8,6 @@
 //! 错误一律以 `isError = true` + 标准错误码对象返回（MCP 规定工具错误仍在 200 内表达）。
 
 use common::{AgentId, AuthCtx, HubError, Scope};
-use mem_core::infra::ExperienceStore;
 use mem_core::{
     BackupService, CognitiveProposalStore, GrantStore, IntegrationService, IntegrationStore,
     MemoryService, NamespaceGrantRecord,
@@ -131,6 +130,8 @@ pub struct ToolDispatcher {
     pub working_memory: Option<Arc<mem_core::WorkingMemoryService>>,
     /// Coding 代码演进记忆服务（主题线程与修订记录）
     pub coding_memory: Option<Arc<mem_core::CodingMemoryService>>,
+    /// 经验验证门槛：至少多少个不同的已完成来源任务才允许 candidate → active
+    pub experience_verify_min_sources: usize,
     /// 整合健康度统计缓存：`(account, namespace) → (写入时刻, 响应)`
     ///
     /// 放在 `Arc<Mutex<..>>` 里是因为 `ToolDispatcher` 会被克隆分发；
@@ -156,6 +157,7 @@ impl ToolDispatcher {
             chat_cognitive: None,
             working_memory: None,
             coding_memory: None,
+            experience_verify_min_sources: 2,
             stats_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
@@ -206,6 +208,12 @@ impl ToolDispatcher {
         self
     }
 
+    /// 注入经验验证门槛（来自配置；非法值在 AppConfig 解析阶段即失败）
+    pub fn with_experience_governance(mut self, verify_min_sources: usize) -> Self {
+        self.experience_verify_min_sources = verify_min_sources.max(1);
+        self
+    }
+
     /// 解析请求指定的整合模式
     ///
     /// `HUB_CONSOLIDATION_ALLOW_MODE_OVERRIDE=false`（默认）时，调用方**不得**逐次
@@ -253,6 +261,12 @@ impl ToolDispatcher {
             "memory_consolidation_stats" => self.consolidation_stats(auth, arguments).await,
             "memory_grant" => self.grant(auth, arguments).await,
             "memory_revoke" => self.revoke(auth, arguments).await,
+            // ===== Agent 记忆集合（任务书 4.4）=====
+            "memory_collection_upsert" => self.memory_collection_upsert(auth, arguments).await,
+            "memory_collection_list" => self.memory_collection_list(auth, arguments).await,
+            "memory_collection_delete" => self.memory_collection_delete(auth, arguments).await,
+            "memory_collection_bind" => self.memory_collection_bind(auth, arguments).await,
+            "memory_collection_unbind" => self.memory_collection_unbind(auth, arguments).await,
             // ===== 认知增强工具 (P2 / P3 / P4) =====
             "cognitive_chat_propose" => self.cognitive_chat_propose(auth, arguments).await,
             "cognitive_proposal_resolve" => self.cognitive_proposal_resolve(auth, arguments).await,
@@ -264,8 +278,15 @@ impl ToolDispatcher {
                 self.working_experience_feedback(auth, arguments).await
             }
             "working_experience_search" => self.working_experience_search(auth, arguments).await,
+            "working_experience_transition" => {
+                self.working_experience_transition(auth, arguments).await
+            }
+            "working_experience_history" => self.working_experience_history(auth, arguments).await,
             "coding_thread_create" => self.coding_thread_create(auth, arguments).await,
+            "coding_thread_list" => self.coding_thread_list(auth, arguments).await,
             "coding_revision_record" => self.coding_revision_record(auth, arguments).await,
+            "coding_revision_list" => self.coding_revision_list(auth, arguments).await,
+            "coding_revision_get" => self.coding_revision_get(auth, arguments).await,
             other => {
                 ToolCallResult::error(&HubError::MethodNotFound(format!("未知工具: {}", other)))
             }
@@ -277,6 +298,7 @@ mod admin;
 mod backup;
 mod coding;
 mod cognitive;
+mod collections;
 mod integration;
 mod memory;
 mod working;

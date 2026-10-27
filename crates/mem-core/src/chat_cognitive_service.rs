@@ -16,7 +16,7 @@ use crate::domain::{
     MemoryEntry, MemoryFilter, MemoryKind, MemoryRelationKind, MemoryScene, MemoryStatus,
     NewEvidence, NewMemoryRelation, VersionChange,
 };
-use crate::infra::{ChatCognitiveExtractor, MemoryHubStore};
+use crate::infra::{AccessChecker, ChatCognitiveExtractor, MemoryHubStore};
 use chrono::{DateTime, Utc};
 use common::{AccountId, AgentId, AuthCtx, HubError, Result, Scope};
 use sha2::{Digest, Sha256};
@@ -55,6 +55,8 @@ pub struct ChatCognitiveService {
     store: Arc<dyn MemoryHubStore>,
     extractor: Arc<dyn ChatCognitiveExtractor>,
     policy: CognitivePolicy,
+    /// 命名空间级访问控制（生产必须注入；None 仅用于单测/纯库嵌入）
+    access: Option<Arc<dyn AccessChecker>>,
 }
 
 impl ChatCognitiveService {
@@ -67,7 +69,38 @@ impl ChatCognitiveService {
             store,
             extractor,
             policy,
+            access: None,
         }
+    }
+
+    /// 注入命名空间 ACL 检查器（生产必须调用）
+    pub fn with_access(mut self, access: Arc<dyn AccessChecker>) -> Self {
+        self.access = Some(access);
+        self
+    }
+
+    async fn ensure_read(&self, auth: &AuthCtx, namespace: &str) -> Result<()> {
+        if !auth.has_scope(&Scope::Read) {
+            return Err(HubError::InsufficientScope);
+        }
+        if let Some(access) = &self.access {
+            if !access.can_read(auth, namespace).await? {
+                return Err(HubError::InsufficientScope);
+            }
+        }
+        Ok(())
+    }
+
+    async fn ensure_write(&self, auth: &AuthCtx, namespace: &str) -> Result<()> {
+        if !auth.has_scope(&Scope::Write) {
+            return Err(HubError::InsufficientScope);
+        }
+        if let Some(access) = &self.access {
+            if !access.can_write(auth, namespace).await? {
+                return Err(HubError::InsufficientScope);
+            }
+        }
+        Ok(())
     }
 
     /// 切换作用域底层存储（账户沙箱化）
@@ -76,6 +109,7 @@ impl ChatCognitiveService {
             store: Arc::new(AccountScopedStore::new(self.store.clone(), account_id)),
             extractor: self.extractor.clone(),
             policy: self.policy.clone(),
+            access: self.access.clone(),
         }
     }
 
@@ -170,9 +204,7 @@ impl ChatCognitiveService {
         auth: &AuthCtx,
         input: ChatCognitiveInput,
     ) -> Result<ChatCognitiveResult> {
-        if !auth.has_scope(&Scope::Write) {
-            return Err(HubError::InsufficientScope);
-        }
+        self.ensure_write(auth, &input.namespace).await?;
 
         let content_hash = Self::compute_messages_hash(&input);
         let now = Utc::now();
@@ -394,6 +426,9 @@ impl ChatCognitiveService {
         }
 
         let proposal = self.store.get_cognitive_proposal(proposal_id).await?;
+        // 提案带命名空间：裁决前必须确认调用方对该命名空间有写权限，
+        // 否则同账户内的任意 Agent 都能凭 ID 采纳/驳回他人空间的提案。
+        self.ensure_write(auth, &proposal.namespace).await?;
         // 只有待审提案可裁决：已裁决（accepted/rejected）的提案再次裁决
         // 返回 Conflict，杜绝重复采纳写入重复记忆
         if proposal.status != CognitiveProposalStatus::PendingReview {
@@ -479,9 +514,7 @@ impl ChatCognitiveService {
         namespace: &str,
         status: Option<CognitiveProposalStatus>,
     ) -> Result<Vec<CognitiveProposalRecord>> {
-        if !auth.has_scope(&Scope::Read) {
-            return Err(HubError::InsufficientScope);
-        }
+        self.ensure_read(auth, namespace).await?;
         self.store.list_cognitive_proposals(namespace, status).await
     }
 
@@ -495,9 +528,7 @@ impl ChatCognitiveService {
         auth: &AuthCtx,
         namespace: &str,
     ) -> Result<Vec<MemoryEntry>> {
-        if !auth.has_scope(&Scope::Read) {
-            return Err(HubError::InsufficientScope);
-        }
+        self.ensure_read(auth, namespace).await?;
 
         let now = Utc::now();
         let items = self

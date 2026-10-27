@@ -1,6 +1,6 @@
 //! MCP 工具契约黄金快照测试
 //!
-//! 目的：把"升级前 28 个工具的名称、参数、必填项、scope、只读/破坏性/幂等标记"
+//! 目的：把"升级前 38 个工具的名称、参数、必填项、scope、只读/破坏性/幂等标记"
 //! 固化成快照文件，任何改动都必须显式刷新——这样"轻量化不得破坏旧客户端"
 //! 就从一个口头承诺变成一条会在 CI 里失败的断言。
 //!
@@ -97,8 +97,8 @@ fn test_snapshot_covers_all_tools_and_keeps_base_tools() {
     let current = snapshot();
     assert_eq!(
         current["tool_count"],
-        json!(28),
-        "工具总数应为 18 个基础 + 10 个认知增强"
+        json!(38),
+        "工具总数应为 18 个基础 + 20 个认知/治理工具"
     );
 
     let names: Vec<&str> = current["tools"]
@@ -142,8 +142,18 @@ fn test_snapshot_covers_all_tools_and_keeps_base_tools() {
         "working_experience_distill",
         "working_experience_feedback",
         "working_experience_search",
+        "working_experience_transition",
+        "working_experience_history",
         "coding_thread_create",
+        "coding_thread_list",
         "coding_revision_record",
+        "coding_revision_list",
+        "coding_revision_get",
+        "memory_collection_upsert",
+        "memory_collection_list",
+        "memory_collection_delete",
+        "memory_collection_bind",
+        "memory_collection_unbind",
     ] {
         assert!(names.contains(&expected), "缺少认知工具: {expected}");
     }

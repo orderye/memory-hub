@@ -23,6 +23,7 @@ pub mod backup_service;
 pub mod chat_cognitive_service;
 pub mod cjk;
 pub mod coding_memory_service;
+pub mod collection_service;
 pub mod domain;
 pub mod fingerprint;
 pub mod infra;
@@ -55,25 +56,30 @@ pub use chat_cognitive_service::{
     ChatCognitiveResult, ChatCognitiveService, CognitiveReviewDecision,
 };
 pub use coding_memory_service::CodingMemoryService;
+pub use collection_service::{validate_collection_name, CollectionService};
 pub use domain::{
     is_intention_active, is_speculative_intention, validate_coding_revision,
     validate_cognitive_candidate, validate_experience_candidate, BackupRecord, BackupSummary,
     ChatCognitiveInput, ChatMessage, ChatRole, CodeChangeKind, CodingRevision, CodingThread,
     CognitiveCandidate, CognitiveGovernanceMode, CognitiveLayer, CognitivePolicy,
-    CognitiveProposalRecord, CognitiveProposalStatus, EvidenceSourceKind, ExperienceCandidate,
-    ExperienceStatus, IntegrationKind, IntegrationProposal, MemoryEntry, MemoryEvidence,
-    MemoryExperience, MemoryFilter, MemoryKind, MemoryPatch, MemoryRelation, MemoryRelationKind,
-    MemoryScene, MemoryStats, MemoryStatus, MemoryTask, MemoryTaskExperience, MemoryVersion,
-    Namespace, NamespaceGrantRecord, NamespaceInfo, NewCodingRevision, NewCodingThread,
-    NewEvidence, NewMemory, NewMemoryExperience, NewMemoryRelation, NewMemoryTask, Page,
-    ProposalStatus, RestoreMode, RestoreReport, Scored, TaskStatus, VersionChange,
+    CognitiveProposalRecord, CognitiveProposalStatus, CollectionBinding, CollectionFilter,
+    EvidenceSourceKind, ExperienceCandidate, ExperienceChangeKind, ExperienceStatus,
+    ExperienceTransition, ExperienceVersion, IntegrationKind, IntegrationProposal,
+    MemoryCollection, MemoryEntry, MemoryEvidence, MemoryExperience, MemoryFilter, MemoryKind,
+    MemoryPatch, MemoryRelation, MemoryRelationKind, MemoryScene, MemoryStats, MemoryStatus,
+    MemoryTask, MemoryTaskExperience, MemoryVersion, Namespace, NamespaceGrantRecord,
+    NamespaceInfo, NewCodingRevision, NewCodingThread, NewEvidence, NewExperienceVersion,
+    NewMemory, NewMemoryExperience, NewMemoryRelation, NewMemoryTask, Page, ProposalStatus,
+    ResolvedCollection, RestoreMode, RestoreReport, Scored, TaskStatus, UpsertCollectionRequest,
+    VersionChange, MAX_COLLECTION_NAMESPACES,
 };
 pub use fingerprint::{canonical_form, content_fingerprint, same_fingerprint};
 pub use infra::{
     AccessChecker, AccountRecord, AccountStore, AgentRecord, AgentRegistration, AgentStore,
-    BackupStore, ChatCognitiveExtractor, Clock, CodingStore, CognitiveProposalStore, Embedder,
-    EvidenceStore, ExperienceStore, GrantStore, IntegrationStore, MemoryHubStore, MemoryStore,
-    RelationStore, Retriever, SessionRecord, SystemClock, TaskStore, TokenIntrospector,
+    BackupStore, ChatCognitiveExtractor, Clock, CodingStore, CognitiveProposalStore,
+    CollectionStore, Embedder, EvidenceStore, ExperienceStore, GrantStore, IntegrationStore,
+    MemoryHubStore, MemoryStore, RelationStore, Retriever, SessionRecord, SystemClock, TaskStore,
+    TokenIntrospector,
 };
 pub use integration_service::{
     IntegrationService, ResolveAction, ResolveRequest, ScanReport, ScanRequest,
@@ -87,4 +93,6 @@ pub use redaction::{
     EVIDENCE_EXCERPT_MAX_CHARS,
 };
 pub use testing::{CountingEmbedder, FixedClock, SemanticTestEmbedder, TestEmbedder, TestHubStore};
-pub use working_memory_service::{ExperienceSearchResult, WorkingMemoryService};
+pub use working_memory_service::{
+    ExperienceSearchOptions, ExperienceSearchResult, WorkingMemoryService,
+};

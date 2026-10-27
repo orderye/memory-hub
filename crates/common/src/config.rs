@@ -183,6 +183,11 @@ pub struct AppConfig {
     pub job_lease_h: u32,
     /// 整合健康度统计缓存时长（秒，0 = 每次重算）
     pub consolidation_stats_ttl_s: u64,
+    /// 经验验证门槛：至少多少个**不同的已完成来源任务**才允许 candidate → active
+    ///
+    /// 任务书 4.3：单次成功不代表已验证。该值只影响显式 `verify` 流转，
+    /// 不影响提炼（提炼只会产出 candidate）。
+    pub experience_verify_min_sources: usize,
 
     // ===== 时效与限流 =====
     pub idempotency_ttl_h: u32,
@@ -355,6 +360,7 @@ impl Default for AppConfig {
             integration_scan_max_entries: DEFAULT_INTEGRATION_SCAN_MAX_ENTRIES,
             job_lease_h: DEFAULT_JOB_LEASE_HOURS,
             consolidation_stats_ttl_s: DEFAULT_CONSOLIDATION_STATS_TTL_S,
+            experience_verify_min_sources: 2,
             idempotency_ttl_h: 24,
             rate_limit_per_agent_rps: 50,
             max_request_bytes: 262_144,
@@ -487,6 +493,16 @@ impl AppConfig {
             "HUB_CONSOLIDATION_STATS_TTL_S",
             cfg.consolidation_stats_ttl_s,
         )?;
+        cfg.experience_verify_min_sources = parse_usize(
+            "HUB_EXPERIENCE_VERIFY_MIN_SOURCES",
+            cfg.experience_verify_min_sources,
+        )?;
+        if !(1..=10).contains(&cfg.experience_verify_min_sources) {
+            anyhow::bail!(
+                "HUB_EXPERIENCE_VERIFY_MIN_SOURCES 必须在 1..=10 之间，当前为 {}",
+                cfg.experience_verify_min_sources
+            );
+        }
 
         cfg.idempotency_ttl_h = parse_u32("HUB_IDEMPOTENCY_TTL_H", cfg.idempotency_ttl_h)?;
         cfg.rate_limit_per_agent_rps =

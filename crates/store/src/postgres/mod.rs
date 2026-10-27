@@ -16,13 +16,14 @@ use chrono::{DateTime, Utc};
 use common::{AccountId, AgentId, HubError, Result};
 use mem_core::{
     AccountRecord, BackupRecord, CodeChangeKind, CodingRevision, CodingStore, CodingThread,
-    CognitiveLayer, CognitiveProposalRecord, CognitiveProposalStatus, EvidenceSourceKind,
-    EvidenceStore, ExperienceStatus, ExperienceStore, IntegrationKind, IntegrationProposal,
+    CognitiveLayer, CognitiveProposalRecord, CognitiveProposalStatus, CollectionBinding,
+    CollectionStore, EvidenceSourceKind, EvidenceStore, ExperienceChangeKind, ExperienceStatus,
+    ExperienceStore, ExperienceVersion, IntegrationKind, IntegrationProposal, MemoryCollection,
     MemoryEntry, MemoryEvidence, MemoryExperience, MemoryFilter, MemoryKind, MemoryRelation,
     MemoryRelationKind, MemoryScene, MemoryStatus, MemoryTask, MemoryTaskExperience, MemoryVersion,
     Namespace, NamespaceGrantRecord, NamespaceInfo, NewCodingRevision, NewCodingThread,
-    NewEvidence, NewMemoryExperience, NewMemoryRelation, NewMemoryTask, ProposalStatus,
-    RelationStore, Scored, SessionRecord, TaskStatus, TaskStore, VersionChange,
+    NewEvidence, NewExperienceVersion, NewMemoryExperience, NewMemoryRelation, NewMemoryTask,
+    ProposalStatus, RelationStore, Scored, SessionRecord, TaskStatus, TaskStore, VersionChange,
 };
 use sqlx::postgres::{PgConnection, PgPool, PgPoolOptions, PgRow};
 use sqlx::{Connection as _, Row};
@@ -220,6 +221,14 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
     (
         "20261027000015_vector_index_halfvec_partial",
         include_str!("../../migrations/20261027000015_vector_index_halfvec_partial.sql"),
+    ),
+    (
+        "20261028000016_experience_asset_lifecycle",
+        include_str!("../../migrations/20261028000016_experience_asset_lifecycle.sql"),
+    ),
+    (
+        "20261028000017_memory_collections",
+        include_str!("../../migrations/20261028000017_memory_collections.sql"),
     ),
 ];
 
@@ -810,8 +819,59 @@ impl PostgresHubStore {
             confidence: r.try_get::<f32, _>("confidence").pg()?,
             status,
             feedback_score: r.try_get::<f32, _>("feedback_score").pg()?,
+            version: r.try_get("version").pg()?,
+            superseded_by: r.try_get("superseded_by").pg()?,
+            verified_at: r.try_get("verified_at").pg()?,
+            verified_by: r.try_get("verified_by").pg()?,
+            verification_note: r.try_get("verification_note").pg()?,
+            status_reason: r.try_get("status_reason").pg()?,
+            source_count: r.try_get("source_count").pg()?,
             created_at: r.try_get("created_at").pg()?,
             updated_at: r.try_get("updated_at").pg()?,
+        })
+    }
+
+    fn experience_version_from_row(r: &PgRow) -> Result<ExperienceVersion> {
+        let status_str: String = r.try_get("status").pg()?;
+        let change_str: String = r.try_get("change_kind").pg()?;
+        Ok(ExperienceVersion {
+            id: r.try_get("id").pg()?,
+            experience_id: r.try_get("experience_id").pg()?,
+            namespace: r.try_get("namespace").pg()?,
+            version: r.try_get("version").pg()?,
+            snapshot: r.try_get("snapshot").pg()?,
+            change_kind: ExperienceChangeKind::parse(&change_str).ok_or_else(|| {
+                HubError::Internal(anyhow::anyhow!("未知经验变更类型: {}", change_str))
+            })?,
+            changed_by: r.try_get("changed_by").pg()?,
+            status: mapping::parse_experience_status(&status_str)?,
+            note: r.try_get("note").pg()?,
+            changed_at: r.try_get("changed_at").pg()?,
+        })
+    }
+
+    fn collection_from_row(r: &PgRow) -> Result<MemoryCollection> {
+        let filter_value: serde_json::Value = r.try_get("filter").pg()?;
+        let filter = serde_json::from_value(filter_value)
+            .map_err(|e| HubError::Internal(anyhow::anyhow!("集合过滤器解析失败: {}", e)))?;
+        Ok(MemoryCollection {
+            id: r.try_get("id").pg()?,
+            account_id: r.try_get("account_id").pg()?,
+            name: r.try_get("name").pg()?,
+            description: r.try_get("description").pg()?,
+            filter,
+            created_by: r.try_get("created_by").pg()?,
+            created_at: r.try_get("created_at").pg()?,
+            updated_at: r.try_get("updated_at").pg()?,
+        })
+    }
+
+    fn collection_binding_from_row(r: &PgRow) -> Result<CollectionBinding> {
+        Ok(CollectionBinding {
+            collection_id: r.try_get("collection_id").pg()?,
+            agent_id: r.try_get("agent_id").pg()?,
+            created_by: r.try_get("created_by").pg()?,
+            created_at: r.try_get("created_at").pg()?,
         })
     }
 
@@ -1096,6 +1156,7 @@ mod pg_integration;
 mod access;
 mod backup;
 mod coding;
+mod collections;
 mod integration;
 mod memory;
 mod working;

@@ -311,14 +311,14 @@ mod tests {
         assert_eq!(report.created.len(), 1);
         let (backup_id, _) = report.created[0];
 
-        // 1) 载荷版本必须为 v4
+        // 1) 载荷版本必须为 v5（含经验版本历史）
         let record = mem_core::BackupStore::get_backup(store.as_ref(), backup_id)
             .await
             .unwrap();
         assert_eq!(
             record.payload["version"],
-            serde_json::json!(4),
-            "定时快照必须是 v4 载荷"
+            serde_json::json!(5),
+            "定时快照必须是 v5 载荷"
         );
 
         // 2) 全实体在载荷中

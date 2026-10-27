@@ -125,4 +125,119 @@ impl ToolDispatcher {
             ))),
         }
     }
+
+    /// 列出代码演进线程（只读）
+    pub(super) async fn coding_thread_list(&self, auth: &AuthCtx, args: Value) -> ToolCallResult {
+        #[derive(Deserialize)]
+        struct Req {
+            namespace: String,
+            #[serde(default)]
+            repository: Option<String>,
+            #[serde(default = "default_coding_limit")]
+            limit: usize,
+        }
+        fn default_coding_limit() -> usize {
+            50
+        }
+        match serde_json::from_value::<Req>(args) {
+            Ok(req) => {
+                let service = self.coding_service(auth);
+                match service
+                    .list_threads(
+                        auth,
+                        &req.namespace,
+                        req.repository.as_deref(),
+                        req.limit.clamp(1, 100),
+                    )
+                    .await
+                {
+                    Ok(threads) => ToolCallResult::success(json!({ "threads": threads })),
+                    Err(e) => ToolCallResult::error(&e),
+                }
+            }
+            Err(e) => ToolCallResult::error(&HubError::InvalidArgument(format!(
+                "参数不符合 coding_thread_list schema: {}",
+                e
+            ))),
+        }
+    }
+
+    /// 列出代码修订（按线程或按文件；只读）
+    pub(super) async fn coding_revision_list(&self, auth: &AuthCtx, args: Value) -> ToolCallResult {
+        #[derive(Deserialize)]
+        struct Req {
+            namespace: String,
+            #[serde(default)]
+            thread_id: Option<uuid::Uuid>,
+            #[serde(default)]
+            repository: Option<String>,
+            #[serde(default)]
+            file_path: Option<String>,
+            #[serde(default = "default_coding_limit")]
+            limit: usize,
+        }
+        fn default_coding_limit() -> usize {
+            50
+        }
+        match serde_json::from_value::<Req>(args) {
+            Ok(req) => {
+                let service = self.coding_service(auth);
+                let limit = req.limit.clamp(1, 100);
+                let result = if let Some(thread_id) = req.thread_id {
+                    service
+                        .list_thread_revisions(auth, &req.namespace, thread_id, limit)
+                        .await
+                } else if let (Some(repo), Some(file)) = (&req.repository, &req.file_path) {
+                    service
+                        .list_file_revisions(auth, &req.namespace, repo, file, limit)
+                        .await
+                } else {
+                    return ToolCallResult::error(&HubError::InvalidArgument(
+                        "必须提供 thread_id，或同时提供 repository 与 file_path".into(),
+                    ));
+                };
+                match result {
+                    Ok(revisions) => ToolCallResult::success(json!({ "revisions": revisions })),
+                    Err(e) => ToolCallResult::error(&e),
+                }
+            }
+            Err(e) => ToolCallResult::error(&HubError::InvalidArgument(format!(
+                "参数不符合 coding_revision_list schema: {}",
+                e
+            ))),
+        }
+    }
+
+    /// 读取单条代码修订（只读）
+    pub(super) async fn coding_revision_get(&self, auth: &AuthCtx, args: Value) -> ToolCallResult {
+        #[derive(Deserialize)]
+        struct Req {
+            namespace: String,
+            revision_id: uuid::Uuid,
+        }
+        match serde_json::from_value::<Req>(args) {
+            Ok(req) => {
+                let service = self.coding_service(auth);
+                match service
+                    .get_revision(auth, &req.namespace, req.revision_id)
+                    .await
+                {
+                    Ok(Some(revision)) => ToolCallResult::success(json!({ "revision": revision })),
+                    Ok(None) => ToolCallResult::error(&HubError::NotFound),
+                    Err(e) => ToolCallResult::error(&e),
+                }
+            }
+            Err(e) => ToolCallResult::error(&HubError::InvalidArgument(format!(
+                "参数不符合 coding_revision_get schema: {}",
+                e
+            ))),
+        }
+    }
+
+    fn coding_service(&self, auth: &AuthCtx) -> mem_core::CodingMemoryService {
+        self.coding_memory
+            .clone()
+            .unwrap_or_else(|| Arc::new(mem_core::CodingMemoryService::new(self.store.clone())))
+            .scoped(auth.account_id)
+    }
 }

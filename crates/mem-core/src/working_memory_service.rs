@@ -11,10 +11,11 @@
 
 use crate::account_scope::AccountScopedStore;
 use crate::domain::{
-    validate_experience_candidate, ExperienceCandidate, ExperienceStatus, MemoryExperience,
-    MemoryScene, MemoryTask, MemoryTaskExperience, NewMemoryExperience, NewMemoryTask, TaskStatus,
+    validate_experience_candidate, ExperienceCandidate, ExperienceChangeKind, ExperienceStatus,
+    ExperienceTransition, ExperienceVersion, MemoryExperience, MemoryScene, MemoryTask,
+    MemoryTaskExperience, NewExperienceVersion, NewMemoryExperience, NewMemoryTask, TaskStatus,
 };
-use crate::infra::MemoryHubStore;
+use crate::infra::{AccessChecker, MemoryHubStore};
 use chrono::Utc;
 use common::{AccountId, AuthCtx, HubError, Result, Scope};
 use serde::{Deserialize, Serialize};
@@ -33,18 +34,57 @@ pub struct ExperienceSearchResult {
 /// Working 经验记忆服务
 pub struct WorkingMemoryService {
     store: Arc<dyn MemoryHubStore>,
+    /// 命名空间级访问控制。
+    ///
+    /// `None` 仅用于单元测试与纯库嵌入场景（此时只校验 Scope）；
+    /// **生产装配必须注入**，否则同一账户内的 Agent 可以凭令牌读取任意命名空间。
+    access: Option<Arc<dyn AccessChecker>>,
 }
 
 impl WorkingMemoryService {
     pub fn new(store: Arc<dyn MemoryHubStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            access: None,
+        }
+    }
+
+    /// 注入命名空间 ACL 检查器（生产必须调用）
+    pub fn with_access(mut self, access: Arc<dyn AccessChecker>) -> Self {
+        self.access = Some(access);
+        self
     }
 
     /// 切换底层作用域存储（账户沙箱化）
     pub fn scoped(&self, account_id: AccountId) -> Self {
         Self {
             store: Arc::new(AccountScopedStore::new(self.store.clone(), account_id)),
+            access: self.access.clone(),
         }
+    }
+
+    async fn ensure_read(&self, auth: &AuthCtx, namespace: &str) -> Result<()> {
+        if !auth.has_scope(&Scope::Read) {
+            return Err(HubError::InsufficientScope);
+        }
+        if let Some(access) = &self.access {
+            if !access.can_read(auth, namespace).await? {
+                return Err(HubError::InsufficientScope);
+            }
+        }
+        Ok(())
+    }
+
+    async fn ensure_write(&self, auth: &AuthCtx, namespace: &str) -> Result<()> {
+        if !auth.has_scope(&Scope::Write) {
+            return Err(HubError::InsufficientScope);
+        }
+        if let Some(access) = &self.access {
+            if !access.can_write(auth, namespace).await? {
+                return Err(HubError::InsufficientScope);
+            }
+        }
+        Ok(())
     }
 
     /// 启动新任务并持久化初始任务事实
@@ -70,9 +110,7 @@ impl WorkingMemoryService {
         source_evidence_id: Option<Uuid>,
         metadata: Option<serde_json::Value>,
     ) -> Result<MemoryTask> {
-        if !auth.has_scope(&Scope::Write) {
-            return Err(HubError::InsufficientScope);
-        }
+        self.ensure_write(auth, namespace).await?;
         let task_trimmed = task.trim();
         if task_trimmed.is_empty() {
             return Err(HubError::InvalidArgument("任务目标描述不能为空".into()));
@@ -104,9 +142,7 @@ impl WorkingMemoryService {
         checkpoint_summary: &str,
         metadata: Option<serde_json::Value>,
     ) -> Result<MemoryTask> {
-        if !auth.has_scope(&Scope::Write) {
-            return Err(HubError::InsufficientScope);
-        }
+        self.ensure_write(auth, namespace).await?;
         let mut task = self
             .store
             .get_task(namespace, task_id)
@@ -133,9 +169,7 @@ impl WorkingMemoryService {
         failure_reason: Option<String>,
         source_evidence_id: Option<Uuid>,
     ) -> Result<MemoryTask> {
-        if !auth.has_scope(&Scope::Write) {
-            return Err(HubError::InsufficientScope);
-        }
+        self.ensure_write(auth, namespace).await?;
         let mut task = self
             .store
             .get_task(namespace, task_id)
@@ -169,9 +203,7 @@ impl WorkingMemoryService {
         namespace: &str,
         candidate: ExperienceCandidate,
     ) -> Result<MemoryExperience> {
-        if !auth.has_scope(&Scope::Write) {
-            return Err(HubError::InsufficientScope);
-        }
+        self.ensure_write(auth, namespace).await?;
 
         // 门槛 1：质量与安全门槛校验（包含敏感词与密钥扫描、可复用性、验证结果）
         validate_experience_candidate(&candidate)?;
@@ -190,7 +222,7 @@ impl WorkingMemoryService {
             e.task.trim() == candidate.task_pattern.trim()
                 && e.solution.trim() == candidate.solution.trim()
         }) {
-            // 补充关联当前源任务
+            // 补充关联当前源任务，并刷新来源计数（验证门槛依赖它）
             let link = MemoryTaskExperience {
                 namespace: Some(namespace.to_string()),
                 task_id: source_task.id,
@@ -198,8 +230,8 @@ impl WorkingMemoryService {
                 relation_kind: "reused".to_string(),
                 created_at: Utc::now(),
             };
-            let _ = self.store.link_task_experience(&link).await;
-            return Ok(found);
+            self.store.link_task_experience(&link).await?;
+            return self.refresh_source_count(namespace, &found).await;
         }
 
         let new_exp = NewMemoryExperience {
@@ -213,7 +245,9 @@ impl WorkingMemoryService {
             failure_modes: candidate.failure_modes.clone(),
             validation: candidate.validation.clone(),
             confidence: candidate.confidence,
-            status: ExperienceStatus::Active,
+            // 任务书 4.3：自动提炼只能产出候选，绝不能直接写“已验证”。
+            // 验证必须走显式 `transition(Verify)` 并满足来源与验证条件。
+            status: ExperienceStatus::Candidate,
             feedback_score: 1.0,
         };
 
@@ -229,42 +263,331 @@ impl WorkingMemoryService {
         };
         self.store.link_task_experience(&link).await?;
 
+        // 记录初始版本快照（只追加，供后续版本历史对照）
+        self.append_snapshot(&saved, ExperienceChangeKind::Created, &auth.agent_id, None)
+            .await?;
+
+        // source_count 是派生元数据，不参与版本推进
+        self.refresh_source_count(namespace, &saved).await
+    }
+
+    /// 重算并写回来源任务数（distinct）。
+    ///
+    /// `source_count` 只用于验证门槛与展示，不是经验内容，**不推进 version**，
+    /// 否则每次关联来源都会制造一个无意义的版本。
+    async fn refresh_source_count(
+        &self,
+        namespace: &str,
+        experience: &MemoryExperience,
+    ) -> Result<MemoryExperience> {
+        let links = self
+            .store
+            .list_links_for_experience(namespace, experience.id)
+            .await?;
+        let distinct: std::collections::BTreeSet<Uuid> =
+            links.into_iter().map(|l| l.task_id).collect();
+        let count = distinct.len() as i64;
+        if count == experience.source_count {
+            return Ok(experience.clone());
+        }
+        let mut updated = experience.clone();
+        updated.source_count = count;
+        self.store
+            .update_experience_if_version(&updated, updated.version)
+            .await
+    }
+
+    /// 追加某个版本的快照（幂等：同一 version 只保留第一条）
+    ///
+    /// 语义：**每个 version 恰好一行**，`change_kind` 描述该版本因何产生。
+    /// 因此创建时写 v1/Created，流转到 v2 后写 v2/Verified，依此类推。
+    async fn append_snapshot(
+        &self,
+        before: &MemoryExperience,
+        kind: ExperienceChangeKind,
+        actor: &str,
+        note: Option<&str>,
+    ) -> Result<ExperienceVersion> {
+        let snapshot = serde_json::to_value(before)
+            .map_err(|e| HubError::Internal(anyhow::anyhow!("经验版本快照序列化失败: {}", e)))?;
+        self.store
+            .append_experience_version(&NewExperienceVersion {
+                id: None,
+                experience_id: before.id,
+                namespace: before.namespace.clone(),
+                version: before.version,
+                snapshot,
+                change_kind: kind,
+                changed_by: actor.to_string(),
+                status: before.status,
+                note: note.map(str::to_string),
+                changed_at: Utc::now(),
+            })
+            .await
+    }
+
+    /// 读取经验版本历史（新版本在前）
+    pub async fn list_versions(
+        &self,
+        auth: &AuthCtx,
+        namespace: &str,
+        experience_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<ExperienceVersion>> {
+        self.ensure_read(auth, namespace).await?;
+        // 不存在或不属于该命名空间一律 NotFound，避免跨租户探测
+        self.store
+            .get_experience(namespace, experience_id)
+            .await?
+            .ok_or(HubError::NotFound)?;
+        self.store
+            .list_experience_versions(namespace, experience_id, limit)
+            .await
+    }
+
+    /// 经验资产状态流转（任务书 4.3：状态转换必须有明确条件）
+    ///
+    /// - `Verify`：仅 `candidate → active`，且满足 `min_sources` 个**不同**的已完成
+    ///   来源任务、关联任务无失败、`validation` 已声明；
+    /// - `Reject`：需给出理由，任意未归档状态 → `rejected`；
+    /// - `Deprecate`：需给出理由，`candidate/active → deprecated`；
+    /// - `Restore`：`rejected/deprecated/archived → candidate`，历史保留。
+    ///
+    /// 所有流转都先写入旧版本快照再推进版本号；并发写用乐观锁，失败返回 `Conflict`。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn transition(
+        &self,
+        auth: &AuthCtx,
+        namespace: &str,
+        experience_id: Uuid,
+        action: ExperienceTransition,
+        reason: Option<&str>,
+        min_sources: usize,
+    ) -> Result<MemoryExperience> {
+        self.ensure_write(auth, namespace).await?;
+        let current = self
+            .store
+            .get_experience(namespace, experience_id)
+            .await?
+            .ok_or(HubError::NotFound)?;
+
+        let legal = match action {
+            ExperienceTransition::Verify => current.status == ExperienceStatus::Candidate,
+            ExperienceTransition::Reject => matches!(
+                current.status,
+                ExperienceStatus::Candidate
+                    | ExperienceStatus::Active
+                    | ExperienceStatus::Deprecated
+            ),
+            ExperienceTransition::Deprecate => current.status == ExperienceStatus::Active,
+            ExperienceTransition::Restore => matches!(
+                current.status,
+                ExperienceStatus::Rejected
+                    | ExperienceStatus::Deprecated
+                    | ExperienceStatus::Archived
+            ),
+        };
+        if !legal {
+            return Err(HubError::InvalidArgument(format!(
+                "不允许从状态 {} 执行 {} 流转",
+                current.status.as_str(),
+                action.as_str()
+            )));
+        }
+
+        let reason_trimmed = reason.map(str::trim).filter(|r| !r.is_empty());
+        if matches!(
+            action,
+            ExperienceTransition::Reject | ExperienceTransition::Deprecate
+        ) && reason_trimmed.is_none()
+        {
+            return Err(HubError::InvalidArgument(format!(
+                "{} 必须给出理由",
+                action.as_str()
+            )));
+        }
+
+        let source_count = if action == ExperienceTransition::Verify {
+            self.ensure_verifiable(namespace, &current, min_sources.max(1))
+                .await?
+        } else {
+            current.source_count
+        };
+
+        let prev_version = current.version;
+        let change_kind = match action {
+            ExperienceTransition::Verify => ExperienceChangeKind::Verified,
+            ExperienceTransition::Reject => ExperienceChangeKind::Rejected,
+            ExperienceTransition::Deprecate => ExperienceChangeKind::Deprecated,
+            ExperienceTransition::Restore => ExperienceChangeKind::Restored,
+        };
+
+        let mut updated = current.clone();
+        updated.status = action.target_status();
+        updated.status_reason = reason_trimmed.map(str::to_string);
+        updated.source_count = source_count;
+        updated.version = prev_version + 1;
+        updated.updated_at = Utc::now();
+        match action {
+            ExperienceTransition::Verify => {
+                updated.verified_at = Some(Utc::now());
+                updated.verified_by = Some(auth.agent_id.clone());
+                updated.verification_note = reason_trimmed.map(str::to_string);
+            }
+            ExperienceTransition::Reject | ExperienceTransition::Deprecate => {
+                // 当前状态的验证元数据清空；历史仍可在版本快照中追溯
+                updated.verified_at = None;
+                updated.verified_by = None;
+                updated.verification_note = None;
+            }
+            ExperienceTransition::Restore => {
+                updated.verified_at = None;
+                updated.verified_by = None;
+                updated.verification_note = None;
+            }
+        }
+
+        let saved = self
+            .store
+            .update_experience_if_version(&updated, prev_version)
+            .await?;
+
+        // 版本快照语义：**每个 version 恰好一行**，change_kind 记录该版本
+        // 因何产生。先更新再写快照，避免与已存在的上一版本快照撞唯一键
+        // （先写旧版本会被创建时的快照吞掉，导致流转动作在历史里不可见）。
+        self.append_snapshot(&saved, change_kind, &auth.agent_id, reason_trimmed)
+            .await?;
+
         Ok(saved)
     }
 
+    /// 验证条件校验：返回去重后的来源任务数
+    async fn ensure_verifiable(
+        &self,
+        namespace: &str,
+        experience: &MemoryExperience,
+        min_sources: usize,
+    ) -> Result<i64> {
+        let links = self
+            .store
+            .list_links_for_experience(namespace, experience.id)
+            .await?;
+        let distinct: std::collections::BTreeSet<Uuid> =
+            links.into_iter().map(|l| l.task_id).collect();
+
+        let mut completed = 0usize;
+        for task_id in &distinct {
+            let task = self
+                .store
+                .get_task(namespace, *task_id)
+                .await?
+                .ok_or_else(|| {
+                    HubError::InvalidArgument(format!("来源任务 {} 不存在，无法验证经验", task_id))
+                })?;
+            match task.status {
+                TaskStatus::Completed => completed += 1,
+                TaskStatus::Failed => {
+                    return Err(HubError::InvalidArgument(format!(
+                        "来源任务 {} 失败，不能据此验证经验",
+                        task_id
+                    )));
+                }
+                TaskStatus::Running | TaskStatus::Cancelled => {}
+            }
+        }
+
+        if completed < min_sources {
+            return Err(HubError::InvalidArgument(format!(
+                "验证至少需要 {} 个不同的已完成来源任务，当前为 {}",
+                min_sources, completed
+            )));
+        }
+
+        if !validation_declared(&experience.validation) {
+            return Err(HubError::InvalidArgument(
+                "验证方法未声明（validation 为空），不能升级为已验证经验".into(),
+            ));
+        }
+
+        Ok(distinct.len() as i64)
+    }
+
     /// 记录经验采用反馈（闭环迭代机制，负反馈降低权重，不硬删除）
+    ///
+    /// 任务书 4.3：**单次成功不能把候选提升为已验证**，因此正反馈只加
+    /// `feedback_score`，不改变状态。负反馈把分数压到阈值以下时标记
+    /// `deprecated`，并写入版本快照（状态变化必须可追溯）。
     pub async fn record_feedback(
         &self,
         auth: &AuthCtx,
         namespace: &str,
         experience_id: Uuid,
         is_success: bool,
-        _notes: Option<String>,
+        notes: Option<String>,
     ) -> Result<MemoryExperience> {
-        if !auth.has_scope(&Scope::Write) {
-            return Err(HubError::InsufficientScope);
-        }
-        let mut exp = self
+        self.ensure_write(auth, namespace).await?;
+        let current = self
             .store
             .get_experience(namespace, experience_id)
             .await?
             .ok_or(HubError::NotFound)?;
 
-        // 反馈只调整 feedback_score 一个因子：置信度反映"提炼时的可信度"，
-        // 此前两者同时被调整、又在打分区相乘，一次负反馈被放大成两次惩罚
-        if is_success {
-            exp.feedback_score = (exp.feedback_score + 0.1).clamp(0.0, 1.0);
-            if exp.status == ExperienceStatus::Candidate {
-                exp.status = ExperienceStatus::Active;
-            }
-        } else {
-            exp.feedback_score = (exp.feedback_score - 0.25).clamp(0.0, 1.0);
-            if exp.feedback_score < 0.3 {
-                exp.status = ExperienceStatus::Deprecated;
-            }
+        if matches!(
+            current.status,
+            ExperienceStatus::Rejected | ExperienceStatus::Archived
+        ) {
+            return Err(HubError::InvalidArgument(format!(
+                "状态为 {} 的经验不接受反馈",
+                current.status.as_str()
+            )));
         }
 
-        self.store.update_experience(&exp).await
+        let mut updated = current.clone();
+        if is_success {
+            updated.feedback_score = (updated.feedback_score + 0.1).clamp(0.0, 1.0);
+        } else {
+            updated.feedback_score = (updated.feedback_score - 0.25).clamp(0.0, 1.0);
+        }
+
+        let prev_version = current.version;
+        let becomes_deprecated = !is_success
+            && updated.feedback_score < 0.3
+            && updated.status != ExperienceStatus::Deprecated;
+        let note =
+            if becomes_deprecated {
+                Some(notes.unwrap_or_else(|| {
+                    format!("负反馈累计使反馈分降至 {:.2}", updated.feedback_score)
+                }))
+            } else {
+                None
+            };
+
+        if becomes_deprecated {
+            updated.status = ExperienceStatus::Deprecated;
+            updated.status_reason = note.clone();
+            updated.version = prev_version + 1;
+            updated.verified_at = None;
+            updated.verified_by = None;
+            updated.verification_note = None;
+        }
+
+        let saved = self
+            .store
+            .update_experience_if_version(&updated, prev_version)
+            .await?;
+
+        if becomes_deprecated {
+            // 状态变化必须留下对应版本的快照（与 transition 同一语义）
+            self.append_snapshot(
+                &saved,
+                ExperienceChangeKind::Deprecated,
+                &auth.agent_id,
+                note.as_deref(),
+            )
+            .await?;
+        }
+
+        Ok(saved)
     }
 
     /// 经验检索单页大小与单次扫描上限
@@ -388,9 +711,33 @@ impl WorkingMemoryService {
         limit: usize,
         strict_env: bool,
     ) -> Result<Vec<ExperienceSearchResult>> {
-        if !auth.has_scope(&Scope::Read) {
-            return Err(HubError::InsufficientScope);
-        }
+        self.search_experiences_governed(
+            auth,
+            namespace,
+            query,
+            ExperienceSearchOptions {
+                current_env,
+                limit,
+                strict_env,
+                include_statuses: None,
+            },
+        )
+        .await
+    }
+
+    /// 治理版经验检索：支持显式限定状态集合
+    ///
+    /// 默认（`include_statuses = None`）排除 `rejected` / `archived`，
+    /// 并按任务书 4.3.5 对未验证经验降权（active 1.0 / candidate 0.6 /
+    /// deprecated 0.3）。显式传入状态集合时按集合过滤（可用于审计检索）。
+    pub async fn search_experiences_governed(
+        &self,
+        auth: &AuthCtx,
+        namespace: &str,
+        query: &str,
+        options: ExperienceSearchOptions<'_>,
+    ) -> Result<Vec<ExperienceSearchResult>> {
+        self.ensure_read(auth, namespace).await?;
 
         let pool = self.scan_experiences(namespace).await?;
 
@@ -403,8 +750,11 @@ impl WorkingMemoryService {
 
         let mut results = Vec::new();
         for (exp, tokens) in pool.into_iter().zip(docs) {
-            // 归档经验不召回（弃用经验保留但由低反馈分自然降序）
-            if exp.status == ExperienceStatus::Archived {
+            let status_allowed = match options.include_statuses {
+                Some(allowed) => allowed.contains(&exp.status),
+                None => exp.status.searchable_by_default(),
+            };
+            if !status_allowed {
                 continue;
             }
 
@@ -417,13 +767,15 @@ impl WorkingMemoryService {
                 continue;
             }
 
-            // 置信度 × 反馈分：反馈只调 feedback_score 一个因子，无双重计分
-            let mut score = lexical * exp.confidence * exp.feedback_score;
+            // 置信度 × 反馈分 × 状态权重：反馈只调 feedback_score 一个因子，
+            // 状态权重表达“验证程度”，两者语义不同、不得互相替代
+            let mut score =
+                lexical * exp.confidence * exp.feedback_score * exp.status.retrieval_weight();
 
             // 环境边界校验
             let mut env_mismatch = false;
             let mut boundary_warning = None;
-            if let Some(env) = current_env {
+            if let Some(env) = options.current_env {
                 if !exp.boundary_envs.is_empty()
                     && !exp
                         .boundary_envs
@@ -435,7 +787,7 @@ impl WorkingMemoryService {
                         "当前环境 [{}] 与经验适用环境边界 {:?} 不匹配，需谨慎参考",
                         env, exp.boundary_envs
                     ));
-                    if strict_env {
+                    if options.strict_env {
                         // 严格模式：环境不匹配 = 不可用，直接拒绝。
                         // 降权只是排序提示，Agent 仍可能误取；有安全后果的场景
                         // 需要硬规则，而不是"排在后面"。
@@ -459,8 +811,30 @@ impl WorkingMemoryService {
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        results.truncate(limit.max(1));
+        results.truncate(options.limit.max(1));
         Ok(results)
+    }
+}
+
+/// 经验检索选项（治理版）
+#[derive(Debug, Clone, Copy)]
+pub struct ExperienceSearchOptions<'a> {
+    pub current_env: Option<&'a str>,
+    pub limit: usize,
+    pub strict_env: bool,
+    /// `None` = 默认可见状态（排除 rejected/archived）
+    pub include_statuses: Option<&'a [ExperienceStatus]>,
+}
+
+/// `validation` 是否已声明（非 null / 非空对象 / 非空数组 / 非空字符串）
+fn validation_declared(validation: &serde_json::Value) -> bool {
+    match validation {
+        serde_json::Value::Null => false,
+        serde_json::Value::Bool(b) => *b,
+        serde_json::Value::String(s) => !s.trim().is_empty(),
+        serde_json::Value::Array(a) => !a.is_empty(),
+        serde_json::Value::Object(o) => !o.is_empty(),
+        serde_json::Value::Number(_) => true,
     }
 }
 
@@ -638,7 +1012,7 @@ mod tests {
             .distill_experience(&auth, "test-ns", valid_candidate)
             .await
             .unwrap();
-        assert_eq!(exp.status, ExperienceStatus::Active);
+        assert_eq!(exp.status, ExperienceStatus::Candidate);
         assert_eq!(exp.feedback_score, 1.0);
     }
 
@@ -689,7 +1063,11 @@ mod tests {
             updated1.confidence, 0.85,
             "反馈不得再同时下调置信度（会被打分区相乘放大成双重惩罚）"
         );
-        assert_eq!(updated1.status, ExperienceStatus::Active);
+        assert_eq!(
+            updated1.status,
+            ExperienceStatus::Candidate,
+            "单次负反馈只降分，不改状态"
+        );
 
         // 再次多次负反馈触发降级 Deprecated
         let _updated2 = service
@@ -1000,6 +1378,13 @@ mod bench {
                 confidence: 0.9,
                 status: ExperienceStatus::Active,
                 feedback_score: 1.0,
+                version: 1,
+                superseded_by: None,
+                verified_at: None,
+                verified_by: None,
+                verification_note: None,
+                status_reason: None,
+                source_count: 0,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             })

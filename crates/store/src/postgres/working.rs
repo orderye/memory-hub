@@ -475,12 +475,13 @@ impl ExperienceStore for PostgresHubStore {
             insert into memory_experiences (
                 id, namespace, task, search_keys, solution, preconditions,
                 boundary_envs, failure_modes, validation, confidence, status,
-                feedback_score, created_at, updated_at
+                feedback_score, version, source_count, created_at, updated_at
             )
-            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now(), now())
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 1, 0, now(), now())
             returning id, namespace, task, search_keys, solution, preconditions,
                       boundary_envs, failure_modes, validation, confidence, status,
-                      feedback_score, created_at, updated_at
+                      feedback_score, version, superseded_by, verified_at, verified_by,
+                      verification_note, status_reason, source_count, created_at, updated_at
             "#,
         )
         .bind(id)
@@ -516,11 +517,19 @@ impl ExperienceStore for PostgresHubStore {
                 confidence = $10,
                 status = $11,
                 feedback_score = $12,
+                version = $13,
+                superseded_by = $14,
+                verified_at = $15,
+                verified_by = $16,
+                verification_note = $17,
+                status_reason = $18,
+                source_count = $19,
                 updated_at = now()
             where namespace = $1 and id = $2
             returning id, namespace, task, search_keys, solution, preconditions,
                       boundary_envs, failure_modes, validation, confidence, status,
-                      feedback_score, created_at, updated_at
+                      feedback_score, version, superseded_by, verified_at, verified_by,
+                      verification_note, status_reason, source_count, created_at, updated_at
             "#,
         )
         .bind(&exp.namespace)
@@ -535,6 +544,13 @@ impl ExperienceStore for PostgresHubStore {
         .bind(exp.confidence)
         .bind(exp.status.as_str())
         .bind(exp.feedback_score)
+        .bind(exp.version)
+        .bind(exp.superseded_by)
+        .bind(exp.verified_at)
+        .bind(&exp.verified_by)
+        .bind(&exp.verification_note)
+        .bind(&exp.status_reason)
+        .bind(exp.source_count)
         .fetch_optional(&self.pool)
         .await
         .pg()?;
@@ -545,12 +561,191 @@ impl ExperienceStore for PostgresHubStore {
         }
     }
 
+    /// 原子乐观并发更新：`where version = $expected` 不成立即 Conflict
+    async fn update_experience_if_version(
+        &self,
+        exp: &MemoryExperience,
+        expected_version: i64,
+    ) -> Result<MemoryExperience> {
+        let row = sqlx::query(
+            r#"
+            update memory_experiences
+            set task = $3,
+                search_keys = $4,
+                solution = $5,
+                preconditions = $6,
+                boundary_envs = $7,
+                failure_modes = $8,
+                validation = $9,
+                confidence = $10,
+                status = $11,
+                feedback_score = $12,
+                version = $13,
+                superseded_by = $14,
+                verified_at = $15,
+                verified_by = $16,
+                verification_note = $17,
+                status_reason = $18,
+                source_count = $19,
+                updated_at = now()
+            where namespace = $1 and id = $2 and version = $20
+            returning id, namespace, task, search_keys, solution, preconditions,
+                      boundary_envs, failure_modes, validation, confidence, status,
+                      feedback_score, version, superseded_by, verified_at, verified_by,
+                      verification_note, status_reason, source_count, created_at, updated_at
+            "#,
+        )
+        .bind(&exp.namespace)
+        .bind(exp.id)
+        .bind(&exp.task)
+        .bind(&exp.search_keys)
+        .bind(&exp.solution)
+        .bind(&exp.preconditions)
+        .bind(&exp.boundary_envs)
+        .bind(&exp.failure_modes)
+        .bind(&exp.validation)
+        .bind(exp.confidence)
+        .bind(exp.status.as_str())
+        .bind(exp.feedback_score)
+        .bind(exp.version)
+        .bind(exp.superseded_by)
+        .bind(exp.verified_at)
+        .bind(&exp.verified_by)
+        .bind(&exp.verification_note)
+        .bind(&exp.status_reason)
+        .bind(exp.source_count)
+        .bind(expected_version)
+        .fetch_optional(&self.pool)
+        .await
+        .pg()?;
+
+        match row {
+            Some(r) => Self::experience_from_row(&r),
+            None => {
+                let exists: bool = sqlx::query_scalar(
+                    "select exists(select 1 from memory_experiences where namespace = $1 and id = $2)",
+                )
+                .bind(&exp.namespace)
+                .bind(exp.id)
+                .fetch_one(&self.pool)
+                .await
+                .pg()?;
+                if exists {
+                    Err(HubError::Conflict)
+                } else {
+                    Err(HubError::NotFound)
+                }
+            }
+        }
+    }
+
+    async fn append_experience_version(
+        &self,
+        version: &NewExperienceVersion,
+    ) -> Result<ExperienceVersion> {
+        let id = version.id.unwrap_or_else(Uuid::new_v4);
+        let inserted = sqlx::query(
+            r#"
+            insert into memory_experience_versions (
+                id, experience_id, namespace, version, snapshot, change_kind,
+                changed_by, status, note, changed_at
+            )
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            on conflict (experience_id, version) do nothing
+            returning id, experience_id, namespace, version, snapshot, change_kind,
+                      changed_by, status, note, changed_at
+            "#,
+        )
+        .bind(id)
+        .bind(version.experience_id)
+        .bind(&version.namespace)
+        .bind(version.version)
+        .bind(&version.snapshot)
+        .bind(version.change_kind.as_str())
+        .bind(&version.changed_by)
+        .bind(version.status.as_str())
+        .bind(&version.note)
+        .bind(version.changed_at)
+        .fetch_optional(&self.pool)
+        .await
+        .pg()?;
+
+        if let Some(row) = inserted {
+            return Self::experience_version_from_row(&row);
+        }
+
+        // 幂等：同一 (experience_id, version) 已存在时返回既有快照
+        let row = sqlx::query(
+            r#"
+            select id, experience_id, namespace, version, snapshot, change_kind,
+                   changed_by, status, note, changed_at
+            from memory_experience_versions
+            where experience_id = $1 and version = $2
+            "#,
+        )
+        .bind(version.experience_id)
+        .bind(version.version)
+        .fetch_one(&self.pool)
+        .await
+        .pg()?;
+
+        Self::experience_version_from_row(&row)
+    }
+
+    async fn list_experience_versions(
+        &self,
+        namespace: &str,
+        experience_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<ExperienceVersion>> {
+        let rows = sqlx::query(
+            r#"
+            select id, experience_id, namespace, version, snapshot, change_kind,
+                   changed_by, status, note, changed_at
+            from memory_experience_versions
+            where namespace = $1 and experience_id = $2
+            order by version desc
+            limit $3
+            "#,
+        )
+        .bind(namespace)
+        .bind(experience_id)
+        .bind(limit.max(1) as i64)
+        .fetch_all(&self.pool)
+        .await
+        .pg()?;
+
+        rows.iter().map(Self::experience_version_from_row).collect()
+    }
+
+    async fn all_experience_versions_in_namespace(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<ExperienceVersion>> {
+        let rows = sqlx::query(
+            r#"
+            select id, experience_id, namespace, version, snapshot, change_kind,
+                   changed_by, status, note, changed_at
+            from memory_experience_versions
+            where namespace = $1
+            order by experience_id asc, version asc
+            "#,
+        )
+        .bind(namespace)
+        .fetch_all(&self.pool)
+        .await
+        .pg()?;
+
+        rows.iter().map(Self::experience_version_from_row).collect()
+    }
+
     async fn get_experience(&self, namespace: &str, id: Uuid) -> Result<Option<MemoryExperience>> {
         let row = sqlx::query(
             r#"
             select id, namespace, task, search_keys, solution, preconditions,
                    boundary_envs, failure_modes, validation, confidence, status,
-                   feedback_score, created_at, updated_at
+                   feedback_score, version, superseded_by, verified_at, verified_by,
+                   verification_note, status_reason, source_count, created_at, updated_at
             from memory_experiences
             where namespace = $1 and id = $2
             "#,
@@ -572,7 +767,7 @@ impl ExperienceStore for PostgresHubStore {
         offset: usize,
     ) -> Result<Vec<MemoryExperience>> {
         let mut builder: sqlx::QueryBuilder<'_, sqlx::Postgres> = sqlx::QueryBuilder::new(
-            "select id, namespace, task, search_keys, solution, preconditions, boundary_envs, failure_modes, validation, confidence, status, feedback_score, created_at, updated_at from memory_experiences where namespace = ",
+            "select id, namespace, task, search_keys, solution, preconditions, boundary_envs, failure_modes, validation, confidence, status, feedback_score, version, superseded_by, verified_at, verified_by, verification_note, status_reason, source_count, created_at, updated_at from memory_experiences where namespace = ",
         );
         builder.push_bind(namespace);
 
@@ -666,7 +861,8 @@ impl ExperienceStore for PostgresHubStore {
             r#"
             select id, namespace, task, search_keys, solution, preconditions,
                     boundary_envs, failure_modes, validation, confidence, status,
-                    feedback_score, created_at, updated_at
+                    feedback_score, version, superseded_by, verified_at, verified_by,
+                    verification_note, status_reason, source_count, created_at, updated_at
             from memory_experiences
             where namespace = $1
             order by created_at asc, id asc

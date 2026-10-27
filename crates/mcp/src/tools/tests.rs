@@ -868,6 +868,7 @@ async fn test_working_memory_tools_lifecycle_and_scope() {
                 "preconditions": ["linux环境"],
                 "boundary_envs": ["os:linux"],
                 "failure_modes": ["未安装调试符号"],
+                "validation": "heaptrack 确认泄漏点并复测通过",
                 "confidence": 0.95,
             })),
         )
@@ -887,7 +888,6 @@ async fn test_working_memory_tools_lifecycle_and_scope() {
                 "namespace": "work-ns",
                 "experience_id": exp_id,
                 "score": 1.0,
-                "status": "active",
             })),
         )
         .await;

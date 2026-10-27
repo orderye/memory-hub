@@ -9,12 +9,13 @@ use chrono::{DateTime, Utc};
 use common::{AccountId, AgentId, HubError, Result};
 use mem_core::{
     AccountRecord, BackupRecord, CodingRevision, CodingStore, CodingThread,
-    CognitiveProposalRecord, CognitiveProposalStatus, EvidenceSourceKind, ExperienceStatus,
-    IntegrationProposal, MemoryEntry, MemoryEvidence, MemoryExperience, MemoryFilter,
-    MemoryRelation, MemoryRelationKind, MemoryStats, MemoryStatus, MemoryTask,
-    MemoryTaskExperience, MemoryVersion, Namespace, NamespaceGrantRecord, NamespaceInfo,
-    NewCodingRevision, NewCodingThread, NewEvidence, NewMemoryExperience, NewMemoryRelation,
-    NewMemoryTask, ProposalStatus, Scored, SessionRecord, TaskStatus, VersionChange,
+    CognitiveProposalRecord, CognitiveProposalStatus, CollectionBinding, EvidenceSourceKind,
+    ExperienceStatus, ExperienceVersion, IntegrationProposal, MemoryCollection, MemoryEntry,
+    MemoryEvidence, MemoryExperience, MemoryFilter, MemoryRelation, MemoryRelationKind,
+    MemoryStats, MemoryStatus, MemoryTask, MemoryTaskExperience, MemoryVersion, Namespace,
+    NamespaceGrantRecord, NamespaceInfo, NewCodingRevision, NewCodingThread, NewEvidence,
+    NewExperienceVersion, NewMemoryExperience, NewMemoryRelation, NewMemoryTask, ProposalStatus,
+    Scored, SessionRecord, TaskStatus, VersionChange,
 };
 use std::collections::BTreeMap;
 use std::sync::RwLock;
@@ -33,6 +34,7 @@ pub struct InMemoryHubStore {
     relations: RwLock<BTreeMap<RelationKey, RelationEntry>>,
     tasks: RwLock<BTreeMap<(Namespace, Uuid), MemoryTask>>,
     experiences: RwLock<BTreeMap<(Namespace, Uuid), MemoryExperience>>,
+    experience_versions: RwLock<BTreeMap<(Uuid, i64), ExperienceVersion>>,
     task_experiences: RwLock<Vec<(Namespace, MemoryTaskExperience)>>,
     coding_threads: RwLock<BTreeMap<(Namespace, Uuid), CodingThread>>,
     coding_revisions: RwLock<BTreeMap<(Namespace, Uuid), CodingRevision>>,
@@ -41,6 +43,8 @@ pub struct InMemoryHubStore {
     cognitive_proposals: RwLock<BTreeMap<Uuid, CognitiveProposalRecord>>,
     namespaces: RwLock<BTreeMap<Namespace, NamespaceInfo>>,
     grants: RwLock<Vec<NamespaceGrantRecord>>,
+    collections: RwLock<Vec<MemoryCollection>>,
+    collection_bindings: RwLock<Vec<CollectionBinding>>,
     agents: RwLock<BTreeMap<AgentId, StoredAgent>>,
     accounts: RwLock<BTreeMap<AccountId, StoredAccount>>,
     /// sha256(会话令牌) → 会话
@@ -208,6 +212,7 @@ mod tests;
 mod access;
 mod backup;
 mod coding;
+mod collections;
 mod integration;
 mod memory;
 mod working;

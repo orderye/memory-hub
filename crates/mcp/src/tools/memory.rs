@@ -117,7 +117,10 @@ impl ToolDispatcher {
     pub(super) async fn search(&self, auth: &AuthCtx, args: Value) -> ToolCallResult {
         #[derive(Deserialize)]
         struct Req {
-            namespace: String,
+            #[serde(default)]
+            namespace: Option<String>,
+            #[serde(default)]
+            collection: Option<String>,
             #[serde(default)]
             query_text: String,
             #[serde(default)]
@@ -142,65 +145,172 @@ impl ToolDispatcher {
         fn default_top_k() -> usize {
             10
         }
-        match serde_json::from_value::<Req>(args) {
-            Ok(req) => {
-                let q = mem_core::SearchQuery {
-                    namespace: req.namespace,
-                    query_text: req.query_text,
-                    kinds: req.kinds,
-                    tags: req.tags,
-                    top_k: req.top_k,
-                    include_archived: req.include_archived,
-                    min_score: req.min_score,
-                    scene: req.scene,
-                    layer: req.layer,
-                    valid_at: req.valid_at,
-                    include_superseded: req.include_superseded,
-                };
-                match self.memory.search(auth, q).await {
-                    Ok(results) => {
-                        let items: Vec<Value> = results
-                            .into_iter()
-                            .map(|s| {
-                                json!({
-                                    "score": s.score,
-                                    "memory": strip_embedding(
-                                        serde_json::to_value(&s.item).unwrap_or(Value::Null)
-                                    ),
-                                })
-                            })
-                            .collect();
-                        // 空结果必须**显式**表达"无可靠匹配"，而不是让调用方
-                        // 把"空数组"误读成"库里没有这条记忆"或"检索坏了"。
-                        // 长期记忆里，一个域外查询硬凑一条低分结果，
-                        // 比明确说"没有"更容易把错误事实写进 Agent 的上下文。
-                        let no_reliable_match = items.is_empty();
-                        ToolCallResult::success(json!({
-                            "results": items,
-                            // 能力声明（追加字段，不改动既有键）：调用方必须能区分
-                            // "检索为纯关键词模式" 与 "向量服务临时故障降级"
-                            "capabilities": {
-                                "semantic_ready": self.semantic_ready(),
-                                "vector_path_enabled": self.vector_path_enabled(),
-                                "keyword_only": !self.vector_path_enabled(),
-                            },
-                            "no_reliable_match": no_reliable_match,
-                            "reason": if no_reliable_match {
-                                "没有达到最小可信分的候选：本次检索未找到可靠匹配，\
-                                 请勿据此编造事实（可放宽 min_score 或调整查询后重试）"
-                            } else {
-                                ""
-                            },
-                        }))
+
+        let req = match serde_json::from_value::<Req>(args) {
+            Ok(req) => req,
+            Err(e) => {
+                return ToolCallResult::error(&HubError::InvalidArgument(format!(
+                    "参数不符合 memory_search schema: {}",
+                    e
+                )));
+            }
+        };
+
+        // 解析检索范围：namespace 与 collection 必须且只能提供一个
+        let (namespaces, filter) = match (req.namespace.clone(), req.collection.clone()) {
+            (Some(ns), None) => (vec![ns], None),
+            (None, Some(name)) => match self.collections().resolve(auth, &name).await {
+                Ok(resolved) => (
+                    resolved.resolved_namespaces,
+                    Some(resolved.collection.filter),
+                ),
+                Err(e) => return ToolCallResult::error(&e),
+            },
+            _ => {
+                return ToolCallResult::error(&HubError::InvalidArgument(
+                    "namespace 与 collection 必须且只能提供一个".into(),
+                ));
+            }
+        };
+
+        let mut skipped: Vec<String> = Vec::new();
+        let mut merged: Vec<(f32, mem_core::MemoryEntry)> = Vec::new();
+        let mut experiences: Vec<Value> = Vec::new();
+        // 只有集合扇出才把无权限命名空间降级为 skipped；
+        // 显式单命名空间请求必须 fail closed（返回错误），否则撤销授权后会静默变成空结果。
+        let fan_out = req.collection.is_some();
+
+        for ns in &namespaces {
+            let q = mem_core::SearchQuery {
+                namespace: ns.clone(),
+                query_text: req.query_text.clone(),
+                kinds: merge_kind_filter(req.kinds.as_deref(), filter.as_ref()),
+                tags: merge_tag_filter(req.tags.as_deref(), filter.as_ref()),
+                top_k: req.top_k.clamp(1, 50),
+                include_archived: req.include_archived
+                    || filter
+                        .as_ref()
+                        .map(|f| f.statuses.contains(&mem_core::MemoryStatus::Archived))
+                        .unwrap_or(false),
+                min_score: req.min_score,
+                scene: match (req.scene, filter.as_ref().and_then(|f| f.scene)) {
+                    (Some(a), Some(b)) if a != b => {
+                        // 集合与请求声明了不同场景：交集为空，该命名空间不产出结果
+                        continue;
                     }
-                    Err(e) => ToolCallResult::error(&e),
+                    (Some(a), _) => Some(a),
+                    (None, b) => b,
+                },
+                layer: match (req.layer, filter.as_ref().and_then(|f| f.layer)) {
+                    (Some(a), Some(b)) if a != b => continue,
+                    (Some(a), _) => Some(a),
+                    (None, b) => b,
+                },
+                valid_at: req.valid_at,
+                include_superseded: req.include_superseded,
+            };
+            match self.memory.search(auth, q).await {
+                Ok(results) => {
+                    for s in results {
+                        if let Some(f) = &filter {
+                            if !f.statuses.is_empty() && !f.statuses.contains(&s.item.status) {
+                                continue;
+                            }
+                        }
+                        merged.push((s.score, s.item));
+                    }
+                }
+                Err(HubError::InsufficientScope) if fan_out => skipped.push(ns.clone()),
+                Err(e) => return ToolCallResult::error(&e),
+            }
+
+            // 集合显式包含经验时，同一范围内附带经验检索（分数体系不同，单独返回）
+            if let Some(f) = &filter {
+                if f.include_experiences {
+                    let service = self
+                        .working_memory
+                        .clone()
+                        .unwrap_or_else(|| {
+                            Arc::new(mem_core::WorkingMemoryService::new(self.store.clone()))
+                        })
+                        .scoped(auth.account_id);
+                    match service
+                        .search_experiences_governed(
+                            auth,
+                            ns,
+                            &req.query_text,
+                            mem_core::ExperienceSearchOptions {
+                                current_env: None,
+                                limit: req.top_k.clamp(1, 50),
+                                strict_env: false,
+                                include_statuses: if f.experience_statuses.is_empty() {
+                                    None
+                                } else {
+                                    Some(f.experience_statuses.as_slice())
+                                },
+                            },
+                        )
+                        .await
+                    {
+                        Ok(rows) => experiences.extend(rows.into_iter().map(|r| {
+                            json!({
+                                "namespace": ns,
+                                "score": r.score,
+                                "env_mismatch": r.env_mismatch,
+                                "boundary_warning": r.boundary_warning,
+                                "experience": r.experience,
+                            })
+                        })),
+                        Err(HubError::InsufficientScope) => {
+                            if !skipped.contains(ns) {
+                                skipped.push(ns.clone());
+                            }
+                        }
+                        Err(e) => return ToolCallResult::error(&e),
+                    }
                 }
             }
-            Err(e) => ToolCallResult::error(&HubError::InvalidArgument(format!(
-                "参数不符合 memory_search schema: {}",
-                e
-            ))),
         }
+
+        merged.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        merged.truncate(req.top_k.clamp(1, 50));
+        let items: Vec<Value> = merged
+            .into_iter()
+            .map(|(score, item)| {
+                json!({
+                    "score": score,
+                    "memory": strip_embedding(
+                        serde_json::to_value(&item).unwrap_or(Value::Null)
+                    ),
+                })
+            })
+            .collect();
+
+        // 空结果必须**显式**表达"无可靠匹配"，而不是让调用方
+        // 把"空数组"误读成"库里没有这条记忆"或"检索坏了"。
+        let no_reliable_match = items.is_empty();
+        ToolCallResult::success(json!({
+            "results": items,
+            "experiences": experiences,
+            "scope": {
+                "namespaces": namespaces,
+                "skipped_namespaces": skipped,
+                "collection": req.collection,
+            },
+            // 能力声明（追加字段，不改动既有键）
+            "capabilities": {
+                "semantic_ready": self.semantic_ready(),
+                "vector_path_enabled": self.vector_path_enabled(),
+                "keyword_only": !self.vector_path_enabled(),
+            },
+            "no_reliable_match": no_reliable_match,
+            "reason": if no_reliable_match {
+                "没有达到最小可信分的候选：本次检索未找到可靠匹配，\
+                 请勿据此编造事实（可放宽 min_score 或调整查询后重试）"
+            } else {
+                ""
+            },
+        }))
     }
 
     pub(super) async fn list(&self, auth: &AuthCtx, args: Value) -> ToolCallResult {
@@ -263,5 +373,55 @@ impl ToolDispatcher {
                 e
             ))),
         }
+    }
+}
+
+/// 集合过滤器与请求 kinds 取交集（两者都是“硬边界”，请求只能进一步收窄）
+fn merge_kind_filter(
+    requested: Option<&[mem_core::MemoryKind]>,
+    filter: Option<&mem_core::CollectionFilter>,
+) -> Option<Vec<mem_core::MemoryKind>> {
+    match (requested, filter) {
+        (None, None) => None,
+        (Some(r), None) => Some(r.to_vec()),
+        (None, Some(f)) => {
+            if f.kinds.is_empty() {
+                None
+            } else {
+                Some(f.kinds.clone())
+            }
+        }
+        (Some(r), Some(f)) => {
+            if f.kinds.is_empty() {
+                Some(r.to_vec())
+            } else {
+                Some(
+                    r.iter()
+                        .filter(|k| f.kinds.contains(*k))
+                        .copied()
+                        .collect::<Vec<_>>(),
+                )
+            }
+        }
+    }
+}
+
+/// 集合标签与请求标签合并：两者都是“必须包含”，取并集去重
+fn merge_tag_filter(
+    requested: Option<&[String]>,
+    filter: Option<&mem_core::CollectionFilter>,
+) -> Option<Vec<String>> {
+    let mut tags: Vec<String> = requested.map(|t| t.to_vec()).unwrap_or_default();
+    if let Some(f) = filter {
+        for tag in &f.tags {
+            if !tags.contains(tag) {
+                tags.push(tag.clone());
+            }
+        }
+    }
+    if tags.is_empty() {
+        None
+    } else {
+        Some(tags)
     }
 }

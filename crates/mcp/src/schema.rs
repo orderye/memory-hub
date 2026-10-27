@@ -1,6 +1,7 @@
 //! MCP 工具 JSON Schema 规范定义
 //!
-//! 28 个工具全部只做三件事：**存储**、**备份**、**整合**。
+//! 38 个工具覆盖**存储**、**备份**、**整合**，以及认知记忆（Chat/Working/Coding）
+//! 与 Agent 记忆集合治理。
 //! 每个 schema 都关闭 `additionalProperties` 并给出边界约束——
 //! 这是与调用方 Agent 的契约：schema 之外的字段一律拒绝。
 
@@ -39,10 +40,66 @@ fn ns_prop() -> Value {
     })
 }
 
+/// 记忆集合过滤器 schema（任务书 4.4）
+fn collection_filter_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["namespaces"],
+        "additionalProperties": false,
+        "properties": {
+            "namespaces": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 20,
+                "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "pattern": "^[a-z0-9._-]+$"
+                },
+                "description": "显式命名空间列表；禁止 '*'（绑定不得成为全量授权）"
+            },
+            "scene": {
+                "enum": ["chat", "working", "coding"],
+                "description": "记忆场景过滤（省略 = 不限）"
+            },
+            "layer": {
+                "enum": ["raw", "fact", "summary", "identity", "knowledge", "schema", "intention"],
+                "description": "认知层级过滤（省略 = 不限）"
+            },
+            "kinds": {
+                "type": "array",
+                "items": { "enum": ["fact", "preference", "episode", "note", "skill", "procedure"] },
+                "description": "记忆类型过滤（空 = 不限）"
+            },
+            "tags": {
+                "type": "array",
+                "items": { "type": "string", "minLength": 1, "maxLength": 128 },
+                "description": "标签过滤（空 = 不限）"
+            },
+            "statuses": {
+                "type": "array",
+                "items": { "enum": ["active", "archived", "merged"] },
+                "description": "记忆状态过滤（空 = 仅 active）"
+            },
+            "include_experiences": {
+                "type": "boolean",
+                "default": false,
+                "description": "是否把 Working 经验纳入集合检索"
+            },
+            "experience_statuses": {
+                "type": "array",
+                "items": { "enum": ["candidate", "active", "deprecated", "rejected", "archived"] },
+                "description": "经验状态过滤（空 = 默认可见状态）"
+            }
+        }
+    })
+}
+
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-/// 全局缓存：28 个 ToolDefinition 仅构建一次
+/// 全局缓存：38 个 ToolDefinition 仅构建一次
 static TOOL_DEFINITIONS: OnceLock<Vec<ToolDefinition>> = OnceLock::new();
 
 /// 全局缓存：工具名 → 作用域的快速查找表
@@ -185,10 +242,15 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
             required_scope: "memory:read",
             input_schema: json!({
                 "type": "object",
-                "required": ["namespace"],
                 "additionalProperties": false,
                 "properties": {
                     "namespace": ns_prop(),
+                    "collection": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 64,
+                        "description": "记忆集合名（与 namespace 互斥）：按集合声明的命名空间与过滤条件检索，结果仍受实时 ACL 约束"
+                    },
                     "query_text": {
                         "type": "string",
                         "maxLength": 2048,
@@ -566,6 +628,95 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
                 }
             }),
         },
+        // ===== Agent 记忆集合（任务书 4.4）=====
+        ToolDefinition {
+            name: "memory_collection_upsert",
+            description: "新建或更新 Agent 记忆集合（账户级配置）。集合只收窄候选范围，不授予任何权限；命名空间必须显式列出且禁止 '*'。",
+            read_only: false,
+            destructive: false,
+            idempotent: true,
+            required_scope: "memory:admin",
+            input_schema: json!({
+                "type": "object",
+                "required": ["name", "filter"],
+                "additionalProperties": false,
+                "properties": {
+                    "id": { "type": "string", "format": "uuid", "description": "更新既有集合时提供" },
+                    "name": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 64,
+                        "pattern": "^[a-z0-9._-]+$",
+                        "description": "集合名（账户内唯一）"
+                    },
+                    "description": { "type": "string", "maxLength": 512 },
+                    "filter": collection_filter_schema()
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "memory_collection_list",
+            description: "列出当前账户的全部记忆集合与绑定关系（管理视图）。",
+            read_only: true,
+            destructive: false,
+            idempotent: true,
+            required_scope: "memory:admin",
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {}
+            }),
+        },
+        ToolDefinition {
+            name: "memory_collection_delete",
+            description: "删除记忆集合。级联删除绑定，但绝不删除任何记忆。",
+            read_only: false,
+            destructive: true,
+            idempotent: true,
+            required_scope: "memory:admin",
+            input_schema: json!({
+                "type": "object",
+                "required": ["collection_id"],
+                "additionalProperties": false,
+                "properties": {
+                    "collection_id": { "type": "string", "format": "uuid" }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "memory_collection_bind",
+            description: "把集合绑定到某个 Agent。绑定只决定候选范围，实际读取仍走原有 ACL；解绑立即生效。",
+            read_only: false,
+            destructive: false,
+            idempotent: true,
+            required_scope: "memory:admin",
+            input_schema: json!({
+                "type": "object",
+                "required": ["collection_id", "agent_id"],
+                "additionalProperties": false,
+                "properties": {
+                    "collection_id": { "type": "string", "format": "uuid" },
+                    "agent_id": { "type": "string", "minLength": 1, "maxLength": 128 }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "memory_collection_unbind",
+            description: "解除集合与 Agent 的绑定（立即生效，不删除任何记忆）。",
+            read_only: false,
+            destructive: false,
+            idempotent: true,
+            required_scope: "memory:admin",
+            input_schema: json!({
+                "type": "object",
+                "required": ["collection_id", "agent_id"],
+                "additionalProperties": false,
+                "properties": {
+                    "collection_id": { "type": "string", "format": "uuid" },
+                    "agent_id": { "type": "string", "minLength": 1, "maxLength": 128 }
+                }
+            }),
+        },
         // ===== 认知增强：对话提炼与提案审核 =====
         ToolDefinition {
             name: "cognitive_chat_propose",
@@ -809,7 +960,7 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "working_experience_feedback",
-            description: "对沉淀的经验记忆提供效用反馈评分与状态演化（成功加分、踩坑减分）。",
+            description: "对沉淀的经验记忆提供效用反馈评分（成功加分、踩坑减分）；只调反馈分，不改变生命周期状态。",
             read_only: false,
             destructive: false,
             idempotent: true,
@@ -830,10 +981,63 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
                         "minimum": -1,
                         "maximum": 1,
                         "description": "反馈评分（+1 验证有效，-1 产生故障，0 中立）"
+                    }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "working_experience_transition",
+            description: "经验资产状态流转：verify（候选→已验证，需满足来源任务数与验证方法门槛）、reject（需理由）、deprecate（需理由）、restore（回到候选，保留历史）。状态变更写入版本快照，不允许绕过。",
+            read_only: false,
+            destructive: false,
+            idempotent: false,
+            required_scope: "memory:write",
+            input_schema: json!({
+                "type": "object",
+                "required": ["namespace", "experience_id", "action"],
+                "additionalProperties": false,
+                "properties": {
+                    "namespace": ns_prop(),
+                    "experience_id": {
+                        "type": "string",
+                        "format": "uuid",
+                        "description": "经验 UUID"
                     },
-                    "status": {
-                        "enum": ["candidate", "active", "deprecated", "archived"],
-                        "description": "可选更新经验生命周期状态"
+                    "action": {
+                        "enum": ["verify", "reject", "deprecate", "restore"],
+                        "description": "verify 需要至少 N 个不同的已完成来源任务且 validation 已声明；reject/deprecate 必须给出 reason"
+                    },
+                    "reason": {
+                        "type": "string",
+                        "maxLength": 2048,
+                        "description": "流转理由（reject/deprecate 必填；verify 时作为验证说明）"
+                    }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "working_experience_history",
+            description: "读取经验资产的版本历史（只追加快照，含状态、变更类型与变更人）。",
+            read_only: true,
+            destructive: false,
+            idempotent: true,
+            required_scope: "memory:read",
+            input_schema: json!({
+                "type": "object",
+                "required": ["namespace", "experience_id"],
+                "additionalProperties": false,
+                "properties": {
+                    "namespace": ns_prop(),
+                    "experience_id": {
+                        "type": "string",
+                        "format": "uuid",
+                        "description": "经验 UUID"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "default": 20
                     }
                 }
             }),
@@ -847,10 +1051,16 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
             required_scope: "memory:read",
             input_schema: json!({
                 "type": "object",
-                "required": ["namespace", "query"],
+                "required": ["query"],
                 "additionalProperties": false,
                 "properties": {
                     "namespace": ns_prop(),
+                    "collection": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 64,
+                        "description": "记忆集合名（与 namespace 互斥）：仅在集合声明且有权访问的命名空间中检索经验"
+                    },
                     "query": {
                         "type": "string",
                         "minLength": 1,
@@ -866,6 +1076,13 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
                         "type": "boolean",
                         "default": false,
                         "description": "严格环境边界：环境不匹配的经验直接不返回（默认 false = 仅降权并告警）。有安全后果的场景应开启——降权只是排序提示，硬拒绝才是规则"
+                    },
+                    "include_statuses": {
+                        "type": "array",
+                        "items": {
+                            "enum": ["candidate", "active", "deprecated", "rejected", "archived"]
+                        },
+                        "description": "显式限定经验状态（审计用）。缺省时排除 rejected/archived，且 candidate 排序权重低于 active"
                     },
                     "top_k": {
                         "type": "integer",
@@ -1003,6 +1220,62 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
                 }
             }),
         },
+        // ===== 认知增强：Coding 只读查询 =====
+        ToolDefinition {
+            name: "coding_thread_list",
+            description: "列出代码演进线程（按仓库过滤，按更新时间倒序）。",
+            read_only: true,
+            destructive: false,
+            idempotent: true,
+            required_scope: "memory:read",
+            input_schema: json!({
+                "type": "object",
+                "required": ["namespace"],
+                "additionalProperties": false,
+                "properties": {
+                    "namespace": ns_prop(),
+                    "repository": { "type": "string", "maxLength": 256 },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 50 }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "coding_revision_list",
+            description: "列出代码修订：按线程（thread_id）或按文件（repository + file_path）查询，用于重建演化链与回滚历史。",
+            read_only: true,
+            destructive: false,
+            idempotent: true,
+            required_scope: "memory:read",
+            input_schema: json!({
+                "type": "object",
+                "required": ["namespace"],
+                "additionalProperties": false,
+                "properties": {
+                    "namespace": ns_prop(),
+                    "thread_id": { "type": "string", "format": "uuid" },
+                    "repository": { "type": "string", "maxLength": 256 },
+                    "file_path": { "type": "string", "maxLength": 1024 },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 50 }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "coding_revision_get",
+            description: "按 ID 读取单条代码修订快照（含真实 diff 与溯源字段）。",
+            read_only: true,
+            destructive: false,
+            idempotent: true,
+            required_scope: "memory:read",
+            input_schema: json!({
+                "type": "object",
+                "required": ["namespace", "revision_id"],
+                "additionalProperties": false,
+                "properties": {
+                    "namespace": ns_prop(),
+                    "revision_id": { "type": "string", "format": "uuid" }
+                }
+            }),
+        },
     ]
     })
 }
@@ -1014,7 +1287,11 @@ mod tests {
     #[test]
     fn test_tool_count_and_names() {
         let defs = get_tool_definitions();
-        assert_eq!(defs.len(), 28, "共应有 18 个基础工具 + 10 个认知增强工具");
+        assert_eq!(
+            defs.len(),
+            38,
+            "共应有 18 个基础工具 + 15 个认知工具 + 5 个集合治理工具"
+        );
         let names: Vec<&str> = defs.iter().map(|d| d.name).collect();
         // 原有 18 个基础工具 100% 保留
         for expected in [
@@ -1049,8 +1326,18 @@ mod tests {
             "working_experience_distill",
             "working_experience_feedback",
             "working_experience_search",
+            "working_experience_transition",
+            "working_experience_history",
             "coding_thread_create",
+            "coding_thread_list",
             "coding_revision_record",
+            "coding_revision_list",
+            "coding_revision_get",
+            "memory_collection_upsert",
+            "memory_collection_list",
+            "memory_collection_delete",
+            "memory_collection_bind",
+            "memory_collection_unbind",
         ] {
             assert!(names.contains(&expected), "认知增强工具缺少: {}", expected);
         }

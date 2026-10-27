@@ -11,7 +11,7 @@ use crate::account_scope::AccountScopedStore;
 use crate::domain::{
     validate_coding_revision, CodingRevision, CodingThread, NewCodingRevision, NewCodingThread,
 };
-use crate::infra::MemoryHubStore;
+use crate::infra::{AccessChecker, MemoryHubStore};
 use common::{AccountId, AuthCtx, HubError, Result, Scope};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -20,18 +20,54 @@ use uuid::Uuid;
 /// Coding 代码演进记忆服务
 pub struct CodingMemoryService {
     store: Arc<dyn MemoryHubStore>,
+    /// 命名空间级访问控制（生产必须注入；None 仅用于单测/纯库嵌入）
+    access: Option<Arc<dyn AccessChecker>>,
 }
 
 impl CodingMemoryService {
     pub fn new(store: Arc<dyn MemoryHubStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            access: None,
+        }
+    }
+
+    /// 注入命名空间 ACL 检查器（生产必须调用）
+    pub fn with_access(mut self, access: Arc<dyn AccessChecker>) -> Self {
+        self.access = Some(access);
+        self
     }
 
     /// 切换底层作用域存储（账户沙箱化）
     pub fn scoped(&self, account_id: AccountId) -> Self {
         Self {
             store: Arc::new(AccountScopedStore::new(self.store.clone(), account_id)),
+            access: self.access.clone(),
         }
+    }
+
+    async fn ensure_read(&self, auth: &AuthCtx, namespace: &str) -> Result<()> {
+        if !auth.has_scope(&Scope::Read) {
+            return Err(HubError::InsufficientScope);
+        }
+        if let Some(access) = &self.access {
+            if !access.can_read(auth, namespace).await? {
+                return Err(HubError::InsufficientScope);
+            }
+        }
+        Ok(())
+    }
+
+    async fn ensure_write(&self, auth: &AuthCtx, namespace: &str) -> Result<()> {
+        if !auth.has_scope(&Scope::Write) {
+            return Err(HubError::InsufficientScope);
+        }
+        if let Some(access) = &self.access {
+            if !access.can_write(auth, namespace).await? {
+                return Err(HubError::InsufficientScope);
+            }
+        }
+        Ok(())
     }
 
     /// 创建代码演进逻辑线程
@@ -40,9 +76,7 @@ impl CodingMemoryService {
         auth: &AuthCtx,
         thread: NewCodingThread,
     ) -> Result<CodingThread> {
-        if !auth.has_scope(&Scope::Write) {
-            return Err(HubError::InsufficientScope);
-        }
+        self.ensure_write(auth, &thread.namespace).await?;
         let repo = thread.repository.trim();
         if repo.is_empty() {
             return Err(HubError::InvalidArgument("仓库标识不能为空".into()));
@@ -65,9 +99,7 @@ impl CodingMemoryService {
         namespace: &str,
         id: Uuid,
     ) -> Result<Option<CodingThread>> {
-        if !auth.has_scope(&Scope::Read) {
-            return Err(HubError::InsufficientScope);
-        }
+        self.ensure_read(auth, namespace).await?;
         self.store.get_thread(namespace, id).await
     }
 
@@ -79,9 +111,7 @@ impl CodingMemoryService {
         repository: Option<&str>,
         limit: usize,
     ) -> Result<Vec<CodingThread>> {
-        if !auth.has_scope(&Scope::Read) {
-            return Err(HubError::InsufficientScope);
-        }
+        self.ensure_read(auth, namespace).await?;
         self.store
             .list_threads(namespace, repository, limit.max(1))
             .await
@@ -93,9 +123,7 @@ impl CodingMemoryService {
         auth: &AuthCtx,
         revision: NewCodingRevision,
     ) -> Result<CodingRevision> {
-        if !auth.has_scope(&Scope::Write) {
-            return Err(HubError::InsufficientScope);
-        }
+        self.ensure_write(auth, &revision.namespace).await?;
 
         // 1. 安全过滤门槛校验
         validate_coding_revision(&revision)?;
@@ -137,9 +165,7 @@ impl CodingMemoryService {
         namespace: &str,
         id: Uuid,
     ) -> Result<Option<CodingRevision>> {
-        if !auth.has_scope(&Scope::Read) {
-            return Err(HubError::InsufficientScope);
-        }
+        self.ensure_read(auth, namespace).await?;
         self.store.get_revision(namespace, id).await
     }
 
@@ -151,9 +177,7 @@ impl CodingMemoryService {
         thread_id: Uuid,
         limit: usize,
     ) -> Result<Vec<CodingRevision>> {
-        if !auth.has_scope(&Scope::Read) {
-            return Err(HubError::InsufficientScope);
-        }
+        self.ensure_read(auth, namespace).await?;
         self.store
             .list_revisions_for_thread(namespace, thread_id, limit.max(1))
             .await
@@ -168,9 +192,7 @@ impl CodingMemoryService {
         file_path: &str,
         limit: usize,
     ) -> Result<Vec<CodingRevision>> {
-        if !auth.has_scope(&Scope::Read) {
-            return Err(HubError::InsufficientScope);
-        }
+        self.ensure_read(auth, namespace).await?;
         self.store
             .list_revisions_for_file(namespace, repository, file_path, limit.max(1))
             .await

@@ -314,6 +314,13 @@ impl mem_core::infra::ExperienceStore for InMemoryHubStore {
             confidence: exp.confidence,
             status: exp.status,
             feedback_score: exp.feedback_score,
+            version: 1,
+            superseded_by: None,
+            verified_at: None,
+            verified_by: None,
+            verification_note: None,
+            status_reason: None,
+            source_count: 0,
             created_at: now,
             updated_at: now,
         };
@@ -332,6 +339,81 @@ impl mem_core::infra::ExperienceStore for InMemoryHubStore {
         updated.updated_at = Utc::now();
         w.insert(key, updated.clone());
         Ok(updated)
+    }
+
+    async fn update_experience_if_version(
+        &self,
+        exp: &MemoryExperience,
+        expected_version: i64,
+    ) -> Result<MemoryExperience> {
+        let mut w = self.experiences.write().unwrap();
+        let key = (exp.namespace.clone(), exp.id);
+        match w.get(&key) {
+            Some(current) if current.version == expected_version => {
+                let mut updated = exp.clone();
+                updated.updated_at = Utc::now();
+                w.insert(key, updated.clone());
+                Ok(updated)
+            }
+            Some(_) => Err(HubError::Conflict),
+            None => Err(HubError::NotFound),
+        }
+    }
+
+    async fn append_experience_version(
+        &self,
+        version: &NewExperienceVersion,
+    ) -> Result<ExperienceVersion> {
+        let mut w = self.experience_versions.write().unwrap();
+        let key = (version.experience_id, version.version);
+        if let Some(existing) = w.get(&key) {
+            return Ok(existing.clone());
+        }
+        let record = ExperienceVersion {
+            id: version.id.unwrap_or_else(Uuid::new_v4),
+            experience_id: version.experience_id,
+            namespace: version.namespace.clone(),
+            version: version.version,
+            snapshot: version.snapshot.clone(),
+            change_kind: version.change_kind,
+            changed_by: version.changed_by.clone(),
+            status: version.status,
+            note: version.note.clone(),
+            changed_at: version.changed_at,
+        };
+        w.insert(key, record.clone());
+        Ok(record)
+    }
+
+    async fn list_experience_versions(
+        &self,
+        namespace: &str,
+        experience_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<ExperienceVersion>> {
+        let r = self.experience_versions.read().unwrap();
+        let mut list: Vec<ExperienceVersion> = r
+            .values()
+            .filter(|v| v.namespace == namespace && v.experience_id == experience_id)
+            .cloned()
+            .collect();
+        list.sort_by_key(|v| std::cmp::Reverse(v.version));
+        list.truncate(limit.max(1));
+        Ok(list)
+    }
+
+    async fn all_experience_versions_in_namespace(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<ExperienceVersion>> {
+        let r = self.experience_versions.read().unwrap();
+        let mut list: Vec<ExperienceVersion> = r
+            .values()
+            .filter(|v| v.namespace == namespace)
+            .cloned()
+            .collect();
+        list.sort_by_key(|v| (v.experience_id, v.version));
+        Ok(list)
     }
 
     async fn get_experience(&self, namespace: &str, id: Uuid) -> Result<Option<MemoryExperience>> {
@@ -445,6 +527,8 @@ impl mem_core::infra::ExperienceStore for InMemoryHubStore {
         if w.remove(&(namespace.to_string(), id)).is_some() {
             let mut te = self.task_experiences.write().unwrap();
             te.retain(|(_, l)| l.experience_id != id);
+            let mut versions = self.experience_versions.write().unwrap();
+            versions.retain(|(exp_id, _), _| *exp_id != id);
             Ok(())
         } else {
             Err(HubError::NotFound)

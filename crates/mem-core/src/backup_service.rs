@@ -11,8 +11,8 @@ use crate::account_scope::AccountScopedStore;
 use crate::domain::{
     BackupRecord, BackupSummary, CodingRevision, CodingThread, MemoryEntry, MemoryEvidence,
     MemoryExperience, MemoryRelation, MemoryTask, MemoryTaskExperience, NewCodingRevision,
-    NewCodingThread, NewEvidence, NewMemoryExperience, NewMemoryRelation, NewMemoryTask,
-    RestoreMode, RestoreReport, VersionChange,
+    NewCodingThread, NewEvidence, NewExperienceVersion, NewMemoryExperience, NewMemoryRelation,
+    NewMemoryTask, RestoreMode, RestoreReport, VersionChange,
 };
 use crate::infra::{
     AccessChecker, BackupStore, Clock, CodingStore, EvidenceStore, ExperienceStore, MemoryHubStore,
@@ -26,7 +26,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 /// 备份负载格式版本（升级至 v4 支持代码演进线程与修订记录）
-pub const BACKUP_PAYLOAD_VERSION: u32 = 4;
+pub const BACKUP_PAYLOAD_VERSION: u32 = 5;
 
 /// 全量快照的保留命名空间标记（不对应任何真实命名空间，也不是授权对象）
 pub const ALL_NAMESPACES: &str = "*";
@@ -174,6 +174,21 @@ impl DefaultBackupService {
         }
     }
 
+    /// 从负载取出经验版本历史（v5+；旧备份无此键时为空）
+    fn experience_versions_of(
+        backup: &BackupRecord,
+    ) -> Result<Vec<crate::domain::ExperienceVersion>> {
+        match backup.payload.get("experience_versions") {
+            Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
+                HubError::Internal(anyhow::anyhow!(
+                    "备份负载 experience_versions 解析失败: {}",
+                    e
+                ))
+            }),
+            None => Ok(Vec::new()),
+        }
+    }
+
     /// 从负载取出任务-经验映射列表
     fn task_experiences_of(backup: &BackupRecord) -> Result<Vec<MemoryTaskExperience>> {
         match backup.payload.get("task_experiences") {
@@ -266,7 +281,33 @@ impl DefaultBackupService {
         hex::encode(hasher.finalize())
     }
 
-    /// 构建备份负载（v4 格式）
+    /// 计算 v5 负载的规范校验和（v4 + 经验版本历史）
+    #[allow(clippy::too_many_arguments)]
+    fn checksum_v5(
+        entries: &[MemoryEntry],
+        evidences: &[MemoryEvidence],
+        relations: &[MemoryRelation],
+        tasks: &[MemoryTask],
+        experiences: &[MemoryExperience],
+        experience_versions: &[crate::domain::ExperienceVersion],
+        task_experiences: &[MemoryTaskExperience],
+        coding_threads: &[CodingThread],
+        coding_revisions: &[CodingRevision],
+    ) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(serde_json::to_vec(entries).unwrap_or_default());
+        hasher.update(serde_json::to_vec(evidences).unwrap_or_default());
+        hasher.update(serde_json::to_vec(relations).unwrap_or_default());
+        hasher.update(serde_json::to_vec(tasks).unwrap_or_default());
+        hasher.update(serde_json::to_vec(experiences).unwrap_or_default());
+        hasher.update(serde_json::to_vec(experience_versions).unwrap_or_default());
+        hasher.update(serde_json::to_vec(task_experiences).unwrap_or_default());
+        hasher.update(serde_json::to_vec(coding_threads).unwrap_or_default());
+        hasher.update(serde_json::to_vec(coding_revisions).unwrap_or_default());
+        hex::encode(hasher.finalize())
+    }
+
+    /// 构建备份负载（v5 格式）
     #[allow(clippy::too_many_arguments)]
     fn payload_of(
         namespace: &str,
@@ -275,6 +316,7 @@ impl DefaultBackupService {
         relations: &[MemoryRelation],
         tasks: &[MemoryTask],
         experiences: &[MemoryExperience],
+        experience_versions: &[crate::domain::ExperienceVersion],
         task_experiences: &[MemoryTaskExperience],
         coding_threads: &[CodingThread],
         coding_revisions: &[CodingRevision],
@@ -287,6 +329,7 @@ impl DefaultBackupService {
             "relations": relations,
             "tasks": tasks,
             "experiences": experiences,
+            "experience_versions": experience_versions,
             "task_experiences": task_experiences,
             "coding_threads": coding_threads,
             "coding_revisions": coding_revisions,
@@ -310,6 +353,9 @@ impl DefaultBackupService {
         let relations = store.all_relations_in_namespace(namespace).await?;
         let tasks = store.all_tasks_in_namespace(namespace).await?;
         let experiences = store.all_experiences_in_namespace(namespace).await?;
+        let experience_versions = store
+            .all_experience_versions_in_namespace(namespace)
+            .await?;
         let task_experiences = store.all_task_experiences_in_namespace(namespace).await?;
         let coding_threads = store.all_threads_in_namespace(namespace).await?;
         let coding_revisions = store.all_revisions_in_namespace(namespace).await?;
@@ -330,12 +376,13 @@ impl DefaultBackupService {
             created_by: auth.agent_id.clone(),
             note: Some(format!("restore-safety:{}", namespace)),
             entry_count: entries.len(),
-            checksum: Self::checksum_v4(
+            checksum: Self::checksum_v5(
                 &entries,
                 &evidences,
                 &relations,
                 &tasks,
                 &experiences,
+                &experience_versions,
                 &task_experiences,
                 &coding_threads,
                 &coding_revisions,
@@ -347,6 +394,7 @@ impl DefaultBackupService {
                 &relations,
                 &tasks,
                 &experiences,
+                &experience_versions,
                 &task_experiences,
                 &coding_threads,
                 &coding_revisions,
@@ -385,6 +433,9 @@ impl DefaultBackupService {
                 let relations = scoped.all_relations_in_namespace(&visible_ns).await?;
                 let tasks = scoped.all_tasks_in_namespace(&visible_ns).await?;
                 let experiences = scoped.all_experiences_in_namespace(&visible_ns).await?;
+                let experience_versions = scoped
+                    .all_experience_versions_in_namespace(&visible_ns)
+                    .await?;
                 let task_experiences = scoped
                     .all_task_experiences_in_namespace(&visible_ns)
                     .await?;
@@ -396,12 +447,13 @@ impl DefaultBackupService {
                     created_by: created_by.clone(),
                     note,
                     entry_count: entries.len(),
-                    checksum: Self::checksum_v4(
+                    checksum: Self::checksum_v5(
                         &entries,
                         &evidences,
                         &relations,
                         &tasks,
                         &experiences,
+                        &experience_versions,
                         &task_experiences,
                         &coding_threads,
                         &coding_revisions,
@@ -413,6 +465,7 @@ impl DefaultBackupService {
                         &relations,
                         &tasks,
                         &experiences,
+                        &experience_versions,
                         &task_experiences,
                         &coding_threads,
                         &coding_revisions,
@@ -430,6 +483,9 @@ impl DefaultBackupService {
                 let relations = store.all_relations_in_namespace(namespace).await?;
                 let tasks = store.all_tasks_in_namespace(namespace).await?;
                 let experiences = store.all_experiences_in_namespace(namespace).await?;
+                let experience_versions = store
+                    .all_experience_versions_in_namespace(namespace)
+                    .await?;
                 let task_experiences = store.all_task_experiences_in_namespace(namespace).await?;
                 let coding_threads = store.all_threads_in_namespace(namespace).await?;
                 let coding_revisions = store.all_revisions_in_namespace(namespace).await?;
@@ -439,12 +495,13 @@ impl DefaultBackupService {
                     created_by: created_by.clone(),
                     note,
                     entry_count: entries.len(),
-                    checksum: Self::checksum_v4(
+                    checksum: Self::checksum_v5(
                         &entries,
                         &evidences,
                         &relations,
                         &tasks,
                         &experiences,
+                        &experience_versions,
                         &task_experiences,
                         &coding_threads,
                         &coding_revisions,
@@ -456,6 +513,7 @@ impl DefaultBackupService {
                         &relations,
                         &tasks,
                         &experiences,
+                        &experience_versions,
                         &task_experiences,
                         &coding_threads,
                         &coding_revisions,
@@ -557,6 +615,18 @@ impl BackupService for DefaultBackupService {
             store.all_experiences_in_namespace(&req.namespace).await?
         };
 
+        let experience_versions: Vec<crate::domain::ExperienceVersion> = if req.namespace == "*" {
+            let mut all = Vec::new();
+            for ns in crate::infra::MemoryStore::list_namespaces(&store).await? {
+                all.extend(store.all_experience_versions_in_namespace(&ns).await?);
+            }
+            all
+        } else {
+            store
+                .all_experience_versions_in_namespace(&req.namespace)
+                .await?
+        };
+
         let task_experiences: Vec<MemoryTaskExperience> = if req.namespace == "*" {
             let mut all = Vec::new();
             for ns in crate::infra::MemoryStore::list_namespaces(&store).await? {
@@ -596,12 +666,13 @@ impl BackupService for DefaultBackupService {
             created_by: auth.agent_id.clone(),
             note: req.note.clone(),
             entry_count: entries.len(),
-            checksum: Self::checksum_v4(
+            checksum: Self::checksum_v5(
                 &entries,
                 &evidences,
                 &relations,
                 &tasks,
                 &experiences,
+                &experience_versions,
                 &task_experiences,
                 &coding_threads,
                 &coding_revisions,
@@ -613,6 +684,7 @@ impl BackupService for DefaultBackupService {
                 &relations,
                 &tasks,
                 &experiences,
+                &experience_versions,
                 &task_experiences,
                 &coding_threads,
                 &coding_revisions,
@@ -645,16 +717,29 @@ impl BackupService for DefaultBackupService {
         let store = self.scoped(auth);
         let backup = store.get_backup(req.backup_id).await?;
 
-        // 完整性校验：重建校验和与写入时比对（兼容 v1、v2、v3 与 v4）
+        // 完整性校验：重建校验和与写入时比对（兼容 v1–v5）
         let entries = Self::entries_of(&backup)?;
         let evidences = Self::evidences_of(&backup)?;
         let relations = Self::relations_of(&backup)?;
         let tasks = Self::tasks_of(&backup)?;
         let experiences = Self::experiences_of(&backup)?;
+        let experience_versions = Self::experience_versions_of(&backup)?;
         let task_experiences = Self::task_experiences_of(&backup)?;
         let coding_threads = Self::coding_threads_of(&backup)?;
         let coding_revisions = Self::coding_revisions_of(&backup)?;
 
+        // 先试 v5：旧备份的 checksum 不匹配 v5，会自然落到 v4–v1
+        let actual_v5 = Self::checksum_v5(
+            &entries,
+            &evidences,
+            &relations,
+            &tasks,
+            &experiences,
+            &experience_versions,
+            &task_experiences,
+            &coding_threads,
+            &coding_revisions,
+        );
         let actual_v4 = Self::checksum_v4(
             &entries,
             &evidences,
@@ -676,7 +761,8 @@ impl BackupService for DefaultBackupService {
         let actual_v2 = Self::checksum_v2(&entries, &evidences, &relations);
         let actual_v1 = Self::checksum_v1(&entries);
 
-        let valid = backup.checksum == actual_v4
+        let valid = backup.checksum == actual_v5
+            || backup.checksum == actual_v4
             || backup.checksum == actual_v3
             || backup.checksum == actual_v2
             || backup.checksum == actual_v1;
@@ -700,6 +786,7 @@ impl BackupService for DefaultBackupService {
             failed_relations: 0,
             failed_tasks: 0,
             failed_experiences: 0,
+            failed_experience_versions: 0,
             failed_task_links: 0,
             failed_threads: 0,
             failed_revisions: 0,
@@ -928,7 +1015,7 @@ impl BackupService for DefaultBackupService {
         // 恢复经验记忆
         let mut first_err: Option<HubError> = None;
         for exp in &experiences {
-            if let Err(e) = store
+            match store
                 .save_experience(&NewMemoryExperience {
                     id: Some(exp.id),
                     namespace: exp.namespace.clone(),
@@ -945,13 +1032,48 @@ impl BackupService for DefaultBackupService {
                 })
                 .await
             {
-                Self::tally_failure(&mut report.failed_experiences, &mut first_err, e);
+                Ok(_) => {
+                    // save 只写内容与基础状态；版本号、验证元数据、来源计数与
+                    // 被替代指向由完整记录回写，避免恢复后版本历史与实体分叉
+                    if let Err(e) = store.update_experience(exp).await {
+                        Self::tally_failure(&mut report.failed_experiences, &mut first_err, e);
+                    }
+                }
+                Err(e) => Self::tally_failure(&mut report.failed_experiences, &mut first_err, e),
             }
         }
         Self::warn_restore_failures(
             "experiences",
             &backup.namespace,
             report.failed_experiences,
+            &first_err,
+        );
+
+        // 恢复经验版本历史（v5+；旧备份为空数组，不报错）
+        let mut first_err: Option<HubError> = None;
+        for v in &experience_versions {
+            if let Err(e) = store
+                .append_experience_version(&NewExperienceVersion {
+                    id: Some(v.id),
+                    experience_id: v.experience_id,
+                    namespace: v.namespace.clone(),
+                    version: v.version,
+                    snapshot: v.snapshot.clone(),
+                    change_kind: v.change_kind,
+                    changed_by: v.changed_by.clone(),
+                    status: v.status,
+                    note: v.note.clone(),
+                    changed_at: v.changed_at,
+                })
+                .await
+            {
+                Self::tally_failure(&mut report.failed_experience_versions, &mut first_err, e);
+            }
+        }
+        Self::warn_restore_failures(
+            "experience_versions",
+            &backup.namespace,
+            report.failed_experience_versions,
             &first_err,
         );
 

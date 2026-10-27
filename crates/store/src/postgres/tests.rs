@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn test_migrations_registered() {
-    assert_eq!(MIGRATIONS.len(), 15);
+    assert_eq!(MIGRATIONS.len(), 17);
     assert!(MIGRATIONS[0].0.starts_with("20261011"));
     // 迁移清单必须按版本号字典序排列（执行顺序依赖于此）
     for w in MIGRATIONS.windows(2) {

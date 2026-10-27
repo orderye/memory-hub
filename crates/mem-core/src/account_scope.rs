@@ -14,16 +14,17 @@
 
 use crate::domain::{
     BackupRecord, CodingRevision, CodingThread, CognitiveProposalRecord, CognitiveProposalStatus,
-    EvidenceSourceKind, ExperienceStatus, IntegrationProposal, MemoryEntry, MemoryEvidence,
-    MemoryExperience, MemoryFilter, MemoryRelation, MemoryRelationKind, MemoryTask,
-    MemoryTaskExperience, MemoryVersion, Namespace, NamespaceGrantRecord, NamespaceInfo,
-    NewCodingRevision, NewCodingThread, NewEvidence, NewMemoryExperience, NewMemoryRelation,
+    CollectionBinding, EvidenceSourceKind, ExperienceStatus, ExperienceVersion,
+    IntegrationProposal, MemoryCollection, MemoryEntry, MemoryEvidence, MemoryExperience,
+    MemoryFilter, MemoryRelation, MemoryRelationKind, MemoryTask, MemoryTaskExperience,
+    MemoryVersion, Namespace, NamespaceGrantRecord, NamespaceInfo, NewCodingRevision,
+    NewCodingThread, NewEvidence, NewExperienceVersion, NewMemoryExperience, NewMemoryRelation,
     NewMemoryTask, ProposalStatus, Scored, TaskStatus,
 };
 use crate::infra::{
     AgentRecord, AgentRegistration, AgentStore, BackupStore, CodingStore, CognitiveProposalStore,
-    EvidenceStore, ExperienceStore, GrantStore, IntegrationStore, MemoryStore, RelationStore,
-    TaskStore,
+    CollectionStore, EvidenceStore, ExperienceStore, GrantStore, IntegrationStore, MemoryStore,
+    RelationStore, TaskStore,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -95,6 +96,16 @@ impl<S: ?Sized> AccountScopedStore<S> {
             Ok(())
         } else {
             Err(HubError::NotFound)
+        }
+    }
+
+    /// 账户级配置（集合/绑定）的装配校验：参数账户必须等于本包装器的账户。
+    /// 跨账户操作一律拒绝，不依赖调用方自觉。
+    fn ensure_account(&self, account_id: AccountId) -> Result<()> {
+        if account_id == self.account {
+            Ok(())
+        } else {
+            Err(HubError::InsufficientScope)
         }
     }
 
@@ -766,6 +777,70 @@ impl<S: ExperienceStore + ?Sized> ExperienceStore for AccountScopedStore<S> {
         Ok(updated)
     }
 
+    async fn update_experience_if_version(
+        &self,
+        experience: &MemoryExperience,
+        expected_version: i64,
+    ) -> Result<MemoryExperience> {
+        let mut exp = experience.clone();
+        exp.namespace = self.scoped(&exp.namespace);
+        let mut updated = self
+            .inner
+            .update_experience_if_version(&exp, expected_version)
+            .await?;
+        updated.namespace = self.unscoped(&updated.namespace);
+        Ok(updated)
+    }
+
+    async fn append_experience_version(
+        &self,
+        version: &NewExperienceVersion,
+    ) -> Result<ExperienceVersion> {
+        let mut scoped = version.clone();
+        scoped.namespace = self.scoped(&scoped.namespace);
+        let mut saved = self.inner.append_experience_version(&scoped).await?;
+        saved.namespace = self.unscoped(&saved.namespace);
+        Ok(saved)
+    }
+
+    async fn list_experience_versions(
+        &self,
+        namespace: &str,
+        experience_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<ExperienceVersion>> {
+        let rows = self
+            .inner
+            .list_experience_versions(&self.scoped(namespace), experience_id, limit)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter(|v| in_scope(&self.account, &v.namespace))
+            .map(|mut v| {
+                v.namespace = self.unscoped(&v.namespace);
+                v
+            })
+            .collect())
+    }
+
+    async fn all_experience_versions_in_namespace(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<ExperienceVersion>> {
+        let rows = self
+            .inner
+            .all_experience_versions_in_namespace(&self.scoped(namespace))
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter(|v| in_scope(&self.account, &v.namespace))
+            .map(|mut v| {
+                v.namespace = self.unscoped(&v.namespace);
+                v
+            })
+            .collect())
+    }
+
     async fn get_experience(&self, namespace: &str, id: Uuid) -> Result<Option<MemoryExperience>> {
         let opt = self
             .inner
@@ -1031,6 +1106,74 @@ impl<S: CodingStore + ?Sized> CodingStore for AccountScopedStore<S> {
         self.inner
             .delete_revision(&self.scoped(namespace), id)
             .await
+    }
+}
+
+// ===== Agent 记忆集合（账户级配置，不做命名空间前缀）=====
+
+#[async_trait]
+impl<S: CollectionStore + ?Sized> CollectionStore for AccountScopedStore<S> {
+    async fn upsert_collection(&self, collection: &MemoryCollection) -> Result<MemoryCollection> {
+        // 集合本身以 account_id 为键；包装器额外校验调用账户，防止装配错误
+        self.ensure_account(collection.account_id)?;
+        self.inner.upsert_collection(collection).await
+    }
+
+    async fn get_collection(
+        &self,
+        account_id: AccountId,
+        id: Uuid,
+    ) -> Result<Option<MemoryCollection>> {
+        self.ensure_account(account_id)?;
+        self.inner.get_collection(account_id, id).await
+    }
+
+    async fn get_collection_by_name(
+        &self,
+        account_id: AccountId,
+        name: &str,
+    ) -> Result<Option<MemoryCollection>> {
+        self.ensure_account(account_id)?;
+        self.inner.get_collection_by_name(account_id, name).await
+    }
+
+    async fn list_collections(&self, account_id: AccountId) -> Result<Vec<MemoryCollection>> {
+        self.ensure_account(account_id)?;
+        self.inner.list_collections(account_id).await
+    }
+
+    async fn delete_collection(&self, account_id: AccountId, id: Uuid) -> Result<()> {
+        self.ensure_account(account_id)?;
+        self.inner.delete_collection(account_id, id).await
+    }
+
+    async fn bind_collection(&self, binding: &CollectionBinding) -> Result<()> {
+        // 绑定前先确认集合属于当前账户（跨账户绑定必须失败）
+        self.inner
+            .get_collection(self.account, binding.collection_id)
+            .await?
+            .ok_or(HubError::NotFound)?;
+        self.inner.bind_collection(binding).await
+    }
+
+    async fn unbind_collection(&self, collection_id: Uuid, agent_id: &AgentId) -> Result<()> {
+        self.inner
+            .get_collection(self.account, collection_id)
+            .await?
+            .ok_or(HubError::NotFound)?;
+        self.inner.unbind_collection(collection_id, agent_id).await
+    }
+
+    async fn list_bindings(&self, collection_id: Uuid) -> Result<Vec<CollectionBinding>> {
+        self.inner
+            .get_collection(self.account, collection_id)
+            .await?
+            .ok_or(HubError::NotFound)?;
+        self.inner.list_bindings(collection_id).await
+    }
+
+    async fn is_bound(&self, collection_id: Uuid, agent_id: &AgentId) -> Result<bool> {
+        self.inner.is_bound(collection_id, agent_id).await
     }
 }
 

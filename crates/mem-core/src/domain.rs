@@ -5,7 +5,7 @@
 //! **整合**（跨 Agent 写入的去重与冲突归并）。
 
 use chrono::{DateTime, Utc};
-use common::AgentId;
+use common::{AccountId, AgentId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -570,12 +570,20 @@ pub struct NewMemoryTask {
 }
 
 /// 经验条目生命周期状态
+///
+/// 语义（任务书 4.3）：
+/// - `Candidate`：候选经验，尚未验证，默认参与检索但排序权重更低；
+/// - `Active`：已验证经验，可在声明的适用范围内复用；
+/// - `Deprecated`：已过期或被替代，保留来源与历史，不再推荐；
+/// - `Rejected`：审核未通过，保留记录与理由，默认不检索；
+/// - `Archived`：归档（软删除），不检索但随备份保留。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExperienceStatus {
     Candidate,
     Active,
     Deprecated,
+    Rejected,
     Archived,
 }
 
@@ -585,6 +593,7 @@ impl ExperienceStatus {
             ExperienceStatus::Candidate => "candidate",
             ExperienceStatus::Active => "active",
             ExperienceStatus::Deprecated => "deprecated",
+            ExperienceStatus::Rejected => "rejected",
             ExperienceStatus::Archived => "archived",
         }
     }
@@ -594,13 +603,126 @@ impl ExperienceStatus {
             "candidate" => Some(ExperienceStatus::Candidate),
             "active" => Some(ExperienceStatus::Active),
             "deprecated" => Some(ExperienceStatus::Deprecated),
+            "rejected" => Some(ExperienceStatus::Rejected),
             "archived" => Some(ExperienceStatus::Archived),
+            _ => None,
+        }
+    }
+
+    /// 未显式指定状态时是否参与检索
+    ///
+    /// `Rejected` 与 `Archived` 默认不召回；`Deprecated` 保留但权重很低，
+    /// 供调用方在“确认旧方案是否仍适用”时显式查阅。
+    pub fn searchable_by_default(&self) -> bool {
+        !matches!(
+            self,
+            ExperienceStatus::Rejected | ExperienceStatus::Archived
+        )
+    }
+
+    /// 检索排序权重（任务书 4.3.5：未验证经验不得与已验证 Skill 同权重）
+    pub fn retrieval_weight(&self) -> f32 {
+        match self {
+            ExperienceStatus::Active => 1.0,
+            ExperienceStatus::Candidate => 0.6,
+            ExperienceStatus::Deprecated => 0.3,
+            ExperienceStatus::Rejected | ExperienceStatus::Archived => 0.0,
+        }
+    }
+}
+
+/// 经验资产状态流转动作（任务书 4.3 生命周期）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExperienceTransition {
+    /// 候选 → 已验证（必须满足来源/验证条件）
+    Verify,
+    /// 审核未通过（需给出理由）
+    Reject,
+    /// 标记过期/被替代（需给出理由）
+    Deprecate,
+    /// 重新打开为候选（保留历史）
+    Restore,
+}
+
+impl ExperienceTransition {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ExperienceTransition::Verify => "verify",
+            ExperienceTransition::Reject => "reject",
+            ExperienceTransition::Deprecate => "deprecate",
+            ExperienceTransition::Restore => "restore",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "verify" => Some(ExperienceTransition::Verify),
+            "reject" => Some(ExperienceTransition::Reject),
+            "deprecate" => Some(ExperienceTransition::Deprecate),
+            "restore" => Some(ExperienceTransition::Restore),
+            _ => None,
+        }
+    }
+
+    /// 目标状态
+    pub fn target_status(&self) -> ExperienceStatus {
+        match self {
+            ExperienceTransition::Verify => ExperienceStatus::Active,
+            ExperienceTransition::Reject => ExperienceStatus::Rejected,
+            ExperienceTransition::Deprecate => ExperienceStatus::Deprecated,
+            ExperienceTransition::Restore => ExperienceStatus::Candidate,
+        }
+    }
+}
+
+/// 经验版本快照的变更类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExperienceChangeKind {
+    Created,
+    Updated,
+    Verified,
+    Rejected,
+    Deprecated,
+    Restored,
+    Superseded,
+}
+
+impl ExperienceChangeKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ExperienceChangeKind::Created => "created",
+            ExperienceChangeKind::Updated => "updated",
+            ExperienceChangeKind::Verified => "verified",
+            ExperienceChangeKind::Rejected => "rejected",
+            ExperienceChangeKind::Deprecated => "deprecated",
+            ExperienceChangeKind::Restored => "restored",
+            ExperienceChangeKind::Superseded => "superseded",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "created" => Some(ExperienceChangeKind::Created),
+            "updated" => Some(ExperienceChangeKind::Updated),
+            "verified" => Some(ExperienceChangeKind::Verified),
+            "rejected" => Some(ExperienceChangeKind::Rejected),
+            "deprecated" => Some(ExperienceChangeKind::Deprecated),
+            "restored" => Some(ExperienceChangeKind::Restored),
+            "superseded" => Some(ExperienceChangeKind::Superseded),
             _ => None,
         }
     }
 }
 
 /// 经验记忆实体
+///
+/// 同时充当“经验资产 / Skill”的承载结构（任务书 4.2）：
+/// `task` = 名称与用途，`search_keys` = 触发条件，`solution` = 执行步骤，
+/// `boundary_envs` + `failure_modes` = 适用环境与限制，`validation` = 验证方法，
+/// `memory_task_experiences` = 来源事实，`version` + `memory_experience_versions`
+/// = 版本历史。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryExperience {
     pub id: Uuid,
@@ -621,12 +743,66 @@ pub struct MemoryExperience {
     pub status: ExperienceStatus,
     #[serde(default = "default_feedback_score")]
     pub feedback_score: f32,
+    /// 内容版本号：内容型变更或状态流转递增（反馈分变化不递增）
+    #[serde(default = "default_experience_version")]
+    pub version: i64,
+    /// 被哪条经验替代（旧记录保留，指向新记录）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_by: Option<AgentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_note: Option<String>,
+    /// 最近一次状态流转理由（拒绝/弃用/恢复）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_reason: Option<String>,
+    /// 关联来源任务数（去重；用于验证门槛与展示，不参与打分）
+    #[serde(default)]
+    pub source_count: i64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
 fn default_feedback_score() -> f32 {
     1.0
+}
+
+fn default_experience_version() -> i64 {
+    1
+}
+
+/// 经验版本快照（只追加）
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExperienceVersion {
+    pub id: Uuid,
+    pub experience_id: Uuid,
+    pub namespace: Namespace,
+    pub version: i64,
+    /// 快照内容：变更前的完整经验记录
+    pub snapshot: serde_json::Value,
+    pub change_kind: ExperienceChangeKind,
+    pub changed_by: AgentId,
+    pub status: ExperienceStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    pub changed_at: DateTime<Utc>,
+}
+
+/// 新建经验版本快照请求
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NewExperienceVersion {
+    pub id: Option<Uuid>,
+    pub experience_id: Uuid,
+    pub namespace: Namespace,
+    pub version: i64,
+    pub snapshot: serde_json::Value,
+    pub change_kind: ExperienceChangeKind,
+    pub changed_by: AgentId,
+    pub status: ExperienceStatus,
+    pub note: Option<String>,
+    pub changed_at: DateTime<Utc>,
 }
 
 /// 新建经验记忆请求
@@ -1294,6 +1470,116 @@ pub struct NamespaceGrantRecord {
     pub created_at: DateTime<Utc>,
 }
 
+// ===== Agent 记忆集合（任务书 4.4）=====
+
+/// 记忆集合过滤器
+///
+/// 集合只决定**候选访问范围**，不授予任何权限：
+/// 解析后仍要与调用 Agent 的实时 grant 求交集，读路径继续走原有 ACL。
+///
+/// 约束：`namespaces` 必须显式列出、禁止 `*` 通配，避免“绑定即全量授权”。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CollectionFilter {
+    /// 允许的命名空间（用户可见名，不含账户前缀）
+    #[serde(default)]
+    pub namespaces: Vec<Namespace>,
+    /// 记忆场景过滤（None = 不限）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scene: Option<MemoryScene>,
+    /// 认知层级过滤（None = 不限）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer: Option<CognitiveLayer>,
+    /// 记忆类型过滤（空 = 不限）
+    #[serde(default)]
+    pub kinds: Vec<MemoryKind>,
+    /// 标签过滤（空 = 不限；任一命中即可，沿用现有 tag 过滤语义）
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// 记忆状态过滤（空 = 仅 active）
+    #[serde(default)]
+    pub statuses: Vec<MemoryStatus>,
+    /// 是否把 Working 经验纳入集合
+    #[serde(default)]
+    pub include_experiences: bool,
+    /// 经验状态过滤（空 = 默认可见状态：candidate/active/deprecated）
+    #[serde(default)]
+    pub experience_statuses: Vec<ExperienceStatus>,
+}
+
+impl CollectionFilter {
+    /// 结构校验：命名空间显式、合法、数量受限、禁止通配
+    pub fn validate(&self) -> common::Result<()> {
+        if self.namespaces.is_empty() {
+            return Err(common::HubError::InvalidArgument(
+                "集合必须显式声明至少一个命名空间".into(),
+            ));
+        }
+        if self.namespaces.len() > MAX_COLLECTION_NAMESPACES {
+            return Err(common::HubError::InvalidArgument(format!(
+                "单个集合最多包含 {} 个命名空间",
+                MAX_COLLECTION_NAMESPACES
+            )));
+        }
+        for ns in &self.namespaces {
+            if ns == "*" {
+                return Err(common::HubError::InvalidArgument(
+                    "集合命名空间禁止通配符 '*'：绑定不得成为全量授权".into(),
+                ));
+            }
+            crate::access::validate_namespace(ns)?;
+        }
+        Ok(())
+    }
+}
+
+/// 单集合命名空间上限（防止绑定变成宽泛授权与检索扇出爆炸）
+pub const MAX_COLLECTION_NAMESPACES: usize = 20;
+
+/// Agent 记忆集合（账户级配置）
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryCollection {
+    pub id: Uuid,
+    pub account_id: AccountId,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub filter: CollectionFilter,
+    pub created_by: AgentId,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// 新建/更新集合请求
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UpsertCollectionRequest {
+    /// 缺省时新建；给出时必须属于当前账户
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<Uuid>,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub filter: CollectionFilter,
+}
+
+/// 集合与 Agent 的绑定
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollectionBinding {
+    pub collection_id: Uuid,
+    pub agent_id: AgentId,
+    pub created_by: AgentId,
+    pub created_at: DateTime<Utc>,
+}
+
+/// 集合解析结果（检索前）
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResolvedCollection {
+    pub collection: MemoryCollection,
+    /// 该 Agent 实际可用的命名空间（= 集合声明 ∩ 实时 grant）
+    pub resolved_namespaces: Vec<Namespace>,
+    /// 集合声明了但该 Agent 无权访问的命名空间（显式回传，不静默吞掉）
+    pub skipped_namespaces: Vec<Namespace>,
+}
+
 // ===== 备份 =====
 
 /// 备份快照记录
@@ -1392,6 +1678,9 @@ pub struct RestoreReport {
     pub failed_tasks: usize,
     #[serde(default)]
     pub failed_experiences: usize,
+    /// 经验版本快照恢复失败数（v5+ 备份）
+    #[serde(default)]
+    pub failed_experience_versions: usize,
     #[serde(default)]
     pub failed_task_links: usize,
     #[serde(default)]

@@ -5,11 +5,12 @@
 
 use crate::domain::{
     BackupRecord, ChatCognitiveInput, CodingRevision, CodingThread, CognitiveCandidate,
-    CognitiveProposalRecord, CognitiveProposalStatus, EvidenceSourceKind, ExperienceStatus,
-    IntegrationProposal, MemoryEntry, MemoryEvidence, MemoryExperience, MemoryFilter,
-    MemoryRelation, MemoryRelationKind, MemoryTask, MemoryTaskExperience, MemoryVersion, Namespace,
-    NamespaceGrantRecord, NamespaceInfo, NewCodingRevision, NewCodingThread, NewEvidence,
-    NewMemoryExperience, NewMemoryRelation, NewMemoryTask, ProposalStatus, Scored, TaskStatus,
+    CognitiveProposalRecord, CognitiveProposalStatus, CollectionBinding, EvidenceSourceKind,
+    ExperienceStatus, ExperienceVersion, IntegrationProposal, MemoryCollection, MemoryEntry,
+    MemoryEvidence, MemoryExperience, MemoryFilter, MemoryRelation, MemoryRelationKind, MemoryTask,
+    MemoryTaskExperience, MemoryVersion, Namespace, NamespaceGrantRecord, NamespaceInfo,
+    NewCodingRevision, NewCodingThread, NewEvidence, NewExperienceVersion, NewMemoryExperience,
+    NewMemoryRelation, NewMemoryTask, ProposalStatus, Scored, TaskStatus,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -412,6 +413,51 @@ pub trait ExperienceStore: Send + Sync {
     /// 更新经验记忆条目（包括反馈分、状态、方案等）
     async fn update_experience(&self, experience: &MemoryExperience) -> Result<MemoryExperience>;
 
+    /// 乐观并发更新：仅当库中 `version == expected_version` 时写入。
+    ///
+    /// 经验内容的“读-改-写”路径（状态流转、内容修订）必须走本方法：
+    /// 两个 Agent 同时读到同一版本再各自写回时，后写者不得静默覆盖前者。
+    /// 版本不匹配返回 `HubError::Conflict`。
+    ///
+    /// 默认实现 = 先读后比再写，供无并发要求的测试替身使用；
+    /// 生产存储与内存存储必须覆盖为原子实现。
+    async fn update_experience_if_version(
+        &self,
+        experience: &MemoryExperience,
+        expected_version: i64,
+    ) -> Result<MemoryExperience> {
+        match self
+            .get_experience(&experience.namespace, experience.id)
+            .await?
+        {
+            Some(current) if current.version == expected_version => {
+                self.update_experience(experience).await
+            }
+            Some(_) => Err(common::HubError::Conflict),
+            None => Err(common::HubError::NotFound),
+        }
+    }
+
+    /// 追加经验版本快照（只追加；同一 `(experience_id, version)` 幂等忽略）
+    async fn append_experience_version(
+        &self,
+        version: &NewExperienceVersion,
+    ) -> Result<ExperienceVersion>;
+
+    /// 读取某条经验的版本历史（version 降序）
+    async fn list_experience_versions(
+        &self,
+        namespace: &str,
+        experience_id: uuid::Uuid,
+        limit: usize,
+    ) -> Result<Vec<ExperienceVersion>>;
+
+    /// 命名空间下全部版本快照（备份/恢复用）
+    async fn all_experience_versions_in_namespace(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<ExperienceVersion>>;
+
     /// 按 ID 读取经验记忆
     async fn get_experience(
         &self,
@@ -439,6 +485,22 @@ pub trait ExperienceStore: Send + Sync {
         task_id: uuid::Uuid,
     ) -> Result<Vec<MemoryTaskExperience>>;
 
+    /// 查询某条经验的全部来源任务关联（验证门槛与 source_count 维护用）
+    ///
+    /// 默认实现扫描命名空间全量映射；生产存储应覆盖为按 experience_id 的定向查询。
+    async fn list_links_for_experience(
+        &self,
+        namespace: &str,
+        experience_id: uuid::Uuid,
+    ) -> Result<Vec<MemoryTaskExperience>> {
+        Ok(self
+            .all_task_experiences_in_namespace(namespace)
+            .await?
+            .into_iter()
+            .filter(|l| l.experience_id == experience_id)
+            .collect())
+    }
+
     /// 命名空间下全部经验记忆（备份/恢复用）
     async fn all_experiences_in_namespace(&self, namespace: &str) -> Result<Vec<MemoryExperience>>;
 
@@ -450,6 +512,41 @@ pub trait ExperienceStore: Send + Sync {
 
     /// 物理删除单条经验记忆
     async fn delete_experience(&self, namespace: &str, id: uuid::Uuid) -> Result<()>;
+}
+
+/// Agent 记忆集合存储（账户级配置，任务书 4.4）
+///
+/// 集合与绑定**不含任何记忆内容**，只描述“哪些命名空间/场景/类型可作为候选范围”。
+/// 删除集合或绑定不得删除底层记忆。
+#[async_trait]
+pub trait CollectionStore: Send + Sync {
+    /// 新建或更新集合（按 `(account_id, name)` 唯一）
+    async fn upsert_collection(&self, collection: &MemoryCollection) -> Result<MemoryCollection>;
+
+    async fn get_collection(
+        &self,
+        account_id: AccountId,
+        id: uuid::Uuid,
+    ) -> Result<Option<MemoryCollection>>;
+
+    async fn get_collection_by_name(
+        &self,
+        account_id: AccountId,
+        name: &str,
+    ) -> Result<Option<MemoryCollection>>;
+
+    async fn list_collections(&self, account_id: AccountId) -> Result<Vec<MemoryCollection>>;
+
+    /// 删除集合（级联删除绑定，不触碰记忆）
+    async fn delete_collection(&self, account_id: AccountId, id: uuid::Uuid) -> Result<()>;
+
+    async fn bind_collection(&self, binding: &CollectionBinding) -> Result<()>;
+
+    async fn unbind_collection(&self, collection_id: uuid::Uuid, agent_id: &AgentId) -> Result<()>;
+
+    async fn list_bindings(&self, collection_id: uuid::Uuid) -> Result<Vec<CollectionBinding>>;
+
+    async fn is_bound(&self, collection_id: uuid::Uuid, agent_id: &AgentId) -> Result<bool>;
 }
 
 /// 代码演进存储（Coding 场景，P4 引入）
@@ -531,6 +628,7 @@ pub trait MemoryHubStore:
     + TaskStore
     + ExperienceStore
     + CodingStore
+    + CollectionStore
 {
 }
 
@@ -545,7 +643,8 @@ impl<
             + RelationStore
             + TaskStore
             + ExperienceStore
-            + CodingStore,
+            + CodingStore
+            + CollectionStore,
     > MemoryHubStore for T
 {
 }

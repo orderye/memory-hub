@@ -190,8 +190,10 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let integration_service = Arc::new(integration);
 
-    let working_memory = Arc::new(WorkingMemoryService::new(store.clone()));
-    let coding_memory = Arc::new(CodingMemoryService::new(store.clone()));
+    let working_memory =
+        Arc::new(WorkingMemoryService::new(store.clone()).with_access(access.clone()));
+    let coding_memory =
+        Arc::new(CodingMemoryService::new(store.clone()).with_access(access.clone()));
     // 生产环境必须接入真实抽取器（LLM）；MockChatCognitiveExtractor 只是占位，
     // 它不会理解对话内容，Chat 认知流的候选完全依赖调用方注入
     let chat_extractor = Arc::new(mem_core::testing::MockChatCognitiveExtractor::new());
@@ -199,15 +201,18 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         "Chat 认知抽取器当前为 MockChatCognitiveExtractor（占位实现）：未接入真实 LLM 抽取器，\
          自动入库候选完全依赖调用方注入；本轮不引入生成式 LLM 依赖"
     );
-    let chat_cognitive = Arc::new(ChatCognitiveService::new(
-        store.clone(),
-        chat_extractor,
-        CognitivePolicy {
-            mode: CognitiveGovernanceMode::Manual,
-            evidence_retention_days: cfg.evidence_retention_days,
-            ..Default::default()
-        },
-    ));
+    let chat_cognitive = Arc::new(
+        ChatCognitiveService::new(
+            store.clone(),
+            chat_extractor,
+            CognitivePolicy {
+                mode: CognitiveGovernanceMode::Manual,
+                evidence_retention_days: cfg.evidence_retention_days,
+                ..Default::default()
+            },
+        )
+        .with_access(access.clone()),
+    );
 
     let dispatcher = Arc::new(
         ToolDispatcher::new(
@@ -231,7 +236,8 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         .with_embedder(embedder.clone())
         .with_working_memory(working_memory)
         .with_coding_memory(coding_memory)
-        .with_chat_cognitive(chat_cognitive),
+        .with_chat_cognitive(chat_cognitive)
+        .with_experience_governance(cfg.experience_verify_min_sources),
     );
 
     // ===== 鉴权 =====
