@@ -99,7 +99,7 @@ CREATE TABLE IF NOT EXISTS coding_revisions (
 
 ---
 
-## 4. 备份与恢复 (v4 协议)
+## 4. 备份与恢复 (v5 协议)
 
 - **备份负载版本升级**：`BACKUP_PAYLOAD_VERSION` 升级至 `4`；
 - **全量快照包含内容**：
@@ -108,11 +108,23 @@ CREATE TABLE IF NOT EXISTS coding_revisions (
   - `relations`: 记忆实体拓扑网；
   - `tasks`: 任务事实归档；
   - `experiences`: 经验记忆库；
+  - `experience_versions`: 经验版本历史（v5 新增）；
   - `task_experiences`: 任务-经验引用图谱；
   - `coding_threads`: 代码演进主题线程；
   - `coding_revisions`: 代码修订历史快照。
-- **向下完全兼容**：恢复时校验和依次校验 `checksum_v4 || checksum_v3 || checksum_v2 || checksum_v1`，确保旧版快照 100% 能够无损恢复。
+- **向下完全兼容**：恢复时校验和依次校验 `checksum_v5 || checksum_v4 || checksum_v3 || checksum_v2 || checksum_v1`，确保旧版快照无损恢复；
+  但旧二进制无法恢复 v5 备份。
 - **引用完整性保障**：恢复时先按依赖拓扑恢复 `coding_threads`，再恢复 `coding_revisions`，避免产生孤儿记录。
+
+---
+
+## 4.5 只读查询与回滚链
+
+- `coding_thread_list`：按仓库列出代码演进线程；
+- `coding_revision_list`：按线程，或按 `repository + file_path` 列出修订（按发生时间倒序）；
+- `coding_revision_get`：按 ID 读取单条修订（真实 diff + 溯源字段）；
+- **回滚建模**：回滚是一次新的修订（真实的反向 diff），通过 `commit_sha` / `parent_sha` / 文件路径与时间顺序重建演化链；
+  不额外引入 `reverts_revision_id` 列——避免为单一用途改表，也让“回滚”仍然是可验证的真实变更。
 
 ---
 

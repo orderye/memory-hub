@@ -6,9 +6,9 @@
 
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
 [![Edition](https://img.shields.io/badge/edition-2021-blue.svg)](https://doc.rust-lang.org/edition-guide/rust-2021/index.html)
-[![Tests](https://img.shields.io/badge/tests-530%20passed-brightgreen.svg)](https://github.com/orderye/memory-hub/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/tests-passing-brightgreen.svg)](https://github.com/orderye/memory-hub/actions/workflows/ci.yml)
 [![Clippy](https://img.shields.io/badge/clippy-zero%20warnings-brightgreen.svg)](https://github.com/orderye/memory-hub/actions/workflows/ci.yml)
-[![MCP](https://img.shields.io/badge/MCP-28%20tools-purple.svg)](https://modelcontextprotocol.io/)
+[![MCP](https://img.shields.io/badge/MCP-38%20tools-purple.svg)](https://modelcontextprotocol.io/)
 [![Storage](https://img.shields.io/badge/storage-PostgreSQL%2015%20%2B%20pgvector%20%7C%20in--memory-blue.svg)](https://www.postgresql.org/)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 
@@ -32,7 +32,7 @@ On the inside it takes care of four things — **storage, backup, consolidation,
 - [4. How memories are organized](#4-how-memories-are-organized)
 - [5. How retrieval works](#5-how-retrieval-works)
 - [6. Security and reliability](#6-security-and-reliability)
-- [7. The MCP tool surface (28 tools)](#7-the-mcp-tool-surface-28-tools)
+- [7. The MCP tool surface (38 tools)](#7-the-mcp-tool-surface-38-tools)
 - [8. Project layout](#8-project-layout)
 - [9. Development, testing and quality gates](#9-development-testing-and-quality-gates)
 - [10. Known limitations and what's next](#10-known-limitations-and-whats-next)
@@ -64,7 +64,7 @@ Not "yet another agent framework" — only **infrastructure**: a memory foundati
 
 | Process | External form | What it owns (by analogy) |
 | :--- | :--- | :--- |
-| **`mcp-server`** | HTTP `:3000` (endpoint `/mcp`), stdio also supported | The library front desk: takes memory read/write and retrieval requests, exposes 28 MCP tools |
+| **`mcp-server`** | HTTP `:3000` (endpoint `/mcp`), stdio also supported | The library front desk: takes memory read/write and retrieval requests, exposes 38 MCP tools |
 | **`auth-server`** | HTTP `:8080`, with a web console | The gatekeeper and the licensing office: registers accounts and agents, issues tokens (OAuth 2.1) |
 | **`backup-worker`** | Long-running background process with cron jobs | The night-shift admin: scheduled backup snapshots, expiry cleanup, offline duplicate and conflict scans |
 | **PostgreSQL 15 + pgvector** | Data files | The warehouse itself (local development can swap in pure in-memory mode — it forgets on restart, debug use only) |
@@ -90,7 +90,7 @@ flowchart TD
 
     subgraph Hub["mcp-server :3000"]
         Guard["Auth and account isolation checks"]
-        Tools["28 tool routes"]
+        Tools["38 tool routes"]
         Engines["Cognitive engines<br/>chat / working / coding / consolidation"]
         Search["Hybrid retrieval engine"]
         Guard --> Tools --> Engines
@@ -293,10 +293,44 @@ When you need the older story, pass `include_superseded` and the historical entr
 | Scene | What it holds | Key points |
 | :--- | :--- | :--- |
 | **Chat** (conversation) | Facts `Fact`, summaries `Summary`, long-term preferences `Pattern`, pending intentions `Intention` | Intentions carry a validity window and expire automatically; hedged wording such as "maybe / TBD" is rejected before it is stored, so you never accumulate hallucinated to-dos; ingestion can be fully automatic, semi-automatic, or human-adjudicated |
-| **Working** (getting things done) | Per-task `WorkingFact` and reusable `Experience` are stored separately | An experience has to clear a high bar before it counts as one; it carries applicable-environment tags and warns plus down-weights when the environment does not match; good outcomes add points and bad ones subtract, and a low score auto-marks it deprecated (archived, not deleted, so the audit trail survives) |
-| **Coding** (changing code) | Logical thread `CodingThread` + version slice `CodingRevision` | Only **real Git diffs** are recorded; writing the same patch twice is idempotent; private keys, tokens and other sensitive strings are scanned for and truncated |
+| **Working** (getting things done) | Per-task `WorkingFact` and reusable `Experience` are stored separately | Distillation only produces a **candidate**; it becomes verified only through an explicit `verify` that requires at least two distinct completed sources, no failed sources, and a declared validation method; it carries applicable-environment tags and warns plus down-weights on mismatch; every state transition writes a version snapshot |
+| **Coding** (changing code) | Logical thread `CodingThread` + version slice `CodingRevision` | Only **real Git diffs** are recorded; writing the same patch twice is idempotent; private keys, tokens and other sensitive strings are scanned for and truncated; read-only queries by thread / file / revision rebuild the evolution and rollback chain |
 
-### 4. Words you will keep seeing
+### 4. Experience assets: distillation is only a candidate, verification is what promotes it
+
+An "experience" in the Working scene is not reusable the moment it is written. It follows an explicit asset lifecycle:
+
+```
+work fact ──distill──▶ candidate
+                          │
+                          │ verify (≥2 distinct completed sources + no failures + validation)
+                          ▼
+                        active (verified, reusable)
+                          │
+        reject (reason) ──┼── deprecate (reason)
+                          ▼
+                    rejected / deprecated (sources and versions retained, never hard-deleted)
+```
+
+- **One success does not verify anything**: positive feedback only raises the feedback score, never the state; neither distillation nor background jobs can promote a candidate;
+- **Recommendations stay inside the declared scope**: a `boundary_envs` mismatch down-weights the hit, or is rejected outright under `strict_env`;
+- **Versions are never lost**: every transition appends to `memory_experience_versions` (one row per version), so you can see who changed what, when, and why;
+- **Retrieval has a priority ladder**: `active` 1.0, `candidate` 0.6, `deprecated` 0.3; `rejected` / `archived` are not returned by default.
+
+Tools: `working_experience_distill`, `working_experience_transition`, `working_experience_history`, `working_experience_feedback`. Details: [`docs/upgrade/ASSET_GOVERNANCE.md`](docs/upgrade/ASSET_GOVERNANCE.md).
+
+### 5. Agent memory collections: narrow the scope, never grant access
+
+Different agents can use different "memory collections" (for example a Coding agent that only sees project conventions, past incidents and verified fixes). A collection is account-level configuration:
+
+- it only declares **candidate scope** (namespaces, scene, kinds, tags, statuses, whether experiences are included);
+- the calling agent **must be explicitly bound**, otherwise the request is rejected (fail closed);
+- binding never bypasses ACL: retrieval still authorizes each namespace in real time, and unauthorized namespaces appear in `skipped_namespaces` instead of silently becoming an empty result;
+- unbinding takes effect immediately; deleting a collection removes bindings only and **never deletes memories**.
+
+Tools: `memory_collection_upsert/list/delete/bind/unbind`; `memory_search` and `working_experience_search` accept `collection` instead of `namespace`. Details: [`docs/upgrade/ASSET_GOVERNANCE.md`](docs/upgrade/ASSET_GOVERNANCE.md).
+
+### 6. Words you will keep seeing
 
 | Term | Plain meaning |
 | :--- | :--- |
@@ -422,6 +456,12 @@ The gate itself is designed to avoid false alarms: the baseline stores **the per
 - **Namespace-level authorization**: whoever owns a space can read and write it, a space can be granted to another agent, and the grant can be revoked at any time (effective immediately);
 - **Three permission scopes**: `memory:read` / `memory:write` / `memory:admin`, and every tool declares which one it needs.
 
+### Permission boundaries for cognitive memory
+
+- **Every cognitive tool checks the namespace ACL**: Working tasks and experiences, Coding threads and revisions, Chat proposals and intentions no longer check only the token scope; unauthorized namespaces inside the same account are rejected;
+- **A collection is not a permission**: `memory_collection_*` only narrows the candidate scope, reads still go through real-time authorization; unbound or unbound-after-revoke agents are rejected;
+- **Explicit single-namespace requests fail closed**: when `namespace` is given, missing permission returns an error; only `collection` fan-out demotes unauthorized namespaces into `skipped_namespaces` and explains it in the response.
+
 ### Two candidate-discovery modes for consolidation (A / B)
 
 The consolidation hub tidies up memories that several agents wrote redundantly. It has two **candidate-discovery** modes,
@@ -469,9 +509,9 @@ Details in [`docs/upgrade/CONSOLIDATION_AB.md`](docs/upgrade/CONSOLIDATION_AB.md
 
 ---
 
-## 7. The MCP tool surface (28 tools)
+## 7. The MCP tool surface (38 tools)
 
-18 `memory_*` tools are the base; 10 `cognitive_*` / `working_*` / `coding_*` tools are the cognitive layer.
+18 `memory_*` tools are the base; 15 `cognitive_*` / `working_*` / `coding_*` tools are the cognitive layer; 5 `memory_collection_*` tools cover collection governance.
 
 ### 1. Basic storage (4)
 
@@ -516,7 +556,7 @@ Details in [`docs/upgrade/CONSOLIDATION_AB.md`](docs/upgrade/CONSOLIDATION_AB.md
 | `memory_grant` | `memory:admin` | Grant one of your namespaces to another agent |
 | `memory_revoke` | `memory:admin` | Revoke a grant, effective immediately |
 
-### 6. Cognitive layer (10)
+### 6. Cognitive layer and governance (20)
 
 | Tool | Scope | What it does |
 | :--- | :--- | :--- |
@@ -525,11 +565,21 @@ Details in [`docs/upgrade/CONSOLIDATION_AB.md`](docs/upgrade/CONSOLIDATION_AB.md
 | `cognitive_intentions_list` | `memory:read` | List current intentions and candidate proposals (see whether any intention has expired) |
 | `working_task_start` | `memory:write` | Open a work task, optionally linked to evidence |
 | `working_task_finish` | `memory:write` | Close a task, recording a result summary or a failure reason |
-| `working_experience_distill` | `memory:write` | Distil a task or a retrospective into an experience (preconditions, boundary environments, known failure modes) |
-| `working_experience_feedback` | `memory:write` | Give an experience a feedback score (+1 useful / -1 a trap), optionally adjusting its lifecycle state |
-| `working_experience_search` | `memory:read` | Search reusable experiences, matching the current environment's boundaries, warning and down-weighting on mismatch |
+| `working_experience_distill` | `memory:write` | Distil a task into a **candidate** experience (preconditions, boundary environments, known failure modes, validation method) |
+| `working_experience_feedback` | `memory:write` | Give an experience a feedback score (+1 useful / -1 a trap); adjusts the score only, never the lifecycle state |
+| `working_experience_search` | `memory:read` | Search reusable experiences with environment boundary matching; filter by status or a memory collection |
+| `working_experience_transition` | `memory:write` | Lifecycle transition: `verify` (source + validation gates) / `reject` / `deprecate` / `restore` |
+| `working_experience_history` | `memory:read` | Read the append-only version history of an experience |
 | `coding_thread_create` | `memory:write` | Open a code-evolution / refactoring logical thread |
+| `coding_thread_list` | `memory:read` | List code-evolution threads |
 | `coding_revision_record` | `memory:write` | Record a code revision (real diff, change kind, safe relative path, symbol fingerprint) |
+| `coding_revision_list` | `memory:read` | List revisions by thread or file to rebuild the evolution/rollback chain |
+| `coding_revision_get` | `memory:read` | Read a single revision snapshot |
+| `memory_collection_upsert` | `memory:admin` | Create/update an agent memory collection (narrows candidates only; grants nothing) |
+| `memory_collection_list` | `memory:admin` | List the account's memory collections |
+| `memory_collection_delete` | `memory:admin` | Delete a collection (bindings cascade; memories are untouched) |
+| `memory_collection_bind` | `memory:admin` | Bind a collection to an agent in the same account |
+| `memory_collection_unbind` | `memory:admin` | Unbind (effective immediately; memories are untouched) |
 
 ---
 
@@ -562,7 +612,7 @@ A standard Rust workspace, layered by responsibility:
     ├── authz/                  # Authorization: HS256 verification, audience checks, protected-resource metadata
     ├── auth-core/              # OAuth primitives: PKCE S256, token-family rotation, Argon2
     ├── auth-web/               # Authorization server: DCR, OAuth endpoints, account console
-    ├── mcp/                    # MCP protocol layer: schemas for 28 tools (tools/, split by domain), HTTP / stdio transport (transport/), ecosystem adapter interceptor layer (adapter/)
+    ├── mcp/                    # MCP protocol layer: schemas for 38 tools (tools/, split by domain), HTTP / stdio transport (transport/), ecosystem adapter interceptor layer (adapter/)
     ├── worker/                 # Background jobs: scheduled snapshots, expiry cleanup, offline scans; embedded scheduling (embedded, shared with the two-process shape)
     └── bins/                   # Three independently deployable binaries
         ├── mcp-server/
@@ -575,8 +625,11 @@ A standard Rust workspace, layered by responsibility:
 ## 9. Development, testing and quality gates
 
 ```bash
-# Full test suite (530 cases under the default feature set, 0 failures; includes contract snapshot and lightweight cases)
+# Full test suite (default feature set; includes the contract snapshot, governance regression and lightweight cases)
 cargo test --workspace
+
+# Governance regression only (lifecycle / ACL / collections / Coding evolution chain)
+cargo test -p mem-core --test asset_governance
 
 # Static checks (zero-warning gate)
 cargo clippy --workspace --all-targets -- -D warnings
@@ -656,14 +709,18 @@ This section exists so nobody steps on a landmine, not to brag:
 7. **Cognitive async jobs are not wired yet**: `ChatCognitiveJob` (session distillation retries) and `ExperienceDistillJob` (experience distillation)
    exist and are tested, but **no binary schedules them** — a real LLM extractor is not integrated yet, and wiring them now
    would only produce placeholder data from the mock extractor.
-8. **Scheduled snapshots use the v1 payload**: the periodic `backup-worker` snapshot only contains memory entries, while
-   `memory_backup_create` produces a v4 payload (entries, evidence, relations, tasks, experiences, coding threads).
-   Restore accepts v1–v4, but a scheduled snapshot without the evidence chain must not be treated as a full backup.
+8. **Scheduled and manual backups share the v5 payload**: the periodic `backup-worker` snapshot and `memory_backup_create`
+   use the same format (entries, evidence, relations, tasks, experiences, **experience version history**, coding threads).
+   Restore accepts v1–v5, but **an older binary cannot restore a v5 backup** — keep the new binary around before downgrading,
+   or finish the restore first.
 9. **Multiple replicas only get "no duplicate execution"** (via `HUB_JOB_LEASE_H`); resumable progress inside a single
    replica is not provided — bound big namespaces with `HUB_INTEGRATION_SCAN_MAX_ENTRIES`.
 10. **Migration 015's index rebuild suits empty / small tables**: the `create index` (non-`CONCURRENTLY`) runs inside the
     startup migration transaction; for large tables, rebuild manually in a maintenance window per
     [`docs/pg-maintenance-runbook.md`](docs/pg-maintenance-runbook.md).
+11. **Experience distillation and feedback semantics changed**: `working_experience_distill` now produces a `candidate` only,
+    and `working_experience_feedback` no longer accepts a `status` argument. Callers that need immediate reuse should call
+    `working_experience_transition(action="verify")` explicitly and satisfy the source and validation gates.
 
 ---
 
@@ -675,7 +732,12 @@ This section exists so nobody steps on a landmine, not to brag:
 | Overall system design specification and tool contracts | [`docs/设计-多智能体长期记忆服务.md`](docs/设计-多智能体长期记忆服务.md) |
 | Cognitive upgrade master plan (P0–P5 requirements) | [`docs/Memory_Hub_Cognitive_Upgrade_Agent_Brief.md`](docs/Memory_Hub_Cognitive_Upgrade_Agent_Brief.md) |
 | The four-layer conversation memory model | [`docs/upgrade/CHAT_MEMORY.md`](docs/upgrade/CHAT_MEMORY.md) |
-| Experience memory and environment boundaries | [`docs/upgrade/WORKING_MEMORY.md`](docs/upgrade/WORKING_MEMORY.md) |
+| Experience memory and environment boundaries (lifecycle is governed by the asset doc) | [`docs/upgrade/WORKING_MEMORY.md`](docs/upgrade/WORKING_MEMORY.md) |
+| Experience-asset lifecycle, version history, agent collections and ACL semantics | [`docs/upgrade/ASSET_GOVERNANCE.md`](docs/upgrade/ASSET_GOVERNANCE.md) |
+| Personal Lite / Production Full deployment and mode switching | [`docs/upgrade/DEPLOYMENT_MODES.md`](docs/upgrade/DEPLOYMENT_MODES.md) |
+| Source audit and security baseline for the governance upgrade | [`docs/upgrade/GOVERNANCE_AUDIT.md`](docs/upgrade/GOVERNANCE_AUDIT.md) |
+| Governance release notes, migrations and rollback | [`docs/upgrade/GOVERNANCE_RELEASE.md`](docs/upgrade/GOVERNANCE_RELEASE.md) |
+| Taskbook and per-section completion report (Chinese) | [`docs/Memory-Hub-认知记忆与知识资产治理升级-任务书与完成情况.md`](docs/Memory-Hub-认知记忆与知识资产治理升级-任务书与完成情况.md) |
 | Code evolution chains and real diffs | [`docs/upgrade/CODING_MEMORY.md`](docs/upgrade/CODING_MEMORY.md) |
 | Retrieval evaluation, baselines and ablations | [`docs/upgrade/EVALUATION.md`](docs/upgrade/EVALUATION.md) |
 | Consolidation A/B modes (candidate discovery, merge gates, evaluation) | [`docs/upgrade/CONSOLIDATION_AB.md`](docs/upgrade/CONSOLIDATION_AB.md) |

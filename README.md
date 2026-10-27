@@ -6,9 +6,9 @@
 
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
 [![Edition](https://img.shields.io/badge/edition-2021-blue.svg)](https://doc.rust-lang.org/edition-guide/rust-2021/index.html)
-[![Tests](https://img.shields.io/badge/tests-530%20passed-brightgreen.svg)](https://github.com/orderye/memory-hub/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/tests-passing-brightgreen.svg)](https://github.com/orderye/memory-hub/actions/workflows/ci.yml)
 [![Clippy](https://img.shields.io/badge/clippy-zero%20warnings-brightgreen.svg)](https://github.com/orderye/memory-hub/actions/workflows/ci.yml)
-[![MCP](https://img.shields.io/badge/MCP-28%20tools-purple.svg)](https://modelcontextprotocol.io/)
+[![MCP](https://img.shields.io/badge/MCP-38%20tools-purple.svg)](https://modelcontextprotocol.io/)
 [![Storage](https://img.shields.io/badge/storage-PostgreSQL%2015%20%2B%20pgvector%20%7C%20in--memory-blue.svg)](https://www.postgresql.org/)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 
@@ -32,7 +32,7 @@
 - [四、记忆是怎么组织的](#四记忆是怎么组织的)
 - [五、检索是怎么工作的](#五检索是怎么工作的)
 - [六、安全与可靠性](#六安全与可靠性)
-- [七、MCP 工具清单（28 个）](#七mcp-工具清单28-个)
+- [七、MCP 工具清单（38 个）](#七mcp-工具清单38-个)
 - [八、项目结构](#八项目结构)
 - [九、开发、测试与质量门禁](#九开发测试与质量门禁)
 - [十、已知限制与下一步](#十已知限制与下一步)
@@ -64,7 +64,7 @@
 
 | 进程 | 对外形态 | 它管什么（打个比方） |
 | :--- | :--- | :--- |
-| **`mcp-server`** | HTTP `:3000`（端点 `/mcp`），也支持 stdio | 图书馆前台：接收记忆读写与检索请求，对外提供 28 个 MCP 工具 |
+| **`mcp-server`** | HTTP `:3000`（端点 `/mcp`），也支持 stdio | 图书馆前台：接收记忆读写与检索请求，对外提供 38 个 MCP 工具 |
 | **`auth-server`** | HTTP `:8080`，带网页控制台 | 门卫 + 办证处：注册账户、登记 Agent、发令牌（OAuth 2.1） |
 | **`backup-worker`** | 后台常驻 + 定时任务 | 夜班管理员：定时做备份快照、清理过期记忆、离线扫描重复与冲突 |
 | **PostgreSQL 15 + pgvector** | 数据文件 | 仓库本体（本地开发可以换成纯内存模式，重启即失忆，仅用于调试） |
@@ -88,7 +88,7 @@ flowchart TD
 
     subgraph Hub["mcp-server :3000"]
         Guard["鉴权与账户隔离检查"]
-        Tools["28 个工具路由"]
+        Tools["38 个工具路由"]
         Engines["认知引擎组<br/>对话 / 经验 / 代码 / 整合"]
         Search["混合检索引擎"]
         Guard --> Tools --> Engines
@@ -289,10 +289,44 @@ curl -s -X POST http://localhost:3000/mcp -H "Authorization: Bearer $TOKEN" \
 | 场景 | 管什么 | 关键点 |
 | :--- | :--- | :--- |
 | **Chat**（对话） | 事实 `Fact`、摘要 `Summary`、长期偏好 `Pattern`、待办意图 `Intention` | 意图带有效期，过期自动失效；"或许会 / 待定"这类含糊措辞在入库前就会被拒，防止"幻觉待办"；入库可选全自动、半自动或人工裁决 |
-| **Working**（干活） | 单次任务 `WorkingFact` 与可复用经验 `Experience` 分开存 | 经验要过高门槛才配叫"经验"；带适用环境标签，环境不符会告警降权；用得好加分、踩过坑减分，分数太低自动标记弃用（不物理删除，留审计） |
-| **Coding**（改代码） | 逻辑线程 `CodingThread` + 版本切片 `CodingRevision` | 只记**真实 Git diff**；同样的补丁重复写会幂等去重；顺手扫描私钥、Token 等敏感串并截断 |
+| **Working**（干活） | 单次任务 `WorkingFact` 与可复用经验 `Experience` 分开存 | 提炼只产出**候选**经验；必须显式 `verify` 且满足「≥2 个不同已完成来源 + 无失败任务 + 有验证方法」才升级为已验证；带适用环境标签，环境不符会告警降权；每次状态流转写版本快照 |
+| **Coding**（改代码） | 逻辑线程 `CodingThread` + 版本切片 `CodingRevision` | 只记**真实 Git diff**；同样的补丁重复写会幂等去重；顺手扫描私钥、Token 等敏感串并截断；提供按线程/文件/单条的只读查询来重建演化与回滚链 |
 
-### 4. 几个经常出现的词
+### 4. 经验资产：提炼只是候选，验证才升级
+
+Working 场景里的"经验"不是写完就能复用的。它走一条显式的资产生命周期：
+
+```
+工作事实 ──distill──▶ candidate（候选）
+                          │
+                          │ verify（≥2 个不同已完成来源 + 无失败 + 有验证方法）
+                          ▼
+                        active（已验证，可复用）
+                          │
+        reject（需理由）──┼── deprecate（需理由）
+                          ▼
+                    rejected / deprecated（保留来源与版本，不物理删除）
+```
+
+- **单次成功不等于已验证**：正反馈只加反馈分，不改状态；自动提炼与后台作业都不会把候选直接升级；
+- **只在声明的范围内推荐**：`boundary_envs` 不匹配会降权或按 `strict_env` 直接拒绝；
+- **版本不丢**：每次状态流转写入 `memory_experience_versions`（每个 version 一行），可回看"谁在什么时候因为什么改了它"；
+- **检索有优先级**：`active` 权重 1.0、`candidate` 0.6、`deprecated` 0.3；`rejected/archived` 默认不返回。
+
+对应工具：`working_experience_distill`、`working_experience_transition`、`working_experience_history`、`working_experience_feedback`。细节见 [`docs/upgrade/ASSET_GOVERNANCE.md`](docs/upgrade/ASSET_GOVERNANCE.md)。
+
+### 5. Agent 记忆集合：只缩小范围，不发放权限
+
+不同的 Agent 可以用不同的"记忆集合"（例如 Coding Agent 只看项目规范、历史故障与已验证修复经验）。集合是账户级配置：
+
+- 集合只声明**候选范围**（命名空间、场景、类型、标签、状态、是否含经验）；
+- 调用 Agent **必须被显式绑定**，否则直接拒绝（fail closed）；
+- 绑定不绕过原有 ACL：检索仍逐命名空间做实时授权，没权限的会出现在 `skipped_namespaces` 里，不会静默变成空结果；
+- 解绑立即生效；删除集合只删绑定，**不删除任何记忆**。
+
+对应工具：`memory_collection_upsert/list/delete/bind/unbind`；`memory_search` 与 `working_experience_search` 可用 `collection` 代替 `namespace`。细节见 [`docs/upgrade/ASSET_GOVERNANCE.md`](docs/upgrade/ASSET_GOVERNANCE.md)。
+
+### 6. 几个经常出现的词
 
 | 词 | 通俗解释 |
 | :--- | :--- |
@@ -421,6 +455,14 @@ Recall@1 68.15% / Recall@5 95.37% / Recall@10 97.22% / MRR@10 0.7989 / nDCG@10 0
 - **命名空间级授权**：谁的空间谁能读写，可以单独把某个空间授权给另一个 Agent，也能随时撤销（立即生效）；
 - **三种权限范围**：`memory:read` / `memory:write` / `memory:admin`，每个工具都要声明自己需要哪一级。
 
+### 认知记忆的权限边界
+
+- **所有认知工具都校验命名空间 ACL**：Working 任务与经验、Coding 线程与修订、Chat 提案与意图，不再只查 token scope；
+  同一账户内未获授权的命名空间一律拒绝；
+- **集合不是权限**：`memory_collection_*` 只决定候选范围，读取仍走实时授权；未绑定或已解绑的 Agent 直接拒绝；
+- **单命名空间请求 fail closed**：显式指定 `namespace` 时，无权限会返回错误；只有 `collection` 扇出才会把无权限命名空间放进
+  `skipped_namespaces` 并在响应里说明。
+
 ### 记忆整合的两种候选发现模式（A / B）
 
 整合中枢负责把"多 Agent 写重了"的记忆收拾干净。它有两种**候选发现**模式，
@@ -468,9 +510,9 @@ HUB_EMBED_MODEL=bge-m3
 
 ---
 
-## 七、MCP 工具清单（28 个）
+## 七、MCP 工具清单（38 个）
 
-`memory_*` 18 个是基础盘，`cognitive_*` / `working_*` / `coding_*` 10 个是认知增强。
+`memory_*` 18 个是基础盘，`cognitive_*` / `working_*` / `coding_*` 15 个是认知增强，`memory_collection_*` 5 个是集合治理。
 
 ### 1. 基础存取（4 个）
 
@@ -515,7 +557,7 @@ HUB_EMBED_MODEL=bge-m3
 | `memory_grant` | `memory:admin` | 把自己的命名空间授权给别的 Agent |
 | `memory_revoke` | `memory:admin` | 撤销授权，立即生效 |
 
-### 6. 认知增强（10 个）
+### 6. 认知增强与治理（20 个）
 
 | 工具 | 权限 | 干什么 |
 | :--- | :--- | :--- |
@@ -524,11 +566,21 @@ HUB_EMBED_MODEL=bge-m3
 | `cognitive_intentions_list` | `memory:read` | 列出当前意图与候选提案（看有没有过期意图） |
 | `working_task_start` | `memory:write` | 开一项工作流任务，可关联证据 |
 | `working_task_finish` | `memory:write` | 结束任务，记录结果摘要或失败原因 |
-| `working_experience_distill` | `memory:write` | 把一个任务或复盘沉淀成经验（含前置条件、边界环境、已知失败模式） |
-| `working_experience_feedback` | `memory:write` | 给经验打分反馈（+1 有效 / -1 踩坑），可顺带改生命周期状态 |
-| `working_experience_search` | `memory:read` | 检索可复用经验，带当前环境做边界匹配，不匹配会告警降权 |
+| `working_experience_distill` | `memory:write` | 把任务沉淀成**候选**经验（含前置条件、边界环境、已知失败模式、验证方法） |
+| `working_experience_feedback` | `memory:write` | 给经验打分反馈（+1 有效 / -1 踩坑）；只调反馈分，不改状态 |
+| `working_experience_search` | `memory:read` | 检索可复用经验，带当前环境做边界匹配，不匹配会告警降权；可限定状态或按集合检索 |
+| `working_experience_transition` | `memory:write` | 状态流转：`verify`（需满足来源与验证门槛）/ `reject` / `deprecate` / `restore` |
+| `working_experience_history` | `memory:read` | 读取经验版本历史（只追加快照） |
 | `coding_thread_create` | `memory:write` | 建一条代码演进/重构逻辑线程 |
+| `coding_thread_list` | `memory:read` | 列出代码演进线程 |
 | `coding_revision_record` | `memory:write` | 记录一次代码修订（真实 diff、变更类型、安全相对路径、符号指纹） |
+| `coding_revision_list` | `memory:read` | 按线程或文件列出修订，重建演化与回滚链 |
+| `coding_revision_get` | `memory:read` | 读取单条修订快照 |
+| `memory_collection_upsert` | `memory:admin` | 新建/更新 Agent 记忆集合（只收窄候选范围，不授权） |
+| `memory_collection_list` | `memory:admin` | 列出账户的记忆集合 |
+| `memory_collection_delete` | `memory:admin` | 删除集合（级联删除绑定，不删记忆） |
+| `memory_collection_bind` | `memory:admin` | 绑定集合到账户内 Agent |
+| `memory_collection_unbind` | `memory:admin` | 解绑（立即生效，不删记忆） |
 
 ---
 
@@ -561,7 +613,7 @@ HUB_EMBED_MODEL=bge-m3
     ├── authz/                  # 鉴权：HS256 验签、受众校验、受保护资源元数据
     ├── auth-core/              # OAuth 原语：PKCE S256、令牌家族轮换、Argon2
     ├── auth-web/               # 授权服务：DCR、OAuth 端点、账户控制台
-    ├── mcp/                    # MCP 协议层：28 个工具 Schema（tools/ 按域拆分）、HTTP / stdio 传输（transport/）、生态适配拦截层（adapter/）
+    ├── mcp/                    # MCP 协议层：38 个工具 Schema（tools/ 按域拆分）、HTTP / stdio 传输（transport/）、生态适配拦截层（adapter/）
     ├── worker/                 # 后台任务：定时快照、过期清理、离线扫描；embedded 内嵌调度（两进程部署复用同一份作业）
     └── bins/                   # 三个可独立部署的二进制
         ├── mcp-server/
@@ -574,8 +626,11 @@ HUB_EMBED_MODEL=bge-m3
 ## 九、开发、测试与质量门禁
 
 ```bash
-# 完整测试套件（当前默认特性下 530 个用例，0 失败；含契约快照与轻量化用例）
+# 完整测试套件（默认特性；含契约快照、治理回归与轻量化用例）
 cargo test --workspace
+
+# 只跑治理回归（生命周期 / ACL / 集合 / Coding 演化链）
+cargo test -p mem-core --test asset_governance
 
 # 静态检查（零警告门禁）
 cargo clippy --workspace --all-targets -- -D warnings
@@ -652,13 +707,16 @@ docker compose -f docker-compose.lite.yml up -d --build    # Lite
 7. **认知异步作业尚未装配**：`ChatCognitiveJob`（会话提炼重试）与 `ExperienceDistillJob`（经验提炼）
    已实现并有测试，但**没有接进任何二进制的调度**——真实 LLM 抽取器尚未接入，
    接进去只会用 Mock 抽取器产出占位数据。等真实抽取器落地后再装配。
-8. **定时备份的快照是 v1 载荷**：`backup-worker` 的周期快照只包含记忆条目，
-   `memory_backup_create` 走的是 v4 载荷（含证据、关系、任务、经验、代码线程）。
-   恢复路径同时支持 v1–v4，但没有证据链的定时快照不能当作完整备份使用。
+8. **定时快照与手工备份统一为 v5 载荷**：`backup-worker` 的周期快照与 `memory_backup_create` 使用同一格式
+   （条目、证据、关系、任务、经验、**经验版本历史**、代码线程）；恢复路径支持 v1–v5，
+   但**回滚后的旧二进制不能恢复 v5 备份**——降级前请保留新二进制或先完成恢复。
 9. **多副本只保证\"不同副本重复执行\"被租约挡住**（`HUB_JOB_LEASE_H`），
    不保证单副本内部的扫描进度可续传；大命名空间请用 `HUB_INTEGRATION_SCAN_MAX_ENTRIES` 分批。
 10. **迁移 015 的向量索引重建适合空表 / 小表**：`create index`（非 `CONCURRENTLY`）在启动迁移事务内执行，
     大表升级请在维护窗口按 [`docs/pg-maintenance-runbook.md`](docs/pg-maintenance-runbook.md) 手动重建。
+11. **经验提炼与反馈的语义已变更**：`working_experience_distill` 只产出 `candidate`；`working_experience_feedback`
+    只调反馈分、不再接受 `status` 参数。需要"立即可复用"的调用方应显式调用
+    `working_experience_transition(action="verify")`，并满足来源与验证门槛。
 
 ---
 
@@ -670,7 +728,12 @@ docker compose -f docker-compose.lite.yml up -d --build    # Lite
 | 系统总体设计规格与工具契约 | [`docs/设计-多智能体长期记忆服务.md`](docs/设计-多智能体长期记忆服务.md) |
 | 认知升级总纲（P0–P5 实施要求） | [`docs/Memory_Hub_Cognitive_Upgrade_Agent_Brief.md`](docs/Memory_Hub_Cognitive_Upgrade_Agent_Brief.md) |
 | 对话记忆四层模型 | [`docs/upgrade/CHAT_MEMORY.md`](docs/upgrade/CHAT_MEMORY.md) |
-| 经验记忆与环境边界 | [`docs/upgrade/WORKING_MEMORY.md`](docs/upgrade/WORKING_MEMORY.md) |
+| 经验记忆与环境边界（生命周期以资产治理文档为准） | [`docs/upgrade/WORKING_MEMORY.md`](docs/upgrade/WORKING_MEMORY.md) |
+| 经验资产生命周期、版本历史、Agent 记忆集合与 ACL 语义 | [`docs/upgrade/ASSET_GOVERNANCE.md`](docs/upgrade/ASSET_GOVERNANCE.md) |
+| 个人轻量版 / 完整生产版双部署与模式切换 | [`docs/upgrade/DEPLOYMENT_MODES.md`](docs/upgrade/DEPLOYMENT_MODES.md) |
+| 治理升级的源码审计与安全基线 | [`docs/upgrade/GOVERNANCE_AUDIT.md`](docs/upgrade/GOVERNANCE_AUDIT.md) |
+| 治理升级发布说明、迁移与回滚 | [`docs/upgrade/GOVERNANCE_RELEASE.md`](docs/upgrade/GOVERNANCE_RELEASE.md) |
+| 本轮任务书原文与逐章完成情况 | [`docs/Memory-Hub-认知记忆与知识资产治理升级-任务书与完成情况.md`](docs/Memory-Hub-认知记忆与知识资产治理升级-任务书与完成情况.md) |
 | 代码演进链与真实 Diff | [`docs/upgrade/CODING_MEMORY.md`](docs/upgrade/CODING_MEMORY.md) |
 | 检索评测、基线与消融 | [`docs/upgrade/EVALUATION.md`](docs/upgrade/EVALUATION.md) |
 | 记忆整合 A/B 双模式（候选发现、合并门槛、评测） | [`docs/upgrade/CONSOLIDATION_AB.md`](docs/upgrade/CONSOLIDATION_AB.md) |

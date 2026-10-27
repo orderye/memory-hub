@@ -124,10 +124,14 @@ Fault Degradation Success: 100.00% (2/2)
 
 ## 6. MCP 与 API 向后兼容性结论
 
-1. **MCP 协议 100% 兼容**：当时的 18 个基础 MCP 工具完全保持不变（工具总数现已扩展到 **28 个**，
-   见根目录 README 的工具清单；本节的 18 个指**原始基础工具合同**）；`memory_search` 新增的 `scene`, `layer`, `valid_at`, `include_superseded`, `min_score` 均为可选字段，已有不传这些参数的客户端执行逻辑与返回值结构完全向后兼容；
+1. **MCP 协议 100% 兼容**：当时的 18 个基础 MCP 工具完全保持不变（工具总数现已扩展到 **38 个**，
+   见根目录 README 的工具清单；本节的 18 个指**原始基础工具合同**）；`memory_search` 新增的 `scene`, `layer`, `valid_at`, `include_superseded`, `min_score`, `collection` 均为可选字段，已有不传这些参数的客户端执行逻辑与返回值结构完全向后兼容；
 2. **Schema 严格约束**：所有工具模式均显式配置 `additionalProperties: false`，杜绝未定义字段注入；
 3. **权限模型双重保护**：检索层严格遵循 `AuthCtx` + Scope + Namespace Grant 双重鉴权，客户端无法伪造 `account_id` 或跨账户窃取记忆。
+
+> **治理升级补充（2026-10）**：新增 `crates/mem-core/tests/asset_governance.rs`（11 项）覆盖经验验证门槛、候选/已验证排序、
+> 集合 fail closed 与 Coding 回滚链；本轮**未新增**独立评测数据集，也未做真实 embedding 与纯规则的对比，
+> 因此本文档的历史评测数字仍只代表检索/整合链路，不包含治理能力的量化结论。
 
 ---
 

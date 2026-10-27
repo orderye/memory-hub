@@ -8,18 +8,30 @@
 
 欢迎查阅 **记忆中枢 (Memory Hub)** 的技术文档库。本目录收录了系统的总体设计规范、认知记忆升级方案、各专业子系统技术协议、基线审计与评测报告。
 
+> **最近一次文档整理（2026-10，治理升级）**：新增经验资产生命周期与版本、Agent 记忆集合、认知服务命名空间 ACL；
+> MCP 工具从 28 个扩展到 38 个，迁移从 15 个增加到 17 个，备份负载升级到 v5。
+> 入口：[`ASSET_GOVERNANCE.md`](./upgrade/ASSET_GOVERNANCE.md) ·
+> [`DEPLOYMENT_MODES.md`](./upgrade/DEPLOYMENT_MODES.md) ·
+> [`GOVERNANCE_RELEASE.md`](./upgrade/GOVERNANCE_RELEASE.md) ·
+> [任务书与完成情况](./Memory-Hub-认知记忆与知识资产治理升级-任务书与完成情况.md)。
+
 ---
 
 ## 1. 文档全景矩阵 (Documentation Matrix)
 
 | 类别 | 文档名称 | 核心主题与范围 | 适用对象 | 状态 |
 | :--- | :--- | :--- | :--- | :--- |
-| **核心设计** | [`设计-多智能体长期记忆服务.md`](./设计-多智能体长期记忆服务.md) | 记忆中枢总体架构规格书 (v2.1)：两级主体模型、账户沙箱、**原始基础工具合同（18 个）**、OAuth 2.1 规范、备份与整合机制 | 架构师 / 开发者 / 审计者 | **历史设计 (Historical)** —— 工具合同已扩展到 28 个，见根目录 README 的工具清单 |
+| **核心设计** | [`设计-多智能体长期记忆服务.md`](./设计-多智能体长期记忆服务.md) | 记忆中枢总体架构规格书 (v2.1)：两级主体模型、账户沙箱、**原始基础工具合同（18 个）**、OAuth 2.1 规范、备份与整合机制 | 架构师 / 开发者 / 审计者 | **历史设计 (Historical)** —— 工具合同已扩展到 38 个，见根目录 README 的工具清单 |
 | **认知升级总纲** | [`Memory_Hub_Cognitive_Upgrade_Agent_Brief.md`](./Memory_Hub_Cognitive_Upgrade_Agent_Brief.md) | 认知升级任务总纲：不可变证据链、时间有效性、Chat/Working/Coding 三大子系统、场景自适应检索实施规范 | 架构师 / Agent 执行者 | **现行规范 (Active)** |
+| **治理审计** | [`upgrade/GOVERNANCE_AUDIT.md`](./upgrade/GOVERNANCE_AUDIT.md) | 知识资产治理升级 P0 基线：工程拓扑、迁移清单、能力三分类（已有/缺失/不确定）、必须保持的契约 | 架构师 / 审计者 | **现行规范 (Active)** |
+| **资产治理** | [`upgrade/ASSET_GOVERNANCE.md`](./upgrade/ASSET_GOVERNANCE.md) | 经验资产（Skill）生命周期：字段映射、状态机与验证门槛、版本历史、检索权重、Agent 记忆集合与 ACL 语义 | Agent 开发者 / 审计者 | **现行规范 (Active)** |
+| **双部署** | [`upgrade/DEPLOYMENT_MODES.md`](./upgrade/DEPLOYMENT_MODES.md) | 个人轻量版 / 完整生产版：组件矩阵、启动、升级降级、模式切换、备份范围与验证状态 | 运维人员 | **现行规范 (Active)** |
+| **发布与回滚** | [`upgrade/GOVERNANCE_RELEASE.md`](./upgrade/GOVERNANCE_RELEASE.md) | 治理升级发布说明：文件级变更、迁移与下行 SQL、测试报告、兼容性、回滚步骤、遗留问题 | 全体 | **现行规范 (Active)** |
+| **任务书回执** | [`Memory-Hub-认知记忆与知识资产治理升级-任务书与完成情况.md`](./Memory-Hub-认知记忆与知识资产治理升级-任务书与完成情况.md) | 任务书原文（章节结构保留）＋ 逐章完成情况、证据、未执行项与遗留问题清单 | 全体 | **现行规范 (Active)** |
 | **工程审计** | [`upgrade/REPOSITORY_AUDIT.md`](./upgrade/REPOSITORY_AUDIT.md) | 仓库代码审计：工程拓扑、空格路径构建约束、依赖特性分析、安全基线盘点 | 运维人员 / 开发者 | **归档报告 (Reference)** |
 | **质量基线** | [`upgrade/BASELINE.md`](./upgrade/BASELINE.md) | P0 基线验证：跨账户沙箱隔离断言、授权撤销立即生效、安全备份恢复与幂等性测试 | 测试与安全人员 | **归档报告 (Reference)** |
 | **认知子系统** | [`upgrade/CHAT_MEMORY.md`](./upgrade/CHAT_MEMORY.md) | P2 Chat 对话认知流：事实/摘要/偏好/意图四层模型、证据存根、事实演化与版本封堵 | Agent 开发者 / 算法工程师 | **现行规范 (Active)** |
-| **认知子系统** | [`upgrade/WORKING_MEMORY.md`](./upgrade/WORKING_MEMORY.md) | P3 Working 经验记忆：任务事实与通用经验解耦、环境边界感知 (`boundary_envs`)、反馈衰减机制 | 自动化 Agent 开发者 | **现行规范 (Active)** |
+| **认知子系统** | [`upgrade/WORKING_MEMORY.md`](./upgrade/WORKING_MEMORY.md) | P3 Working 经验记忆：任务事实与通用经验解耦、环境边界感知 (`boundary_envs`)、反馈衰减机制 | 自动化 Agent 开发者 | **现行规范 (Active)** —— 生命周期与版本细节见 `ASSET_GOVERNANCE.md` |
 | **认知子系统** | [`upgrade/CODING_MEMORY.md`](./upgrade/CODING_MEMORY.md) | P4 Coding 代码演进链：真实 Git Diff 捕获、SHA-256 幂等、隐私凭证过滤、Thread 与 Revision 模型 | 代码 Agent / 辅助开发工具 | **现行规范 (Active)** |
 | **评测报告** | [`upgrade/EVALUATION.md`](./upgrade/EVALUATION.md) | P5 检索优化与基准评测：**Bench v2（480 文档 / 600 查询，Recall@K / MRR@10 / nDCG@10）**、域外拒绝门禁、业务正确性门禁、阈值标定曲线 | 搜索与评测工程师 | **现行规范 (Active)** |
 | **整合升级** | [`upgrade/CONSOLIDATION_AB.md`](./upgrade/CONSOLIDATION_AB.md) | 记忆整合 A/B 双模式：候选发现（纯本地规则 / 向量辅助）、关系分类与自动合并安全门槛、溯源字段、整合专属评测 | 架构师 / 开发者 / 审计者 | **现行规范 (Active)** |
@@ -40,7 +52,13 @@
 
 | 项目 | 历史文档写法 | **当前口径** | 依据 |
 | :--- | :--- | :--- | :--- |
-| MCP 工具数量 | 18 个（`设计-多智能体长期记忆服务.md`） | **28 个** | 根目录 README「MCP 工具清单」 |
+| MCP 工具数量 | 18 个（`设计-多智能体长期记忆服务.md`） | **38 个** | 根目录 README「MCP 工具清单」 |
+| 经验状态 | candidate / active / deprecated / archived | **candidate / active / deprecated / rejected / archived**；提炼只产出 candidate，`active` 必须显式 `working_experience_transition(verify)` 且满足来源门槛 | `docs/upgrade/ASSET_GOVERNANCE.md` |
+| 经验版本 | 无版本历史 | **每次状态/内容变更写 `memory_experience_versions`（每个 version 一行）**；`working_experience_history` 可查 | 迁移 `20261028000016` |
+| Agent 记忆集合 | 仅有命名空间 grant | **`memory_collections` + 绑定**：只收窄候选范围、不授予权限；未绑定 fail closed；解绑即时生效；删除集合不删记忆 | 迁移 `20261028000017` + `docs/upgrade/ASSET_GOVERNANCE.md` |
+| 认知工具权限 | 只校验 token scope | **Working / Coding / Chat 全部校验命名空间 ACL**；显式单命名空间无权限返回错误（不静默为空） | `crates/mem-core/src/{working,coding,chat}_*.rs` |
+| 备份负载 | v4（无经验版本历史） | **v5**：含条目/证据/关系/任务/经验/**经验版本**/代码线程；恢复支持 v1–v5，但旧二进制不能恢复 v5 | `crates/mem-core/src/backup_service.rs` |
+| 迁移数量 | 15 个 | **17 个**（新增 016/017） | `crates/store/migrations/` |
 | 评测指标 | MRR@5、6 大测试集（`upgrade/EVALUATION.md` 旧版） | **Recall@1/5/10、MRR@10、nDCG@10**、硬负例违规率、首位误取率、域外误召回率、p50/p95 延迟 | `crates/retrieval/tests/eval_bench.rs` |
 | 评测规模 | 6 大测试集 | **Bench v2：480 文档 / 600 查询**，指纹 `9f5b3b075a558371` | 同上 |
 | 检索最小分 | 无默认 `min_score` | **默认拒绝阈值 0.65**（`HUB_RETRIEVAL_MIN_SCORE`），无可靠匹配时返回 `no_reliable_match: true` | `crates/common/src/config.rs` |
@@ -69,19 +87,21 @@ flowchart TD
         V2_Core --> V2_Sandbox
     end
 
-    subgraph Cognitive["认知升级演进 (P0 - P5)"]
+    subgraph Cognitive["认知升级演进 (P0 - P6)"]
         P1["P1: 证据存根 (Evidence) 与时间有效性"]
         P2["P2: Chat 对话认知流 (四层模型)"]
         P3["P3: Working 经验记忆 (环境边界)"]
         P4["P4: Coding 代码演进链 (真实 Diff)"]
         P5["P5: 场景自适应混合检索 (MMR 重排)"]
-        
+        P6["P6: 经验资产治理 (生命周期/版本) 与 Agent 记忆集合"]
+
         P1 --> P2
         P1 --> P3
         P1 --> P4
         P2 --> P5
         P3 --> P5
         P4 --> P5
+        P5 --> P6
     end
 
     V1_Old -.->|彻底重写| V2_Core
@@ -89,7 +109,7 @@ flowchart TD
 ```
 
 ### 核心定位声明
-- **只做三件事**：记忆的存取（Store）、备份（Backup）与整合归并（Consolidation）。
+- **只做五件事**：记忆的存取（Store）、备份（Backup）、整合归并（Consolidation）、认知记忆（Chat/Working/Coding）与经验资产治理。
 - **非侵入与生成解耦**：记忆中枢绝不内嵌任何生成式 Agent 的 Prompt 行为规范或自由推理逻辑，检索返回确切的记忆条目与结构化上下文，由调用方 Agent 自主决定推理方式。
 - **确定性与不可篡改**：代码修订必须来自真实 Git Diff、经验必须经受环境边界校验、事实变更采用时间封堵与因果溯源（`supersedes`），拒绝模型幻觉虚构。
 
@@ -122,7 +142,9 @@ flowchart TD
 - **环境边界感知 (`boundary_envs`)**：
   - 经验显式声明适用环境（例如 `["linux", "k8s"]`）。
   - 在检索时若传入的环境不匹配，系统不仅扣减匹配分，而且显式返回 `env_mismatch = true` 警告，严禁不兼容经验误导执行。
-- **反馈闭环**：支持正向反馈（提权）与负向反馈（降权）；当置信度低于阈值时标记为 `Deprecated`，绝不物理硬删除。
+- **资产生命周期**：提炼只产出 `candidate`；`verify` 需满足「≥2 个不同已完成来源 + 无失败来源 + validation 非空」才升级为 `active`；`reject` / `deprecate` 必须给理由；每次流转写入版本快照。
+- **反馈闭环**：正反馈只提升反馈分，**不改变状态**；负反馈降分，低于阈值（< 0.3）时标记 `deprecated`，绝不物理硬删除。
+- **版本可追溯**：`memory_experience_versions` 每个 version 一行，记录变更类型、变更人与时间。
 
 ### 3.4 Coding 代码演进链
 详见 [`upgrade/CODING_MEMORY.md`](./upgrade/CODING_MEMORY.md)。
@@ -136,6 +158,12 @@ flowchart TD
 - **五维加权打分**：
   $$\text{Score} = w_v \cdot \text{VectorSim} + w_f \cdot \text{FtsScore} + w_r \cdot \text{Recency} + w_w \cdot \text{Weight} + w_c \cdot \text{SceneBoost}$$
 - **MMR (Maximal Marginal Relevance) 多样性重排**：在检索前 $K$ 个结果中最大化信息增益，消除上下文窗口中的冗余碎片。
+
+### 3.6 经验资产治理与 Agent 记忆集合
+详见 [`upgrade/ASSET_GOVERNANCE.md`](./upgrade/ASSET_GOVERNANCE.md)。
+- **资产而非文本**：经验带版本、状态、验证元数据与来源证据，可按时间回看每一次变更；
+- **Agent 记忆集合**：账户级配置 + 显式绑定，只收窄候选范围，不授予权限；未绑定 fail closed，解绑立即生效；
+- **权限边界**：Working / Coding / Chat 全部校验命名空间 ACL；单命名空间请求无权限时直接报错。
 
 ---
 
@@ -152,14 +180,17 @@ graph LR
     UserPath --> U1["1. 查看主目录 README.md (快速开始与 MCP 工具)"]
     U1 --> U2["2. 阅读设计-多智能体长期记忆服务.md (工具与授权)"]
     U2 --> U3["3. 按需阅读 CHAT / WORKING / CODING 规范"]
+    U3 --> U4["4. 资产治理：ASSET_GOVERNANCE.md"]
 
     DevPath --> D1["1. 阅读设计-多智能体长期记忆服务.md (领域模型)"]
     D1 --> D2["2. 阅读 Memory_Hub_Cognitive_Upgrade_Agent_Brief.md (演进设计)"]
     D2 --> D3["3. 研读 upgrade 目录下的专业规范与评测用例"]
+    D3 --> D4["4. 阅读 ASSET_GOVERNANCE.md 与 GOVERNANCE_RELEASE.md"]
     
     OpsPath --> O1["1. 查阅 upgrade/REPOSITORY_AUDIT.md (环境与特性约束)"]
     O1 --> O2["2. 查看 upgrade/BASELINE.md 与 EVALUATION.md (基线与评测)"]
-    O2 --> O3["3. 配置 .env 与 Docker Compose 生产化部署"]
+    O2 --> O3["3. 按 DEPLOYMENT_MODES.md 配置轻量或生产部署"]
+    O3 --> O4["4. 按 GOVERNANCE_RELEASE.md 升级、迁移与回滚"]
 ```
 
 ---
@@ -168,4 +199,6 @@ graph LR
 
 1. **真实代码对齐**：所有文档中出现的接口契约、结构体字段、MCP 工具参数必须与实际 Rust 源码及 Migration 保持 100% 同步，严禁编写未经代码实现的“空中楼阁”；
 2. **测试用例对应**：涉及算法与策略变更（如打分公式、MMR 算法、环境感知），必须在 `crates/retrieval/tests/` 或对应 crate 的单元/集成测试中提供可复现的断言验证；
-3. **安全与隔离纪律**：任何涉及账户、鉴权和记忆隔离的修改，必须确保满足 Fail-Closed 原则并在 `upgrade/BASELINE.md` 中进行回归记录。
+3. **安全与隔离纪律**：任何涉及账户、鉴权和记忆隔离的修改，必须确保满足 Fail-Closed 原则并在 `upgrade/BASELINE.md` 中进行回归记录；
+4. **能力变更同步**：新增/修改 MCP 工具或状态机时，必须同时更新根目录 README 的工具清单、`upgrade/ASSET_GOVERNANCE.md` 与本目录的「当前口径速查」，并刷新 `crates/mcp/tests/data/tool_schemas.golden.json`；
+5. **快照与现行分开**：`LIGHTWEIGHT_*`、`REPOSITORY_AUDIT.md`、`CODE_REVIEW.md` 等是**带基线的历史快照**，引用前先看其“定基于”的 commit；不要把它们当作当前接口契约。
