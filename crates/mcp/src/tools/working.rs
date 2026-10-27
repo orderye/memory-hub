@@ -103,7 +103,11 @@ impl ToolDispatcher {
         }
     }
 
-    pub(super) async fn working_experience_distill(&self, auth: &AuthCtx, args: Value) -> ToolCallResult {
+    pub(super) async fn working_experience_distill(
+        &self,
+        auth: &AuthCtx,
+        args: Value,
+    ) -> ToolCallResult {
         #[derive(Deserialize)]
         struct Req {
             namespace: String,
@@ -195,7 +199,11 @@ impl ToolDispatcher {
         }
     }
 
-    pub(super) async fn working_experience_feedback(&self, auth: &AuthCtx, args: Value) -> ToolCallResult {
+    pub(super) async fn working_experience_feedback(
+        &self,
+        auth: &AuthCtx,
+        args: Value,
+    ) -> ToolCallResult {
         #[derive(Deserialize)]
         struct Req {
             namespace: String,
@@ -252,7 +260,11 @@ impl ToolDispatcher {
         }
     }
 
-    pub(super) async fn working_experience_search(&self, auth: &AuthCtx, args: Value) -> ToolCallResult {
+    pub(super) async fn working_experience_search(
+        &self,
+        auth: &AuthCtx,
+        args: Value,
+    ) -> ToolCallResult {
         #[derive(Deserialize)]
         struct Req {
             namespace: String,
@@ -311,5 +323,4 @@ impl ToolDispatcher {
             ))),
         }
     }
-
 }

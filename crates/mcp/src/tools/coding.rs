@@ -44,7 +44,11 @@ impl ToolDispatcher {
         }
     }
 
-    pub(super) async fn coding_revision_record(&self, auth: &AuthCtx, args: Value) -> ToolCallResult {
+    pub(super) async fn coding_revision_record(
+        &self,
+        auth: &AuthCtx,
+        args: Value,
+    ) -> ToolCallResult {
         #[derive(Deserialize)]
         struct Req {
             namespace: String,
@@ -122,4 +126,3 @@ impl ToolDispatcher {
         }
     }
 }
-

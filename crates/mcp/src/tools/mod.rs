@@ -275,8 +275,8 @@ impl ToolDispatcher {
 
 mod admin;
 mod backup;
-mod cognitive;
 mod coding;
+mod cognitive;
 mod integration;
 mod memory;
 mod working;

@@ -1,6 +1,6 @@
+use super::dispatch::{stdio_local_auth_ctx, MAX_BATCH_REQUESTS};
+use super::http::{handle_capabilities, handle_healthz, handle_http_mcp, handle_readyz};
 use super::*;
-    use super::dispatch::{stdio_local_auth_ctx, MAX_BATCH_REQUESTS};
-    use super::http::{handle_capabilities, handle_healthz, handle_http_mcp, handle_readyz};
 use crate::tools::ToolDispatcher;
 use async_trait::async_trait;
 use common::{Acl, Scope};

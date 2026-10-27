@@ -791,7 +791,10 @@ async fn test_all_in_namespace_limited_returns_most_recently_updated() {
         e.updated_at = Utc::now() - chrono::Duration::minutes(i as i64);
         store.insert(&e).await.unwrap();
     }
-    let top2 = store.all_in_namespace_limited("ns", false, 2).await.unwrap();
+    let top2 = store
+        .all_in_namespace_limited("ns", false, 2)
+        .await
+        .unwrap();
     assert_eq!(top2.len(), 2);
     // 最近更新的两条：条目 0（0 分钟前）与条目 1（1 分钟前）
     assert_eq!(top2[0].content, "条目 0");

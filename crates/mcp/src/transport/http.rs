@@ -1,5 +1,5 @@
-use super::*;
 use super::dispatch::MAX_BATCH_REQUESTS;
+use super::*;
 
 /// 单个 MCP 请求的硬超时（秒）。
 ///
@@ -351,4 +351,3 @@ pub fn first_text(res: &ToolCallResult) -> Option<&str> {
         McpContentItem::Text { text } => text.as_str(),
     })
 }
-

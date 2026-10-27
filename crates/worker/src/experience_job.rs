@@ -150,8 +150,8 @@ impl ExperienceDistillJob {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::{Scope, BOOTSTRAP_ACCOUNT_ID};
     use common::HubError;
+    use common::{Scope, BOOTSTRAP_ACCOUNT_ID};
     use mem_core::domain::{MemoryScene, TaskStatus};
     use store::InMemoryHubStore;
 

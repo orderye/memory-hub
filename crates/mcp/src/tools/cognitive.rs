@@ -1,7 +1,11 @@
 use super::*;
 
 impl ToolDispatcher {
-    pub(super) async fn cognitive_chat_propose(&self, auth: &AuthCtx, args: Value) -> ToolCallResult {
+    pub(super) async fn cognitive_chat_propose(
+        &self,
+        auth: &AuthCtx,
+        args: Value,
+    ) -> ToolCallResult {
         if !auth.has_scope(&Scope::Write) {
             return ToolCallResult::error(&HubError::InsufficientScope);
         }
@@ -82,7 +86,11 @@ impl ToolDispatcher {
         }
     }
 
-    pub(super) async fn cognitive_proposal_resolve(&self, auth: &AuthCtx, args: Value) -> ToolCallResult {
+    pub(super) async fn cognitive_proposal_resolve(
+        &self,
+        auth: &AuthCtx,
+        args: Value,
+    ) -> ToolCallResult {
         if !auth.has_scope(&Scope::Write) {
             return ToolCallResult::error(&HubError::InsufficientScope);
         }
@@ -192,7 +200,11 @@ impl ToolDispatcher {
         }
     }
 
-    pub(super) async fn cognitive_intentions_list(&self, auth: &AuthCtx, args: Value) -> ToolCallResult {
+    pub(super) async fn cognitive_intentions_list(
+        &self,
+        auth: &AuthCtx,
+        args: Value,
+    ) -> ToolCallResult {
         if !auth.has_scope(&Scope::Read) {
             return ToolCallResult::error(&HubError::InsufficientScope);
         }
@@ -283,5 +295,4 @@ impl ToolDispatcher {
             ))),
         }
     }
-
 }

@@ -1,5 +1,5 @@
-use super::*;
 use super::dispatch::stdio_local_auth_ctx;
+use super::*;
 
 /// stdio 桥接主循环：读一行、回一帧
 pub async fn run_stdio(state: Arc<McpTransportState>) -> Result<()> {
@@ -37,4 +37,3 @@ pub async fn run_stdio(state: Arc<McpTransportState>) -> Result<()> {
     }
     Ok(())
 }
-

@@ -233,4 +233,3 @@ pub(super) fn stdio_local_auth_ctx(profile: &str) -> Result<Option<AuthCtx>> {
         acl,
     )))
 }
-
