@@ -207,11 +207,12 @@ impl mem_core::MemoryStore for PostgresHubStore {
         let mut out = Vec::with_capacity(rows.len());
         for r in &rows {
             let item = Self::entry_from_row_slim(r)?;
-            // halfvec 距离返回 real（f4），与 fp32 vector 的 double precision 不同
-            let dist: f32 = r.try_get("dist").pg()?;
+            // halfvec 余弦距离与 vector 一样返回 double precision（f8），
+            // pgvector 0.7/0.8 的 halfvec 距离函数均为 float8，不存在 f4 特例。
+            let dist: f64 = r.try_get("dist").pg()?;
             out.push(Scored {
                 item,
-                score: (1.0 - dist).clamp(0.0, 1.0),
+                score: (1.0 - dist as f32).clamp(0.0, 1.0),
             });
         }
         Ok(out)
