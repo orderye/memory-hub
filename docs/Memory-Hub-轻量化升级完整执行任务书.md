@@ -12,7 +12,7 @@
 
 | 项目 | 内容 |
 | :--- | :--- |
-| 项目地址 | `https://cnb.cool/toroyxxx/memory-hub` |
+| 项目地址 | `https://cnb.cool/<CNB 组织>/memory-hub` |
 | 实施方式 | 基于现有 Rust Workspace 原地升级 |
 | 目标版本 | Lightweight Deployment & Runtime Optimization V1 |
 | 执行原则 | 先审计、后修改；小步提交；先保证兼容，再做性能优化 |

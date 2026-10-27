@@ -6,7 +6,7 @@
 
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
 [![Edition](https://img.shields.io/badge/edition-2021-blue.svg)](https://doc.rust-lang.org/edition-guide/rust-2021/index.html)
-[![Tests](https://img.shields.io/badge/tests-485%20passed-brightgreen.svg)](https://github.com/orderye/memory-hub/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/tests-530%20passed-brightgreen.svg)](https://github.com/orderye/memory-hub/actions/workflows/ci.yml)
 [![Clippy](https://img.shields.io/badge/clippy-zero%20warnings-brightgreen.svg)](https://github.com/orderye/memory-hub/actions/workflows/ci.yml)
 [![MCP](https://img.shields.io/badge/MCP-28%20tools-purple.svg)](https://modelcontextprotocol.io/)
 [![Storage](https://img.shields.io/badge/storage-PostgreSQL%2015%20%2B%20pgvector%20%7C%20in--memory-blue.svg)](https://www.postgresql.org/)
@@ -310,11 +310,16 @@ curl -s -X POST http://localhost:3000/mcp -H "Authorization: Bearer $TOKEN" \
 
 检索这件事，可以想象成一个图书管理员：
 
-1. **两条路一起找**：一条按**字面**找（中文全文索引，自带分词，不依赖外部分词库），一条按**意思**找（向量相似度，pgvector HNSW 索引）；
+1. **两条路一起找**：一条按**字面**找（中文全文索引，自带分词，不依赖外部分词库），一条按**意思**找（向量相似度，pgvector HNSW **halfvec 半精度 + 部分索引**，只索引 `active` / `archived`，体积约为 fp32 的一半）；
 2. **过滤条件下推到存储层**：场景、层级、有效期、状态、标签这些条件在取候选时就过滤掉，不浪费打分；
 3. **五维打分排序**：五项加权求和，公式见下；
-4. **结果去重（MMR）**：相似内容不会一起挤满前几名，把名额让给真正不同的信息；
+4. **结果去重（MMR）**：相似内容不会一起挤满前几名，把名额让给真正不同的信息。ANN 一路走「瘦列契约」不回传向量文本，MMR 需要的相似度按 `top_k × 4` 候选池二次取回，省掉大字段搬运；
 5. **坏了也不趴窝**：向量服务故障 → 自动退化成纯关键词检索；查询超时 → 保留已经拿到的那一路结果；两路都没结果才走游标列表兜底。
+
+> 向量索引自 2026-10-27（迁移 015）起为 **halfvec 半精度 + 部分索引**：查询侧
+> `embedding::halfvec(1024) <=>` 与索引表达式必须逐字一致，带过滤的 ANN 靠
+> `hnsw.iterative_scan` 与 `hnsw.ef_search=100` 凑满召回；重建与观测见
+> [`docs/pg-maintenance-runbook.md`](docs/pg-maintenance-runbook.md)。
 
 打分公式（语义相似、关键词命中、置信度、新鲜度、层级先验五项加权求和）：
 
@@ -352,7 +357,7 @@ $$\text{Score} = w_{sim}\cdot\text{语义相似} + w_{kw}\cdot\text{关键词命
 ```mermaid
 flowchart LR
     Q["查询：关键词 + 过滤条件"] --> FTS["按字面找<br/>中文全文索引"]
-    Q --> VEC["按意思找<br/>向量相似度"]
+    Q --> VEC["按意思找<br/>向量相似度（halfvec 索引）"]
     FTS --> Score["五维打分融合"]
     VEC --> Score
     Score --> Dedup["结果去重 MMR"]
@@ -536,6 +541,7 @@ HUB_EMBED_MODEL=bge-m3
 ├── Cargo.toml                  # Workspace 与统一依赖
 ├── Dockerfile                  # 多阶段构建的生产镜像
 ├── docker-compose.yml          # 一键编排（DB + 三个服务）
+├── docker-compose.lite.yml     # Lite 形态编排（三进程，定时作业内嵌 mcp-server）
 ├── .cnb.yml                    # CNB 云构建：PR / 分支 push 跑质量门禁；main push 出镜像并部署；tag push 出定版镜像；tag 部署触发器；分支页手动按钮事件
 ├── .cnb/tag_deploy.yml         # CNB 自定义部署环境：Tag 详情页「部署」选 production
 ├── .cnb/settings.yml           # CNB 页面 UI 定制：NPC 角色（记忆管家 / 审查员）、按钮文案与悬浮图
@@ -555,8 +561,8 @@ HUB_EMBED_MODEL=bge-m3
     ├── authz/                  # 鉴权：HS256 验签、受众校验、受保护资源元数据
     ├── auth-core/              # OAuth 原语：PKCE S256、令牌家族轮换、Argon2
     ├── auth-web/               # 授权服务：DCR、OAuth 端点、账户控制台
-    ├── mcp/                    # MCP 协议层：28 个工具 Schema、HTTP / stdio 传输
-    ├── worker/                 # 后台任务：定时快照、过期清理、离线扫描
+    ├── mcp/                    # MCP 协议层：28 个工具 Schema（tools/ 按域拆分）、HTTP / stdio 传输（transport/）、生态适配拦截层（adapter/）
+    ├── worker/                 # 后台任务：定时快照、过期清理、离线扫描；embedded 内嵌调度（两进程部署复用同一份作业）
     └── bins/                   # 三个可独立部署的二进制
         ├── mcp-server/
         ├── auth-server/
@@ -568,7 +574,7 @@ HUB_EMBED_MODEL=bge-m3
 ## 九、开发、测试与质量门禁
 
 ```bash
-# 完整测试套件（当前默认特性下 485 个用例，0 失败；含契约快照与轻量化用例）
+# 完整测试套件（当前默认特性下 530 个用例，0 失败；含契约快照与轻量化用例）
 cargo test --workspace
 
 # 静态检查（零警告门禁）
@@ -587,105 +593,20 @@ cargo test --test consolidation_eval -- --nocapture
 cargo test -p store --features pg-integration -- --ignored
 ```
 
-CI 分两条：
+CI 分两条；平台专属的流水线细节以配置为准，这里只记口径：
 
-- **GitHub Actions**（`.github/workflows/ci.yml`）：① 质量门禁（fmt / clippy `--all-features` / 测试 / 文档构建）；
-  ② PostgreSQL + pgvector 真实库集成测试（串行执行）；③ 依赖准入与安全审计（cargo-deny + cargo-audit）；④ Release 构建三个二进制。
-- **CNB 云构建**（`.cnb.yml`）：① PR（目标 `main`）创建 / 重新打开 / 源分支 push 触发 `pull_request`
-  质量门禁（fmt / clippy / test，与分支兜底同口径，不构建镜像、不部署）；② push 到 `main` 触发发布——
-  云端构建镜像 → 推制品库 → SSH 部署到服务器 → 探活 `/readyz`，失败自动回滚到上一稳定版本。
-  其它分支 push 走 `$` 兜底流水线，只跑质量门禁（fmt / clippy / test），不构建镜像、不碰生产；
-  连续多次 push 由流水线锁排队，不会并发部署。
-  打 tag 走同一条 `$` 兜底键下的 `tag_push`：把该 tag 的提交打成 `:<tag 名>` 定版镜像入库，
-  不部署、也不改动 `latest`（上线仍只由 `main` push 负责）。
-  另外可在 **Tag 详情页 →「部署」→ 选 `production`** 手动上线或回滚到某个已发布的 tag
-  （`tag_deploy.production`，环境与权限在 `.cnb/tag_deploy.yml`）；
-  **`main` 分支详情页**则有四个一键按钮（部署生产 / 回滚上一版本 / 仅构建镜像 / 问问记忆管家），见下一节。
-
-### 分支页一键按钮（CNB Web Trigger）
-
-配置在 `.cnb/web_trigger.yml`，只在 **`main` 分支详情页**出现（`reg: ^main$`）；
-按钮点下去触发 `.cnb.yml` 里 `main` 下同名事件，流水线与 `main` push 共用同一份 stages 和同一把 `deploy-main` 锁：
-
-| 按钮 | 事件 | 行为 | 谁能点 | 需要密钥仓 |
-|---|---|---|---|---|
-| 部署生产 | `web_trigger_deploy` | 当前提交构建镜像 → 推制品库 → 部署 → `/readyz` 探活，失败自动回滚 | master（含 owner） | 是 |
-| 回滚上一版本 | `web_trigger_rollback` | 把服务器切回 `previous_release.env` 里的上一稳定镜像并探活 | master（含 owner） | 是 |
-| 仅构建镜像 | `web_trigger_build` | 只构建并推镜像入库，不碰线上 | 仓库写权限 | 否 |
-| 问问记忆管家 | `web_trigger_npc` | 弹窗输入任务 → `npc:go` 读仓库后回复，不构建、不部署 | 仓库写权限 | 否 |
-
-两条边界：
-
-- 部署 / 回滚要读密钥仓 `toroyxxx/ci-secrets/deploy-key.yml`；该文件若声明了 `allow_events`，
-  需覆盖 `web_trigger*` 与 `tag_deploy.*`，`allow_branches` 要包含 `main` 与 tag 名（如 `v*`），
-  否则会在 prepare 阶段因文件引用鉴权被拒（只有「仅构建镜像」不受影响）；
-- 回滚读的是服务器上的 `previous_release.env`（每次部署写入，保留上一稳定版本），
-  它不随回滚变化，所以可以重复点；机器没成功部署过时会直接报错退出。
-
-### NPC 助手（记忆管家 / 审查员）
-
-NPC 角色定义在 `.cnb/settings.yml`（`npc.roles`），执行流水线在 `.cnb.yml`。本仓有两个角色：
-
-| 角色 | 定位 | 怎么叫 |
-|---|---|---|
-| 记忆管家（默认） | 本仓常驻助手：存取、检索、整合、备份与工程约束 | `@toroyxxx/memory-hub(记忆管家)`，或 `main` 分支页「问问记忆管家」 |
-| 审查员 | 代码审查：正确性 / 安全隔离 / 兼容演进 / 可测试性，按严重度输出 | `@toroyxxx/memory-hub(审查员)` |
-
-两个入口：
-
-- **评论 `@` 提及**：`issue.comment@npc` / `pull_request.comment@npc` 事件，提示词由平台按角色注入；评论里贴的截图也能读（`supportImage: true`）。需要它直接改代码时，在评论区勾选「替我上班」开启工作模式（需仓库开发者及以上权限）。
-- **分支页按钮**：`main` 分支详情页 →「AI 助手」→「问问记忆管家」，在弹窗里写任务（`userPrompt` 必填）。这个入口没有评论上下文，提示词只来自 `userPrompt` 与角色人格段。
-
-三条边界：
-
-- 两个评论事件必须在 `main` 与 `$` 各声明一次：`main` 是精确分支键，命中后不会走 `$`，漏配会表现为「按钮点了没反应」或「PR 评论不触发」。
-- 运行镜像是平台默认的 `cnbcool/default-npc:latest`，仓库不自建 NPC 镜像；要预装额外 CLI / Skill 时再按官方文档补 Dockerfile 与构建流水线。
-- NPC 计费归**云原生开发用量**；代理权限上限为 Developer，超出角色上限的操作会被拒。
-
-### 手动部署 / 按 tag 回滚（CNB 部署触发器）
-
-`main` push 仍是默认上线方式；需要**指定版本上线或回滚**时走部署页：
-
-1. 先让目标版本有定版镜像：推 tag（双端分别打，见 [`docs/upgrade/PUSH_PROCESS.md`](docs/upgrade/PUSH_PROCESS.md) §5.2），
-   `tag_push` 会产出 `memory-hub:<tag 名>`；
-2. CNB 仓库页 → Tag 列表 → 打开该 tag →「部署」→ 选 `production` → 确认；
-3. 流水线依次执行：取定版镜像并固化 digest → 部署 → `/readyz` 探活，失败自动回滚到上一稳定版本。
-
-三条边界：
-
-- 流水线配置来自**该 tag 提交里的** `.cnb.yml` / `.cnb/tag_deploy.yml`，早于本功能的老 tag 没有部署入口；
-- 定版镜像不存在时部署直接失败并提示，不会现场重新构建——避免部署的镜像与发布制品不是同一个 digest；
-- 部署与 `main` 发布共用一把锁（`deploy-main`）；两条入口都会改写服务器的
-  `current_release.env` / `previous_release.env`，并发执行会让回滚基准指向错的镜像。
-
-### 云原生开发环境（CNB，仅预览模式）
-
-不装本地工具链也能看效果：CNB 仓库页 →「云原生开发」→ 环境起来后**直接进入预览页**，不再是 WebIDE
-（`vscode.options.onlyPreview`；片段定义在 `.cnb.yml` 的 `.vscode_preview`，`main` 与 `$` 各自引用一次，
-因为 `$` 只是兜底分支键、main 命中精确键后不会再走它；基础镜像在 `.ide/Dockerfile`，启动脚本在 `.ide/preview.sh`）。
-
-- **预览起来的是什么**：`auth-server` 编译后监听 `8686`，用内存存储（`HUB_DB_URL=memory://preview`），
-  落地页直接进账户控制台：登录 / 自助注册 → 管理本账户的 Agent、命名空间与授权。
-- **不会起来什么**：PostgreSQL 与 `mcp-server`。内存存储是进程内的，两个进程各拿一份数据，
-  起一个「能连但数据对不上」的 MCP 端点比不起更误导；要真库联调请走 SSH 接入。
-- **数据是临时的**：环境回收或进程重启即清空；`HUB_TOKEN_SECRET` 每次启动随机生成，不落仓库。
-- **耗时**：首次点开要构建镜像（`rust:1-bookworm` + code-server，约 5–10 分钟）并 `cargo build -p auth-server`；
-  之后命中镜像层缓存与 `target/` 数据卷，只剩增量编译。默认静置 10 分钟回收。
-- **镜像里已有**：Rust 工具链（stable）与 `cargo clippy` / `cargo fmt`、`build-essential` + `pkg-config`
-  （`tikv-jemalloc-sys` 需要 C 编译）、`psql`、`jq` / `ripgrep`、Docker CLI，以及 `code-server`
-  与 rust-analyzer 等插件。仅预览模式用不到 WebIDE，但「头像 → 我的云原生开发」里的客户端 / SSH 接入仍可用。
-- **依赖缓存**：`/usr/local/cargo/registry` 与 `target/` 走数据卷，只在当前构建节点内有效，换节点自动失效。
-- **真库联调**（SSH 进环境后）：`cp .env.example .env` 并填好 `POSTGRES_PASSWORD` / `HUB_TOKEN_SECRET`，
-  `docker compose up -d postgres` 起 `pgvector/pgvector:pg15`，再按「方式 B」设置 `HUB_DB_URL` 后跑
-  `cargo test -p store --features pg-integration -- --ignored`。
-- **改环境**：改 `.ide/Dockerfile` / `.ide/preview.sh` / `.cnb.yml` 的 `.vscode_preview` 段，提交后用
-  `./scripts/push-cnb.sh --push` 同步到 CNB。`build.by` 只认 `.ide/Dockerfile`，源码改动不会触发镜像重建
-  （预览服务的编译放在 stages 里）。
+- **GitHub Actions**（`.github/workflows/ci.yml`）：质量门禁（fmt / clippy / test / 文档构建，与本地同一脚本）、
+  PostgreSQL + pgvector 真实库集成测试（串行）、依赖准入与安全审计（cargo-deny + cargo-audit）、Release 构建三个二进制。
+- **CNB 云构建**（`.cnb.yml`）：PR 与分支 push 跑同一套质量门禁；`main` push 构建镜像并部署（探活 `/readyz`，失败自动回滚）；
+  tag push 出定版镜像，可在 Tag 详情页手动部署。分支页一键按钮、NPC 助手、云原生预览环境属 CNB 专属能力，
+  细节都在 `.cnb/` 配置里（`web_trigger.yml` / `settings.yml` / `tag_deploy.yml`），README 不展开。
 
 ### 回滚（应用版本 / 部署形态）
 
-本轮升级**没有新增数据库迁移**，Lite 与 Production 共用同一 schema、同一备份格式，
-因此回滚只涉及二进制/镜像，不需要数据库回滚：
+Lite 与 Production 共用同一 schema、同一备份格式，回滚只涉及二进制/镜像，不需要数据库回滚。
+迁移 015 只重建向量索引并收紧表级 autovacuum、不改表结构，回滚到早于它的二进制功能照常，
+只是 fp32 向量查询不再命中索引、退化为顺序扫描，按
+[`docs/pg-maintenance-runbook.md`](docs/pg-maintenance-runbook.md) 可随时恢复。
 
 ```bash
 # 1. 应用版本回滚：回到上一个稳定 tag/commit，重新构建并重启
@@ -728,7 +649,6 @@ docker compose -f docker-compose.lite.yml up -d --build    # Lite
    即使配了真实嵌入服务也不会自动启用向量整合；A 模式的语义增益需真实模型 +
    `cargo test --test consolidation_eval` 才能验收，详见
    [`docs/upgrade/CONSOLIDATION_AB.md`](docs/upgrade/CONSOLIDATION_AB.md)。
-
 7. **认知异步作业尚未装配**：`ChatCognitiveJob`（会话提炼重试）与 `ExperienceDistillJob`（经验提炼）
    已实现并有测试，但**没有接进任何二进制的调度**——真实 LLM 抽取器尚未接入，
    接进去只会用 Mock 抽取器产出占位数据。等真实抽取器落地后再装配。
@@ -737,6 +657,8 @@ docker compose -f docker-compose.lite.yml up -d --build    # Lite
    恢复路径同时支持 v1–v4，但没有证据链的定时快照不能当作完整备份使用。
 9. **多副本只保证\"不同副本重复执行\"被租约挡住**（`HUB_JOB_LEASE_H`），
    不保证单副本内部的扫描进度可续传；大命名空间请用 `HUB_INTEGRATION_SCAN_MAX_ENTRIES` 分批。
+10. **迁移 015 的向量索引重建适合空表 / 小表**：`create index`（非 `CONCURRENTLY`）在启动迁移事务内执行，
+    大表升级请在维护窗口按 [`docs/pg-maintenance-runbook.md`](docs/pg-maintenance-runbook.md) 手动重建。
 
 ---
 
@@ -752,6 +674,7 @@ docker compose -f docker-compose.lite.yml up -d --build    # Lite
 | 代码演进链与真实 Diff | [`docs/upgrade/CODING_MEMORY.md`](docs/upgrade/CODING_MEMORY.md) |
 | 检索评测、基线与消融 | [`docs/upgrade/EVALUATION.md`](docs/upgrade/EVALUATION.md) |
 | 记忆整合 A/B 双模式（候选发现、合并门槛、评测） | [`docs/upgrade/CONSOLIDATION_AB.md`](docs/upgrade/CONSOLIDATION_AB.md) |
+| PostgreSQL / pgvector 维护（halfvec 索引、ef_search、观测与重建） | [`docs/pg-maintenance-runbook.md`](docs/pg-maintenance-runbook.md) |
 | 双平台推送流程（GitHub + CNB 身份隔离与重放） | [`docs/upgrade/PUSH_PROCESS.md`](docs/upgrade/PUSH_PROCESS.md) |
 | 质量与安全基线 | [`docs/upgrade/BASELINE.md`](docs/upgrade/BASELINE.md) |
 | 仓库与构建环境审计 | [`docs/upgrade/REPOSITORY_AUDIT.md`](docs/upgrade/REPOSITORY_AUDIT.md) |

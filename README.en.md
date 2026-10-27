@@ -6,7 +6,7 @@
 
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
 [![Edition](https://img.shields.io/badge/edition-2021-blue.svg)](https://doc.rust-lang.org/edition-guide/rust-2021/index.html)
-[![Tests](https://img.shields.io/badge/tests-485%20passed-brightgreen.svg)](https://github.com/orderye/memory-hub/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/tests-530%20passed-brightgreen.svg)](https://github.com/orderye/memory-hub/actions/workflows/ci.yml)
 [![Clippy](https://img.shields.io/badge/clippy-zero%20warnings-brightgreen.svg)](https://github.com/orderye/memory-hub/actions/workflows/ci.yml)
 [![MCP](https://img.shields.io/badge/MCP-28%20tools-purple.svg)](https://modelcontextprotocol.io/)
 [![Storage](https://img.shields.io/badge/storage-PostgreSQL%2015%20%2B%20pgvector%20%7C%20in--memory-blue.svg)](https://www.postgresql.org/)
@@ -314,11 +314,16 @@ When you need the older story, pass `include_superseded` and the historical entr
 
 Picture a librarian:
 
-1. **Two paths at once**: one searches by **literal text** (Chinese full-text index with built-in tokenization, no external segmenter needed), the other searches by **meaning** (vector similarity over a pgvector HNSW index);
+1. **Two paths at once**: one searches by **literal text** (Chinese full-text index with built-in tokenization, no external segmenter needed), the other searches by **meaning** (vector similarity over a pgvector HNSW **halfvec partial index** — only `active` / `archived` rows are indexed, at roughly half the fp32 size);
 2. **Filters are pushed down to the storage layer**: scene, layer, validity window, status and tags are applied while candidates are being fetched, so no scoring effort is wasted;
 3. **Five-dimensional scoring**: a weighted sum of five signals, formula below;
-4. **Result de-duplication (MMR)**: near-identical hits do not crowd out the top slots, leaving room for genuinely different information;
+4. **Result de-duplication (MMR)**: near-identical hits do not crowd out the top slots, leaving room for genuinely different information. The ANN path follows a "thin-column contract" and never ships vector text back; the similarities MMR needs are fetched in a second pass over a `top_k × 4` candidate pool, avoiding large-field traffic;
 5. **It does not fall over**: vector service failure → automatically degrades to pure keyword retrieval; query timeout → keeps the results the other path already returned; only when both paths come up empty does it fall back to a cursor listing.
+
+> Since 2026-10-27 (migration 015) the vector index is a **halfvec partial index**: the query side
+> `embedding::halfvec(1024) <=>` must match the index expression verbatim, and filtered ANN
+> relies on `hnsw.iterative_scan` plus `hnsw.ef_search=100` to fill the result set; rebuilding
+> and observability are covered in [`docs/pg-maintenance-runbook.md`](docs/pg-maintenance-runbook.md).
 
 The scoring formula (a weighted sum of semantic similarity, keyword hit, confidence, freshness and layer prior):
 
@@ -355,7 +360,7 @@ The system recognizes this at startup and:
 ```mermaid
 flowchart LR
     Q["Query: keywords + filters"] --> FTS["Search by literal text<br/>Chinese full-text index"]
-    Q --> VEC["Search by meaning<br/>vector similarity"]
+    Q --> VEC["Search by meaning<br/>vector similarity (halfvec index)"]
     FTS --> Score["Five-dimensional score fusion"]
     VEC --> Score
     Score --> Dedup["MMR de-duplication"]
@@ -537,6 +542,7 @@ A standard Rust workspace, layered by responsibility:
 ├── Cargo.toml                  # Workspace and shared dependencies
 ├── Dockerfile                  # Multi-stage production image
 ├── docker-compose.yml          # One-command orchestration (DB + three services)
+├── docker-compose.lite.yml     # Lite orchestration (three processes, scheduled jobs embedded in mcp-server)
 ├── .cnb.yml                    # CNB cloud build: PR / branch push runs the quality gate; main push ships and deploys; tag push ships a versioned image; tag deploy trigger; branch-page button events
 ├── .cnb/tag_deploy.yml         # CNB custom deploy environment: Tag page → Deploy → production
 ├── .cnb/settings.yml           # CNB page UI customisation: NPC roles (memory steward / reviewer), button copy and hover images
@@ -556,8 +562,8 @@ A standard Rust workspace, layered by responsibility:
     ├── authz/                  # Authorization: HS256 verification, audience checks, protected-resource metadata
     ├── auth-core/              # OAuth primitives: PKCE S256, token-family rotation, Argon2
     ├── auth-web/               # Authorization server: DCR, OAuth endpoints, account console
-    ├── mcp/                    # MCP protocol layer: schemas for 28 tools, HTTP / stdio transport
-    ├── worker/                 # Background jobs: scheduled snapshots, expiry cleanup, offline scans
+    ├── mcp/                    # MCP protocol layer: schemas for 28 tools (tools/, split by domain), HTTP / stdio transport (transport/), ecosystem adapter interceptor layer (adapter/)
+    ├── worker/                 # Background jobs: scheduled snapshots, expiry cleanup, offline scans; embedded scheduling (embedded, shared with the two-process shape)
     └── bins/                   # Three independently deployable binaries
         ├── mcp-server/
         ├── auth-server/
@@ -569,7 +575,7 @@ A standard Rust workspace, layered by responsibility:
 ## 9. Development, testing and quality gates
 
 ```bash
-# Full test suite (485 cases under the default feature set, 0 failures; includes contract snapshot and lightweight cases)
+# Full test suite (530 cases under the default feature set, 0 failures; includes contract snapshot and lightweight cases)
 cargo test --workspace
 
 # Static checks (zero-warning gate)
@@ -589,111 +595,22 @@ cargo test --test consolidation_eval -- --nocapture
 cargo test -p store --features pg-integration -- --ignored
 ```
 
-CI runs on two platforms:
+CI runs on two platforms; platform-specific pipeline detail lives in the configs, so this is only the summary:
 
-- **GitHub Actions** (`.github/workflows/ci.yml`): ① quality gate (fmt / clippy `--all-features` / tests / doc build);
-  ② integration tests against a real PostgreSQL + pgvector database (serialized); ③ dependency admission and security audit (cargo-deny + cargo-audit); ④ release build of the three binaries.
-- **CNB cloud build** (`.cnb.yml`): ① a PR targeting `main` (created / reopened / source branch pushed) runs the
-  `pull_request` quality gate (fmt / clippy / test, same commands as the branch fallback — no image build, no deploy);
-  ② a push to `main` ships — build the image in the cloud → push to the artifact registry → SSH-deploy to the server →
-  probe `/readyz`, rolling back to the previous stable version on failure. A push to any other branch hits the `$`
-  fallback pipeline instead: quality gate only (fmt / clippy / test), no image build and no deployment.
-  Repeated pushes queue behind a pipeline lock instead of deploying concurrently.
-  A tag push runs `tag_push` under the same `$` fallback key: the tagged commit is built as a `:<tag name>` versioned image and pushed to the
-  registry — no deployment, and `latest` is left untouched (shipping stays tied to `main` pushes).
-  You can also ship or roll back to a published tag by hand from **Tag page → Deploy → `production`**
-  (`tag_deploy.production`; environment and permissions live in `.cnb/tag_deploy.yml`).
-  The **`main` branch page** additionally carries four one-click buttons (deploy / roll back one version / build image only / ask the memory steward) — see the next section.
-
-### One-click buttons on the branch page (CNB Web Trigger)
-
-Configured in `.cnb/web_trigger.yml` and shown only on the **`main` branch page** (`reg: ^main$`). A button click runs the
-same-named event under `main` in `.cnb.yml`, so the pipelines share one set of stages and one `deploy-main` lock with regular `main` pushes:
-
-| Button | Event | What it does | Who can click | Needs the secret repo |
-|---|---|---|---|---|
-| Deploy production | `web_trigger_deploy` | build the current commit → push to the registry → deploy → probe `/readyz`, auto-rollback on failure | master (owner included) | yes |
-| Roll back one version | `web_trigger_rollback` | switch the server back to the previous stable image in `previous_release.env`, then probe | master (owner included) | yes |
-| Build image only | `web_trigger_build` | build and push the image, never touching production | any repo write access | no |
-| Ask the memory steward | `web_trigger_npc` | type a task in the dialog → `npc:go` reads the repo and replies; no build, no deploy | any repo write access | no |
-
-Two boundaries:
-
-- Deploy and rollback read the secret repo `toroyxxx/ci-secrets/deploy-key.yml`. If that file declares `allow_events`, it must cover
-  `web_trigger*` and `tag_deploy.*`, and `allow_branches` must include `main` and the tag pattern (e.g. `v*`);
-  otherwise the reference is rejected in the prepare stage (only "build image only" is unaffected).
-- Rollback reads `previous_release.env` on the server (written by every deploy, holding the previous stable version). Rollback never
-  rewrites it, so clicking again is idempotent; on a machine that never deployed successfully it fails fast.
-
-### NPC assistants (memory steward / reviewer)
-
-NPC roles live in `.cnb/settings.yml` (`npc.roles`); their pipelines live in `.cnb.yml`. This repo defines two roles:
-
-| Role | Focus | How to call it |
-|---|---|---|
-| Memory steward (default) | Resident repo assistant: storage, retrieval, consolidation, backup and engineering constraints | `@toroyxxx/memory-hub(记忆管家)`, or **Ask the memory steward** on the `main` branch page |
-| Reviewer | Code review: correctness, security isolation, compatibility, testability — reported by severity | `@toroyxxx/memory-hub(审查员)` |
-
-Two entry points:
-
-- **Comment `@` mentions**: the `issue.comment@npc` / `pull_request.comment@npc` events; the platform injects the role prompt. Screenshots pasted into the comment are readable (`supportImage: true`). Tick **替我上班** (work mode) in the comment box to let it change code directly — that requires developer access or above.
-- **Branch-page button**: `main` branch page → **AI 助手** → **问问记忆管家**, then type the task in the dialog (`userPrompt` is required). This entry has no comment context, so the prompt is just `userPrompt` plus the role's persona paragraph.
-
-Three boundaries:
-
-- Both comment events are declared under `main` and `$` separately: `main` is an exact branch key and will not fall through to `$`. A missing copy shows up as "the button does nothing" or "PR comments never trigger".
-- The runtime image is the platform default `cnbcool/default-npc:latest`; the repo does not build its own NPC image. Add a Dockerfile and build pipeline only when extra CLIs / Skills must be preinstalled.
-- NPC usage is billed as **cloud-native development** consumption; delegated authority is capped at Developer, so operations beyond that role are rejected.
-
-### Manual deploy / roll back by tag (CNB deploy trigger)
-
-`main` pushes remain the default way to ship. When you need a **specific version** (manual release or rollback), use the deploy page:
-
-1. Make sure the target version has a versioned image: push the tag (one per platform, see `docs/upgrade/PUSH_PROCESS.md` §5.2);
-   `tag_push` produces `memory-hub:<tag name>`.
-2. CNB repository page → Tags → open the tag → **Deploy** → pick `production` → confirm.
-3. The pipeline pulls that exact image and pins its digest → deploys → probes `/readyz`, rolling back to the previous stable
-   version on failure.
-
-Three boundaries:
-
-- Pipeline config is read from **that tag's commit** (`.cnb.yml` / `.cnb/tag_deploy.yml`); tags older than this feature have no deploy entry.
-- If the versioned image is missing the deploy fails fast instead of rebuilding — so the deployed image is always the released artifact.
-- Deploy and `main` shipping share one lock (`deploy-main`), because both rewrite `current_release.env` /
-  `previous_release.env` on the server and a concurrent run would corrupt the rollback baseline.
-
-### Cloud-native dev environment (CNB, preview-only)
-
-No local toolchain needed to see it running: CNB repository page → "Cloud-native development" → the environment opens the
-**preview page directly** instead of WebIDE (`vscode.options.onlyPreview`; the fragment lives in `.cnb.yml` as
-`.vscode_preview` and is referenced from both `main` and `$`, because `$` is only a fallback branch key — `main` matches an
-exact key and never falls through to it. Base image: `.ide/Dockerfile`; launch script: `.ide/preview.sh`).
-
-- **What the preview runs**: `auth-server` listens on `8686` with in-memory storage (`HUB_DB_URL=memory://preview`); the
-  landing page goes straight to the account console — sign in or self-register, then manage that account's agents,
-  namespaces and grants.
-- **What it does not run**: PostgreSQL and `mcp-server`. In-memory storage is per-process, so the two processes would hold
-  different data; an MCP endpoint that connects but disagrees is worse than none. Use SSH access for real-database work.
-- **Data is temporary**: it is wiped when the environment is recycled or the process restarts; `HUB_TOKEN_SECRET` is
-  generated randomly per launch and never committed.
-- **Timing**: the first launch builds the image (`rust:1-bookworm` + code-server, roughly 5–10 minutes) and runs
-  `cargo build -p auth-server`; later launches hit the layer cache and the `target/` volume, leaving only incremental
-  compilation. Idle environments are recycled after 10 minutes by default.
-- **Preinstalled**: Rust toolchain (stable) with `cargo clippy` / `cargo fmt`, `build-essential` + `pkg-config`
-  (`tikv-jemalloc-sys` needs a C compiler), `psql`, `jq` / `ripgrep`, Docker CLI, plus `code-server` and extensions such as
-  rust-analyzer. Preview mode does not use WebIDE, but client/SSH access from "avatar → My cloud-native dev" still works.
-- **Caches**: `/usr/local/cargo/registry` and `target/` are mounted as data volumes, valid only on the current build node.
-- **Real database** (after SSH-ing in): `cp .env.example .env` and fill in `POSTGRES_PASSWORD` / `HUB_TOKEN_SECRET`, run
-  `docker compose up -d postgres` for `pgvector/pgvector:pg15`, then set `HUB_DB_URL` as in "Way B" and run
-  `cargo test -p store --features pg-integration -- --ignored`.
-- **Changing the environment**: edit `.ide/Dockerfile`, `.ide/preview.sh`, or the `.vscode_preview` fragment in `.cnb.yml`,
-  then `./scripts/push-cnb.sh --push`. `build.by` only tracks `.ide/Dockerfile`, so source changes never rebuild the image
-  (the preview service is compiled in `stages`).
+- **GitHub Actions** (`.github/workflows/ci.yml`): quality gate (fmt / clippy / test / doc build, the same script as local),
+  integration tests against a real PostgreSQL + pgvector database (serialized), dependency admission and security audit (cargo-deny + cargo-audit), release build of the three binaries.
+- **CNB cloud build** (`.cnb.yml`): PRs and branch pushes run the same quality gate; a `main` push builds the image and deploys
+  (probes `/readyz`, auto-rolls back on failure); a tag push produces a versioned image that can be deployed by hand from the Tag page.
+  Branch-page one-click buttons, the NPC assistants and the cloud-native preview environment are CNB-exclusive capabilities;
+  their detail lives in `.cnb/` (`web_trigger.yml` / `settings.yml` / `tag_deploy.yml`) and is not spelled out here.
 
 ### Rollback (application version / deployment shape)
 
-This upgrade **adds no database migration**; Lite and Production share the same schema and backup format,
-so rolling back only involves binaries/images — no database rollback is needed:
+Lite and Production share the same schema and backup format, so rolling back only involves binaries/images — no database rollback is needed.
+Migration 015 only rebuilds the vector index and tightens table-level autovacuum without changing the table shape,
+so a binary older than it keeps working after a rollback; the only difference is that its fp32 vector queries
+no longer hit an index (015 drops the full fp32 index) and fall back to sequential scans — see
+[`docs/pg-maintenance-runbook.md`](docs/pg-maintenance-runbook.md) to restore.
 
 ```bash
 # 1. Roll back the application: check out the previous stable tag/commit and rebuild
@@ -736,7 +653,6 @@ This section exists so nobody steps on a landmine, not to brag:
    so configuring a real embedding service does not automatically turn on vector consolidation; the semantic gain of mode A has to be
    validated with a real model and `cargo test --test consolidation_eval`, see
    [`docs/upgrade/CONSOLIDATION_AB.md`](docs/upgrade/CONSOLIDATION_AB.md).
-
 7. **Cognitive async jobs are not wired yet**: `ChatCognitiveJob` (session distillation retries) and `ExperienceDistillJob` (experience distillation)
    exist and are tested, but **no binary schedules them** — a real LLM extractor is not integrated yet, and wiring them now
    would only produce placeholder data from the mock extractor.
@@ -745,6 +661,9 @@ This section exists so nobody steps on a landmine, not to brag:
    Restore accepts v1–v4, but a scheduled snapshot without the evidence chain must not be treated as a full backup.
 9. **Multiple replicas only get "no duplicate execution"** (via `HUB_JOB_LEASE_H`); resumable progress inside a single
    replica is not provided — bound big namespaces with `HUB_INTEGRATION_SCAN_MAX_ENTRIES`.
+10. **Migration 015's index rebuild suits empty / small tables**: the `create index` (non-`CONCURRENTLY`) runs inside the
+    startup migration transaction; for large tables, rebuild manually in a maintenance window per
+    [`docs/pg-maintenance-runbook.md`](docs/pg-maintenance-runbook.md).
 
 ---
 
@@ -760,6 +679,7 @@ This section exists so nobody steps on a landmine, not to brag:
 | Code evolution chains and real diffs | [`docs/upgrade/CODING_MEMORY.md`](docs/upgrade/CODING_MEMORY.md) |
 | Retrieval evaluation, baselines and ablations | [`docs/upgrade/EVALUATION.md`](docs/upgrade/EVALUATION.md) |
 | Consolidation A/B modes (candidate discovery, merge gates, evaluation) | [`docs/upgrade/CONSOLIDATION_AB.md`](docs/upgrade/CONSOLIDATION_AB.md) |
+| PostgreSQL / pgvector maintenance (halfvec index, ef_search, observability and rebuilds) | [`docs/pg-maintenance-runbook.md`](docs/pg-maintenance-runbook.md) |
 | Dual-platform push flow (GitHub + CNB identity isolation and replay) | [`docs/upgrade/PUSH_PROCESS.md`](docs/upgrade/PUSH_PROCESS.md) |
 | Quality and security baselines | [`docs/upgrade/BASELINE.md`](docs/upgrade/BASELINE.md) |
 | Repository and build environment audit | [`docs/upgrade/REPOSITORY_AUDIT.md`](docs/upgrade/REPOSITORY_AUDIT.md) |

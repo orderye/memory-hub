@@ -24,9 +24,10 @@
 | **评测报告** | [`upgrade/EVALUATION.md`](./upgrade/EVALUATION.md) | P5 检索优化与基准评测：**Bench v2（480 文档 / 600 查询，Recall@K / MRR@10 / nDCG@10）**、域外拒绝门禁、业务正确性门禁、阈值标定曲线 | 搜索与评测工程师 | **现行规范 (Active)** |
 | **整合升级** | [`upgrade/CONSOLIDATION_AB.md`](./upgrade/CONSOLIDATION_AB.md) | 记忆整合 A/B 双模式：候选发现（纯本地规则 / 向量辅助）、关系分类与自动合并安全门槛、溯源字段、整合专属评测 | 架构师 / 开发者 / 审计者 | **现行规范 (Active)** |
 | **发布流程** | [`upgrade/PUSH_PROCESS.md`](./upgrade/PUSH_PROCESS.md) | 双平台（GitHub + CNB）推送规范：身份隔离、patch-id 口径重放、凭证自检、发版与故障排查 | 运维人员 / 贡献者 | **现行规范 (Active)** |
-| **轻量化审计** | [`upgrade/LIGHTWEIGHT_AUDIT.md`](./upgrade/LIGHTWEIGHT_AUDIT.md) | 轻量化升级 P0 源码审计：Workspace/Features/Embedding/Retrieval/Consolidation/Cognitive/Storage/Worker/MCP(28 工具)/Backup/CI/迁移逐项结论与缺口清单 | 架构师 / 审计者 | **现行规范 (Active)** |
-| **性能基线** | [`upgrade/LIGHTWEIGHT_BASELINE.md`](./upgrade/LIGHTWEIGHT_BASELINE.md) | 优化前后实测对比：二进制体积、启动耗时、空闲 RSS、内存库延迟；明确标注 NOT MEASURED 项（真实 PG / 真实嵌入） | 运维 / 性能工程师 | **现行规范 (Active)** |
-| **轻量化执行报告** | [`upgrade/LIGHTWEIGHT_EXECUTION_REPORT.md`](./upgrade/LIGHTWEIGHT_EXECUTION_REPORT.md) | P0–P5 逐阶段实施记录、19 项验收勾选（PASS/BLOCKED/NOT RUN）、已知局限、回滚与复现命令 | 全体 | **现行规范 (Active)** |
+| **运维手册** | [`pg-maintenance-runbook.md`](./pg-maintenance-runbook.md) | PostgreSQL / pgvector 维护：halfvec 半精度部分索引（迁移 015）、`hnsw.ef_search` / `iterative_scan` 调参、索引重建（CONCURRENTLY）与死元组 / 膨胀观测 | 运维人员 / 开发者 | **现行规范 (Active)** |
+| **轻量化审计** | [`upgrade/LIGHTWEIGHT_AUDIT.md`](./upgrade/LIGHTWEIGHT_AUDIT.md) | 轻量化升级 P0 源码审计：Workspace/Features/Embedding/Retrieval/Consolidation/Cognitive/Storage/Worker/MCP(28 工具)/Backup/CI/迁移逐项结论与缺口清单 | 架构师 / 审计者 | **审计快照 (Reference)** —— 定基于 `3048efc`（2026-10-21）；其后变更（迁移 014/015、halfvec 索引、tools/transport 拆分等）不在审计范围 |
+| **性能基线** | [`upgrade/LIGHTWEIGHT_BASELINE.md`](./upgrade/LIGHTWEIGHT_BASELINE.md) | 优化前后实测对比：二进制体积、启动耗时、空闲 RSS、内存库延迟；明确标注 NOT MEASURED 项（真实 PG / 真实嵌入） | 运维 / 性能工程师 | **性能快照 (Reference)** —— 定基于 `3048efc`；真实 PG / 真实嵌入项未实测 |
+| **轻量化执行报告** | [`upgrade/LIGHTWEIGHT_EXECUTION_REPORT.md`](./upgrade/LIGHTWEIGHT_EXECUTION_REPORT.md) | P0–P5 逐阶段实施记录、19 项验收勾选（PASS/BLOCKED/NOT RUN）、已知局限、回滚与复现命令 | 全体 | **执行快照 (Reference)** —— 定基于 `3048efc` 的实施记录；晚于基线的变更未覆盖 |
 | **轻量化任务书** | [`Memory-Hub-轻量化升级完整执行任务书.md`](./Memory-Hub-轻量化升级完整执行任务书.md) | 轻量化升级原始执行任务书：P0–P5 阶段目标、不可违反约束、验收命令与交付清单 | 架构师 / Agent 执行者 | **归档任务书 (Reference)** |
 | **代码审校** | [`upgrade/CODE_REVIEW.md`](./upgrade/CODE_REVIEW.md) | 2026-10 全量代码审校：三条危险链路、P0–P3 共 32 项精选问题与 34 项轻微项（含位置与修复方向）、分批执行方案与进度跟踪表 | 全体 | **归档报告 (Reference)** |
 | **业务集成** | [`创界山智能接入层实施方案.md`](./创界山智能接入层实施方案.md) | 零侵入防腐中间层实施方案：特征指纹探测、虚拟双路召回、数据法规水印与角色视角整合策略 | 外部业务集成人员 | **集成方案 (Active)** |
@@ -46,6 +47,7 @@
 | 语义能力 | 隐含"向量服务在跑 = 语义可用" | **伪向量嵌入器不参与打分**；`/readyz`、`/capabilities` 显式声明 `semantic.ready` | `crates/mem-core/src/infra.rs` |
 | 证据写入 | "原封不动保存" | **写入前脱敏 + 最小化 + 到期清理**；"不可变"指写入后不可悄悄改写 | `crates/mem-core/src/redaction.rs` |
 | 整合候选发现 | 默认按向量相似度查重 | **默认 `HUB_CONSOLIDATION_MODE=rules`（纯本地规则整合，embedding 调用恒为 0）**；`hybrid` 需显式开启，且**只有原文/规范化后完全相同**的记忆才允许自动合并 | `docs/upgrade/CONSOLIDATION_AB.md` |
+| 向量索引 | pgvector HNSW（fp32 全量列索引 `idx_memories_embedding`） | **halfvec 半精度 + 部分索引** `idx_memories_embedding_hf`（`status in ('active', 'archived')`）；查询侧 `embedding::halfvec(1024) <=>` 与索引表达式逐字一致；会话参数内置 `hnsw.ef_search=100` | 迁移 `20261027000015` + `docs/pg-maintenance-runbook.md` |
 
 > 旧文档保留是为了看清演进脉络，不是当前接口契约。**接口与验收以根目录 README 与本表为准。**
 

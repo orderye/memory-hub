@@ -1,6 +1,6 @@
 # PostgreSQL / pgvector 维护 runbook
 
-适用部署：tx-cloud 2C/2GB VPS，`pgvector/pgvector:pg15`（生产实测 pgvector 0.8.7）。
+适用部署：2C/2GB 小内存 VPS（本仓生产形态），`pgvector/pgvector:pg15`（生产实测 pgvector 0.8.7）。
 迁移 015（2026-10-27）起向量索引为 **halfvec 半精度 + 部分索引**：
 
 ```sql

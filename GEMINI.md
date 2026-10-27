@@ -7,7 +7,7 @@
 | 位置 | 分支 | 提交身份 | 推送方式 |
 |---|---|---|---|
 | 主目录 | `main` | `orderye <orderye@qq.com>` | `git push origin main`（GitHub 主仓） |
-| `.cnb-worktree` | `cnb-main` | `orderye <3WJRP74JzJLZlOYQ8b7VcB+cnb.dgyOUWMigHA@noreply.cnb.cool>` | `git -C .cnb-worktree push cnb cnb-main:main`（upstream = `cnb/main`，**触发生产部署**） |
+| `.cnb-worktree` | `cnb-main` | CNB 专用身份（noreply 邮箱，确定性校验值见 `scripts/push-cnb.sh`） | `git -C .cnb-worktree push cnb cnb-main:main`（upstream = `cnb/main`，**触发生产部署**） |
 
 > 完整操作手册（含凭证自检、故障排查、禁忌清单、SHA 对照留档）见
 > [`docs/upgrade/PUSH_PROCESS.md`](docs/upgrade/PUSH_PROCESS.md)。本节是可执行的最小版本。
@@ -101,4 +101,4 @@ git log --format='%ae' -20 | sort -u             # 只有一种邮箱
 ## 2. 构建与测试纪律
 - 禁止运行 `cargo test --all-features`（路径包含空格会导致 `tikv-jemalloc-sys` C 编译报错）。
 - 统一使用 `cargo test --workspace` 与 `cargo clippy --workspace --all-targets -- -D warnings`。
-- `.cnb-worktree/` 由 `.git/info/exclude` 排除，不要提交它；部署主机等敏感信息统一走密钥仓 `toroyxxx/ci-secrets` 导入（如 `.cnb.yml` 的 `${DEPLOY_HOST}`），禁止在仓库内硬编码。
+- `.cnb-worktree/` 由 `.git/info/exclude` 排除，不要提交它；部署主机等敏感信息统一走密钥仓 `<CNB 组织>/ci-secrets` 导入（如 `.cnb.yml` 的 `${DEPLOY_HOST}`），禁止在仓库内硬编码。

@@ -812,7 +812,7 @@ feature 组合要点：
 |---|---|---|
 | 触发 | main 分支 push | 11-14 |
 | 运行环境 | 8 CPU + `services: [docker]` | 14-16 |
-| 密钥 | `imports: https://cnb.cool/toroyxxx/ci-secrets/-/blob/main/deploy-key.yml` | 17 |
+| 密钥 | `imports: https://cnb.cool/<CNB 组织>/ci-secrets/-/blob/main/deploy-key.yml` | 17 |
 | 阶段 1 | `docker build`（APT_MIRROR=mirrors.tencentyun.com、CRATES_MIRROR=sparse+https://rsproxy.cn/index/），打 CNB_COMMIT 前 8 位与 latest 两个 tag | 19-28 |
 | 阶段 2 | `docker push` 两个 tag；取 RepoDigests 写入 `/tmp/release.env` | 29-38 |
 | 阶段 3 | ssh 到部署主机（${DEPLOY_HOST}）：轮换 current/previous_release.env → `docker compose pull` → `up -d` → 15×2s 探活 8080/readyz 与 3000/readyz → 失败则回滚到 previous_release.env 并 exit 1 | 39-74 |

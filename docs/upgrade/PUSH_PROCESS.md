@@ -53,16 +53,16 @@ git -C .cnb-worktree log --right-only --cherry-pick --no-merges --reverse --form
 | 维度 | GitHub 侧 | CNB 侧 |
 | :--- | :--- | :--- |
 | 远端名 | `origin` | `cnb` |
-| 远端地址 | `ssh://git@ssh.github.com:443/orderye/memory-hub.git` | `https://cnb.cool/toroyxxx/memory-hub.git` |
-| 平台账号 | `orderye` | `toroyxxx` |
+| 远端地址 | `ssh://git@ssh.github.com:443/orderye/memory-hub.git` | `https://cnb.cool/<CNB 组织>/memory-hub.git` |
+| 平台账号 | `orderye` | `<CNB 账号>` |
 | 凭证来源 | SSH 私钥 `~/.ssh/id_ed25519`；`gh` 的 token 在 keychain 的 `github.com/orderye` 条目 | keychain 里 `srvr=cnb.cool` 的独立条目（密码位是 CNB 访问令牌） |
 | 主线分支 | `main`（本地 `main` 跟踪 `origin/main`） | 远端只保留 `main`；本地 `cnb-main` 跟踪 `cnb/main`，实际检出在 `.cnb-worktree/` |
-| 提交身份 | `orderye <orderye@qq.com>` | `orderye <3WJRP74JzJLZlOYQ8b7VcB+cnb.dgyOUWMigHA@noreply.cnb.cool>` |
+| 提交身份 | `orderye <orderye@qq.com>` | `orderye <CNB noreply 邮箱>` |
 | CI 入口 | `.github/workflows/ci.yml` | `.cnb.yml` |
 | CI 触发 | `push` / `pull_request` / 手动 `workflow_dispatch` | PR（目标 `main`）· `main` 分支 push（发布）· 其它分支 push（`$` 兜底门禁）· Tag 详情页「部署」 |
 | CI 覆盖 | 质量门禁 / PG 集成 / 依赖审计 / Release 构建（4 个 job） | PR 与分支：质量门禁（fmt / clippy / test）；`main` / Tag 发布：构建镜像 → 推制品库 → SSH 部署 → 探活回滚 |
 | 发布物 | 容器镜像（`docker build`） | 同左（CNB 侧推 `docker.cnb.cool` 制品库） |
-| 额外影响 | — | **推 `main` 会触发生产部署**（`tx-cloud` 主机） |
+| 额外影响 | — | **推 `main` 会触发生产部署**（生产 VPS 主机） |
 
 **为什么两端 SHA 不一样**：同一个提交在两个平台署名邮箱不同，commit 对象哈希就不同。
 判断两端内容是否真的一致，要**比树而不是比 SHA**：
@@ -128,7 +128,7 @@ git config user.email "orderye@qq.com"
 
 # CNB worktree：CNB 身份
 git -C .cnb-worktree config --worktree user.name  "orderye"
-git -C .cnb-worktree config --worktree user.email "3WJRP74JzJLZlOYQ8b7VcB+cnb.dgyOUWMigHA@noreply.cnb.cool"
+git -C .cnb-worktree config --worktree user.email "<CNB noreply 邮箱>"
 ```
 
 > 若 `.cnb-worktree/` 不存在，先建出来：
@@ -152,7 +152,7 @@ includeIf.hasconfig:remote.*.url:https://cnb.cool/**.path=~/.gitconfig-cnb
   （GitHub 侧由 Release job 构建；CNB 侧推 `docker.cnb.cool`）。**不提交进仓库**。
 - `target/`、`dist/` 一类产物目录已被忽略，**不要**把构建产物提交进仓库，也不要推成 git 分支。
 - 部署所需密钥（`DEPLOY_HOST`、部署私钥）只存在于 CNB 流水线从密钥仓
-  `toroyxxx/ci-secrets` 导入的变量里，**禁止在仓库内硬编码**。
+  `<CNB 组织>/ci-secrets` 导入的变量里，**禁止在仓库内硬编码**。
 - GitHub 侧 `cargo-audit` 需要 `GITHUB_TOKEN`（仓库内置，无需额外配置）；
   CNB 流水线保持无密钥状态（除部署密钥外）。
 
@@ -412,7 +412,7 @@ git -C .cnb-worktree push cnb v0.1.0
 ```
 
 推 tag 到 CNB 会触发 `.cnb.yml` 里的 `tag_push`：把该 tag 指向的提交构建成定版镜像
-`docker.cnb.cool/toroyxxx/memory-hub:vX.Y.Z` 推入制品库，流水线带 `RELEASE` 标签。
+`docker.cnb.cool/<CNB 组织>/memory-hub:vX.Y.Z` 推入制品库，流水线带 `RELEASE` 标签。
 这一步**只入库、不上线**——默认上线仍由 `main` push 那条流水线负责，`latest` 也不会被 tag 改动。
 
 需要**指定版本上线或回滚**时，在该 Tag 详情页点「部署」→ 选 `production`（环境定义在
@@ -439,7 +439,7 @@ git ls-remote --tags cnb "v0.1.0"
 - [ ] GitHub 与 CNB 两端分支最新 commit 内容一致，作者身份各自独立且自足；
 - [ ] 双端均存在对应的 `vX.Y.Z` 标签；
 - [ ] GitHub 侧 `ci.yml` 四个 job 全绿；
-- [ ] CNB 侧 `main` push 流水线完成"部署到 tx-cloud 与探活回滚"，`/readyz` 探活通过；
+- [ ] CNB 侧 `main` push 流水线完成"部署到生产 VPS 与探活回滚"，`/readyz` 探活通过；
 - [ ] CNB 制品库出现本次 tag 的定版镜像 `memory-hub:vX.Y.Z`（`tag_push` 流水线，标签 `RELEASE`）。
 
 ---
@@ -465,7 +465,7 @@ remote="$1"
 url="$(git remote get-url --push "$remote")"
 case "${url}" in
   *github.com*) expect_mail="orderye@qq.com" ;;
-  *cnb.cool*)    expect_mail="3WJRP74JzJLZlOYQ8b7VcB+cnb.dgyOUWMigHA@noreply.cnb.cool" ;;
+  *cnb.cool*)    expect_mail="<CNB noreply 邮箱>" ;;   # 真实值见 scripts/push-cnb.sh 的 EXPECT_CNB_MAIL
   *) echo "pre-push: unconfigured remote ${url}, skip identity check" >&2; exit 0 ;;
 esac
 bad=""
@@ -502,7 +502,7 @@ chmod +x .git/hooks/pre-push
 | :--- | :--- | :--- |
 | 推 CNB 报 `Authentication failed` | keychain 里 `cnb.cool` 条目过期或丢失 | `security find-internet-password -s cnb.cool` 确认条目在；重新登录 CNB 拿到新令牌后更新该条目。**不要**改用 GitHub token |
 | 推 GitHub 报 `Permission denied (publickey)` | SSH key 没加到 `orderye` 账号 | `ssh -T git@github.com` 自检；`gh auth status` 看 token；SSH 失效时可临时用 `gh auth setup-git` 走 HTTPS + gh helper |
-| `scripts/push-cnb.sh` 报 `CNB worktree identity is wrong` | worktree 级身份被改坏 | `git -C .cnb-worktree config --worktree user.email 3WJRP74JzJLZlOYQ8b7VcB+cnb.dgyOUWMigHA@noreply.cnb.cool` |
+| `scripts/push-cnb.sh` 报 `CNB worktree identity is wrong` | worktree 级身份被改坏 | `git -C .cnb-worktree config --worktree user.email <CNB noreply 邮箱>` |
 | `scripts/push-cnb.sh` 报 `has uncommitted changes` | 上一轮重放有残留 | 提交/丢弃那些改动，或加 `--force-reset` 丢弃（该 worktree 应当只是镜像） |
 | `pre-push` 拦下推送 | 待推提交署名与目标平台不符 | 主工作区推 GitHub 前应是 `orderye@qq.com`；推 CNB 前应先在 `.cnb-worktree` 用 §四 Step 3 重放 |
 | 重放时报 `nothing to commit` | 用 SHA 区间比对导致已同步提交被重复重放 | 改用 `--right-only --cherry-pick --no-merges`（patch-id 口径）筛选待同步提交；`scripts/push-cnb.sh` 已内建该口径 |

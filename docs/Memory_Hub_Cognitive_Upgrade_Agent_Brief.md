@@ -2,7 +2,7 @@
 
 **版本：** 1.0  
 **基线日期：** 2026-10-18  
-**目标仓库：** https://cnb.cool/toroyxxx/memory-hub  
+**目标仓库：** https://cnb.cool/<CNB 组织>/memory-hub  
 **执行方式：** 按 P0 → P1 → P2 → P3 → P4 → P5 顺序分阶段实施；每阶段独立提交、独立验收。  
 **关键要求：** 先审阅当前工作树和实际源码，再修改。不得假设 README 中的描述完全等于实现，不得虚构文件、trait、API、migration 编号或命令。
 
