@@ -10,6 +10,7 @@ common = { workspace = true }
 mem-core = { workspace = true }
 anyhow.workspace = true
 sqlx = { workspace = true }
+pgvector.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -16,6 +16,7 @@
 -- 无法用 `CONCURRENTLY`（迁移语句跑在事务内，而 CONCURRENTLY 禁止事务内执行），
 -- 在已有数据的库上原地重建会长时间持有锁。因此这一项**留作维护窗口的手动操作**，
 -- 不在本文件里做。
+-- （2026-10-27 已由迁移 015 在空表上落地：halfvec + partial，旧全量 fp32 索引移除。）
 
 create index if not exists idx_memories_tags_gin on memories using gin (tags);
 

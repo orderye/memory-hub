@@ -131,12 +131,28 @@ pub trait MemoryStore: Send + Sync {
 
     /// 向量近邻召回：过滤条件（命名空间/状态/场景/层级/时间有效性/标签/类型）
     /// 必须下推到存储层执行，只返回满足条件的最近邻；排序为相似度降序。
+    ///
+    /// 返回的条目**不携带 embedding**（瘦列契约）：ANN 只需要距离排序，
+    /// 整包回传 1024 维向量会让每次检索白拉 ~12KB/行。需要真实向量做
+    /// 两两相似度（MMR）的调用方，对入围候选用 [`Self::embeddings_by_ids`]
+    /// 二次取回。
     async fn similar(
         &self,
         filter: &MemoryFilter,
         embedding: &[f32],
         k: usize,
     ) -> Result<Vec<Scored<MemoryEntry>>>;
+
+    /// 批量取回条目的嵌入向量（MMR 重排的专用二次取回）。
+    ///
+    /// 只返回 `namespace` 内、`ids` 中实际带向量的条目 `(id, 向量)`，
+    /// 其余（无向量 / 不在命名空间 / 已被并发删除）缺席。
+    /// 命名空间入参是硬隔离要求：实现不得凭 id 跨命名空间取数。
+    async fn embeddings_by_ids(
+        &self,
+        namespace: &str,
+        ids: &[uuid::Uuid],
+    ) -> Result<Vec<(uuid::Uuid, Vec<f32>)>>;
 
     /// 命名空间下全部条目（备份与整合扫描用；merged 可排除）
     async fn all_in_namespace(
@@ -159,11 +175,7 @@ pub trait MemoryStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<MemoryEntry>> {
         let mut all = self.all_in_namespace(namespace, include_merged).await?;
-        all.sort_by(|a, b| {
-            b.updated_at
-                .cmp(&a.updated_at)
-                .then(b.id.cmp(&a.id))
-        });
+        all.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(b.id.cmp(&a.id)));
         if all.len() > limit {
             all.truncate(limit);
         }

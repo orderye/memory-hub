@@ -217,8 +217,12 @@ impl mem_core::MemoryStore for InMemoryHubStore {
                     return None;
                 }
                 let dot: f32 = iv.iter().zip(embedding.iter()).map(|(x, y)| x * y).sum();
+                let mut item = e.clone();
+                // 瘦列契约：ANN 召回结果不携带向量（与 PostgreSQL 实现一致），
+                // 需要向量的调用方走 embeddings_by_ids
+                item.embedding = None;
                 Some(Scored {
-                    item: e.clone(),
+                    item,
                     score: dot.clamp(0.0, 1.0),
                 })
             })
@@ -230,6 +234,24 @@ impl mem_core::MemoryStore for InMemoryHubStore {
         });
         scored.truncate(k);
         Ok(scored)
+    }
+
+    async fn embeddings_by_ids(
+        &self,
+        namespace: &str,
+        ids: &[uuid::Uuid],
+    ) -> Result<Vec<(uuid::Uuid, Vec<f32>)>> {
+        Ok(self
+            .items
+            .read()
+            .unwrap()
+            .values()
+            .filter(|e| e.namespace == namespace && ids.contains(&e.id))
+            .filter_map(|e| {
+                let v = e.embedding.as_ref()?;
+                Some((e.id, v.clone()))
+            })
+            .collect())
     }
 
     async fn all_in_namespace(

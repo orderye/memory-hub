@@ -185,19 +185,20 @@ impl mem_core::MemoryStore for PostgresHubStore {
         embedding: &[f32],
         k: usize,
     ) -> Result<Vec<Scored<MemoryEntry>>> {
-        let literal = mapping::vector_literal(embedding);
         // 状态缺省按 active 处理（与历史行为一致，避免默认召回已归档条目）
         let mut effective = filter.clone();
         if effective.statuses.is_none() {
             effective.statuses = Some(vec![MemoryStatus::Active]);
         }
 
-        let mut qb = sqlx::QueryBuilder::<sqlx::Postgres>::new(format!(
-            "select {}, (embedding <=> ",
-            Self::ENTRY_COLUMNS
-        ));
-        qb.push_bind(literal)
-            .push("::vector) as dist from memories where embedding is not null");
+        let mut qb = sqlx::QueryBuilder::<sqlx::Postgres>::new("select ");
+        qb.push(Self::ENTRY_COLUMNS_NO_EMBEDDING)
+            // 瘦列契约：ANN 只需要距离排序，条目不携带向量（MMR 走 embeddings_by_ids）。
+            // dist 表达式须与迁移 015 的表达式索引逐字一致，规划器才能命中
+            // idx_memories_embedding_hf（halfvec 半精度，索引体积减半）。
+            .push(", (embedding::halfvec(1024) <=> ");
+        qb.push_bind(mapping::halfvec_param(embedding))
+            .push(") as dist from memories where embedding is not null");
         // 过滤条件下推到 SQL：否则其它场景/已失效条目会占满 top-k，导致目标候选缺失
         Self::push_memory_filters(&mut qb, &effective);
         qb.push(" order by dist limit ").push_bind(k as i64);
@@ -205,15 +206,40 @@ impl mem_core::MemoryStore for PostgresHubStore {
         let rows = qb.build().fetch_all(&self.pool).await.pg()?;
         let mut out = Vec::with_capacity(rows.len());
         for r in &rows {
-            let item = Self::entry_from_row(r)?;
-            // dist 是本查询自身计算出的别名列，缺列属 SQL 拼装错误，直接传播
-            let dist: f64 = r.try_get("dist").pg()?;
+            let item = Self::entry_from_row_slim(r)?;
+            // halfvec 距离返回 real（f4），与 fp32 vector 的 double precision 不同
+            let dist: f32 = r.try_get("dist").pg()?;
             out.push(Scored {
                 item,
-                score: (1.0 - dist as f32).clamp(0.0, 1.0),
+                score: (1.0 - dist).clamp(0.0, 1.0),
             });
         }
         Ok(out)
+    }
+
+    /// 批量取回条目向量（瘦列契约的二次取回，见 trait 文档）
+    ///
+    /// 命名空间是硬隔离条件；无向量 / 不在命名空间内的 id 自然缺席。
+    /// embedding 列走 pgvector 二进制协议解码，不做文本序列化。
+    async fn embeddings_by_ids(
+        &self,
+        namespace: &str,
+        ids: &[Uuid],
+    ) -> Result<Vec<(Uuid, Vec<f32>)>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<(Uuid, pgvector::Vector)> = sqlx::query_as(
+            "select id, embedding from memories \
+             where namespace = $1 and id = any($2) and embedding is not null",
+        )
+        .bind(namespace)
+        .bind(ids)
+        .fetch_all(&self.pool)
+        .await
+        .pg()?;
+
+        Ok(rows.into_iter().map(|(id, v)| (id, v.to_vec())).collect())
     }
 
     async fn all_in_namespace(

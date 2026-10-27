@@ -6,7 +6,9 @@
 //! - **软超时**：整体受 `soft_timeout_ms` 约束，超时时降级为纯列表召回，
 //!   保证检索永不无限期挂起；
 //! - **融合打分**：sim / kw / conf / rec / prior 五维加权（权重见配置）；
-//! - **MMR 重排**：在相关性与多样性间取平衡，避免 top-k 全是近重复内容。
+//! - **MMR 重排**：在相关性与多样性间取平衡，避免 top-k 全是近重复内容；
+//! - **瘦列契约**：ANN 召回不回传向量文本，只有进入 MMR 候选池的条目
+//!   才通过 `embeddings_by_ids` 二次取回（见 `search`）。
 
 use async_trait::async_trait;
 use common::{AuthCtx, Result};
@@ -20,6 +22,10 @@ use mem_core::{
 };
 use std::sync::Arc;
 use std::time::Duration;
+
+/// MMR 候选池相对 top_k 的放大系数：只有按分截断后的前 k×FACTOR 条候选
+/// 参与重排（有界 MMR），因此也只有这些条目需要二次取回向量。
+const MMR_POOL_FACTOR: usize = 4;
 
 /// 混合检索器
 #[derive(Clone)]
@@ -187,7 +193,12 @@ impl HybridRetriever {
 
     /// 打分/防御性复核共用的过滤判定（与 [`Self::base_filter`] 同一套条件的
     /// Rust 侧复核；存储实现差异兜底）
-    fn passes_query_filters(&self, q: &SearchQuery, item: &MemoryEntry, now: chrono::DateTime<chrono::Utc>) -> bool {
+    fn passes_query_filters(
+        &self,
+        q: &SearchQuery,
+        item: &MemoryEntry,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> bool {
         passes_validity_filter(item, q.valid_at, q.include_superseded, now)
             && matches_tag_filter(item, &q.tags)
             && self.scene_keeps(q, item)
@@ -319,6 +330,11 @@ impl HybridRetriever {
     }
 
     /// 五维加权打分
+    ///
+    /// `query_vec` 供词法路候选现算相似度：候选携带向量且模型一致时，sim
+    /// 维度参与打分（设计意图，见
+    /// `test_fts_hit_gets_similarity_from_query_vector`）。当前生产接线中
+    /// 候选不带向量（瘦列契约），该路径自然缺席、按不可用归一化处理。
     fn score_items(
         &self,
         candidates: Vec<(MemoryEntry, Option<f32>)>,
@@ -346,11 +362,16 @@ impl HybridRetriever {
             .zip(candidate_tokens)
             .filter(|((item, _), _)| self.passes_query_filters(q, item, now))
             .map(|((item, vec_sim), tokens)| {
-                // 关键词路命中此前一律记 sim=0，而 sim 权重高达 0.50 —— 于是
-                // "全文精确命中"最高只能得 0.5 分，被任何中等向量命中压过，
-                // 双路融合名不副实。这里用条目自带向量与查询向量现算相似度。
-                let usable = embedding_usable(&item, self.embedder.model_id());
-                let sim = if usable {
+                // 向量相似度优先取向量路召回的 dist：ANN 距离是存储层算好的真实
+                // 相似度，与候选是否回传向量无关（瘦列契约后向量路候选不带
+                // embedding，门禁只看模型一致性——条目向量由其它模型生成时，
+                // 与查询向量的距离没有语义）。vec_sim 缺席的词法路候选在自身
+                // 携带向量时现算（当前生产接线不发生，见 score_items 文档）。
+                let model_consistent = item
+                    .embedding_model
+                    .as_deref()
+                    .is_none_or(|m| m == self.embedder.model_id());
+                let sim = if model_consistent {
                     vec_sim.or_else(|| {
                         let qv = query_vec?;
                         let e = item.embedding.as_deref()?;
@@ -448,7 +469,6 @@ impl HybridRetriever {
         mut scored: Vec<Scored<MemoryEntry>>,
         k: usize,
     ) -> Vec<Scored<MemoryEntry>> {
-        const MMR_POOL_FACTOR: usize = 4;
         let pool = k.saturating_mul(MMR_POOL_FACTOR).max(k);
         if scored.len() > pool {
             scored.truncate(pool);
@@ -581,19 +601,76 @@ impl Retriever for HybridRetriever {
             return Ok(Vec::new());
         }
 
+        // 向量路候选的 id 集合：MMR 相似度只认向量路候选（与瘦列化前一致，
+        // 词法路候选在相似度计算中按全异处理），二次取回也只取这个交集。
+        let vec_path_ids: std::collections::HashSet<_> = merged
+            .iter()
+            .filter(|(_, vec_sim)| vec_sim.is_some())
+            .map(|(e, _)| e.id)
+            .collect();
+
         let this = self.clone();
         let q_clone = q.clone();
         let qv_clone = query_vec;
-        let reranked = tokio::task::spawn_blocking(move || {
+        let mut scored = tokio::task::spawn_blocking(move || {
             let mut scored = this.score_items(merged, &q_clone, qv_clone.as_deref());
             // min_score 必须在 MMR 之前应用：否则 MMR 先按 top_k 选满、
             // 再被阈值删掉低分项，结果数会少于高阈值下本可返回的数量
             if let Some(min_s) = min_score {
                 scored.retain(|s| s.score >= min_s);
             }
+            scored
+        })
+        .await
+        .map_err(|e| common::HubError::Internal(anyhow::anyhow!("检索打分任务调度失败: {}", e)))?;
+
+        // MMR 相似度只消费按分截断后的前 k×FACTOR 条候选，只对其中向量路的
+        // 条目二次取回向量：瘦列化的 ANN 路不再整包回传 1024 维文本，
+        // 回传量被候选池上限 4×top_k 封顶。伪向量嵌入器的向量虽是哈希噪声，
+        // 但基线口径包含"伪向量参与 MMR"的行为（有评测门禁背书），
+        // 是否连同 MMR 一起关掉属于重冻基线的决策，不在这里顺手改。
+        let pool_n = top_k
+            .saturating_mul(MMR_POOL_FACTOR)
+            .max(top_k)
+            .min(scored.len());
+        let want_vectors = pool_n > 0
+            && scored[..pool_n].iter().any(|s| {
+                vec_path_ids.contains(&s.item.id)
+                    && s.item
+                        .embedding_model
+                        .as_deref()
+                        .is_none_or(|m| m == self.embedder.model_id())
+            });
+        if want_vectors {
+            let ids: Vec<_> = scored[..pool_n]
+                .iter()
+                .filter(|s| vec_path_ids.contains(&s.item.id))
+                .map(|s| s.item.id)
+                .collect();
+            match self.store.embeddings_by_ids(&q.namespace, &ids).await {
+                Ok(rows) => {
+                    let vec_map: std::collections::HashMap<_, _> = rows.into_iter().collect();
+                    for s in scored[..pool_n].iter_mut() {
+                        if let Some(v) = vec_map.get(&s.item.id) {
+                            s.item.embedding = Some(v.clone());
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        namespace = %q.namespace,
+                        "MMR 向量补齐失败：相似度按 0 处理，MMR 退化为按分截断"
+                    );
+                }
+            }
+        }
+
+        let this = self.clone();
+        let reranked = tokio::task::spawn_blocking(move || {
             // MMR 的意义是"相关性 + 多样性"。候选集里没有任何可用向量时，
-            // 两两相似度矩阵恒为 0，MMR 的选择顺序与"按分排序后截断"逐条相同，
-            // 直接截断即可省掉 O(pool²·dim) 的相似度矩阵（结果不变）。
+            // 两两相似度恒为 0，MMR 的选择顺序与"按分排序后截断"逐条相同，
+            // 直接截断即可（结果不变）。
             if this.has_usable_embedding(&scored) {
                 this.mmr_rerank(scored, top_k)
             } else {

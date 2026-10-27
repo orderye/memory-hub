@@ -900,6 +900,13 @@ async fn test_restore_counts_partial_failures_and_continues() {
         ) -> Result<Vec<crate::domain::Scored<MemoryEntry>>> {
             self.inner.similar(filter, qv, k).await
         }
+        async fn embeddings_by_ids(
+            &self,
+            namespace: &str,
+            ids: &[Uuid],
+        ) -> Result<Vec<(Uuid, Vec<f32>)>> {
+            self.inner.embeddings_by_ids(namespace, ids).await
+        }
         async fn all_in_namespace(
             &self,
             ns: &str,

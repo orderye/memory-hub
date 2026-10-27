@@ -114,30 +114,16 @@ mod mapping {
         }
     }
 
-    /// `pgvector` 字面向量：`[1,2,3]`
-    pub fn vector_literal(v: &[f32]) -> String {
-        let mut out = String::with_capacity(v.len() * 12 + 2);
-        out.push('[');
-        for (i, x) in v.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            out.push_str(&format!("{}", x));
-        }
-        out.push(']');
-        out
+    /// 查询向量 → `halfvec` 二进制参数（迁移 015 的 halfvec(1024) 表达式索引配套）。
+    /// 半精度舍入在客户端完成，与 SQL 侧 `embedding::halfvec(1024)` 的结果一致，
+    /// 免去每次查询 ~12KB 文本的序列化与解析。
+    pub fn halfvec_param(v: &[f32]) -> pgvector::HalfVector {
+        pgvector::HalfVector::from_f32_slice(v)
     }
 
-    /// 从 text 列读回 pgvector 表示并解析
-    pub fn parse_vector(text: &str) -> Vec<f32> {
-        let trimmed = text.trim().trim_start_matches('[').trim_end_matches(']');
-        if trimmed.is_empty() {
-            return Vec::new();
-        }
-        trimmed
-            .split(',')
-            .filter_map(|s| s.trim().parse::<f32>().ok())
-            .collect()
+    /// 写入向量 → `vector` 二进制参数（INSERT / UPDATE 共用）。
+    pub fn vector_param(v: &[f32]) -> pgvector::Vector {
+        pgvector::Vector::from(v.to_vec())
     }
 }
 
@@ -230,6 +216,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
     (
         "20261027000014_memories_ns_updated_index",
         include_str!("../../migrations/20261027000014_memories_ns_updated_index.sql"),
+    ),
+    (
+        "20261027000015_vector_index_halfvec_partial",
+        include_str!("../../migrations/20261027000015_vector_index_halfvec_partial.sql"),
     ),
 ];
 
@@ -405,6 +395,13 @@ impl PostgresHubStore {
                     }
                     if flag.load(std::sync::atomic::Ordering::Relaxed) {
                         sqlx::query("set hnsw.iterative_scan = 'relaxed_order'")
+                            .execute(&mut *conn)
+                            .await?;
+                        // HNSW 图探索宽度（默认 40）对候选池 vec_k=100 过窄：
+                        // 迭代扫描下 ef_search 决定单轮探索量，过窄会为凑满 k
+                        // 反复回扫。flag 已保证 pgvector >= 0.8，ef_search（0.5
+                        // 引入）必可用；召回不足时先调这里，再考虑 vec_k。
+                        sqlx::query("set hnsw.ef_search = 100")
                             .execute(&mut *conn)
                             .await?;
                     }
@@ -669,55 +666,9 @@ impl PostgresHubStore {
         }
     }
 
-    fn entry_from_row(r: &PgRow) -> Result<MemoryEntry> {
-        let kind: String = r.try_get("kind").pg()?;
-        let status: String = r.try_get("status").pg()?;
-        // 可空列一律强类型 Option<T> 解码并传播错误：SELECT 列清单一旦与
-        // schema 漂移，缺列/类型不符必须显式报错，静默变 None 等于数据丢失
-        let embedding: Option<String> = r.try_get("embedding").pg()?;
-        let scene_str: Option<String> = r.try_get("scene").pg()?;
-        let layer_str: Option<String> = r.try_get("layer").pg()?;
-        let scene = match scene_str.as_deref() {
-            Some(s) => Some(mapping::parse_scene(s)?),
-            None => None,
-        };
-        let layer = match layer_str.as_deref() {
-            Some(s) => Some(mapping::parse_layer(s)?),
-            None => None,
-        };
-        let valid_from: Option<DateTime<Utc>> = r.try_get("valid_from").pg()?;
-        let valid_until: Option<DateTime<Utc>> = r.try_get("valid_until").pg()?;
-        let occurred_at: Option<DateTime<Utc>> = r.try_get("occurred_at").pg()?;
-
-        Ok(MemoryEntry {
-            id: r.try_get("id").pg()?,
-            namespace: r.try_get("namespace").pg()?,
-            key: r.try_get("key").pg()?,
-            kind: mapping::parse_kind(&kind)?,
-            content: r.try_get("content").pg()?,
-            tags: r.try_get("tags").pg()?,
-            metadata: r.try_get("metadata").pg()?,
-            embedding: embedding.map(|t| mapping::parse_vector(&t)),
-            embedding_model: r.try_get("embedding_model").pg()?,
-            source_agent: r.try_get("source_agent").pg()?,
-            confidence: r.try_get("confidence").pg()?,
-            status: mapping::parse_status(&status)?,
-            version: r.try_get("version").pg()?,
-            expires_at: r.try_get("expires_at").pg()?,
-            merged_into: r.try_get("merged_into").pg()?,
-            created_at: r.try_get("created_at").pg()?,
-            updated_at: r.try_get("updated_at").pg()?,
-            scene,
-            layer,
-            valid_from,
-            valid_until,
-            occurred_at,
-        })
-    }
-
-    /// 瘦版行映射：与 [`Self::entry_from_row`] 相同，但跳过 `embedding` 列解析
-    ///（对应 [`Self::ENTRY_COLUMNS_NO_EMBEDDING`]）。读路径大多不需要向量，
-    /// 避免 ~4KB/行 的 embedding 文本传输与 float 解析开销。
+    /// 瘦版行映射：跳过 `embedding` 列解析（对应 [`Self::ENTRY_COLUMNS_NO_EMBEDDING`]）。
+    /// 读路径大多不需要向量，避免 ~4KB/行 的 embedding 传输与解析开销；
+    /// 需要向量的路径（MMR 二次取回）走 `embeddings_by_ids` 二进制读回。
     fn entry_from_row_slim(r: &PgRow) -> Result<MemoryEntry> {
         let kind: String = r.try_get("kind").pg()?;
         let status: String = r.try_get("status").pg()?;
@@ -920,7 +871,7 @@ impl PostgresHubStore {
         entry: &MemoryEntry,
         expected_version: Option<i64>,
     ) -> Result<u64> {
-        let embedding_literal = entry.embedding.as_ref().map(|v| mapping::vector_literal(v));
+        let embedding_param = entry.embedding.as_ref().map(|v| mapping::vector_param(v));
         let tsv_tokens = tsv_tokens_for(&entry.content);
         let guard = if expected_version.is_some() {
             " and version = $23"
@@ -947,7 +898,7 @@ impl PostgresHubStore {
             .bind(&entry.content)
             .bind(&entry.tags)
             .bind(&entry.metadata)
-            .bind(&embedding_literal)
+            .bind(&embedding_param)
             .bind(&entry.embedding_model)
             .bind(&entry.source_agent)
             .bind(entry.confidence)
@@ -1007,7 +958,7 @@ impl PostgresHubStore {
 
     /// 在给定连接上插入新条目（INSERT 列清单与参数顺序的唯一来源）
     async fn insert_memory_on(conn: &mut PgConnection, entry: &MemoryEntry) -> Result<()> {
-        let embedding_literal = entry.embedding.as_ref().map(|v| mapping::vector_literal(v));
+        let embedding_param = entry.embedding.as_ref().map(|v| mapping::vector_param(v));
         let tsv_tokens = tsv_tokens_for(&entry.content);
         sqlx::query(Self::MEMORY_INSERT_SQL)
             .bind(entry.id)
@@ -1017,7 +968,7 @@ impl PostgresHubStore {
             .bind(&entry.content)
             .bind(&entry.tags)
             .bind(&entry.metadata)
-            .bind(&embedding_literal)
+            .bind(&embedding_param)
             .bind(&entry.embedding_model)
             .bind(&entry.source_agent)
             .bind(entry.confidence)
@@ -1106,14 +1057,9 @@ impl PostgresHubStore {
         })
     }
 
-    /// 全列 SELECT（供行映射复用）
-    const ENTRY_COLUMNS: &'static str = "id, namespace, key, kind, content, tags, metadata, \
-         embedding::text as embedding, embedding_model, source_agent, confidence, status, \
-         version, expires_at, merged_into, created_at, updated_at, \
-         scene, layer, valid_from, valid_until, occurred_at";
-
-    /// 瘦版列清单：省略 embedding，适用于 list / count / get / 备份摘要等
-    /// 不需要向量的读路径。single 条目获取也走瘦版——如需 embedding 再单次查询。
+    /// 瘦版列清单：省略 embedding，适用于 list / count / get / similar /
+    /// 备份摘要等不需要向量的读路径。single 条目获取也走瘦版——如需 embedding
+    /// 再单次查询（embeddings_by_ids，二进制协议）。
     const ENTRY_COLUMNS_NO_EMBEDDING: &'static str =
         "id, namespace, key, kind, content, tags, metadata, \
          embedding_model, source_agent, confidence, status, \

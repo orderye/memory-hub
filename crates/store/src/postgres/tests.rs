@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn test_migrations_registered() {
-    assert_eq!(MIGRATIONS.len(), 14);
+    assert_eq!(MIGRATIONS.len(), 15);
     assert!(MIGRATIONS[0].0.starts_with("20261011"));
     // 迁移清单必须按版本号字典序排列（执行顺序依赖于此）
     for w in MIGRATIONS.windows(2) {
@@ -17,7 +17,7 @@ fn test_migrations_registered() {
     // 此前只抽查了 002/003，切分器对 dollar-quoted 块出错时另一条会被静默截断。
     for (version, sql) in MIGRATIONS {
         let stmts = split_sql_statements(sql);
-        assert!(stmts.len() >= 1, "迁移 {} 应至少切出一条语句", version);
+        assert!(!stmts.is_empty(), "迁移 {} 应至少切出一条语句", version);
         assert!(
             stmts.iter().all(|s| s.trim_end().ends_with(';')),
             "迁移 {} 存在未被切分的尾段",
@@ -88,21 +88,15 @@ fn test_split_full_migration_keeps_do_block_intact() {
 }
 
 #[test]
-fn test_vector_literal_roundtrip() {
+fn test_vector_params_roundtrip() {
     let v = vec![0.5f32, -0.25, 1.0];
-    let literal = mapping::vector_literal(&v);
-    assert!(literal.starts_with('['));
-    assert!(literal.ends_with(']'));
-    let parsed = mapping::parse_vector(&literal);
-    assert_eq!(parsed.len(), 3);
-    assert!((parsed[0] - 0.5).abs() < 1e-6);
-    assert!((parsed[1] + 0.25).abs() < 1e-6);
-}
-
-#[test]
-fn test_parse_vector_edge_cases() {
-    assert!(mapping::parse_vector("[]").is_empty());
-    assert!(mapping::parse_vector("[1,2,3]").len() == 3);
+    // 写路径参数：fp32 精度无损
+    let vec_param = mapping::vector_param(&v);
+    assert_eq!(vec_param.to_vec().len(), 3);
+    assert!((vec_param.to_vec()[1] + 0.25).abs() < 1e-6);
+    // 查询参数：halfvec 半精度（f16 存储，维度保持）
+    let half_param = mapping::halfvec_param(&v);
+    assert_eq!(half_param.to_vec().len(), 3);
 }
 
 #[test]

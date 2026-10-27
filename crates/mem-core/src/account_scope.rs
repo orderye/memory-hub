@@ -208,6 +208,16 @@ impl<S: MemoryStore + ?Sized> MemoryStore for AccountScopedStore<S> {
             .collect())
     }
 
+    async fn embeddings_by_ids(
+        &self,
+        namespace: &str,
+        ids: &[uuid::Uuid],
+    ) -> Result<Vec<(uuid::Uuid, Vec<f32>)>> {
+        self.inner
+            .embeddings_by_ids(&self.scoped(namespace), ids)
+            .await
+    }
+
     async fn all_in_namespace(
         &self,
         namespace: &str,

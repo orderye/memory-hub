@@ -283,3 +283,92 @@ async fn pg_fts_backfill_retokenizes_legacy_rows() {
 
     store.delete(ns, e.id).await.unwrap();
 }
+
+/// 迁移 015 + 瘦列契约 + 二进制协议的端到端验证：
+/// - 写路径以 pgvector 二进制参数落库（INSERT）；
+/// - `similar` 以 halfvec 二进制参数走表达式索引（迁移 015），返回瘦列
+///   （不带 embedding）与 fp16 距离分数；
+/// - `embeddings_by_ids` 按 id 二进制读回向量，且严格受命名空间隔离；
+/// - merged 状态不进部分索引（迁移 015 谓词 `status in ('active','archived')`）。
+#[tokio::test]
+#[ignore = "需要 DATABASE_URL"]
+async fn pg_vector_ann_halfvec_and_embeddings_by_ids() {
+    let store = store().await;
+    let ns = "it-ns-vec-halfvec";
+    let other = "it-ns-vec-halfvec-other";
+    store
+        .ensure_namespace(ns, &AgentId::from("it-agent"))
+        .await
+        .unwrap();
+    store
+        .ensure_namespace(other, &AgentId::from("it-agent"))
+        .await
+        .unwrap();
+
+    let model = "halfvec-it-embedder";
+    let mut target = entry(ns, "it-agent", "东京区域的部署事实");
+    target.embedding = Some(vec![1.0; 1024]);
+    target.embedding_model = Some(model.to_string());
+    store.insert(&target).await.unwrap();
+
+    let mut noise = entry(ns, "it-agent", "无关的噪声条目");
+    noise.embedding = Some(vec![-1.0; 1024]);
+    noise.embedding_model = Some(model.to_string());
+    store.insert(&noise).await.unwrap();
+
+    // merged 行带向量也不该被 ANN 召回（部分索引谓词排除）
+    let mut merged_row = entry(ns, "it-agent", "已被整合取代的历史条目");
+    merged_row.embedding = Some(vec![1.0; 1024]);
+    merged_row.embedding_model = Some(model.to_string());
+    merged_row.status = MemoryStatus::Merged;
+    store.insert(&merged_row).await.unwrap();
+
+    let mut cross = entry(other, "it-agent", "其它命名空间的同向量条目");
+    cross.embedding = Some(vec![1.0; 1024]);
+    cross.embedding_model = Some(model.to_string());
+    store.insert(&cross).await.unwrap();
+
+    // ANN：查询向量与 target 同向
+    let filter = MemoryFilter {
+        namespace: Some(ns.to_string()),
+        ..Default::default()
+    };
+    let hits = store.similar(&filter, &vec![1.0; 1024], 10).await.unwrap();
+    assert!(!hits.is_empty(), "halfvec ANN 必须命中同向条目");
+    assert_eq!(hits[0].item.id, target.id);
+    // 瘦列契约：结果不带向量；分数接近 1（同向余弦）
+    assert!(hits[0].item.embedding.is_none(), "similar 返回瘦列");
+    assert!(
+        (hits[0].score - 1.0).abs() < 1e-2,
+        "同向条目的半精度余弦分数应接近 1：{}",
+        hits[0].score
+    );
+    assert!(
+        hits.iter().all(|h| h.item.id != merged_row.id),
+        "merged 行不进部分索引，不应被召回"
+    );
+
+    // 二次取回：本命名空间内按 id 取回向量（二进制协议）
+    let rows = store
+        .embeddings_by_ids(ns, &[target.id, noise.id, merged_row.id])
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 3, "三条都带向量（merged 只是索引不可见）");
+    let got_target = rows.iter().find(|(id, _)| *id == target.id).unwrap();
+    assert_eq!(got_target.1, vec![1.0; 1024]);
+
+    // 硬隔离：换命名空间后同 id 集合取不到任何向量
+    let rows_other = store
+        .embeddings_by_ids(other, &[target.id, noise.id])
+        .await
+        .unwrap();
+    assert!(
+        rows_other.is_empty(),
+        "embeddings_by_ids 不得跨命名空间取数"
+    );
+
+    for id in [target.id, noise.id, merged_row.id] {
+        store.delete(ns, id).await.unwrap();
+    }
+    store.delete(other, cross.id).await.unwrap();
+}

@@ -69,4 +69,25 @@ mod tests {
         assert!(migration_sql.contains("using hnsw (embedding vector_cosine_ops)"));
         assert!(migration_sql.contains("using gin (to_tsvector('simple', content))"));
     }
+
+    #[test]
+    fn test_migration_15_vector_index_overhaul() {
+        let sql = include_str!("../migrations/20261027000015_vector_index_halfvec_partial.sql");
+
+        // 死索引清理：tsv_tokens 接管后 content 表达式 GIN 零查询引用
+        assert!(sql.contains("drop index if exists idx_memories_tsv"));
+
+        // halfvec 半精度 + partial：表达式与查询侧 similar() 的 dist 表达式
+        // 必须逐字一致（embedding::halfvec(1024)），否则规划器不认表达式索引；
+        // 谓词覆盖两种查询形态（active / active+archived），merged 不进索引
+        assert!(sql.contains(
+            "using hnsw ((embedding::halfvec(1024)) halfvec_cosine_ops)\n  where status in ('active', 'archived')"
+        ));
+        // 旧全量 fp32 索引移除（查询形态已全部被部分索引覆盖）
+        assert!(sql.contains("drop index if exists idx_memories_embedding"));
+
+        // memories 高频 upsert：表级 autovacuum 收紧
+        assert!(sql.contains("autovacuum_vacuum_scale_factor = 0.05"));
+        assert!(sql.contains("autovacuum_analyze_scale_factor = 0.02"));
+    }
 }

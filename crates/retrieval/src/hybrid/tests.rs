@@ -141,8 +141,11 @@ impl MemoryStore for TestStore {
             })
             .filter_map(|e| {
                 let iv = e.embedding.as_ref()?;
+                let mut item = e.clone();
+                // 瘦列契约：ANN 结果不带向量，MMR 走 embeddings_by_ids
+                item.embedding = None;
                 Some(Scored {
-                    item: e.clone(),
+                    item,
                     score: cosine_similarity(qv, iv),
                 })
             })
@@ -150,6 +153,20 @@ impl MemoryStore for TestStore {
         out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
         out.truncate(k);
         Ok(out)
+    }
+    async fn embeddings_by_ids(
+        &self,
+        namespace: &str,
+        ids: &[Uuid],
+    ) -> Result<Vec<(Uuid, Vec<f32>)>> {
+        Ok(self
+            .items
+            .read()
+            .unwrap()
+            .values()
+            .filter(|e| e.namespace == namespace && ids.contains(&e.id) && e.embedding.is_some())
+            .map(|e| (e.id, e.embedding.clone().unwrap()))
+            .collect())
     }
     async fn all_in_namespace(&self, ns: &str, _m: bool) -> Result<Vec<MemoryEntry>> {
         Ok(self
