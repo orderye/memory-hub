@@ -64,7 +64,7 @@
 
 | 进程 | 对外形态 | 它管什么（打个比方） |
 | :--- | :--- | :--- |
-| **`mcp-server`** | HTTP `:3000`（端点 `/mcp`），也支持 stdio | 图书馆前台：接收记忆读写与检索请求，对外提供 38 个 MCP 工具 |
+| **`mcp-server`** | HTTP `:3000`（`/mcp` Streamable HTTP、`/sse` 旧版 SSE），也支持 stdio | 图书馆前台：接收记忆读写与检索请求，对外提供 38 个 MCP 工具 |
 | **`auth-server`** | HTTP `:8080`，带网页控制台 | 门卫 + 办证处：注册账户、登记 Agent、发令牌（OAuth 2.1） |
 | **`backup-worker`** | 后台常驻 + 定时任务 | 夜班管理员：定时做备份快照、清理过期记忆、离线扫描重复与冲突 |
 | **PostgreSQL 15 + pgvector** | 数据文件 | 仓库本体（本地开发可以换成纯内存模式，重启即失忆，仅用于调试） |
@@ -266,6 +266,85 @@ curl -s -X POST http://localhost:3000/mcp -H "Authorization: Bearer $TOKEN" \
   -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"memory_backup_create",
        "arguments":{"namespace":"infra-team"}}}' | jq .
 ```
+
+### 接入 MCP 客户端：三种传输方式（Stdio / Streamable HTTP / SSE）
+
+MCP 客户端（Cherry Studio、Claude Desktop、Cursor、Cline、ZCode 等）添加服务器时都要选一种传输方式，本服务三种都支持，跑的是同一套 38 个工具，区别只在"JSON-RPC 帧怎么走"：
+
+| 客户端里的选项 | 地址 / 启动方式 | 什么时候用 |
+| :--- | :--- | :--- |
+| **Stdio** | 启动子进程 `mcp-server`（`HUB_SERVE_MODE=stdio`） | 本机单人使用，不暴露端口 |
+| **Streamable HTTP** | `http://localhost:3000/mcp` | **推荐**：新版 MCP 客户端的默认协议 |
+| **SSE** | `http://localhost:3000/sse` | 兼容：只支持旧版（2024-11-05）HTTP + SSE 的客户端 |
+
+#### ① Stdio
+
+服务以子进程形式活在客户端进程里，stdin/stdout 走换行分隔的 JSON-RPC 帧。适合"就我自己用"：
+
+```json
+{
+  "mcpServers": {
+    "memory-hub": {
+      "type": "stdio",
+      "command": "cargo",
+      "args": ["run", "--bin", "mcp-server"],
+      "env": {
+        "HUB_SERVE_MODE": "stdio",
+        "HUB_DB_URL": "memory://local",
+        "HUB_TOKEN_SECRET": "dev-secret-at-least-32-chars-long",
+        "HUB_STDIO_LOCAL_AGENT": "local-agent"
+      }
+    }
+  }
+}
+```
+
+- `HUB_DB_URL` 按需换成 PostgreSQL 连接串，即可与其他部署共用同一个记忆库；
+- `HUB_STDIO_LOCAL_AGENT` 只在 `HUB_DEPLOYMENT_PROFILE=lite` 下生效：stdio 会话被视作"进程所有者本人的本地桥接"，以 bootstrap 账户全权限运行；不设置则与 HTTP 一样必须带令牌；
+- Docker 部署想走 stdio 也行：`"command": "docker", "args": ["exec", "-i", "<mcp 容器名>", "mcp-server"]`，容器环境需设 `HUB_SERVE_MODE=stdio`。
+
+> Claude Desktop 原生只支持 Stdio；Cursor / Cherry Studio 等三种都支持，`type` 字段的写法按所用客户端的枚举填（如 `streamableHttp` / `http`）。
+
+#### ② Streamable HTTP（推荐）
+
+所有 JSON-RPC 帧直接 POST 到同一个端点，无需握手：
+
+```json
+{
+  "mcpServers": {
+    "memory-hub": {
+      "type": "streamableHttp",
+      "url": "http://localhost:3000/mcp",
+      "headers": { "Authorization": "Bearer <按上文流程换取的令牌>" }
+    }
+  }
+}
+```
+
+令牌从授权服务换：`POST http://localhost:8080/oauth/token`（`client_credentials`），见上面"第一次调用"。本地开发（内存模式、限流关闭时）也可以先不带令牌调 `initialize` / `tools/list`，但 `tools/call` 一律要求令牌。
+
+#### ③ SSE（旧版兼容）
+
+客户端先 `GET /sse` 建立下行事件流，服务端推回 `endpoint` 事件告知上行地址（`/messages?sessionId=...`），此后把 JSON-RPC 帧 POST 到该地址，响应再从下行流推回。客户端配置里只填 `/sse` 这一个地址：
+
+```json
+{
+  "mcpServers": {
+    "memory-hub": {
+      "type": "sse",
+      "url": "http://localhost:3000/sse",
+      "headers": { "Authorization": "Bearer <按上文流程换取的令牌>" }
+    }
+  }
+}
+```
+
+两个注意点：
+
+- **反代要关缓冲**：SSE 是长连接事件流，nginx 之类默认缓冲会把它卡到超时。服务端已回 `X-Accel-Buffering: no`，且 `/sse` 不吃 30s 请求硬超时；自建反代时同样要配 `proxy_buffering off`；
+- **会话跟连接绑定**：SSE 断开即会话失效，客户端重连会拿到新的 `sessionId`。
+
+> 什么时候选 SSE：客户端只实现了 2024-11-05 的 "HTTP with SSE"（某些旧版客户端）。能用 Streamable HTTP 就不要用 SSE。
 
 ---
 
@@ -613,7 +692,7 @@ HUB_EMBED_MODEL=bge-m3
     ├── authz/                  # 鉴权：HS256 验签、受众校验、受保护资源元数据
     ├── auth-core/              # OAuth 原语：PKCE S256、令牌家族轮换、Argon2
     ├── auth-web/               # 授权服务：DCR、OAuth 端点、账户控制台
-    ├── mcp/                    # MCP 协议层：38 个工具 Schema（tools/ 按域拆分）、HTTP / stdio 传输（transport/）、生态适配拦截层（adapter/）
+    ├── mcp/                    # MCP 协议层：38 个工具 Schema（tools/ 按域拆分）、HTTP / SSE / stdio 传输（transport/）、生态适配拦截层（adapter/）
     ├── worker/                 # 后台任务：定时快照、过期清理、离线扫描；embedded 内嵌调度（两进程部署复用同一份作业）
     └── bins/                   # 三个可独立部署的二进制
         ├── mcp-server/

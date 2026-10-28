@@ -79,6 +79,8 @@ axum = { version = "0.8", features = ["http1", "tokio", "json", "form", "query"]
 # 仅启用实际使用的中间件（请求硬超时 + 访问追踪）；体积上限走 axum 自带的
 # DefaultBodyLimit，无需 tower-http 的 limit/cors
 tower-http = { version = "0.6", features = ["timeout", "trace"] }
+# SSE 传输：把 tokio mpsc 接收端适配为 axum SSE 所需的 Stream
+tokio-stream = "0.1"
 
 # 持久化
 sqlx = { version = "0.8", default-features = false, features = [

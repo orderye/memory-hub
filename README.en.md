@@ -64,7 +64,7 @@ Not "yet another agent framework" — only **infrastructure**: a memory foundati
 
 | Process | External form | What it owns (by analogy) |
 | :--- | :--- | :--- |
-| **`mcp-server`** | HTTP `:3000` (endpoint `/mcp`), stdio also supported | The library front desk: takes memory read/write and retrieval requests, exposes 38 MCP tools |
+| **`mcp-server`** | HTTP `:3000` (`/mcp` Streamable HTTP, `/sse` legacy SSE), stdio also supported | The library front desk: takes memory read/write and retrieval requests, exposes 38 MCP tools |
 | **`auth-server`** | HTTP `:8080`, with a web console | The gatekeeper and the licensing office: registers accounts and agents, issues tokens (OAuth 2.1) |
 | **`backup-worker`** | Long-running background process with cron jobs | The night-shift admin: scheduled backup snapshots, expiry cleanup, offline duplicate and conflict scans |
 | **PostgreSQL 15 + pgvector** | Data files | The warehouse itself (local development can swap in pure in-memory mode — it forgets on restart, debug use only) |
@@ -270,6 +270,85 @@ curl -s -X POST http://localhost:3000/mcp -H "Authorization: Bearer $TOKEN" \
   -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"memory_backup_create",
        "arguments":{"namespace":"infra-team"}}}' | jq .
 ```
+
+### Connecting MCP clients: three transports (Stdio / Streamable HTTP / SSE)
+
+MCP clients (Cherry Studio, Claude Desktop, Cursor, Cline, ZCode, ...) all ask you to pick a transport when adding a server. All three are supported here, running the same 38 tools — only the way JSON-RPC frames travel differs:
+
+| Client option | Address / how it starts | When to use it |
+| :--- | :--- | :--- |
+| **Stdio** | spawn `mcp-server` as a child process (`HUB_SERVE_MODE=stdio`) | single-user local use, no open port |
+| **Streamable HTTP** | `http://localhost:3000/mcp` | **recommended**: the default protocol of modern MCP clients |
+| **SSE** | `http://localhost:3000/sse` | compatibility: clients that only speak the legacy (2024-11-05) HTTP + SSE transport |
+
+#### 1. Stdio
+
+The server lives as a child process inside the client, exchanging newline-delimited JSON-RPC frames over stdin/stdout:
+
+```json
+{
+  "mcpServers": {
+    "memory-hub": {
+      "type": "stdio",
+      "command": "cargo",
+      "args": ["run", "--bin", "mcp-server"],
+      "env": {
+        "HUB_SERVE_MODE": "stdio",
+        "HUB_DB_URL": "memory://local",
+        "HUB_TOKEN_SECRET": "dev-secret-at-least-32-chars-long",
+        "HUB_STDIO_LOCAL_AGENT": "local-agent"
+      }
+    }
+  }
+}
+```
+
+- Point `HUB_DB_URL` at PostgreSQL to share the same memory store as other deployments;
+- `HUB_STDIO_LOCAL_AGENT` only takes effect with `HUB_DEPLOYMENT_PROFILE=lite`: the stdio session is treated as "the process owner's local bridge" and runs with full bootstrap privileges; unset, stdio requires a Bearer token just like HTTP;
+- Docker deployments can bridge over stdio too: `"command": "docker", "args": ["exec", "-i", "<mcp container>", "mcp-server"]` with `HUB_SERVE_MODE=stdio` set in the container.
+
+> Claude Desktop natively supports only Stdio; Cursor / Cherry Studio and similar support all three — spell `type` the way your client expects (e.g. `streamableHttp` / `http`).
+
+#### 2. Streamable HTTP (recommended)
+
+Every JSON-RPC frame is POSTed to a single endpoint, no handshake:
+
+```json
+{
+  "mcpServers": {
+    "memory-hub": {
+      "type": "streamableHttp",
+      "url": "http://localhost:3000/mcp",
+      "headers": { "Authorization": "Bearer <token from the steps above>" }
+    }
+  }
+}
+```
+
+Tokens come from the auth server: `POST http://localhost:8080/oauth/token` (`client_credentials`), see "First call" above. In local dev (in-memory mode) you may call `initialize` / `tools/list` without a token, but `tools/call` always requires one.
+
+#### 3. SSE (legacy compatibility)
+
+The client opens a downstream event stream with `GET /sse`; the server pushes an `endpoint` event naming the upstream address (`/messages?sessionId=...`); JSON-RPC frames are then POSTed there and responses come back over the same stream. Clients only need the `/sse` URL:
+
+```json
+{
+  "mcpServers": {
+    "memory-hub": {
+      "type": "sse",
+      "url": "http://localhost:3000/sse",
+      "headers": { "Authorization": "Bearer <token from the steps above>" }
+    }
+  }
+}
+```
+
+Two caveats:
+
+- **Disable proxy buffering**: SSE is a long-lived event stream; nginx-style buffering stalls it. The server already sends `X-Accel-Buffering: no` and excludes `/sse` from the 30s request timeout — when adding your own reverse proxy, set `proxy_buffering off` as well;
+- **Sessions are bound to the connection**: when the SSE stream drops, the session dies; reconnecting yields a new `sessionId`.
+
+> When to pick SSE: only when the client implements just the 2024-11-05 "HTTP with SSE" transport. Otherwise prefer Streamable HTTP.
 
 ---
 
@@ -612,7 +691,7 @@ A standard Rust workspace, layered by responsibility:
     ├── authz/                  # Authorization: HS256 verification, audience checks, protected-resource metadata
     ├── auth-core/              # OAuth primitives: PKCE S256, token-family rotation, Argon2
     ├── auth-web/               # Authorization server: DCR, OAuth endpoints, account console
-    ├── mcp/                    # MCP protocol layer: schemas for 38 tools (tools/, split by domain), HTTP / stdio transport (transport/), ecosystem adapter interceptor layer (adapter/)
+    ├── mcp/                    # MCP protocol layer: schemas for 38 tools (tools/, split by domain), HTTP / SSE / stdio transport (transport/), ecosystem adapter interceptor layer (adapter/)
     ├── worker/                 # Background jobs: scheduled snapshots, expiry cleanup, offline scans; embedded scheduling (embedded, shared with the two-process shape)
     └── bins/                   # Three independently deployable binaries
         ├── mcp-server/

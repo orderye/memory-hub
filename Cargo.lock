@@ -1225,6 +1225,7 @@ dependencies = [
  "serde_json",
  "store",
  "tokio",
+ "tokio-stream",
  "tower-http",
  "tracing",
  "uuid",

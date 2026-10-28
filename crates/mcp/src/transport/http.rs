@@ -24,7 +24,11 @@ pub fn mcp_router(state: Arc<McpTransportState>) -> Router {
             std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS),
         ))
         .layer(tower_http::trace::TraceLayer::new_for_http())
-        .with_state(state)
+        .with_state(state.clone())
+        // 旧版 SSE 传输（/sse + /messages）。merge 必须放在各 layer 之后：
+        // SSE 是长连接事件流，不能被上面的 30s 请求硬超时层掐断
+        // （Router::layer 只包裹此前已注册的路由，后 merge 的路由不受影响）。
+        .merge(super::sse::sse_routes(state))
 }
 
 /// GET `/mcp`：打开 SSE 通道的占位实现（本服务无服务端推送需求）
@@ -321,7 +325,12 @@ pub(super) async fn handle_http_mcp(
         .unwrap_or_else(|_| (status, "Internal Server Error").into_response())
 }
 
-fn jsonrpc_http(status: StatusCode, id: Option<Value>, code: i64, message: String) -> Response {
+pub(super) fn jsonrpc_http(
+    status: StatusCode,
+    id: Option<Value>,
+    code: i64,
+    message: String,
+) -> Response {
     let resp = JsonRpcResponse::err(id, code, message);
     let mut builder = Response::builder()
         .status(status)

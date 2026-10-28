@@ -1,9 +1,11 @@
-//! MCP 传输层（Streamable HTTP + stdio）与 JSON-RPC 2.0 协议帧
+//! MCP 传输层（Streamable HTTP + SSE + stdio）与 JSON-RPC 2.0 协议帧
 //!
 //! 设计要点：
 //! - `handle_jsonrpc` 是**纯函数**：不持有任何 IO，可直接单测；
 //! - `mcp_router` 产出 axum 路由，供二进制进程挂载；
 //! - `run_stdio` 走换行分隔的 JSON-RPC 帧，供本地桥接客户端使用。
+//! - 旧版 SSE 传输（`/sse` + `/messages`）只为只支持 2024-11-05
+//!   "HTTP with SSE" 的客户端保留，新客户端请走 Streamable HTTP。
 //! - 鉴权在协议层完成：Bearer 令牌经 `TokenIntrospector` 换取 `AuthCtx`，
 //!   随后按工具的 `required_scope` 做范围强制校验（设计规范 5.9 节）。
 
@@ -308,6 +310,7 @@ type SharedState = Arc<McpTransportState>;
 
 mod dispatch;
 mod http;
+mod sse;
 mod stdio;
 
 pub use dispatch::{handle_jsonrpc, handle_jsonrpc_ext, handle_raw_frame};

@@ -721,3 +721,203 @@ async fn test_missing_capability_report_defaults_to_not_ready() {
     assert!(!caps.semantic_ready);
     assert!(caps.semantic_reason.is_some());
 }
+
+// ===== 旧版 SSE 传输（/sse + /messages）=====
+
+use super::sse::{handle_sse_connect, handle_sse_message, MessagesQuery, SseState};
+use axum::extract::Query;
+
+/// GET /sse：200 + text/event-stream，首帧必须是 endpoint 事件（旧版握手）
+#[tokio::test]
+async fn test_sse_connect_emits_endpoint_event() {
+    let st = SseState::new(Arc::new(state()));
+    let resp = handle_sse_connect(State(st), HeaderMap::new()).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/event-stream",
+        "SSE 响应必须是 text/event-stream"
+    );
+
+    let frame = first_sse_frame(resp).await;
+    assert!(
+        frame.contains("event: endpoint"),
+        "首帧必须是 endpoint 事件：{frame}"
+    );
+    assert!(
+        frame.contains("data: /messages?sessionId="),
+        "endpoint 事件必须给出上行 POST 地址：{frame}"
+    );
+}
+
+/// GET /sse 带无效令牌必须 401
+#[tokio::test]
+async fn test_sse_connect_rejects_bad_token() {
+    let st = SseState::new(Arc::new(state()));
+    let mut headers = HeaderMap::new();
+    headers.insert(header::AUTHORIZATION, "Bearer bad".parse().unwrap());
+    let resp = handle_sse_connect(State(st), headers).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert!(
+        resp.headers().contains_key(header::WWW_AUTHENTICATE),
+        "401 响应必须携带 WWW-Authenticate 头部"
+    );
+}
+
+/// 握手 → POST tools/list → 202 → 响应经下行流推回
+#[tokio::test]
+async fn test_sse_roundtrip_tools_list() {
+    let st = SseState::new(Arc::new(state()));
+    let resp = handle_sse_connect(State(st.clone()), HeaderMap::new()).await;
+    let mut stream = resp.into_body().into_data_stream();
+
+    let handshake = first_sse_frame_from_stream(&mut stream).await;
+    let session_id = handshake
+        .split("sessionId=")
+        .nth(1)
+        .expect("endpoint 事件必须携带 sessionId")
+        .trim()
+        .to_string();
+    assert!(!session_id.is_empty());
+
+    let mut headers = HeaderMap::new();
+    headers.insert(header::AUTHORIZATION, "Bearer good".parse().unwrap());
+    let body = Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
+    let post = handle_sse_message(
+        State(st.clone()),
+        Query(MessagesQuery {
+            session_id: session_id.clone(),
+        }),
+        headers,
+        body,
+    )
+    .await;
+    assert_eq!(post.status(), StatusCode::ACCEPTED, "POST 应只回 202");
+
+    // JSON-RPC 响应从同一下行流推回，而不是 POST 响应体
+    let frame = first_sse_frame_from_stream(&mut stream).await;
+    assert!(
+        frame.contains("event: message"),
+        "响应须为 message 事件：{frame}"
+    );
+    let payload: serde_json::Value = serde_json::from_str(
+        frame
+            .split_once("data: ")
+            .expect("message 事件必须携带 data")
+            .1
+            .trim(),
+    )
+    .expect("data 必须是单行 JSON-RPC");
+    assert_eq!(payload["id"], json!(1));
+    assert!(
+        payload["result"]["tools"].is_array(),
+        "tools/list 应返回工具数组"
+    );
+}
+
+/// 未知 sessionId 必须 404
+#[tokio::test]
+async fn test_sse_message_unknown_session_404() {
+    let st = SseState::new(Arc::new(state()));
+    let post = handle_sse_message(
+        State(st),
+        Query(MessagesQuery {
+            session_id: "no-such-session".to_string(),
+        }),
+        HeaderMap::new(),
+        Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#),
+    )
+    .await;
+    assert_eq!(post.status(), StatusCode::NOT_FOUND);
+}
+
+/// POST /messages 带无效令牌必须 401
+#[tokio::test]
+async fn test_sse_message_rejects_bad_token() {
+    let st = SseState::new(Arc::new(state()));
+    let resp = handle_sse_connect(State(st.clone()), HeaderMap::new()).await;
+    let session_id = first_sse_frame(resp)
+        .await
+        .split("sessionId=")
+        .nth(1)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let mut headers = HeaderMap::new();
+    headers.insert(header::AUTHORIZATION, "Bearer bad".parse().unwrap());
+    let post = handle_sse_message(
+        State(st),
+        Query(MessagesQuery { session_id }),
+        headers,
+        Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#),
+    )
+    .await;
+    assert_eq!(post.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// 标准通知帧：202 静默消费，不往下行流推任何东西
+#[tokio::test]
+async fn test_sse_notification_silently_accepted() {
+    let st = SseState::new(Arc::new(state()));
+    let resp = handle_sse_connect(State(st.clone()), HeaderMap::new()).await;
+    let session_id = first_sse_frame(resp)
+        .await
+        .split("sessionId=")
+        .nth(1)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let post = handle_sse_message(
+        State(st),
+        Query(MessagesQuery { session_id }),
+        HeaderMap::new(),
+        Bytes::from_static(br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#),
+    )
+    .await;
+    assert_eq!(post.status(), StatusCode::ACCEPTED);
+}
+
+/// SSE 流断开后会话被回收：新连接时清理僵尸会话，投递失败时移除对应会话
+#[tokio::test]
+async fn test_sse_session_reclaimed_after_stream_drop() {
+    let st = SseState::new(Arc::new(state()));
+    let session_id = {
+        let resp = handle_sse_connect(State(st.clone()), HeaderMap::new()).await;
+        first_sse_frame(resp).await
+    };
+    // first_sse_frame 返回时，响应体流（连同里面的 mpsc 接收端）已被丢弃
+    // = 客户端断开了 SSE 流；注册表此时还挂着发送端
+    assert_eq!(st.sessions.len(), 1);
+
+    st.sessions.prune_closed();
+    assert_eq!(st.sessions.len(), 0, "断开的会话必须被清理");
+
+    // 此后向该会话 POST 必须 404
+    let post = handle_sse_message(
+        State(st),
+        Query(MessagesQuery { session_id }),
+        HeaderMap::new(),
+        Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#),
+    )
+    .await;
+    assert_eq!(post.status(), StatusCode::NOT_FOUND);
+}
+
+/// 读出 SSE 响应的第一帧（endpoint 事件）
+async fn first_sse_frame(resp: Response) -> String {
+    let mut stream = resp.into_body().into_data_stream();
+    first_sse_frame_from_stream(&mut stream).await
+}
+
+/// 从 SSE 流读第一帧；2 秒读不到即失败（endpoint 事件应立即可读）
+async fn first_sse_frame_from_stream(stream: &mut axum::body::BodyDataStream) -> String {
+    use tokio_stream::StreamExt;
+    let chunk = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+        .await
+        .expect("SSE 首帧应在 2 秒内可读")
+        .expect("SSE 流不应结束")
+        .expect("SSE 流不应出错");
+    String::from_utf8(chunk.to_vec()).expect("SSE 帧必须是 UTF-8")
+}
