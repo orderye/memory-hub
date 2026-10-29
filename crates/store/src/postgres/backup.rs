@@ -227,4 +227,25 @@ impl mem_core::BackupStore for PostgresHubStore {
         tx.commit().await.pg()?;
         Ok(())
     }
+
+    /// 审计只允许追加：`audit_log` 对应用角色无 UPDATE/DELETE/TRUNCATE 权限。
+    async fn append_audit(
+        &self,
+        actor: &str,
+        action: &str,
+        target: Option<&str>,
+        detail: &serde_json::Value,
+    ) -> Result<()> {
+        sqlx::query(
+            "insert into audit_log (actor, action, target, detail) values ($1, $2, $3, $4)",
+        )
+        .bind(actor)
+        .bind(action)
+        .bind(target)
+        .bind(detail)
+        .execute(&self.pool)
+        .await
+        .pg()?;
+        Ok(())
+    }
 }

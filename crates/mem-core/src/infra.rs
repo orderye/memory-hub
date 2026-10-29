@@ -319,6 +319,20 @@ pub trait BackupStore: Send + Sync {
             "atomic namespace restore is not supported by this store".to_string(),
         ))
     }
+
+    /// 追加一条审计记录（备份/恢复的成功与失败都要留痕）。
+    ///
+    /// 审计表只允许追加，实现不得更新或删除既有记录。默认实现为无操作，
+    /// 供不关心审计的测试替身使用；生产存储必须覆盖。
+    async fn append_audit(
+        &self,
+        _actor: &str,
+        _action: &str,
+        _target: Option<&str>,
+        _detail: &serde_json::Value,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// 整合提案存储

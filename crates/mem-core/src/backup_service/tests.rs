@@ -526,6 +526,168 @@ async fn test_backup_and_restore_are_isolated_between_accounts() {
 }
 
 #[tokio::test]
+async fn test_restore_writes_audit_records_for_success_and_failure() {
+    let (svc, store) = setup();
+    let auth = admin("agent-a");
+    let ns = "audited";
+    store
+        .ensure_namespace(&scoped_ns(ns), &"agent-a".to_string())
+        .await
+        .unwrap();
+    store
+        .grant(&NamespaceGrantRecord {
+            namespace: scoped_ns(ns),
+            agent_id: "agent-a".to_string(),
+            can_read: true,
+            can_write: true,
+            granted_by: "agent-a".to_string(),
+            created_at: chrono::Utc::now(),
+        })
+        .await
+        .unwrap();
+    store.seed(&scoped_ns(ns), "agent-a", "审计数据");
+    let backup = svc
+        .create(
+            &auth,
+            BackupCreateRequest {
+                namespace: ns.to_string(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    svc.restore(
+        &auth,
+        RestoreRequest {
+            backup_id: backup.id,
+            mode: RestoreMode::Merge,
+        },
+    )
+    .await
+    .unwrap();
+
+    // 失败：未知格式版本
+    let mut bad = backup.clone();
+    bad.namespace = scoped_ns(ns);
+    bad.payload["version"] = serde_json::json!(99);
+    store.save_backup(&bad).await.unwrap();
+    let failed = svc
+        .restore(
+            &auth,
+            RestoreRequest {
+                backup_id: bad.id,
+                mode: RestoreMode::Merge,
+            },
+        )
+        .await
+        .expect_err("不支持版本必须失败");
+
+    let records = store.audit_records.lock().unwrap().clone();
+    let success = records
+        .iter()
+        .find(|(_, action, _, detail)| {
+            action == "memory_restore"
+                && detail.get("status").and_then(|s| s.as_str()) == Some("success")
+        })
+        .expect("成功恢复必须留下审计记录");
+    assert_eq!(success.0, "agent-a", "审计必须记录操作者");
+    assert_eq!(
+        success.2.as_deref(),
+        Some(backup.id.to_string().as_str()),
+        "审计必须记录目标备份"
+    );
+
+    let failure = records
+        .iter()
+        .find(|(_, action, _, detail)| {
+            action == "memory_restore"
+                && detail.get("status").and_then(|s| s.as_str()) == Some("failed")
+        })
+        .expect("失败恢复必须留下审计记录");
+    assert!(
+        failure.3.get("error").and_then(|e| e.as_str()).is_some(),
+        "失败审计必须带诊断信息"
+    );
+    assert!(!matches!(failed, HubError::NotFound));
+}
+
+#[tokio::test]
+async fn test_prune_respects_keep_and_ttl_boundaries() {
+    use crate::infra::Clock;
+
+    struct FixedClock(chrono::DateTime<chrono::Utc>);
+    impl Clock for FixedClock {
+        fn now(&self) -> chrono::DateTime<chrono::Utc> {
+            self.0
+        }
+    }
+
+    let store = Arc::new(TestHubStore::default());
+    let now = chrono::Utc::now();
+    let svc = DefaultBackupService::new(store.clone(), Arc::new(GrantChecker::new(store.clone())))
+        .with_clock(Arc::new(FixedClock(now)));
+
+    // 同一命名空间 5 份快照，时间从旧到新
+    let mut ids = Vec::new();
+    for i in 0..5 {
+        let record = BackupRecord {
+            id: Uuid::new_v4(),
+            namespace: scoped_ns("prune-ns"),
+            created_by: "agent-a".to_string(),
+            note: None,
+            entry_count: 0,
+            checksum: String::new(),
+            payload: serde_json::json!({}),
+            retain_until: None,
+            created_at: now - chrono::Duration::days(5 - i),
+        };
+        store.save_backup(&record).await.unwrap();
+        ids.push(record.id);
+    }
+
+    // keep=2, retention=0：只保留最新 2 份
+    let report = svc.prune(2, 0).await.unwrap();
+    assert_eq!(report.deleted.len(), 3);
+    let remaining = store
+        .list_backups(Some(&scoped_ns("prune-ns")))
+        .await
+        .unwrap();
+    assert_eq!(remaining.len(), 2, "keep=2 必须只留最新两份");
+    for kept in &remaining {
+        assert!(!report.deleted.contains(&kept.id));
+    }
+
+    // TTL：在保留组内再造一份 10 天前的旧快照（非最新），应被淘汰；
+    // 最新一份即使超过 TTL 也必须保留。
+    let stale = BackupRecord {
+        id: Uuid::new_v4(),
+        namespace: scoped_ns("prune-ns"),
+        created_by: "agent-a".to_string(),
+        note: None,
+        entry_count: 0,
+        checksum: String::new(),
+        payload: serde_json::json!({}),
+        retain_until: None,
+        created_at: now - chrono::Duration::days(10),
+    };
+    store.save_backup(&stale).await.unwrap();
+
+    let report_ttl = svc.prune(10, 3).await.unwrap();
+    assert_eq!(
+        report_ttl.deleted.len(),
+        1,
+        "TTL 只淘汰非最新且过期的快照，最新一份永远保留"
+    );
+    assert!(report_ttl.deleted.contains(&stale.id));
+    let left = store
+        .list_backups(Some(&scoped_ns("prune-ns")))
+        .await
+        .unwrap();
+    assert_eq!(left.len(), 2, "最新两份（含最新一份）不得被 TTL 删除");
+}
+
+#[tokio::test]
 async fn test_replace_creates_safety_backup_and_rebuilds() {
     let (svc, store) = setup();
     let a = admin("agent-a");

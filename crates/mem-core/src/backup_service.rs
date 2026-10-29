@@ -700,178 +700,45 @@ impl DefaultBackupService {
             "恢复部分实体失败（已跳过并继续，详见 RestoreReport 失败计数）"
         );
     }
-}
 
-#[async_trait]
-impl BackupService for DefaultBackupService {
-    async fn create(&self, auth: &AuthCtx, req: BackupCreateRequest) -> Result<BackupRecord> {
-        self.require_admin(auth).await?;
-        if req.namespace.trim().is_empty() {
-            return Err(HubError::InvalidArgument("namespace 不能为空".to_string()));
+    /// 记录恢复审计；审计写入失败只告警，不改变恢复结果。
+    async fn audit_restore(
+        &self,
+        auth: &AuthCtx,
+        req: &RestoreRequest,
+        result: &Result<RestoreReport>,
+    ) {
+        let detail = match result {
+            Ok(report) => serde_json::json!({
+                "status": "success",
+                "mode": format!("{:?}", req.mode),
+                "created": report.created,
+                "updated": report.updated,
+                "unchanged": report.unchanged,
+                "safety_backup_ids": report.safety_backup_ids,
+            }),
+            Err(error) => serde_json::json!({
+                "status": "failed",
+                "mode": format!("{:?}", req.mode),
+                "error": error.to_string(),
+            }),
+        };
+        let status = detail["status"].as_str().unwrap_or("unknown");
+        if let Err(error) = self
+            .store
+            .append_audit(
+                &auth.agent_id,
+                "memory_restore",
+                Some(&req.backup_id.to_string()),
+                &detail,
+            )
+            .await
+        {
+            tracing::warn!(%error, status, "恢复审计写入失败");
         }
-        let store = self.scoped(auth);
-
-        let entries: Vec<MemoryEntry> = if req.namespace == "*" {
-            let mut all = Vec::new();
-            for ns in crate::infra::MemoryStore::list_namespaces(&store).await? {
-                all.extend(store.all_in_namespace(&ns, true).await?);
-            }
-            all
-        } else {
-            self.require_write(auth, &req.namespace).await?;
-            store.all_in_namespace(&req.namespace, true).await?
-        };
-
-        let evidences: Vec<MemoryEvidence> = if req.namespace == "*" {
-            let mut all = Vec::new();
-            for ns in crate::infra::MemoryStore::list_namespaces(&store).await? {
-                all.extend(store.all_evidence_in_namespace(&ns).await?);
-            }
-            all
-        } else {
-            store.all_evidence_in_namespace(&req.namespace).await?
-        };
-
-        let memory_versions: Vec<MemoryVersion> = if req.namespace == "*" {
-            let mut all = Vec::new();
-            for ns in crate::infra::MemoryStore::list_namespaces(&store).await? {
-                all.extend(store.all_versions_in_namespace(&ns).await?);
-            }
-            all
-        } else {
-            store.all_versions_in_namespace(&req.namespace).await?
-        };
-
-        let relations: Vec<MemoryRelation> = if req.namespace == "*" {
-            let mut all = Vec::new();
-            for ns in crate::infra::MemoryStore::list_namespaces(&store).await? {
-                all.extend(store.all_relations_in_namespace(&ns).await?);
-            }
-            all
-        } else {
-            store.all_relations_in_namespace(&req.namespace).await?
-        };
-
-        let tasks: Vec<MemoryTask> = if req.namespace == "*" {
-            let mut all = Vec::new();
-            for ns in crate::infra::MemoryStore::list_namespaces(&store).await? {
-                all.extend(store.all_tasks_in_namespace(&ns).await?);
-            }
-            all
-        } else {
-            store.all_tasks_in_namespace(&req.namespace).await?
-        };
-
-        let experiences: Vec<MemoryExperience> = if req.namespace == "*" {
-            let mut all = Vec::new();
-            for ns in crate::infra::MemoryStore::list_namespaces(&store).await? {
-                all.extend(store.all_experiences_in_namespace(&ns).await?);
-            }
-            all
-        } else {
-            store.all_experiences_in_namespace(&req.namespace).await?
-        };
-
-        let experience_versions: Vec<crate::domain::ExperienceVersion> = if req.namespace == "*" {
-            let mut all = Vec::new();
-            for ns in crate::infra::MemoryStore::list_namespaces(&store).await? {
-                all.extend(store.all_experience_versions_in_namespace(&ns).await?);
-            }
-            all
-        } else {
-            store
-                .all_experience_versions_in_namespace(&req.namespace)
-                .await?
-        };
-
-        let task_experiences: Vec<MemoryTaskExperience> = if req.namespace == "*" {
-            let mut all = Vec::new();
-            for ns in crate::infra::MemoryStore::list_namespaces(&store).await? {
-                all.extend(store.all_task_experiences_in_namespace(&ns).await?);
-            }
-            all
-        } else {
-            store
-                .all_task_experiences_in_namespace(&req.namespace)
-                .await?
-        };
-
-        let coding_threads: Vec<CodingThread> = if req.namespace == "*" {
-            let mut all = Vec::new();
-            for ns in crate::infra::MemoryStore::list_namespaces(&store).await? {
-                all.extend(store.all_threads_in_namespace(&ns).await?);
-            }
-            all
-        } else {
-            store.all_threads_in_namespace(&req.namespace).await?
-        };
-
-        let coding_revisions: Vec<CodingRevision> = if req.namespace == "*" {
-            let mut all = Vec::new();
-            for ns in crate::infra::MemoryStore::list_namespaces(&store).await? {
-                all.extend(store.all_revisions_in_namespace(&ns).await?);
-            }
-            all
-        } else {
-            store.all_revisions_in_namespace(&req.namespace).await?
-        };
-
-        let now = self.clock.now();
-        let record = BackupRecord {
-            id: Uuid::new_v4(),
-            namespace: req.namespace.clone(),
-            created_by: auth.agent_id.clone(),
-            note: req.note.clone(),
-            entry_count: entries.len(),
-            checksum: Self::checksum_v6(
-                &entries,
-                &memory_versions,
-                &evidences,
-                &relations,
-                &tasks,
-                &experiences,
-                &experience_versions,
-                &task_experiences,
-                &coding_threads,
-                &coding_revisions,
-            ),
-            payload: Self::payload_of(
-                &req.namespace,
-                &entries,
-                &memory_versions,
-                &evidences,
-                &relations,
-                &tasks,
-                &experiences,
-                &experience_versions,
-                &task_experiences,
-                &coding_threads,
-                &coding_revisions,
-            ),
-            retain_until: None,
-            created_at: now,
-        };
-        store.save_backup(&record).await?;
-        Ok(record)
     }
 
-    async fn list(&self, auth: &AuthCtx, namespace: Option<&str>) -> Result<Vec<BackupSummary>> {
-        let all = self.scoped(auth).list_backups(namespace).await?;
-        let mut out = Vec::with_capacity(all.len());
-        for b in &all {
-            // 逐份校验访问权。全量快照的命名空间标记 `*` 不是授权对象（通配授权已废除），
-            // 若按命名空间判权必然落空并让整次列举失败，故改由 admin 作用域把关。
-            if b.namespace == ALL_NAMESPACES {
-                self.require_admin(auth).await?;
-            } else {
-                self.require_read(auth, &b.namespace).await?;
-            }
-            out.push(BackupSummary::from(b));
-        }
-        Ok(out)
-    }
-
-    async fn restore(&self, auth: &AuthCtx, req: RestoreRequest) -> Result<RestoreReport> {
+    async fn restore_inner(&self, auth: &AuthCtx, req: &RestoreRequest) -> Result<RestoreReport> {
         self.require_admin(auth).await?;
         let store = self.scoped(auth);
         let backup = store.get_backup(req.backup_id).await?;
@@ -1324,6 +1191,182 @@ impl BackupService for DefaultBackupService {
         );
 
         Ok(report)
+    }
+}
+
+#[async_trait]
+impl BackupService for DefaultBackupService {
+    async fn create(&self, auth: &AuthCtx, req: BackupCreateRequest) -> Result<BackupRecord> {
+        self.require_admin(auth).await?;
+        if req.namespace.trim().is_empty() {
+            return Err(HubError::InvalidArgument("namespace 不能为空".to_string()));
+        }
+        let store = self.scoped(auth);
+
+        let entries: Vec<MemoryEntry> = if req.namespace == "*" {
+            let mut all = Vec::new();
+            for ns in crate::infra::MemoryStore::list_namespaces(&store).await? {
+                all.extend(store.all_in_namespace(&ns, true).await?);
+            }
+            all
+        } else {
+            self.require_write(auth, &req.namespace).await?;
+            store.all_in_namespace(&req.namespace, true).await?
+        };
+
+        let evidences: Vec<MemoryEvidence> = if req.namespace == "*" {
+            let mut all = Vec::new();
+            for ns in crate::infra::MemoryStore::list_namespaces(&store).await? {
+                all.extend(store.all_evidence_in_namespace(&ns).await?);
+            }
+            all
+        } else {
+            store.all_evidence_in_namespace(&req.namespace).await?
+        };
+
+        let memory_versions: Vec<MemoryVersion> = if req.namespace == "*" {
+            let mut all = Vec::new();
+            for ns in crate::infra::MemoryStore::list_namespaces(&store).await? {
+                all.extend(store.all_versions_in_namespace(&ns).await?);
+            }
+            all
+        } else {
+            store.all_versions_in_namespace(&req.namespace).await?
+        };
+
+        let relations: Vec<MemoryRelation> = if req.namespace == "*" {
+            let mut all = Vec::new();
+            for ns in crate::infra::MemoryStore::list_namespaces(&store).await? {
+                all.extend(store.all_relations_in_namespace(&ns).await?);
+            }
+            all
+        } else {
+            store.all_relations_in_namespace(&req.namespace).await?
+        };
+
+        let tasks: Vec<MemoryTask> = if req.namespace == "*" {
+            let mut all = Vec::new();
+            for ns in crate::infra::MemoryStore::list_namespaces(&store).await? {
+                all.extend(store.all_tasks_in_namespace(&ns).await?);
+            }
+            all
+        } else {
+            store.all_tasks_in_namespace(&req.namespace).await?
+        };
+
+        let experiences: Vec<MemoryExperience> = if req.namespace == "*" {
+            let mut all = Vec::new();
+            for ns in crate::infra::MemoryStore::list_namespaces(&store).await? {
+                all.extend(store.all_experiences_in_namespace(&ns).await?);
+            }
+            all
+        } else {
+            store.all_experiences_in_namespace(&req.namespace).await?
+        };
+
+        let experience_versions: Vec<crate::domain::ExperienceVersion> = if req.namespace == "*" {
+            let mut all = Vec::new();
+            for ns in crate::infra::MemoryStore::list_namespaces(&store).await? {
+                all.extend(store.all_experience_versions_in_namespace(&ns).await?);
+            }
+            all
+        } else {
+            store
+                .all_experience_versions_in_namespace(&req.namespace)
+                .await?
+        };
+
+        let task_experiences: Vec<MemoryTaskExperience> = if req.namespace == "*" {
+            let mut all = Vec::new();
+            for ns in crate::infra::MemoryStore::list_namespaces(&store).await? {
+                all.extend(store.all_task_experiences_in_namespace(&ns).await?);
+            }
+            all
+        } else {
+            store
+                .all_task_experiences_in_namespace(&req.namespace)
+                .await?
+        };
+
+        let coding_threads: Vec<CodingThread> = if req.namespace == "*" {
+            let mut all = Vec::new();
+            for ns in crate::infra::MemoryStore::list_namespaces(&store).await? {
+                all.extend(store.all_threads_in_namespace(&ns).await?);
+            }
+            all
+        } else {
+            store.all_threads_in_namespace(&req.namespace).await?
+        };
+
+        let coding_revisions: Vec<CodingRevision> = if req.namespace == "*" {
+            let mut all = Vec::new();
+            for ns in crate::infra::MemoryStore::list_namespaces(&store).await? {
+                all.extend(store.all_revisions_in_namespace(&ns).await?);
+            }
+            all
+        } else {
+            store.all_revisions_in_namespace(&req.namespace).await?
+        };
+
+        let now = self.clock.now();
+        let record = BackupRecord {
+            id: Uuid::new_v4(),
+            namespace: req.namespace.clone(),
+            created_by: auth.agent_id.clone(),
+            note: req.note.clone(),
+            entry_count: entries.len(),
+            checksum: Self::checksum_v6(
+                &entries,
+                &memory_versions,
+                &evidences,
+                &relations,
+                &tasks,
+                &experiences,
+                &experience_versions,
+                &task_experiences,
+                &coding_threads,
+                &coding_revisions,
+            ),
+            payload: Self::payload_of(
+                &req.namespace,
+                &entries,
+                &memory_versions,
+                &evidences,
+                &relations,
+                &tasks,
+                &experiences,
+                &experience_versions,
+                &task_experiences,
+                &coding_threads,
+                &coding_revisions,
+            ),
+            retain_until: None,
+            created_at: now,
+        };
+        store.save_backup(&record).await?;
+        Ok(record)
+    }
+
+    async fn list(&self, auth: &AuthCtx, namespace: Option<&str>) -> Result<Vec<BackupSummary>> {
+        let all = self.scoped(auth).list_backups(namespace).await?;
+        let mut out = Vec::with_capacity(all.len());
+        for b in &all {
+            // 逐份校验访问权。全量快照的命名空间标记 `*` 不是授权对象（通配授权已废除），
+            // 若按命名空间判权必然落空并让整次列举失败，故改由 admin 作用域把关。
+            if b.namespace == ALL_NAMESPACES {
+                self.require_admin(auth).await?;
+            } else {
+                self.require_read(auth, &b.namespace).await?;
+            }
+            out.push(BackupSummary::from(b));
+        }
+        Ok(out)
+    }
+
+    async fn restore(&self, auth: &AuthCtx, req: RestoreRequest) -> Result<RestoreReport> {
+        let result = self.restore_inner(auth, &req).await;
+        self.audit_restore(auth, &req, &result).await;
+        result
     }
 
     async fn prune(&self, keep: usize, retention_days: u32) -> Result<PruneReport> {

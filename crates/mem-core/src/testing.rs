@@ -279,6 +279,9 @@ impl Clock for FixedClock {
     }
 }
 
+/// 审计记录：(actor, action, target, detail)
+pub type AuditRecord = (String, String, Option<String>, serde_json::Value);
+
 /// 测试用全功能内存存储（实现 MemoryHubStore 全套 trait）
 #[derive(Default)]
 pub struct TestHubStore {
@@ -306,6 +309,8 @@ pub struct TestHubStore {
     pub fail_revise: std::sync::atomic::AtomicBool,
     /// 原子替换接口被调用的次数（验证 Replace 走批量事务而非逐步提交）
     pub replace_calls: std::sync::atomic::AtomicUsize,
+    /// 审计记录：(actor, action, target, detail)
+    pub audit_records: std::sync::Mutex<Vec<AuditRecord>>,
 }
 
 impl TestHubStore {
@@ -644,6 +649,22 @@ impl BackupStore for TestHubStore {
     }
     async fn delete_backup(&self, id: Uuid) -> Result<()> {
         self.backups.write().unwrap().remove(&id);
+        Ok(())
+    }
+
+    async fn append_audit(
+        &self,
+        actor: &str,
+        action: &str,
+        target: Option<&str>,
+        detail: &serde_json::Value,
+    ) -> Result<()> {
+        self.audit_records.lock().unwrap().push((
+            actor.to_string(),
+            action.to_string(),
+            target.map(str::to_string),
+            detail.clone(),
+        ));
         Ok(())
     }
 
