@@ -220,7 +220,18 @@ async fn pg_atomic_namespace_replace_rolls_back_on_failure() {
         .replace_namespaces_from_snapshots(&[(namespace.to_string(), snapshot)])
         .await
         .is_err());
-    assert_eq!(store.get(namespace, original.id).await.unwrap(), original);
+    // 回滚成功 = 原数据仍在、替换数据不存在。
+    // 不能整结构 assert_eq：PostgreSQL timestamptz 是微秒精度，而 Utc::now()
+    // 有纳秒精度，往返后 created_at/updated_at 必然不等——那是精度差异，不是数据损坏。
+    let kept = store.get(namespace, original.id).await.unwrap();
+    assert_eq!(kept.id, original.id);
+    assert_eq!(kept.namespace, original.namespace);
+    assert_eq!(kept.content, original.content, "回滚后原内容必须保持不变");
+    assert_eq!(kept.version, original.version);
+    assert_eq!(kept.status, original.status);
+    assert_eq!(kept.tags, original.tags);
+    assert_eq!(kept.metadata, original.metadata);
+    assert_eq!(kept.source_agent, original.source_agent);
     assert!(store.get(namespace, replacement.id).await.is_err());
     store.delete(namespace, original.id).await.unwrap();
 }
