@@ -11,3 +11,23 @@ build.log
 docker-compose*.yml
 Dockerfile
 .dockerignore
+# 本地专属：CNB worktree、前端依赖与产物、运行数据、部署状态、模型
+.cnb-worktree
+.zcode
+.idea
+.vscode
+web
+node_modules
+data
+local-data
+backups
+pgdata
+*.dump
+*.sql.gz
+*.sqlite
+*.sqlite3
+*.db
+*.pem
+*.key
+*.onnx
+*.gguf
