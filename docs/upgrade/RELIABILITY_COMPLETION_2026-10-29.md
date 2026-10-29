@@ -129,10 +129,12 @@
 - 查询侧 `similar()` 已内联状态字面量，与索引表达式逐字一致（前序提交修正）。
 - 本轮新增 `pg_migration_015_interruption_leaves_no_partial_index_and_retries`：
   用 `lock_timeout` 制造确定性中断，断言“失败后无半成品索引、解除阻塞后重试成功且索引有效”。
+- **CI 实测（2026-10-29，PR #2 的 PG job，PG15 + pgvector）**：
+  `pg_migration_015_interruption_leaves_no_partial_index_and_retries ... ok`，
+  该 job 13 passed / 0 failed。
 
 **未验证：**
-- 该用例需要 `DATABASE_URL`，**本机未运行**；CI 的 PG job 会在下次推送时执行。
-- 生产规模（百万行级）的建索引耗时、锁等待、以及 `CONCURRENTLY` 维护窗口实测：**未演练**。
+- 生产规模（百万行级）的建索引耗时、锁等待，以及 `CONCURRENTLY` 的维护窗口实测：**未演练**。
   方案见 `docs/pg-maintenance-runbook.md` §2 / §2.1 / §2.3。
 - 旧二进制回滚后的性能：已给出机制说明与临时 fp32 索引方案，**未实测延迟**。
 
@@ -175,8 +177,8 @@
 | 2 | `cargo test -p mem-core --lib backup_service` | 本机 | 通过 | 27 passed / 0 failed（新增 5 条恢复失败注入用例） |
 | 3 | `CARGO_TARGET_DIR=/tmp/mh-target cargo test --workspace --all-features` | 本机 | 见 §8.1 | 与 CI `quality-gate.sh` 同口径 |
 | 4 | `CARGO_TARGET_DIR=/tmp/mh-target cargo clippy --all-targets --all-features -- -D warnings` | 本机 | 见 §8.1 | 同上 |
-| 5 | `cargo test -p store --features pg-integration -- --ignored` | CI | 通过（历史 run `40828521543`，12 passed） | 本轮新增 015 中断用例已随 `--all-features` 编译通过，执行待下次 CI |
-| 6 | 迁移 015 中断/重试 | CI | **未运行** | 需 `DATABASE_URL`；本机无 PG |
+| 5 | `cargo test -p store --features pg-integration -- --ignored` | CI | **通过**（run `40853880906`，13 passed / 0 failed） | 含本轮新增的 015 中断用例 |
+| 6 | 迁移 015 中断/重试 | CI（PG15 + pgvector） | **通过** | `pg_migration_015_interruption_leaves_no_partial_index_and_retries ... ok` |
 | 7 | 大表 `CONCURRENTLY` 演练 | — | **未运行** | 需生产规模数据与维护窗口 |
 | 8 | Lite/Production 运行态观察 | — | **未运行** | 需起二进制 |
 | 9 | 真实 embedding 语义验收 | — | **不在本轮范围** | 任务书明确不做 |
@@ -191,8 +193,20 @@
 | `cargo clippy --all-targets --all-features -- -D warnings` | **通过**（exit 0，无 warning） |
 
 20 个 ignored 中包括 `store --features pg-integration` 的 PG 用例与本轮新增的
-`pg_migration_015_interruption_leaves_no_partial_index_and_retries`——它们**已编译通过但未执行**
-（无 `DATABASE_URL`），不计入通过数。
+`pg_migration_015_interruption_leaves_no_partial_index_and_retries`——它们**已编译通过但本机未执行**
+（无 `DATABASE_URL`），不计入上面的本机通过数。
+
+### 8.1.1 CI 实测（PR #2，run `40853880906`）
+
+| Job | 结果 |
+|---|---|
+| 依赖准入与安全审计 | **success** |
+| 质量门禁（`fmt` / `clippy --all-features` / `test --all-features`） | **success** |
+| PostgreSQL 集成测试（PG15 + pgvector） | **success**：13 passed / 0 failed，含 `pg_migration_015_interruption_leaves_no_partial_index_and_retries ... ok` |
+| Release 构建 | **success** |
+
+因此“PG 侧的执行证据”不再缺失：015 中断/重试、018 历史去重、v1–v6 恢复矩阵、
+ANN 部分索引命中都在真实 PG 上跑过。仍缺的只有生产规模数据与运行态观察。
 
 ### 8.2 运行后清理
 构建产物在 `/tmp/mh-target`（仓库外），诊断日志在 `/tmp/mh-*.log`（仓库外）；
@@ -223,7 +237,7 @@
 |---|---|---|---|
 | R1 | 真实 embedding / LLM 抽取器未接入，语义能力与认知提炼均未验收 | 高（能力缺口） | 否（本轮范围外，已在 README 与健康检查如实暴露） |
 | R2 | merge 补偿在 PostgreSQL 上没有注入测试，只有内存实现证据 | 中 | 否（replace 的原子路径有 PG 证据） |
-| R3 | 迁移 015 大表 `CONCURRENTLY` 未演练（耗时/锁/回滚） | 中 | 否（单机小表可自动迁移；大表按 runbook 维护窗口） |
+| R3 | 迁移 015 大表 `CONCURRENTLY` 未演练（耗时/锁）；中断/重试语义已由 CI 的 PG15 实测 | 中 | 否（单机小表可自动迁移；大表按 runbook 维护窗口） |
 | R4 | 迁移 018 清理会删除历史重复提案（不可回溯） | 低 | 否（同逻辑候选的冗余副本） |
 | R5 | `partial=true` 的 merge 不保证原子；调用方必须检查报告 | 低 | 否（已在文档与报告字段显式暴露） |
 | R6 | 补偿回滚会让条目版本号 +2 | 低 | 否（内容与关联正确） |
