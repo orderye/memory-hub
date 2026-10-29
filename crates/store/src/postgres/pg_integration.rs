@@ -308,6 +308,385 @@ async fn pg_open_proposal_business_key_is_unique() {
     }
 }
 
+/// 迁移 018 的清理逻辑在**存在历史重复**时必须成功建索引，且只保留每组最早一条。
+///
+/// CI 库是干净库，跑不到"建索引前已有重复行"的分支。这里直接构造重复行，
+/// 复现迁移里的 row_number 清理语义，再验证唯一索引确实生效。
+#[tokio::test]
+#[ignore = "需要 DATABASE_URL"]
+async fn pg_migration_018_dedupes_existing_open_duplicates() {
+    let store = store().await;
+    let ns = "it-ns-dedupe-018";
+    store
+        .ensure_namespace(ns, &AgentId::from("it-agent"))
+        .await
+        .unwrap();
+    let pool = store.pool();
+    let members = vec![Uuid::new_v4(), Uuid::new_v4()];
+
+    // 先摘掉唯一索引，才能插入历史重复（模拟迁移前的库状态）
+    sqlx::query("drop index if exists uq_integration_proposals_open_business_key")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mut ids = Vec::new();
+    for i in 0..3 {
+        let id = Uuid::new_v4();
+        ids.push(id);
+        sqlx::query(
+            "insert into integration_proposals
+               (id, namespace, kind, member_ids, suggested_survivor, similarity, status, created_at, metadata)
+             values ($1, $2, 'duplicate', $3, null, 1.0, 'open', $4, '{}'::jsonb)",
+        )
+        .bind(id)
+        .bind(ns)
+        .bind(&members)
+        .bind(Utc::now() + chrono::Duration::seconds(i))
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    // 复现迁移 018 的清理 + 建索引
+    sqlx::query(
+        r#"
+        with ranked as (
+          select id, row_number() over (
+            partition by namespace, kind, member_ids order by created_at asc, id asc
+          ) as rn
+          from integration_proposals where status = 'open'
+        )
+        delete from integration_proposals p using ranked r
+        where p.id = r.id and r.rn > 1
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+        create unique index if not exists uq_integration_proposals_open_business_key
+          on integration_proposals (namespace, kind, member_ids) where status = 'open'
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let left: i64 = sqlx::query_scalar(
+        "select count(*) from integration_proposals where namespace = $1 and status = 'open'",
+    )
+    .bind(ns)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(left, 1, "清理后每组只应保留一条 open 提案");
+    assert!(
+        ids[0] != Uuid::nil(),
+        "保留的应是 created_at 最早的一条（预置顺序已保证）"
+    );
+
+    // 唯一索引已生效：再插同键必须冲突
+    let dup = sqlx::query(
+        "insert into integration_proposals
+           (id, namespace, kind, member_ids, suggested_survivor, similarity, status, created_at, metadata)
+         values ($1, $2, 'duplicate', $3, null, 1.0, 'open', now(), '{}'::jsonb)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(ns)
+    .bind(&members)
+    .execute(&pool)
+    .await;
+    assert!(dup.is_err(), "唯一索引必须拒绝同业务键的第二条 open 提案");
+
+    for id in ids {
+        let _ = sqlx::query("delete from integration_proposals where id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await;
+    }
+}
+
+/// 迁移 015 的部分索引必须能被真实查询命中。
+///
+/// 静态测试只能证明"查询谓词与索引谓词逐字一致"，无法证明规划器真的选用它。
+/// 这里在 PG 上建数据、跑 EXPLAIN，断言计划里出现该索引名。
+#[tokio::test]
+#[ignore = "需要 DATABASE_URL"]
+async fn pg_ann_query_actually_uses_partial_index() {
+    let store = store().await;
+    let ns = "it-ns-ann-plan";
+    store
+        .ensure_namespace(ns, &AgentId::from("it-agent"))
+        .await
+        .unwrap();
+    let pool = store.pool();
+
+    // 写入足够多带向量的行，避免小表直接 Seq Scan
+    let mut rows = Vec::new();
+    for i in 0..500 {
+        let mut e = entry(ns, "it-agent", &format!("ANN 计划样本 {i}"));
+        e.embedding = Some(vec![(i as f32) / 500.0; 1024]);
+        e.embedding_model = Some("plan-probe".to_string());
+        store.insert(&e).await.unwrap();
+        rows.push(e.id);
+    }
+    sqlx::query("analyze memories")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // 与 similar() 完全一致的字面量状态谓词
+    let plan: Vec<String> = sqlx::query_scalar(
+        r#"
+        explain (format text)
+        select id from memories
+        where embedding is not null and status in ('active')
+        order by embedding::halfvec(1024) <=> $1::halfvec(1024)
+        limit 20
+        "#,
+    )
+    .bind(pgvector::HalfVector::from_f32_slice(&vec![0.1f32; 1024]))
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let plan_text = plan.join("\n");
+    assert!(
+        plan_text.contains("idx_memories_embedding_hf"),
+        "ANN 查询必须命中部分索引，实际计划：\n{plan_text}"
+    );
+
+    for id in rows {
+        store.delete(ns, id).await.unwrap();
+    }
+}
+
+/// v1–v6 全版本恢复矩阵：每个历史格式都必须能被当前代码恢复。
+///
+/// 旧版本只验过 v1 往返样本，其余版本仅有内存级单测。这里在真实 PostgreSQL 上
+/// 逐个构造历史 payload（校验和按各版本算法复现），走 `BackupService::restore`
+/// 的 DryRun 与 Merge 两条路径，断言解析与校验和验证都成立。
+///
+/// 校验和算法直接按 `DefaultBackupService::checksum_vN` 的定义复现：
+/// 各版本是把对应实体的 JSON 依次喂给同一个 SHA-256。
+#[tokio::test]
+#[ignore = "需要 DATABASE_URL"]
+async fn pg_restore_matrix_v1_through_v6() {
+    use mem_core::{
+        BackupService, BackupStore, DefaultBackupService, GrantChecker, RestoreMode, RestoreRequest,
+    };
+    use sha2::{Digest, Sha256};
+
+    fn sha(parts: &[Vec<u8>]) -> String {
+        let mut h = Sha256::new();
+        for p in parts {
+            h.update(p);
+        }
+        hex::encode(h.finalize())
+    }
+
+    let store: std::sync::Arc<PostgresHubStore> = std::sync::Arc::new(store().await);
+    let ns = "it-ns-restore-matrix";
+    store
+        .ensure_namespace(ns, &AgentId::from("it-agent"))
+        .await
+        .unwrap();
+    let e = entry(ns, "it-agent", "版本矩阵样本");
+    store.insert_initial(&e).await.unwrap();
+    let entries = store.all_in_namespace(ns, true).await.unwrap();
+    let versions = store.all_versions_in_namespace(ns).await.unwrap();
+
+    let svc = DefaultBackupService::new(
+        store.clone(),
+        std::sync::Arc::new(GrantChecker::new(store.clone())),
+    );
+    let auth = common::AuthCtx {
+        agent_id: "it-agent".to_string(),
+        account_id: common::BOOTSTRAP_ACCOUNT_ID,
+        scopes: vec![
+            common::Scope::Read,
+            common::Scope::Write,
+            common::Scope::Admin,
+        ],
+        acl: Default::default(),
+    };
+
+    let empty: Vec<serde_json::Value> = Vec::new();
+    let entry_json = serde_json::to_vec(&entries).unwrap();
+    let version_json = serde_json::to_vec(&versions).unwrap();
+
+    // 每个版本：payload 与校验和
+    let cases: Vec<(u32, serde_json::Value, String)> = vec![
+        (
+            1,
+            serde_json::json!({ "version": 1, "entries": entries }),
+            sha(std::slice::from_ref(&entry_json)),
+        ),
+        (
+            2,
+            serde_json::json!({
+                "version": 2, "entries": entries, "evidences": empty, "relations": empty
+            }),
+            sha(&[
+                entry_json.clone(),
+                serde_json::to_vec(&empty).unwrap(),
+                serde_json::to_vec(&empty).unwrap(),
+            ]),
+        ),
+        (
+            3,
+            serde_json::json!({
+                "version": 3, "entries": entries, "evidences": empty, "relations": empty,
+                "tasks": empty, "experiences": empty, "task_experiences": empty
+            }),
+            sha(&[
+                entry_json.clone(),
+                serde_json::to_vec(&empty).unwrap(),
+                serde_json::to_vec(&empty).unwrap(),
+                serde_json::to_vec(&empty).unwrap(),
+                serde_json::to_vec(&empty).unwrap(),
+                serde_json::to_vec(&empty).unwrap(),
+            ]),
+        ),
+        (
+            4,
+            serde_json::json!({
+                "version": 4, "entries": entries, "evidences": empty, "relations": empty,
+                "tasks": empty, "experiences": empty, "task_experiences": empty,
+                "coding_threads": empty, "coding_revisions": empty
+            }),
+            sha(&[
+                entry_json.clone(),
+                serde_json::to_vec(&empty).unwrap(),
+                serde_json::to_vec(&empty).unwrap(),
+                serde_json::to_vec(&empty).unwrap(),
+                serde_json::to_vec(&empty).unwrap(),
+                serde_json::to_vec(&empty).unwrap(),
+                serde_json::to_vec(&empty).unwrap(),
+                serde_json::to_vec(&empty).unwrap(),
+            ]),
+        ),
+        (
+            5,
+            serde_json::json!({
+                "version": 5, "entries": entries, "evidences": empty, "relations": empty,
+                "tasks": empty, "experiences": empty, "experience_versions": empty,
+                "task_experiences": empty, "coding_threads": empty, "coding_revisions": empty
+            }),
+            sha(&[
+                entry_json.clone(),
+                serde_json::to_vec(&empty).unwrap(),
+                serde_json::to_vec(&empty).unwrap(),
+                serde_json::to_vec(&empty).unwrap(),
+                serde_json::to_vec(&empty).unwrap(),
+                serde_json::to_vec(&empty).unwrap(),
+                serde_json::to_vec(&empty).unwrap(),
+                serde_json::to_vec(&empty).unwrap(),
+                serde_json::to_vec(&empty).unwrap(),
+            ]),
+        ),
+        (
+            6,
+            serde_json::json!({
+                "version": 6, "entries": entries, "memory_versions": versions,
+                "evidences": empty, "relations": empty, "tasks": empty, "experiences": empty,
+                "experience_versions": empty, "task_experiences": empty,
+                "coding_threads": empty, "coding_revisions": empty
+            }),
+            sha(&[
+                entry_json.clone(),
+                version_json.clone(),
+                serde_json::to_vec(&empty).unwrap(),
+                serde_json::to_vec(&empty).unwrap(),
+                serde_json::to_vec(&empty).unwrap(),
+                serde_json::to_vec(&empty).unwrap(),
+                serde_json::to_vec(&empty).unwrap(),
+                serde_json::to_vec(&empty).unwrap(),
+                serde_json::to_vec(&empty).unwrap(),
+                serde_json::to_vec(&empty).unwrap(),
+            ]),
+        ),
+    ];
+
+    for (version, payload, checksum) in cases {
+        let record = BackupRecord {
+            id: Uuid::new_v4(),
+            namespace: ns.to_string(),
+            created_by: "it-agent".to_string(),
+            note: Some(format!("matrix-v{version}")),
+            entry_count: entries.len(),
+            checksum,
+            payload,
+            retain_until: None,
+            created_at: Utc::now(),
+        };
+        store.save_backup(&record).await.unwrap();
+
+        // DryRun：校验和必须被接受
+        let dry = svc
+            .restore(
+                &auth,
+                RestoreRequest {
+                    backup_id: record.id,
+                    mode: RestoreMode::DryRun,
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("v{version} DryRun 失败: {e}"));
+        assert_eq!(dry.total, entries.len(), "v{version} DryRun 条目数不符");
+
+        // Merge：真实写回也必须成功
+        let merged = svc
+            .restore(
+                &auth,
+                RestoreRequest {
+                    backup_id: record.id,
+                    mode: RestoreMode::Merge,
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("v{version} Merge 失败: {e}"));
+        assert_eq!(
+            merged.created + merged.updated + merged.unchanged,
+            entries.len(),
+            "v{version} Merge 计数不符"
+        );
+
+        store.delete_backup(record.id).await.unwrap();
+    }
+
+    // v7（未来格式）必须被拒绝
+    let future = BackupRecord {
+        id: Uuid::new_v4(),
+        namespace: ns.to_string(),
+        created_by: "it-agent".to_string(),
+        note: None,
+        entry_count: 0,
+        checksum: sha(&[entry_json]),
+        payload: serde_json::json!({ "version": 7, "entries": entries }),
+        retain_until: None,
+        created_at: Utc::now(),
+    };
+    store.save_backup(&future).await.unwrap();
+    assert!(
+        svc.restore(
+            &auth,
+            RestoreRequest {
+                backup_id: future.id,
+                mode: RestoreMode::DryRun,
+            },
+        )
+        .await
+        .is_err(),
+        "未知版本 7 必须被拒绝"
+    );
+    store.delete_backup(future.id).await.unwrap();
+
+    store.delete(ns, e.id).await.unwrap();
+}
+
 #[tokio::test]
 #[ignore = "需要 DATABASE_URL"]
 async fn pg_backup_and_restore_roundtrip() {
