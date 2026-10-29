@@ -1297,6 +1297,62 @@ impl Embedder for CachedEmbedder {
     }
 }
 
+/// 回归：显式配置了真实嵌入端点、且要求语义时，端点不可达必须让评测
+/// **显式失败**，而不是回落到伪向量后继续产出"看起来跑过了"的结果。
+///
+/// 注意 `HttpEmbedder::new` 只构建 HTTP 客户端、不发起连接，所以"配置了端点"
+/// 不等于"端点可用"——真正的失败发生在首次 embed 调用。
+///
+/// 这里用**子进程**隔离环境变量：`std::env::set_var` 是进程级全局状态，
+/// 在同进程内设置会污染并行运行的其他评测用例（实测会让 bench 门禁连到
+/// 不可达端点而失败）。子进程让该场景自成一体，不与其他测试共享环境。
+#[test]
+fn unreachable_configured_endpoint_fails_when_semantics_required() {
+    let exe = std::env::current_exe().expect("当前测试二进制路径");
+    let output = std::process::Command::new(&exe)
+        .args([
+            "--exact",
+            "unreachable_endpoint_probe_inner",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(
+            "HUB_EVAL_EMBED_ENDPOINT",
+            "http://127.0.0.1:1/v1/embeddings",
+        )
+        .env("HUB_EVAL_REQUIRE_SEMANTIC", "1")
+        .env(
+            "HUB_EVAL_EMBED_CACHE",
+            "/tmp/mh_eval_unreachable_probe.json",
+        )
+        .output()
+        .expect("无法启动子进程");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let combined = format!("{stdout}{stderr}");
+    let _ = std::fs::remove_file("/tmp/mh_eval_unreachable_probe.json");
+
+    assert!(
+        combined.contains("PROBE_RESULT: explicit_failure"),
+        "不可达端点必须让 embed 显式失败；子进程输出：\n{combined}"
+    );
+}
+
+/// 子进程内部探针：验证"配置了真实端点 + 要求语义"时不会静默回落到伪向量。
+#[tokio::test]
+#[ignore = "由 unreachable_configured_endpoint_fails_when_semantics_required 在子进程中触发"]
+async fn unreachable_endpoint_probe_inner() {
+    let (embedder, _cached, label) = eval_embedder();
+    let semantic_ready = embedder.provides_semantic_signal();
+    let embed_result = embedder.embed(&["探测文本".to_string()]).await;
+    if semantic_ready && embed_result.is_err() {
+        println!("PROBE_RESULT: explicit_failure");
+    } else {
+        println!("PROBE_RESULT: silent_fallback({label})");
+    }
+}
+
 fn eval_embedder() -> (Arc<dyn Embedder>, Option<Arc<CachedEmbedder>>, String) {
     if let Ok(endpoint) = std::env::var("HUB_EVAL_EMBED_ENDPOINT") {
         if !endpoint.trim().is_empty() {
@@ -1374,7 +1430,7 @@ struct PerQueryRecord {
     result_count: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct BenchReport {
     dataset_fingerprint: String,
     dataset_docs: usize,
@@ -1740,6 +1796,34 @@ fn baseline_path() -> std::path::PathBuf {
         .join("crates/retrieval/tests/data/eval_baseline.json")
 }
 
+/// 基线可比性判定：指纹 / 配置 / 嵌入器任一不同即视为不可比，必须显式失败。
+///
+/// 抽成独立函数是为了让"不可比必须报错"这一契约可被单测覆盖——
+/// 门禁里写成 `println + return` 时，测试无法区分"没退化"与"没比较"。
+fn assert_baseline_comparable(base: &BenchReport, report: &BenchReport) {
+    if base.dataset_fingerprint != report.dataset_fingerprint {
+        panic!(
+            "数据集指纹与基线不一致（{} → {}）：两次评测不可比，\
+             不得据此判定无退化。确认数据变更符合预期后，用 \
+             HUB_EVAL_WRITE_BASELINE=1 重新冻结基线",
+            base.dataset_fingerprint, report.dataset_fingerprint
+        );
+    }
+    if base.config != report.config {
+        panic!(
+            "评测配置与基线不一致（基线 {} / 本次 {}）：权重、阈值或场景模式\
+             不同意味着指标口径不同，不可做配对检验。确认无回归后用 \
+             HUB_EVAL_WRITE_BASELINE=1 重新冻结基线",
+            base.config, report.config
+        );
+    }
+    assert_eq!(
+        base.embedder, report.embedder,
+        "嵌入器与基线不一致（{} vs {}）：伪向量与真实模型不可比，请用相同嵌入器重跑或重新冻结基线",
+        base.embedder, report.embedder
+    );
+}
+
 fn load_baseline() -> Option<BenchReport> {
     std::fs::read_to_string(baseline_path())
         .ok()
@@ -2032,6 +2116,58 @@ fn paired_gate(base: &BenchReport, cur: &BenchReport) -> Vec<String> {
     failures
 }
 
+/// 回归：基线不可比时门禁必须**显式失败**，不能静默跳过。
+///
+/// 旧行为在数据集指纹或配置不一致时只打印一行提示就 return，测试照样绿，
+/// 于是"数据集/权重被改动"与"质量达标"在 CI 里长得一模一样。
+#[test]
+fn incomparable_baseline_must_fail_loudly() {
+    let mut base = BenchReport {
+        dataset_fingerprint: "fingerprint-a".to_string(),
+        config: "cfg-a".to_string(),
+        embedder: "embedder-a".to_string(),
+        ..Default::default()
+    };
+    let report = BenchReport {
+        dataset_fingerprint: "fingerprint-b".to_string(),
+        config: "cfg-b".to_string(),
+        embedder: "embedder-b".to_string(),
+        ..Default::default()
+    };
+    // 指纹不同 → 必须 panic（用 catch_unwind 观察，而不是接受"正常返回"）
+    let outcome = std::panic::catch_unwind(|| {
+        assert_baseline_comparable(&base, &report);
+    });
+    assert!(
+        outcome.is_err(),
+        "数据集指纹不一致时必须显式失败，而不是静默跳过门禁"
+    );
+
+    // 指纹相同但配置不同 → 同样必须失败
+    base.dataset_fingerprint = report.dataset_fingerprint.clone();
+    let outcome = std::panic::catch_unwind(|| {
+        assert_baseline_comparable(&base, &report);
+    });
+    assert!(
+        outcome.is_err(),
+        "配置口径不一致时必须显式失败，而不是静默跳过门禁"
+    );
+
+    // 嵌入器不同（伪向量 vs 真实模型）→ 同样必须失败
+    base.config = report.config.clone();
+    let outcome = std::panic::catch_unwind(|| {
+        assert_baseline_comparable(&base, &report);
+    });
+    assert!(
+        outcome.is_err(),
+        "嵌入器不一致时必须显式失败：伪向量与真实模型不可比"
+    );
+
+    // 三项一致时应当通过
+    base.embedder = report.embedder.clone();
+    assert_baseline_comparable(&base, &report);
+}
+
 #[tokio::test]
 async fn test_retrieval_bench_gate() {
     let ds = build_dataset();
@@ -2066,29 +2202,7 @@ async fn test_retrieval_bench_gate() {
         return;
     };
 
-    if base.dataset_fingerprint != report.dataset_fingerprint {
-        println!(
-            "[bench] 数据集指纹变化（{} → {}），跳过逐指标门禁；确认无回归后重新冻结基线",
-            base.dataset_fingerprint, report.dataset_fingerprint
-        );
-        return;
-    }
-    assert_eq!(
-        base.embedder, report.embedder,
-        "嵌入器与基线不一致（{} vs {}）：伪向量与真实模型不可比，请用相同嵌入器重跑或重新冻结基线",
-        base.embedder, report.embedder
-    );
-
-    // 配置不同则指标口径不同（权重、阈值、场景模式都会改分数），
-    // 拿两套口径的数字做配对检验等于自欺。必须显式重冻。
-    if base.config != report.config {
-        println!(
-            "[bench] 配置与基线不一致（基线 {} / 本次 {}），跳过逐指标门禁；\
-             确认无回归后用 HUB_EVAL_WRITE_BASELINE=1 重新冻结基线",
-            base.config, report.config
-        );
-        return;
-    }
+    assert_baseline_comparable(&base, &report);
 
     let regressions = paired_gate(&base, &report);
     assert!(
