@@ -77,9 +77,9 @@ pub use fingerprint::{canonical_form, content_fingerprint, same_fingerprint};
 pub use infra::{
     AccessChecker, AccountRecord, AccountStore, AgentRecord, AgentRegistration, AgentStore,
     BackupStore, ChatCognitiveExtractor, Clock, CodingStore, CognitiveProposalStore,
-    CollectionStore, Embedder, EvidenceStore, ExperienceStore, GrantStore, IntegrationStore,
-    MemoryHubStore, MemoryStore, RelationStore, Retriever, SessionRecord, SystemClock, TaskStore,
-    TokenIntrospector,
+    CollectionStore, CreateProposalOutcome, Embedder, EvidenceStore, ExperienceStore, GrantStore,
+    IntegrationStore, MemoryHubStore, MemoryStore, RelationStore, Retriever, SessionRecord,
+    SystemClock, TaskStore, TokenIntrospector,
 };
 pub use integration_service::{
     IntegrationService, ResolveAction, ResolveRequest, ScanReport, ScanRequest,

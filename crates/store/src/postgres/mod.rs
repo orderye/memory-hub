@@ -230,6 +230,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "20261028000017_memory_collections",
         include_str!("../../migrations/20261028000017_memory_collections.sql"),
     ),
+    (
+        "20261028000018_proposal_open_uniqueness",
+        include_str!("../../migrations/20261028000018_proposal_open_uniqueness.sql"),
+    ),
 ];
 
 /// PostgreSQL 四合一存储

@@ -225,6 +225,78 @@ async fn pg_atomic_namespace_replace_rolls_back_on_failure() {
     store.delete(namespace, original.id).await.unwrap();
 }
 
+/// 迁移 018 的业务唯一键：并发创建同一逻辑 open 提案时只落一条。
+/// 这是跨进程去重的数据库侧证据（进程内 mutex 覆盖不到）。
+#[tokio::test]
+#[ignore = "需要 DATABASE_URL"]
+async fn pg_open_proposal_business_key_is_unique() {
+    use mem_core::{CreateProposalOutcome, IntegrationKind, IntegrationStore, ProposalStatus};
+
+    let store = store().await;
+    let ns = "it-ns-proposal-unique";
+    store
+        .ensure_namespace(ns, &AgentId::from("it-agent"))
+        .await
+        .unwrap();
+
+    let members = vec![Uuid::new_v4(), Uuid::new_v4()];
+    let make = |id: Uuid| mem_core::IntegrationProposal {
+        id,
+        namespace: ns.to_string(),
+        kind: IntegrationKind::Duplicate,
+        member_ids: members.clone(),
+        suggested_survivor: Some(members[0]),
+        similarity: 1.0,
+        status: ProposalStatus::Open,
+        resolution_note: None,
+        created_at: Utc::now(),
+        resolved_at: None,
+        metadata: serde_json::json!({}),
+    };
+
+    let first = store
+        .create_open_proposal_once(&make(Uuid::new_v4()))
+        .await
+        .unwrap();
+    assert_eq!(first, CreateProposalOutcome::Created);
+
+    // 不同 id、相同业务键：必须被唯一索引拒绝为"已存在"，而不是新建第二条
+    let second = store
+        .create_open_proposal_once(&make(Uuid::new_v4()))
+        .await
+        .unwrap();
+    assert_eq!(second, CreateProposalOutcome::AlreadyExists);
+
+    let open = store
+        .list_proposals(ns, Some(ProposalStatus::Open))
+        .await
+        .unwrap();
+    assert_eq!(open.len(), 1, "同一业务键只允许一条 open 提案");
+
+    // 关闭后可再次新建（部分索引只约束 open 行）
+    let mut closed = open[0].clone();
+    closed.status = ProposalStatus::Merged;
+    closed.resolved_at = Some(Utc::now());
+    store.save_proposal(&closed).await.unwrap();
+    let third = store
+        .create_open_proposal_once(&make(Uuid::new_v4()))
+        .await
+        .unwrap();
+    assert_eq!(
+        third,
+        CreateProposalOutcome::Created,
+        "提案关闭后同一逻辑候选允许再次出现"
+    );
+
+    for p in store.list_proposals(ns, None).await.unwrap() {
+        sqlx::query("delete from integration_proposals where id = $1")
+            .bind(p.id)
+            .execute(&store.pool())
+            .await
+            .unwrap();
+    }
+}
+
 #[tokio::test]
 #[ignore = "需要 DATABASE_URL"]
 async fn pg_backup_and_restore_roundtrip() {

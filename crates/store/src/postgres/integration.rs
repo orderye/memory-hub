@@ -92,6 +92,49 @@ impl mem_core::IntegrationStore for PostgresHubStore {
         rows.iter().map(Self::proposal_from_row).collect()
     }
 
+    /// 原子创建 open 提案：部分唯一索引 + `on conflict do nothing`。
+    ///
+    /// 同一 `(namespace, kind, member_ids)` 的 open 提案只允许一条；并发插入时
+    /// 后到者 0 行受影响，返回 AlreadyExists 而不是报错或产生重复行。
+    async fn create_open_proposal_once(
+        &self,
+        p: &IntegrationProposal,
+    ) -> Result<mem_core::CreateProposalOutcome> {
+        let res = sqlx::query(
+            r#"
+            insert into integration_proposals
+              (id, namespace, kind, member_ids, suggested_survivor, similarity, status, resolution_note, created_at, resolved_at, metadata)
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            on conflict (namespace, kind, member_ids) where status = 'open' do nothing
+            "#,
+        )
+        .bind(p.id)
+        .bind(&p.namespace)
+        .bind(p.kind.as_str())
+        .bind(&p.member_ids)
+        .bind(p.suggested_survivor)
+        .bind(p.similarity)
+        .bind(match p.status {
+            ProposalStatus::Open => "open",
+            ProposalStatus::Merged => "merged",
+            ProposalStatus::Dismissed => "dismissed",
+            ProposalStatus::Expired => "expired",
+        })
+        .bind(&p.resolution_note)
+        .bind(p.created_at)
+        .bind(p.resolved_at)
+        .bind(&p.metadata)
+        .execute(&self.pool)
+        .await
+        .pg()?;
+
+        if res.rows_affected() == 0 {
+            Ok(mem_core::CreateProposalOutcome::AlreadyExists)
+        } else {
+            Ok(mem_core::CreateProposalOutcome::Created)
+        }
+    }
+
     async fn open_exists(&self, namespace: &str, members: &[(String, Vec<Uuid>)]) -> Result<bool> {
         for (kind, ids) in members {
             let count: i64 = sqlx::query_scalar(

@@ -351,6 +351,41 @@ pub trait IntegrationStore: Send + Sync {
         namespace: &str,
         kind_member: &[(String, Vec<uuid::Uuid>)],
     ) -> Result<bool>;
+
+    /// 原子地创建 open 提案：若同一 `(namespace, kind, member_ids)` 已有 open 提案，
+    /// 返回既有提案并标记为“已存在”，绝不新建第二条。
+    ///
+    /// 这是跨进程安全的入口：进程内 mutex 只覆盖同进程，两个进程（MCP server 与
+    /// backup-worker）同时扫描同一 namespace 时，先查后插的窗口仍会产生重复提案。
+    /// 生产实现必须由数据库唯一约束 + 冲突处理保证，而不是依赖调用方先查。
+    async fn create_open_proposal_once(
+        &self,
+        proposal: &IntegrationProposal,
+    ) -> Result<CreateProposalOutcome> {
+        if self
+            .open_exists(
+                &proposal.namespace,
+                &[(
+                    proposal.kind.as_str().to_string(),
+                    proposal.member_ids.clone(),
+                )],
+            )
+            .await?
+        {
+            return Ok(CreateProposalOutcome::AlreadyExists);
+        }
+        self.save_proposal(proposal).await?;
+        Ok(CreateProposalOutcome::Created)
+    }
+}
+
+/// 创建 open 提案的结果
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateProposalOutcome {
+    /// 本次新建
+    Created,
+    /// 已存在等价 open 提案，未新建
+    AlreadyExists,
 }
 
 /// 认知提案存储（Chat 认知提炼的人工审查队列）

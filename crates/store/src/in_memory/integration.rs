@@ -49,6 +49,29 @@ impl mem_core::IntegrationStore for InMemoryHubStore {
                 })
         }))
     }
+
+    /// 原子创建：在同一把写锁内完成"查重 + 插入"，消除跨进程 check-then-act 窗口。
+    async fn create_open_proposal_once(
+        &self,
+        proposal: &IntegrationProposal,
+    ) -> Result<mem_core::CreateProposalOutcome> {
+        let mut w = self.proposals.write().unwrap();
+        let equivalent = w.values().any(|p| {
+            p.status == ProposalStatus::Open
+                && p.namespace == proposal.namespace
+                && p.kind == proposal.kind
+                && {
+                    let a: std::collections::HashSet<_> = p.member_ids.iter().collect();
+                    let b: std::collections::HashSet<_> = proposal.member_ids.iter().collect();
+                    a == b && p.member_ids.len() == proposal.member_ids.len()
+                }
+        });
+        if equivalent {
+            return Ok(mem_core::CreateProposalOutcome::AlreadyExists);
+        }
+        w.insert(proposal.id, proposal.clone());
+        Ok(mem_core::CreateProposalOutcome::Created)
+    }
 }
 
 #[async_trait]

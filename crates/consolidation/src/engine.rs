@@ -561,28 +561,19 @@ impl ConsolidationEngine {
         // 旧实现每个提案单独发一次 open_exists 查询（N+1）；与 `open_exists` 的
         // SQL 语义（kind 相同 + cardinality 相等 + 超集）等价于集合相等。
         // 本批刚保存的提案同样进入签名集——同批出现相同签名时第二个也要跳过。
-        let mut open_signatures: std::collections::HashSet<(String, Vec<Uuid>)> = self
-            .store
-            .list_proposals(namespace, Some(ProposalStatus::Open))
-            .await?
-            .into_iter()
-            .map(|p| {
-                let mut members = p.member_ids;
-                members.sort();
-                (p.kind.as_str().to_string(), members)
-            })
-            .collect();
+        // 跨进程安全：写入走存储层的原子入口（数据库唯一约束 + 冲突处理），
+        // 而不是"先读 open 集合、再逐个 insert"——后者在两个进程同时扫描时
+        // 会在窗口内各自插入，产生重复 open 提案。进程内 mutex 只覆盖同进程。
         for proposal in new_proposals {
-            let mut members = proposal.member_ids.clone();
-            members.sort();
-            let signature = (proposal.kind.as_str().to_string(), members);
-            if !open_signatures.insert(signature) {
-                report.skipped_existing += 1;
-                continue;
+            match self.store.create_open_proposal_once(&proposal).await? {
+                mem_core::CreateProposalOutcome::Created => {
+                    report.proposals_created += 1;
+                    report.proposals.push(proposal);
+                }
+                mem_core::CreateProposalOutcome::AlreadyExists => {
+                    report.skipped_existing += 1;
+                }
             }
-            self.store.save_proposal(&proposal).await?;
-            report.proposals_created += 1;
-            report.proposals.push(proposal);
         }
 
         Ok(report)

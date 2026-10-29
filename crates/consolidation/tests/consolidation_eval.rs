@@ -25,8 +25,8 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 use common::{ConsolidationFallback, ConsolidationMode, Scope};
 use consolidation::{AutoPolicy, CandidateLimits, ConsolidationEngine, PolicyMode};
 use mem_core::{
-    account_scope::scope_name, domain::MemoryKind, testing::FixedClock, Embedder, MemoryEntry,
-    MemoryScene, MemoryStatus, MemoryStore,
+    account_scope::scope_name, domain::MemoryKind, testing::FixedClock, Embedder, IntegrationStore,
+    MemoryEntry, MemoryScene, MemoryStatus, MemoryStore,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -884,6 +884,66 @@ async fn test_account_isolation_is_enforced_in_both_modes() {
             }
         }
     }
+}
+
+/// 回归：跨进程并发（进程内 mutex 覆盖不到）时，同一逻辑候选只能留下一个 open 提案。
+///
+/// `NAMESPACE_LOCKS` 是进程内全局表，同进程多实例共享同一把锁，因此无法用它复现
+/// 跨进程竞争。这里直接模拟两个进程各自的 check-then-act 序列：都先读 open 提案
+/// 集合（都为空），再各自写入同一逻辑提案。
+///
+/// 旧实现下两条都会落库（重复 open 提案）；修复后第二次写入必须被数据库层的
+/// 业务唯一键拒绝，或幂等地返回既有提案。
+#[tokio::test]
+async fn test_concurrent_processes_create_only_one_open_proposal() {
+    let store = Arc::new(InMemoryHubStore::new());
+    let now = fixed_now();
+    let mut member_ids = Vec::new();
+    for content in ["跨进程重复内容", "跨进程重复内容"] {
+        let e = build_entry("proc-race", &EntrySpec::new(content), now);
+        member_ids.push(e.id);
+        store.insert(&e).await.unwrap();
+    }
+    member_ids.sort();
+
+    // 两个"进程"先并行完成各自的 check（都为空），再并行写入
+    let (a, b) = tokio::join!(
+        store.list_proposals("proc-race", Some(mem_core::ProposalStatus::Open)),
+        store.list_proposals("proc-race", Some(mem_core::ProposalStatus::Open))
+    );
+    assert!(
+        a.unwrap().is_empty() && b.unwrap().is_empty(),
+        "竞争窗口内两边都看不到既有 open 提案"
+    );
+
+    for _ in 0..2 {
+        let proposal = mem_core::IntegrationProposal {
+            id: Uuid::new_v4(),
+            namespace: "proc-race".to_string(),
+            kind: mem_core::IntegrationKind::Duplicate,
+            member_ids: member_ids.clone(),
+            suggested_survivor: Some(member_ids[0]),
+            similarity: 1.0,
+            status: mem_core::ProposalStatus::Open,
+            resolution_note: None,
+            created_at: now,
+            resolved_at: None,
+            metadata: json!({}),
+        };
+        // 生产路径必须走原子入口，而不是先查后插
+        store.create_open_proposal_once(&proposal).await.unwrap();
+    }
+
+    let open = store
+        .list_proposals("proc-race", Some(mem_core::ProposalStatus::Open))
+        .await
+        .unwrap();
+    assert_eq!(
+        open.len(),
+        1,
+        "同一逻辑候选的重复写入必须只留下一个 open 提案，实际 {} 条",
+        open.len()
+    );
 }
 
 #[tokio::test]
