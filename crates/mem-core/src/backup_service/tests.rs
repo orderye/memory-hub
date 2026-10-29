@@ -166,6 +166,365 @@ async fn test_replace_uses_atomic_snapshot_api() {
     }
 }
 
+/// Replace 后各关联实体必须整体一致：证据、关系、任务、经验、版本、关联与代码链
+/// 全部回到快照状态，且没有残留的旧数据。
+#[tokio::test]
+async fn test_replace_restores_all_related_entities_consistently() {
+    use crate::domain::{
+        CodeChangeKind, MemoryScene, NewCodingRevision, NewCodingThread, NewExperienceVersion,
+        NewMemoryExperience, NewMemoryTask,
+    };
+    use crate::infra::{CodingStore, ExperienceStore, TaskStore};
+
+    let (svc, store) = setup();
+    let auth = admin("agent-a");
+    let ns = "consistency";
+    store
+        .ensure_namespace(&scoped_ns(ns), &"agent-a".to_string())
+        .await
+        .unwrap();
+    store
+        .grant(&NamespaceGrantRecord {
+            namespace: scoped_ns(ns),
+            agent_id: "agent-a".to_string(),
+            can_read: true,
+            can_write: true,
+            granted_by: "agent-a".to_string(),
+            created_at: chrono::Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let a = store.seed(&scoped_ns(ns), "agent-a", "记忆 A");
+    let b = store.seed(&scoped_ns(ns), "agent-a", "记忆 B");
+    let evidence = store
+        .append_evidence(&NewEvidence {
+            id: None,
+            namespace: scoped_ns(ns),
+            source_kind: EvidenceSourceKind::Session,
+            source_ref: Some("s-1".to_string()),
+            content_hash: "h-1".to_string(),
+            excerpt: Some("证据".to_string()),
+            occurred_at: Some(chrono::Utc::now()),
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+    store
+        .add_relation(
+            &scoped_ns(ns),
+            &NewMemoryRelation {
+                from_memory_id: a.id,
+                to_memory_id: b.id,
+                relation_kind: MemoryRelationKind::DerivedFrom,
+                confidence: 0.9,
+                source_evidence_id: Some(evidence.id),
+            },
+        )
+        .await
+        .unwrap();
+    let task = store
+        .create_task(&NewMemoryTask {
+            id: None,
+            namespace: scoped_ns(ns),
+            scene: MemoryScene::Working,
+            task: "任务".to_string(),
+            status: TaskStatus::Completed,
+            started_at: chrono::Utc::now(),
+            finished_at: Some(chrono::Utc::now()),
+            result_summary: None,
+            failure_reason: None,
+            source_evidence_id: Some(evidence.id),
+            metadata: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let experience = store
+        .save_experience(&NewMemoryExperience {
+            id: None,
+            namespace: scoped_ns(ns),
+            task: "经验".to_string(),
+            search_keys: vec!["k".to_string()],
+            solution: "方案".to_string(),
+            preconditions: serde_json::json!({}),
+            boundary_envs: vec![],
+            failure_modes: vec![],
+            validation: serde_json::json!({}),
+            confidence: 0.8,
+            status: ExperienceStatus::Active,
+            feedback_score: 1.0,
+        })
+        .await
+        .unwrap();
+    store
+        .link_task_experience(&crate::domain::MemoryTaskExperience {
+            namespace: Some(scoped_ns(ns)),
+            task_id: task.id,
+            experience_id: experience.id,
+            relation_kind: "derived_from".to_string(),
+            created_at: chrono::Utc::now(),
+        })
+        .await
+        .unwrap();
+    store
+        .append_experience_version(&NewExperienceVersion {
+            id: None,
+            experience_id: experience.id,
+            namespace: scoped_ns(ns),
+            version: 1,
+            snapshot: serde_json::json!({"solution": "旧方案"}),
+            change_kind: crate::domain::ExperienceChangeKind::Created,
+            changed_by: "agent-a".to_string(),
+            status: ExperienceStatus::Candidate,
+            note: None,
+            changed_at: chrono::Utc::now(),
+        })
+        .await
+        .unwrap();
+    let thread = store
+        .create_thread(&NewCodingThread {
+            id: None,
+            namespace: scoped_ns(ns),
+            repository: "org/repo".to_string(),
+            branch: Some("main".to_string()),
+            task_id: Some(task.id),
+            title: "线程".to_string(),
+            description: None,
+        })
+        .await
+        .unwrap();
+    store
+        .save_revision(
+            &NewCodingRevision {
+                id: None,
+                thread_id: Some(thread.id),
+                namespace: scoped_ns(ns),
+                repository: "org/repo".to_string(),
+                branch: Some("main".to_string()),
+                commit_sha: Some("abc".to_string()),
+                parent_sha: None,
+                file_path: "src/lib.rs".to_string(),
+                change_kind: CodeChangeKind::Modify,
+                diff_content: "+x".to_string(),
+                symbol_fingerprint: None,
+                is_committed: true,
+                author: None,
+                occurred_at: Some(chrono::Utc::now()),
+                source_evidence_id: Some(evidence.id),
+                source_task_id: Some(task.id),
+            },
+            "hash-1",
+        )
+        .await
+        .unwrap();
+
+    let backup = svc
+        .create(
+            &auth,
+            BackupCreateRequest {
+                namespace: ns.to_string(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    // 全部清空后 Replace：必须整体回到快照状态
+    for item in store.all_in_namespace(&scoped_ns(ns), true).await.unwrap() {
+        store.delete(&scoped_ns(ns), item.id).await.unwrap();
+    }
+    for e in store
+        .all_evidence_in_namespace(&scoped_ns(ns))
+        .await
+        .unwrap()
+    {
+        store.delete_evidence(&scoped_ns(ns), e.id).await.unwrap();
+    }
+    for t in store.all_tasks_in_namespace(&scoped_ns(ns)).await.unwrap() {
+        store.delete_task(&scoped_ns(ns), t.id).await.unwrap();
+    }
+    for e in store
+        .all_experiences_in_namespace(&scoped_ns(ns))
+        .await
+        .unwrap()
+    {
+        store.delete_experience(&scoped_ns(ns), e.id).await.unwrap();
+    }
+    for t in store
+        .all_threads_in_namespace(&scoped_ns(ns))
+        .await
+        .unwrap()
+    {
+        store.delete_thread(&scoped_ns(ns), t.id).await.unwrap();
+    }
+
+    let report = svc
+        .restore(
+            &auth,
+            RestoreRequest {
+                backup_id: backup.id,
+                mode: RestoreMode::Replace,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.created, 2, "两条记忆都应重建");
+    assert_eq!(report.failed_evidences, 0);
+    assert_eq!(report.failed_relations, 0);
+    assert_eq!(report.failed_tasks, 0);
+    assert_eq!(report.failed_experiences, 0);
+    assert_eq!(report.failed_threads, 0);
+    assert_eq!(report.failed_revisions, 0);
+    assert!(
+        report.safety_backup_id.is_some(),
+        "Replace 必须先建安全备份"
+    );
+
+    assert_eq!(
+        store
+            .all_in_namespace(&scoped_ns(ns), true)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        store
+            .all_evidence_in_namespace(&scoped_ns(ns))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .all_relations_in_namespace(&scoped_ns(ns))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .all_tasks_in_namespace(&scoped_ns(ns))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .all_experiences_in_namespace(&scoped_ns(ns))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .all_experience_versions_in_namespace(&scoped_ns(ns))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .all_task_experiences_in_namespace(&scoped_ns(ns))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .all_threads_in_namespace(&scoped_ns(ns))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .all_revisions_in_namespace(&scoped_ns(ns))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // 记忆版本历史也必须随之恢复
+    assert!(
+        !store.versions(a.id).await.unwrap().is_empty(),
+        "记忆版本历史应恢复"
+    );
+}
+
+/// 备份与恢复必须按账户隔离：另一账户不能读取或恢复本账户的快照。
+#[tokio::test]
+async fn test_backup_and_restore_are_isolated_between_accounts() {
+    let (svc, store) = setup();
+    let owner = admin("agent-a");
+    let ns = "isolated";
+    store
+        .ensure_namespace(&scoped_ns(ns), &"agent-a".to_string())
+        .await
+        .unwrap();
+    store
+        .grant(&NamespaceGrantRecord {
+            namespace: scoped_ns(ns),
+            agent_id: "agent-a".to_string(),
+            can_read: true,
+            can_write: true,
+            granted_by: "agent-a".to_string(),
+            created_at: chrono::Utc::now(),
+        })
+        .await
+        .unwrap();
+    store.seed(&scoped_ns(ns), "agent-a", "本账户机密");
+    let backup = svc
+        .create(
+            &owner,
+            BackupCreateRequest {
+                namespace: ns.to_string(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    // 另一个账户：同名 namespace 在它的作用域里是不同的物理命名空间
+    let other_account = uuid::Uuid::from_u128(2);
+    let intruder = AuthCtx {
+        agent_id: "agent-b".to_string(),
+        account_id: other_account,
+        scopes: vec![Scope::Read, Scope::Write, Scope::Admin],
+        acl: Default::default(),
+    };
+    let err = svc
+        .restore(
+            &intruder,
+            RestoreRequest {
+                backup_id: backup.id,
+                mode: RestoreMode::Replace,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, HubError::NotFound | HubError::InsufficientScope),
+        "跨账户恢复必须被拒绝，实际: {err:?}"
+    );
+
+    let listed = svc.list(&intruder, None).await.unwrap();
+    assert!(listed.is_empty(), "跨账户不得看到他人快照");
+
+    // 本账户数据未受影响
+    let items = store.all_in_namespace(&scoped_ns(ns), true).await.unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].content, "本账户机密");
+}
+
 #[tokio::test]
 async fn test_replace_creates_safety_backup_and_rebuilds() {
     let (svc, store) = setup();

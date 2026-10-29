@@ -772,9 +772,23 @@ impl<S: RelationStore + ?Sized> RelationStore for AccountScopedStore<S> {
     }
 
     async fn all_relations_in_namespace(&self, namespace: &str) -> Result<Vec<MemoryRelation>> {
-        self.inner
+        let rows = self
+            .inner
             .all_relations_in_namespace(&self.scoped(namespace))
-            .await
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter(|r| match &r.namespace {
+                Some(ns) => in_scope(&self.account, ns),
+                None => true,
+            })
+            .map(|mut r| {
+                if let Some(ref ns) = r.namespace {
+                    r.namespace = Some(self.unscoped(ns));
+                }
+                r
+            })
+            .collect())
     }
 }
 
@@ -1299,6 +1313,71 @@ mod tests {
         // 用户可见名不含 `/`，永远不可能"看起来已作用域化"
         assert!(!in_scope(&a, "personal"));
         assert!(in_scope(&a, &scope_name(&a, "personal")));
+    }
+
+    /// 快照类读取必须把内部键还原为用户可见名，否则备份负载里的
+    /// namespace 与实际恢复目标不匹配，实体会被静默丢弃。
+    #[tokio::test]
+    async fn test_relation_snapshot_reads_use_visible_namespace() {
+        use crate::domain::{MemoryEntry, MemoryKind, MemoryRelationKind, MemoryStatus};
+        use crate::testing::TestHubStore;
+
+        let inner = Arc::new(TestHubStore::default());
+        let account = account(1);
+        let scoped = AccountScopedStore::new(inner.clone(), account);
+        let raw_ns = scope_name(&account, "personal");
+
+        let entry = MemoryEntry {
+            id: Uuid::new_v4(),
+            namespace: raw_ns.clone(),
+            key: None,
+            kind: MemoryKind::Fact,
+            content: "条目".to_string(),
+            tags: vec![],
+            metadata: serde_json::json!({}),
+            embedding: None,
+            embedding_model: None,
+            source_agent: "agent-a".to_string(),
+            confidence: 1.0,
+            status: MemoryStatus::Active,
+            version: 1,
+            expires_at: None,
+            merged_into: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            scene: None,
+            layer: None,
+            valid_from: None,
+            valid_until: None,
+            occurred_at: None,
+        };
+        inner.insert(&entry).await.unwrap();
+        let other = MemoryEntry {
+            id: Uuid::new_v4(),
+            ..entry.clone()
+        };
+        inner.insert(&other).await.unwrap();
+        inner
+            .add_relation(
+                &raw_ns,
+                &crate::domain::NewMemoryRelation {
+                    from_memory_id: entry.id,
+                    to_memory_id: other.id,
+                    relation_kind: MemoryRelationKind::DerivedFrom,
+                    confidence: 1.0,
+                    source_evidence_id: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let rows = scoped.all_relations_in_namespace("personal").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].namespace.as_deref(),
+            Some("personal"),
+            "快照读取必须返回用户可见 namespace，而不是内部作用域键"
+        );
     }
 }
 
