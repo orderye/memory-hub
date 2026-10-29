@@ -501,16 +501,17 @@ async fn pg_restore_matrix_v1_through_v6() {
     }
 
     let store: std::sync::Arc<PostgresHubStore> = std::sync::Arc::new(store().await);
-    let ns = "it-ns-restore-matrix";
+    let visible_ns = "it-ns-restore-matrix";
+    // ACL 判定按账户作用域进行：`can_read` 会先 scope_name(account, ns) 再查授权，
+    // 因此命名空间与授权都必须以作用域键登记，否则判权永远落空（报"对象不存在"）。
+    let ns = mem_core::account_scope::scope_name(&common::BOOTSTRAP_ACCOUNT_ID, visible_ns);
     store
-        .ensure_namespace(ns, &AgentId::from("it-agent"))
+        .ensure_namespace(&ns, &AgentId::from("it-agent"))
         .await
         .unwrap();
-    // restore 走 require_read/require_write 的 ACL 判定：必须显式授权，
-    // 否则 DryRun 会在判权阶段报 NotFound（"对象不存在"）。
     store
         .grant(&NamespaceGrantRecord {
-            namespace: ns.to_string(),
+            namespace: ns.clone(),
             agent_id: "it-agent".to_string(),
             can_read: true,
             can_write: true,
@@ -521,8 +522,14 @@ async fn pg_restore_matrix_v1_through_v6() {
         .unwrap();
     let e = entry(ns, "it-agent", "版本矩阵样本");
     store.insert_initial(&e).await.unwrap();
-    let entries = store.all_in_namespace(ns, true).await.unwrap();
-    let versions = store.all_versions_in_namespace(ns).await.unwrap();
+    // 备份负载存的是**用户可见名**（服务层 create 经 AccountScopedStore 产出的形态），
+    // 而不是内部作用域键。这里手工构造负载，必须同样换成可见名，否则 restore
+    // 作用域化后找不到对应命名空间。
+    let mut entries = store.all_in_namespace(&ns, true).await.unwrap();
+    for entry in &mut entries {
+        entry.namespace = visible_ns.to_string();
+    }
+    let versions = store.all_versions_in_namespace(&ns).await.unwrap();
 
     let svc = DefaultBackupService::new(
         store.clone(),
