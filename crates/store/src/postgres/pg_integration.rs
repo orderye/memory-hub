@@ -412,7 +412,9 @@ async fn pg_migration_018_dedupes_existing_open_duplicates() {
 /// 迁移 015 的部分索引必须能被真实查询命中。
 ///
 /// 静态测试只能证明"查询谓词与索引谓词逐字一致"，无法证明规划器真的选用它。
-/// 这里在 PG 上建数据、跑 EXPLAIN，断言计划里出现该索引名。
+/// 小表上 Seq Scan + Sort 成本更低，规划器不会走索引——这是正常的，不能据此
+/// 断言"索引失效"。因此这里批量写入足够多的行，再跑 EXPLAIN 断言计划里出现
+/// 索引名；若仍走 Seq Scan，输出完整计划供诊断。
 #[tokio::test]
 #[ignore = "需要 DATABASE_URL"]
 async fn pg_ann_query_actually_uses_partial_index() {
@@ -424,21 +426,30 @@ async fn pg_ann_query_actually_uses_partial_index() {
         .unwrap();
     let pool = store.pool();
 
-    // 写入足够多带向量的行，避免小表直接 Seq Scan
-    let mut rows = Vec::new();
-    for i in 0..500 {
-        let mut e = entry(ns, "it-agent", &format!("ANN 计划样本 {i}"));
-        e.embedding = Some(vec![(i as f32) / 500.0; 1024]);
-        e.embedding_model = Some("plan-probe".to_string());
-        store.insert(&e).await.unwrap();
-        rows.push(e.id);
-    }
+    // 批量写入：逐条走 store.insert 会有 2 万次往返，直接一条 SQL 造数。
+    // 向量用确定性伪随机填充，避免全部同向导致 HNSW 图退化。
+    sqlx::query(
+        r#"
+        insert into memories
+          (id, namespace, kind, content, tags, metadata, embedding, embedding_model,
+           source_agent, confidence, status, version, created_at, updated_at, tsv_tokens)
+        select gen_random_uuid(), $1, 'fact', 'ANN 计划样本 ' || i, '{}'::text[],
+               '{}'::jsonb,
+               (select array_agg((random())::real)::vector from generate_series(1, 1024)),
+               'plan-probe', 'it-agent', 1.0, 'active', 1, now(), now(), 'ann sample ' || i
+        from generate_series(1, 20000) as i
+        "#,
+    )
+    .bind(ns)
+    .execute(&pool)
+    .await
+    .unwrap();
+
     sqlx::query("analyze memories")
         .execute(&pool)
         .await
         .unwrap();
 
-    // 与 similar() 完全一致的字面量状态谓词
     let plan: Vec<String> = sqlx::query_scalar(
         r#"
         explain (format text)
@@ -458,9 +469,11 @@ async fn pg_ann_query_actually_uses_partial_index() {
         "ANN 查询必须命中部分索引，实际计划：\n{plan_text}"
     );
 
-    for id in rows {
-        store.delete(ns, id).await.unwrap();
-    }
+    sqlx::query("delete from memories where namespace = $1")
+        .bind(ns)
+        .execute(&pool)
+        .await
+        .unwrap();
 }
 
 /// v1–v6 全版本恢复矩阵：每个历史格式都必须能被当前代码恢复。
@@ -491,6 +504,19 @@ async fn pg_restore_matrix_v1_through_v6() {
     let ns = "it-ns-restore-matrix";
     store
         .ensure_namespace(ns, &AgentId::from("it-agent"))
+        .await
+        .unwrap();
+    // restore 走 require_read/require_write 的 ACL 判定：必须显式授权，
+    // 否则 DryRun 会在判权阶段报 NotFound（"对象不存在"）。
+    store
+        .grant(&NamespaceGrantRecord {
+            namespace: ns.to_string(),
+            agent_id: "it-agent".to_string(),
+            can_read: true,
+            can_write: true,
+            granted_by: "it-agent".to_string(),
+            created_at: Utc::now(),
+        })
         .await
         .unwrap();
     let e = entry(ns, "it-agent", "版本矩阵样本");
