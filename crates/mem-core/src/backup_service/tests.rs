@@ -1085,6 +1085,120 @@ async fn test_wildcard_backup_visible_to_admin_not_to_reader() {
     assert!(matches!(err, HubError::InsufficientScope));
 }
 
+/// 安全回归：restore 的目标命名空间必须逐个通过 ACL 判定。
+///
+/// `namespaces` 集合从 payload 各实体派生。若某类实体（如只有 relations、
+/// 没有 entries）的 namespace 未被纳入集合，该 namespace 就跳过了 require_write，
+/// 等于绕过 ACL 写入。这里构造一个"只有 relations + task_experiences"的备份，
+/// 验证无写权限的 agent 会被拒绝。
+#[tokio::test]
+async fn test_restore_checks_acl_for_namespaces_derived_only_from_relations() {
+    let (svc, store) = setup();
+    let owner = admin("agent-a");
+    let ns = "relation-only-ns";
+    store
+        .ensure_namespace(&scoped_ns(ns), &"agent-a".to_string())
+        .await
+        .unwrap();
+    store
+        .grant(&NamespaceGrantRecord {
+            namespace: scoped_ns(ns),
+            agent_id: "agent-a".to_string(),
+            can_read: true,
+            can_write: true,
+            granted_by: "agent-a".to_string(),
+            created_at: chrono::Utc::now(),
+        })
+        .await
+        .unwrap();
+    let e = store.seed(&scoped_ns(ns), "agent-a", "记忆");
+    let other = store.seed(&scoped_ns(ns), "agent-a", "另一条");
+    store
+        .add_relation(
+            &scoped_ns(ns),
+            &NewMemoryRelation {
+                from_memory_id: e.id,
+                to_memory_id: other.id,
+                relation_kind: MemoryRelationKind::DerivedFrom,
+                confidence: 1.0,
+                source_evidence_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let backup = svc
+        .create(
+            &owner,
+            BackupCreateRequest {
+                namespace: ns.to_string(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    // 只把 relations 留在 payload 里，entries/evidences/tasks 等全部清空：
+    // namespace 集合只能从 relations 派生出来。
+    let mut relation_only = backup.clone();
+    relation_only.namespace = scoped_ns(ns);
+    let relations = relation_only.payload["relations"].clone();
+    relation_only.payload = serde_json::json!({
+        "version": BACKUP_PAYLOAD_VERSION,
+        "namespace": ns,
+        "entries": [],
+        "memory_versions": [],
+        "evidences": [],
+        "relations": relations,
+        "tasks": [],
+        "experiences": [],
+        "experience_versions": [],
+        "task_experiences": [],
+        "coding_threads": [],
+        "coding_revisions": [],
+    });
+    let parsed_relations: Vec<MemoryRelation> = serde_json::from_value(relations).unwrap();
+    relation_only.checksum = DefaultBackupService::checksum_v6(
+        &[],
+        &[],
+        &[],
+        &parsed_relations,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+    );
+    store.save_backup(&relation_only).await.unwrap();
+
+    // 同账户、有 admin scope、但对该 namespace 无写授权的 agent
+    let stranger = AuthCtx {
+        agent_id: "agent-b".to_string(),
+        account_id: common::BOOTSTRAP_ACCOUNT_ID,
+        scopes: vec![Scope::Read, Scope::Write, Scope::Admin],
+        acl: Default::default(),
+    };
+    let err = svc
+        .restore(
+            &stranger,
+            RestoreRequest {
+                backup_id: relation_only.id,
+                mode: RestoreMode::Replace,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, HubError::InsufficientScope),
+        "无写授权的 agent 不得通过 relations 派生的 namespace 绕过 ACL，实际: {err:?}"
+    );
+
+    // 数据未被改动
+    let items = store.all_in_namespace(&scoped_ns(ns), true).await.unwrap();
+    assert_eq!(items.len(), 2);
+}
+
 #[tokio::test]
 async fn test_backup_requires_admin_scope() {
     let (svc, _store) = setup();

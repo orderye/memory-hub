@@ -669,6 +669,88 @@ async fn test_grant_and_revoke_via_tools() {
     assert!(search_b.is_error, "撤销后应不可搜");
 }
 
+/// 安全回归：跨 namespace 读写在**无授权**时必须拒绝，且不得泄露资源存在性。
+///
+/// 判定标准：对"存在但无权"与"根本不存在"两种输入，返回的错误必须是同一类
+/// （InsufficientScope），否则调用方可用错误码差异探测他人数据是否存在。
+#[tokio::test]
+async fn test_cross_namespace_access_denied_without_leaking_existence() {
+    let (d, owner) = harness();
+
+    // owner 在 own-ns 写入数据
+    d.dispatch(
+        &owner,
+        "memory_put",
+        arg(json!({ "namespace": "own-ns", "kind": "note", "content": "私有内容" })),
+    )
+    .await;
+
+    // 同账户、无 own-ns 授权的 agent
+    let stranger = AuthCtx {
+        agent_id: "agent-stranger".to_string(),
+        account_id: common::BOOTSTRAP_ACCOUNT_ID,
+        scopes: vec![Scope::Read, Scope::Write],
+        acl: Default::default(),
+    };
+
+    // 1) 读"存在但无权"的 namespace
+    let existing = d
+        .dispatch(
+            &stranger,
+            "memory_list",
+            arg(json!({ "namespace": "own-ns" })),
+        )
+        .await;
+    assert!(existing.is_error, "无授权的跨 namespace 读取必须被拒绝");
+
+    // 2) 读"根本不存在"的 namespace
+    let missing = d
+        .dispatch(
+            &stranger,
+            "memory_list",
+            arg(json!({ "namespace": "never-existed-ns" })),
+        )
+        .await;
+    assert!(missing.is_error, "不存在的 namespace 也必须被拒绝");
+
+    // 3) 两者错误类型必须一致（不得通过错误差异探测存在性）
+    let existing_kind = existing
+        .content
+        .iter()
+        .map(|c| match c {
+            McpContentItem::Text { text } => text.clone(),
+        })
+        .collect::<String>();
+    let missing_kind = missing
+        .content
+        .iter()
+        .map(|c| match c {
+            McpContentItem::Text { text } => text.clone(),
+        })
+        .collect::<String>();
+    assert_eq!(
+        existing_kind, missing_kind,
+        "存在但无权 与 不存在 的错误码必须相同，否则可探测资源存在性：\
+         存在={existing_kind} 不存在={missing_kind}"
+    );
+
+    // 4) 写同样被拒
+    let write = d
+        .dispatch(
+            &stranger,
+            "memory_put",
+            arg(json!({ "namespace": "own-ns", "kind": "note", "content": "注入" })),
+        )
+        .await;
+    assert!(write.is_error, "无授权的跨 namespace 写入必须被拒绝");
+
+    // 5) 原数据未被污染
+    let owner_list = d
+        .dispatch(&owner, "memory_list", arg(json!({ "namespace": "own-ns" })))
+        .await;
+    assert!(!owner_list.is_error);
+}
+
 #[tokio::test]
 async fn test_grant_rejects_cross_account_and_wildcard() {
     let (d, auth) = harness();
