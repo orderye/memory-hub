@@ -63,7 +63,7 @@ cron IntegrationScanJob       crates/worker/src/integration_job.rs → engine.rs
 |---|---|
 | 合并后重嵌入是整合链路唯一的嵌入调用 | `engine.rs`（合并分支） |
 | 提案表无溯源字段，`kind` 有 `CHECK (kind in ('duplicate','conflict'))` | `integration_proposals` DDL |
-| `integration_proposals` **不在任何备份快照载荷内** | 当时快照 v1~v4；现为 v5（新增 `experience_versions`），仍不含提案表 |
+| `integration_proposals` **不在任何备份快照载荷内** | 当时快照 v1~v4；现为 v6（含 `memory_versions` 与 `experience_versions`），仍不含提案表 |
 | `open_exists` 的 PG 与内存实现**语义一致** | PG 用 `cardinality` 相等 + `@>`，等价于集合相等 |
 | `embedding_model` 全仓从未被读回比较 | 检测器会跨模型比较向量（本次已补守卫） |
 | `MemoryStore::similar`（账户隔离的 ANN 召回）现成可用 | `infra.rs` / `account_scope.rs` |

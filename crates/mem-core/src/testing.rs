@@ -304,6 +304,8 @@ pub struct TestHubStore {
     pub fail_add_relation: std::sync::atomic::AtomicBool,
     /// 错误注入：置位后 revise 一律失败（测试 supersedes 封堵失败不拖垮主流程）
     pub fail_revise: std::sync::atomic::AtomicBool,
+    /// 原子替换接口被调用的次数（验证 Replace 走批量事务而非逐步提交）
+    pub replace_calls: std::sync::atomic::AtomicUsize,
 }
 
 impl TestHubStore {
@@ -649,12 +651,8 @@ impl BackupStore for TestHubStore {
         &self,
         snapshots: &[(Namespace, crate::domain::RestoreSnapshot)],
     ) -> Result<()> {
-        if snapshots.len() != 1 {
-            return Err(HubError::InvalidArgument(
-                "test store supports one namespace snapshot at a time".into(),
-            ));
-        }
-        let (namespace, snapshot) = &snapshots[0];
+        self.replace_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let items = self.items.read().unwrap().clone();
         let versions = self.versions.read().unwrap().clone();
         let evidences = self.evidences.read().unwrap().clone();
@@ -666,94 +664,183 @@ impl BackupStore for TestHubStore {
         let coding_threads = self.coding_threads.read().unwrap().clone();
         let coding_revisions = self.coding_revisions.read().unwrap().clone();
 
-        self.items
-            .write()
-            .unwrap()
-            .retain(|(ns, _), _| ns != namespace);
-        let namespace_entry_ids: std::collections::HashSet<Uuid> = items
-            .keys()
-            .filter(|(ns, _)| ns == namespace)
-            .map(|(_, id)| *id)
-            .collect();
-        self.versions
-            .write()
-            .unwrap()
-            .retain(|version| !namespace_entry_ids.contains(&version.memory_id));
-        self.evidences
-            .write()
-            .unwrap()
-            .retain(|evidence| evidence.namespace != *namespace);
-        self.relations
-            .write()
-            .unwrap()
-            .retain(|relation| relation.namespace.as_deref() != Some(namespace));
-        self.tasks
-            .write()
-            .unwrap()
-            .retain(|(ns, _), _| ns != namespace);
-        self.experiences
-            .write()
-            .unwrap()
-            .retain(|(ns, _), _| ns != namespace);
-        self.experience_versions
-            .write()
-            .unwrap()
-            .retain(|version| version.namespace != *namespace);
-        self.task_experiences
-            .write()
-            .unwrap()
-            .retain(|link| link.namespace.as_deref() != Some(namespace));
-        self.coding_threads
-            .write()
-            .unwrap()
-            .retain(|(ns, _), _| ns != namespace);
-        self.coding_revisions
-            .write()
-            .unwrap()
-            .retain(|(ns, _), _| ns != namespace);
+        for (namespace, _) in snapshots {
+            self.items
+                .write()
+                .unwrap()
+                .retain(|(ns, _), _| ns != namespace);
+            let namespace_entry_ids: std::collections::HashSet<Uuid> = items
+                .keys()
+                .filter(|(ns, _)| ns == namespace)
+                .map(|(_, id)| *id)
+                .collect();
+            self.versions
+                .write()
+                .unwrap()
+                .retain(|version| !namespace_entry_ids.contains(&version.memory_id));
+            self.evidences
+                .write()
+                .unwrap()
+                .retain(|evidence| evidence.namespace != *namespace);
+            self.relations
+                .write()
+                .unwrap()
+                .retain(|relation| relation.namespace.as_deref() != Some(namespace));
+            self.tasks
+                .write()
+                .unwrap()
+                .retain(|(ns, _), _| ns != namespace);
+            self.experiences
+                .write()
+                .unwrap()
+                .retain(|(ns, _), _| ns != namespace);
+            self.experience_versions
+                .write()
+                .unwrap()
+                .retain(|version| version.namespace != *namespace);
+            self.task_experiences
+                .write()
+                .unwrap()
+                .retain(|link| link.namespace.as_deref() != Some(namespace));
+            self.coding_threads
+                .write()
+                .unwrap()
+                .retain(|(ns, _), _| ns != namespace);
+            self.coding_revisions
+                .write()
+                .unwrap()
+                .retain(|(ns, _), _| ns != namespace);
+        }
 
         let result = async {
-            for entry in &snapshot.entries {
-                if entry.namespace != *namespace {
-                    return Err(HubError::InvalidArgument(
-                        "snapshot namespace mismatch".into(),
-                    ));
+            for (namespace, snapshot) in snapshots {
+                for entry in &snapshot.entries {
+                    if entry.namespace != *namespace {
+                        return Err(HubError::InvalidArgument(
+                            "snapshot namespace mismatch".into(),
+                        ));
+                    }
+                    self.insert_initial(entry).await?;
                 }
-                self.insert_initial(entry).await?;
-            }
-            for evidence in &snapshot.evidences {
-                if evidence.namespace != *namespace {
-                    return Err(HubError::InvalidArgument(
-                        "snapshot namespace mismatch".into(),
-                    ));
+                for evidence in &snapshot.evidences {
+                    if evidence.namespace != *namespace {
+                        return Err(HubError::InvalidArgument(
+                            "snapshot namespace mismatch".into(),
+                        ));
+                    }
+                    self.append_evidence(&NewEvidence {
+                        id: Some(evidence.id),
+                        namespace: evidence.namespace.clone(),
+                        source_kind: evidence.source_kind,
+                        source_ref: evidence.source_ref.clone(),
+                        content_hash: evidence.content_hash.clone(),
+                        excerpt: evidence.excerpt.clone(),
+                        occurred_at: evidence.occurred_at,
+                        expires_at: evidence.expires_at,
+                    })
+                    .await?;
                 }
-                self.append_evidence(&NewEvidence {
-                    id: Some(evidence.id),
-                    namespace: evidence.namespace.clone(),
-                    source_kind: evidence.source_kind,
-                    source_ref: evidence.source_ref.clone(),
-                    content_hash: evidence.content_hash.clone(),
-                    excerpt: evidence.excerpt.clone(),
-                    occurred_at: evidence.occurred_at,
-                    expires_at: evidence.expires_at,
-                })
-                .await?;
-            }
-            for task in &snapshot.tasks {
-                self.create_task(&NewMemoryTask {
-                    id: Some(task.id),
-                    namespace: task.namespace.clone(),
-                    scene: task.scene,
-                    task: task.task.clone(),
-                    status: task.status,
-                    started_at: task.started_at,
-                    finished_at: task.finished_at,
-                    result_summary: task.result_summary.clone(),
-                    failure_reason: task.failure_reason.clone(),
-                    source_evidence_id: task.source_evidence_id,
-                    metadata: task.metadata.clone(),
-                })
-                .await?;
+                for task in &snapshot.tasks {
+                    self.create_task(&NewMemoryTask {
+                        id: Some(task.id),
+                        namespace: task.namespace.clone(),
+                        scene: task.scene,
+                        task: task.task.clone(),
+                        status: task.status,
+                        started_at: task.started_at,
+                        finished_at: task.finished_at,
+                        result_summary: task.result_summary.clone(),
+                        failure_reason: task.failure_reason.clone(),
+                        source_evidence_id: task.source_evidence_id,
+                        metadata: task.metadata.clone(),
+                    })
+                    .await?;
+                }
+                for experience in &snapshot.experiences {
+                    self.save_experience(&NewMemoryExperience {
+                        id: Some(experience.id),
+                        namespace: experience.namespace.clone(),
+                        task: experience.task.clone(),
+                        search_keys: experience.search_keys.clone(),
+                        solution: experience.solution.clone(),
+                        preconditions: experience.preconditions.clone(),
+                        boundary_envs: experience.boundary_envs.clone(),
+                        failure_modes: experience.failure_modes.clone(),
+                        validation: experience.validation.clone(),
+                        confidence: experience.confidence,
+                        status: experience.status,
+                        feedback_score: experience.feedback_score,
+                    })
+                    .await?;
+                    self.update_experience(experience).await?;
+                }
+                for version in &snapshot.experience_versions {
+                    self.append_experience_version(&NewExperienceVersion {
+                        id: Some(version.id),
+                        experience_id: version.experience_id,
+                        namespace: version.namespace.clone(),
+                        version: version.version,
+                        snapshot: version.snapshot.clone(),
+                        change_kind: version.change_kind,
+                        changed_by: version.changed_by.clone(),
+                        status: version.status,
+                        note: version.note.clone(),
+                        changed_at: version.changed_at,
+                    })
+                    .await?;
+                }
+                for link in &snapshot.task_experiences {
+                    self.link_task_experience(link).await?;
+                }
+                for relation in &snapshot.relations {
+                    self.add_relation(
+                        namespace,
+                        &NewMemoryRelation {
+                            from_memory_id: relation.from_memory_id,
+                            to_memory_id: relation.to_memory_id,
+                            relation_kind: relation.relation_kind,
+                            confidence: relation.confidence,
+                            source_evidence_id: relation.source_evidence_id,
+                        },
+                    )
+                    .await?;
+                }
+                for thread in &snapshot.coding_threads {
+                    self.create_thread(&NewCodingThread {
+                        id: Some(thread.id),
+                        namespace: thread.namespace.clone(),
+                        repository: thread.repository.clone(),
+                        branch: thread.branch.clone(),
+                        task_id: thread.task_id,
+                        title: thread.title.clone(),
+                        description: thread.description.clone(),
+                    })
+                    .await?;
+                }
+                for revision in &snapshot.coding_revisions {
+                    self.save_revision(
+                        &NewCodingRevision {
+                            id: Some(revision.id),
+                            thread_id: revision.thread_id,
+                            namespace: revision.namespace.clone(),
+                            repository: revision.repository.clone(),
+                            branch: revision.branch.clone(),
+                            commit_sha: revision.commit_sha.clone(),
+                            parent_sha: revision.parent_sha.clone(),
+                            file_path: revision.file_path.clone(),
+                            change_kind: revision.change_kind,
+                            diff_content: revision.diff_content.clone(),
+                            symbol_fingerprint: revision.symbol_fingerprint.clone(),
+                            is_committed: revision.is_committed,
+                            author: revision.author.clone(),
+                            occurred_at: Some(revision.occurred_at),
+                            source_evidence_id: revision.source_evidence_id,
+                            source_task_id: revision.source_task_id,
+                        },
+                        &revision.diff_hash,
+                    )
+                    .await?;
+                }
             }
             Ok(())
         }

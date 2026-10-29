@@ -12,7 +12,7 @@ use crate::domain::{
     BackupRecord, BackupSummary, CodingRevision, CodingThread, MemoryEntry, MemoryEvidence,
     MemoryExperience, MemoryRelation, MemoryTask, MemoryTaskExperience, MemoryVersion,
     NewCodingRevision, NewCodingThread, NewEvidence, NewExperienceVersion, NewMemoryExperience,
-    NewMemoryRelation, NewMemoryTask, RestoreMode, RestoreReport, VersionChange,
+    NewMemoryRelation, NewMemoryTask, RestoreMode, RestoreReport, RestoreSnapshot, VersionChange,
 };
 use crate::infra::{
     AccessChecker, BackupStore, Clock, CodingStore, EvidenceStore, ExperienceStore, MemoryHubStore,
@@ -576,6 +576,104 @@ impl DefaultBackupService {
         }
     }
 
+    /// 把备份负载按 namespace 拆成原子替换所需的快照列表。
+    #[allow(clippy::too_many_arguments)]
+    fn snapshots_for_replace(
+        backup_namespace: &str,
+        namespaces: &[String],
+        entries: &[MemoryEntry],
+        memory_versions: &[MemoryVersion],
+        evidences: &[MemoryEvidence],
+        relations: &[MemoryRelation],
+        tasks: &[MemoryTask],
+        experiences: &[MemoryExperience],
+        experience_versions: &[crate::domain::ExperienceVersion],
+        task_experiences: &[MemoryTaskExperience],
+        coding_threads: &[CodingThread],
+        coding_revisions: &[CodingRevision],
+    ) -> Vec<(String, RestoreSnapshot)> {
+        let namespace_of_entry: std::collections::HashMap<Uuid, String> = entries
+            .iter()
+            .map(|entry| (entry.id, entry.namespace.clone()))
+            .collect();
+        let mut snapshots: Vec<(String, RestoreSnapshot)> = namespaces
+            .iter()
+            .map(|ns| (ns.clone(), RestoreSnapshot::default()))
+            .collect();
+        let index: std::collections::HashMap<String, usize> = snapshots
+            .iter()
+            .enumerate()
+            .map(|(i, (ns, _))| (ns.clone(), i))
+            .collect();
+
+        for entry in entries {
+            if let Some(i) = index.get(entry.namespace.as_str()) {
+                snapshots[*i].1.entries.push(entry.clone());
+            }
+        }
+        for version in memory_versions {
+            if let Some(ns) = namespace_of_entry.get(&version.memory_id) {
+                if let Some(i) = index.get(ns.as_str()) {
+                    snapshots[*i].1.memory_versions.push(version.clone());
+                }
+            }
+        }
+        for evidence in evidences {
+            if let Some(i) = index.get(evidence.namespace.as_str()) {
+                snapshots[*i].1.evidences.push(evidence.clone());
+            }
+        }
+        for relation in relations {
+            let ns = relation
+                .namespace
+                .clone()
+                .or_else(|| namespace_of_entry.get(&relation.from_memory_id).cloned())
+                .unwrap_or_else(|| backup_namespace.to_string());
+            if let Some(i) = index.get(ns.as_str()) {
+                snapshots[*i].1.relations.push(relation.clone());
+            }
+        }
+        for task in tasks {
+            if let Some(i) = index.get(task.namespace.as_str()) {
+                snapshots[*i].1.tasks.push(task.clone());
+            }
+        }
+        for experience in experiences {
+            if let Some(i) = index.get(experience.namespace.as_str()) {
+                snapshots[*i].1.experiences.push(experience.clone());
+            }
+        }
+        for version in experience_versions {
+            if let Some(i) = index.get(version.namespace.as_str()) {
+                snapshots[*i].1.experience_versions.push(version.clone());
+            }
+        }
+        for link in task_experiences {
+            let ns = link.namespace.clone().or_else(|| {
+                tasks
+                    .iter()
+                    .find(|task| task.id == link.task_id)
+                    .map(|task| task.namespace.clone())
+            });
+            if let Some(ns) = ns {
+                if let Some(i) = index.get(ns.as_str()) {
+                    snapshots[*i].1.task_experiences.push(link.clone());
+                }
+            }
+        }
+        for thread in coding_threads {
+            if let Some(i) = index.get(thread.namespace.as_str()) {
+                snapshots[*i].1.coding_threads.push(thread.clone());
+            }
+        }
+        for revision in coding_revisions {
+            if let Some(i) = index.get(revision.namespace.as_str()) {
+                snapshots[*i].1.coding_revisions.push(revision.clone());
+            }
+        }
+        snapshots
+    }
+
     /// 记一次恢复失败：计数并保留首条错误（作汇总日志摘要）
     fn tally_failure(count: &mut usize, first_err: &mut Option<HubError>, e: HubError) {
         if first_err.is_none() {
@@ -920,38 +1018,26 @@ impl BackupService for DefaultBackupService {
                     report.safety_backup_ids.push(safety.id);
                 }
             }
-            // 清空当前状态：按外键依赖逆序由子表到父表深度清空，保证无脏数据且无外键阻塞。
-            // 任何查询或删除失败都必须中止；不能把未完成清理继续报告为成功恢复。
-            for ns in &namespaces {
-                for cur in store.all_revisions_in_namespace(ns).await? {
-                    store.delete_revision(ns, cur.id).await?;
-                }
-                for cur in store.all_threads_in_namespace(ns).await? {
-                    store.delete_thread(ns, cur.id).await?;
-                }
-                for cur in store.all_experiences_in_namespace(ns).await? {
-                    store.delete_experience(ns, cur.id).await?;
-                }
-                for cur in store.all_tasks_in_namespace(ns).await? {
-                    store.delete_task(ns, cur.id).await?;
-                }
-                for cur in store.all_relations_in_namespace(ns).await? {
-                    store
-                        .delete_relation(
-                            ns,
-                            cur.from_memory_id,
-                            cur.to_memory_id,
-                            cur.relation_kind,
-                        )
-                        .await?;
-                }
-                for cur in store.all_evidence_in_namespace(ns).await? {
-                    store.delete_evidence(&cur.namespace, cur.id).await?;
-                }
-                for cur in store.all_in_namespace(ns, true).await? {
-                    store.delete(&cur.namespace, cur.id).await?;
-                }
-            }
+
+            // 整个 Replace 在一次存储事务内完成：所有 namespace 一起清空并写回，
+            // 任何一步失败都回滚，不会留下半恢复状态。
+            let snapshots = Self::snapshots_for_replace(
+                &backup.namespace,
+                &namespaces,
+                &entries,
+                &memory_versions,
+                &evidences,
+                &relations,
+                &tasks,
+                &experiences,
+                &experience_versions,
+                &task_experiences,
+                &coding_threads,
+                &coding_revisions,
+            );
+            store.replace_namespaces_from_snapshots(&snapshots).await?;
+            report.created = entries.len();
+            return Ok(report);
         } else {
             for ns in &namespaces {
                 self.require_write(auth, ns).await?;

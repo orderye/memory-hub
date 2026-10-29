@@ -130,8 +130,8 @@ Working 经验记忆系统（Working Memory System）专为智能体长期多任
 
 ## 6. 备份与还原
 
-- 备份负载已升级到 **v5**：包含 `tasks`、`experiences`、`experience_versions`、`task_experiences` 等全量数据；
-- 恢复路径兼容 v1–v5；**旧二进制不能恢复 v5 备份**（旧代码只认 v1–v4 校验和）；
+- 备份负载已升级到 **v6**：包含 `memory_versions`、`tasks`、`experiences`、`experience_versions`、`task_experiences` 等全量数据；
+- 恢复路径兼容 v1–v6；**旧二进制不能恢复 v6 备份**（旧代码只认 v1–v5 校验和）；
 - 校验和不匹配一律拒绝恢复，不把部分恢复报成成功。
 
 细节见 [`GOVERNANCE_RELEASE.md`](./GOVERNANCE_RELEASE.md) §3 与 [`DEPLOYMENT_MODES.md`](./DEPLOYMENT_MODES.md) §5。

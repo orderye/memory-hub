@@ -99,7 +99,7 @@ CREATE TABLE IF NOT EXISTS coding_revisions (
 
 ---
 
-## 4. 备份与恢复 (v5 协议)
+## 4. 备份与恢复 (v6 协议)
 
 - **备份负载版本升级**：`BACKUP_PAYLOAD_VERSION` 升级至 `4`；
 - **全量快照包含内容**：
@@ -112,8 +112,8 @@ CREATE TABLE IF NOT EXISTS coding_revisions (
   - `task_experiences`: 任务-经验引用图谱；
   - `coding_threads`: 代码演进主题线程；
   - `coding_revisions`: 代码修订历史快照。
-- **向下完全兼容**：恢复时校验和依次校验 `checksum_v5 || checksum_v4 || checksum_v3 || checksum_v2 || checksum_v1`，确保旧版快照无损恢复；
-  但旧二进制无法恢复 v5 备份。
+- **向下完全兼容**：恢复时校验和依次校验 `checksum_v6 || checksum_v5 || checksum_v4 || checksum_v3 || checksum_v2 || checksum_v1`，确保旧版快照无损恢复；
+  但旧二进制无法恢复 v6 备份。
 - **引用完整性保障**：恢复时先按依赖拓扑恢复 `coding_threads`，再恢复 `coding_revisions`，避免产生孤儿记录。
 
 ---

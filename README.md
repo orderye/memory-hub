@@ -786,9 +786,9 @@ docker compose -f docker-compose.lite.yml up -d --build    # Lite
 7. **认知异步作业尚未装配**：`ChatCognitiveJob`（会话提炼重试）与 `ExperienceDistillJob`（经验提炼）
    已实现并有测试，但**没有接进任何二进制的调度**——真实 LLM 抽取器尚未接入，
    接进去只会用 Mock 抽取器产出占位数据。等真实抽取器落地后再装配。
-8. **定时快照与手工备份统一为 v5 载荷**：`backup-worker` 的周期快照与 `memory_backup_create` 使用同一格式
-   （条目、证据、关系、任务、经验、**经验版本历史**、代码线程）；恢复路径支持 v1–v5，
-   但**回滚后的旧二进制不能恢复 v5 备份**——降级前请保留新二进制或先完成恢复。
+8. **定时快照与手工备份统一为 v6 载荷**：`backup-worker` 的周期快照与 `memory_backup_create` 使用同一格式
+   （条目、**记忆版本历史**、证据、关系、任务、经验、经验版本历史、代码线程）；恢复路径支持 v1–v6，
+   但**回滚后的旧二进制不能恢复 v6 备份**——降级前请保留新二进制或先完成恢复。
 9. **多副本只保证\"不同副本重复执行\"被租约挡住**（`HUB_JOB_LEASE_H`），
    不保证单副本内部的扫描进度可续传；大命名空间请用 `HUB_INTEGRATION_SCAN_MAX_ENTRIES` 分批。
 10. **迁移 015 的向量索引重建适合空表 / 小表**：`create index`（非 `CONCURRENTLY`）在启动迁移事务内执行，

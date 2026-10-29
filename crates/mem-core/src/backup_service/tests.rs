@@ -110,6 +110,63 @@ async fn test_backup_create_and_restore_dry_run() {
 }
 
 #[tokio::test]
+async fn test_replace_uses_atomic_snapshot_api() {
+    let (svc, store) = setup();
+    let auth = admin("agent-a");
+    for ns in ["atomic-a", "atomic-b"] {
+        store
+            .ensure_namespace(&scoped_ns(ns), &"agent-a".to_string())
+            .await
+            .unwrap();
+        store
+            .grant(&NamespaceGrantRecord {
+                namespace: scoped_ns(ns),
+                agent_id: "agent-a".to_string(),
+                can_read: true,
+                can_write: true,
+                granted_by: "agent-a".to_string(),
+                created_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        store.seed(&scoped_ns(ns), "agent-a", &format!("{ns} 数据"));
+    }
+    let backup = svc
+        .create(
+            &auth,
+            BackupCreateRequest {
+                namespace: ALL_NAMESPACES.to_string(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    svc.restore(
+        &auth,
+        RestoreRequest {
+            backup_id: backup.id,
+            mode: RestoreMode::Replace,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        store
+            .replace_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "Replace 必须一次性走原子替换接口，而不是逐 namespace 分步提交"
+    );
+    for ns in ["atomic-a", "atomic-b"] {
+        let items = store.all_in_namespace(&scoped_ns(ns), true).await.unwrap();
+        assert_eq!(items.len(), 1, "{ns} 应被完整替换");
+        assert!(items[0].content.contains(ns));
+    }
+}
+
+#[tokio::test]
 async fn test_replace_creates_safety_backup_and_rebuilds() {
     let (svc, store) = setup();
     let a = admin("agent-a");
@@ -1029,6 +1086,23 @@ async fn test_restore_counts_partial_failures_and_continues() {
         }
         async fn delete_backup(&self, id: Uuid) -> Result<()> {
             self.inner.delete_backup(id).await
+        }
+
+        async fn replace_namespaces_from_snapshots(
+            &self,
+            snapshots: &[(String, crate::domain::RestoreSnapshot)],
+        ) -> Result<()> {
+            let failing = self.fail_delete_ids.lock().unwrap().clone();
+            if snapshots
+                .iter()
+                .flat_map(|(_, snapshot)| snapshot.entries.iter())
+                .any(|entry| failing.contains(&entry.id))
+            {
+                return Err(HubError::Unavailable);
+            }
+            self.inner
+                .replace_namespaces_from_snapshots(snapshots)
+                .await
         }
     }
 
