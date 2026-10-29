@@ -2443,6 +2443,336 @@ fn test_restore_report_deserializes_legacy_json_without_new_fields() {
     let report: RestoreReport = serde_json::from_value(legacy).unwrap();
     assert_eq!(report.failed_relations, 0);
     assert!(report.safety_backup_ids.is_empty());
+    // 新增字段必须默认兼容，不得让旧客户端反序列化失败
+    assert!(!report.partial);
+}
+
+/// Merge 的条目写入中途致命失败：必须回滚到操作前，而不是留下"更新了一条、
+/// 新建了一条"的半恢复状态。
+#[tokio::test]
+async fn test_merge_fatal_failure_rolls_back_entries_to_pre_restore_state() {
+    let (svc, store) = setup();
+    let a = admin("agent-a");
+    store
+        .ensure_namespace(&scoped_ns("ns"), &"agent-a".to_string())
+        .await
+        .unwrap();
+    store
+        .grant(&NamespaceGrantRecord {
+            namespace: scoped_ns("ns"),
+            agent_id: "agent-a".to_string(),
+            can_read: true,
+            can_write: true,
+            granted_by: "agent-a".to_string(),
+            created_at: chrono::Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let keep = store.seed(&scoped_ns("ns"), "agent-a", "快照里的内容 A");
+    let to_delete_b = store.seed(&scoped_ns("ns"), "agent-a", "快照里的内容 B");
+    let to_delete_c = store.seed(&scoped_ns("ns"), "agent-a", "快照里的内容 C");
+
+    let backup = svc
+        .create(
+            &a,
+            BackupCreateRequest {
+                namespace: "ns".to_string(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    // 操作前现场：A 被本地改写，B/C 被删除——merge 会把 A 改回快照内容并重建 B/C
+    let mut local_a = store.get(&scoped_ns("ns"), keep.id).await.unwrap();
+    local_a.content = "本地改写后的内容 A".to_string();
+    store
+        .revise(&local_a, 1, VersionChange::Updated)
+        .await
+        .unwrap();
+    store
+        .delete(&scoped_ns("ns"), to_delete_b.id)
+        .await
+        .unwrap();
+    store
+        .delete(&scoped_ns("ns"), to_delete_c.id)
+        .await
+        .unwrap();
+
+    // 注入致命失败：允许重建 1 条，第 2 条 insert 时失败
+    *store.fail_insert_initial_after.lock().unwrap() = Some(1);
+    let err = svc
+        .restore(
+            &a,
+            RestoreRequest {
+                backup_id: backup.id,
+                mode: RestoreMode::Merge,
+            },
+        )
+        .await
+        .unwrap_err();
+    *store.fail_insert_initial_after.lock().unwrap() = None;
+    assert!(
+        err.to_string().contains("回滚到操作前状态"),
+        "错误必须明确说明已回滚，实际: {err}"
+    );
+
+    // 终态校验：只有 A 存在且内容回到操作前（B/C 仍不存在，不得被半恢复出来）
+    let after = store
+        .all_in_namespace(&scoped_ns("ns"), true)
+        .await
+        .unwrap();
+    assert_eq!(after.len(), 1, "已成功重建的条目必须被补偿删除: {after:?}");
+    assert_eq!(after[0].id, keep.id);
+    assert_eq!(
+        after[0].content, "本地改写后的内容 A",
+        "被修订的条目必须回滚到前像"
+    );
+}
+
+/// `get` 返回非 NotFound 的存储错误时，恢复必须中止，不能把"读失败"当成
+/// "库里没有"去插入（旧实现 `Err(_) => insert_initial` 正是这个缺陷）。
+#[tokio::test]
+async fn test_merge_does_not_treat_storage_error_as_missing_entry() {
+    let (svc, store) = setup();
+    let a = admin("agent-a");
+    store
+        .ensure_namespace(&scoped_ns("ns"), &"agent-a".to_string())
+        .await
+        .unwrap();
+    store
+        .grant(&NamespaceGrantRecord {
+            namespace: scoped_ns("ns"),
+            agent_id: "agent-a".to_string(),
+            can_read: true,
+            can_write: true,
+            granted_by: "agent-a".to_string(),
+            created_at: chrono::Utc::now(),
+        })
+        .await
+        .unwrap();
+    let existing = store.seed(&scoped_ns("ns"), "agent-a", "原有内容");
+    let backup = svc
+        .create(
+            &a,
+            BackupCreateRequest {
+                namespace: "ns".to_string(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    store
+        .fail_get
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let err = svc
+        .restore(
+            &a,
+            RestoreRequest {
+                backup_id: backup.id,
+                mode: RestoreMode::Merge,
+            },
+        )
+        .await
+        .unwrap_err();
+    store
+        .fail_get
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        err.to_string().contains("回滚到操作前状态"),
+        "读失败必须中止并回滚，实际: {err}"
+    );
+
+    // 原条目仍在且未被改写/重复插入
+    let after = store
+        .all_in_namespace(&scoped_ns("ns"), true)
+        .await
+        .unwrap();
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].id, existing.id);
+    assert_eq!(after[0].content, "原有内容");
+}
+
+/// 成功路径必须显式标注 `partial=false`，让调用方能把"完整恢复"和"部分成功"区分开。
+#[tokio::test]
+async fn test_merge_success_reports_complete_state() {
+    let (svc, store) = setup();
+    let a = admin("agent-a");
+    store
+        .ensure_namespace(&scoped_ns("ns"), &"agent-a".to_string())
+        .await
+        .unwrap();
+    store
+        .grant(&NamespaceGrantRecord {
+            namespace: scoped_ns("ns"),
+            agent_id: "agent-a".to_string(),
+            can_read: true,
+            can_write: true,
+            granted_by: "agent-a".to_string(),
+            created_at: chrono::Utc::now(),
+        })
+        .await
+        .unwrap();
+    store.seed(&scoped_ns("ns"), "agent-a", "内容");
+    let backup = svc
+        .create(
+            &a,
+            BackupCreateRequest {
+                namespace: "ns".to_string(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let report = svc
+        .restore(
+            &a,
+            RestoreRequest {
+                backup_id: backup.id,
+                mode: RestoreMode::Merge,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!report.partial);
+    assert_eq!(report.unchanged, 1);
+}
+
+/// 修订本身失败时库里的版本没动，补偿账本必须是空的：
+/// 若把"未成功的修订"记为前像，回滚会因版本不符而误报"灾难恢复状态"。
+#[tokio::test]
+async fn test_merge_revise_failure_does_not_report_disaster_state() {
+    let (svc, store) = setup();
+    let a = admin("agent-a");
+    store
+        .ensure_namespace(&scoped_ns("ns"), &"agent-a".to_string())
+        .await
+        .unwrap();
+    store
+        .grant(&NamespaceGrantRecord {
+            namespace: scoped_ns("ns"),
+            agent_id: "agent-a".to_string(),
+            can_read: true,
+            can_write: true,
+            granted_by: "agent-a".to_string(),
+            created_at: chrono::Utc::now(),
+        })
+        .await
+        .unwrap();
+    let e = store.seed(&scoped_ns("ns"), "agent-a", "快照内容");
+    let backup = svc
+        .create(
+            &a,
+            BackupCreateRequest {
+                namespace: "ns".to_string(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+    let mut local = store.get(&scoped_ns("ns"), e.id).await.unwrap();
+    local.content = "本地内容".to_string();
+    store
+        .revise(&local, 1, VersionChange::Updated)
+        .await
+        .unwrap();
+
+    store
+        .fail_revise
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let err = svc
+        .restore(
+            &a,
+            RestoreRequest {
+                backup_id: backup.id,
+                mode: RestoreMode::Merge,
+            },
+        )
+        .await
+        .unwrap_err();
+    store
+        .fail_revise
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+
+    let message = err.to_string();
+    assert!(
+        message.contains("已按补偿账本回滚到操作前状态"),
+        "实际: {message}"
+    );
+    assert!(
+        !message.contains("灾难恢复状态"),
+        "没有发生任何写入时不得报灾难状态: {message}"
+    );
+    // 内容保持操作前现场
+    let after = store.get(&scoped_ns("ns"), e.id).await.unwrap();
+    assert_eq!(after.content, "本地内容");
+}
+
+/// 干跑也要校验目标范围的写权限：否则预演会给出"看起来能成"的结论，
+/// 真正执行时才因 ACL 失败。
+#[tokio::test]
+async fn test_dry_run_checks_write_acl_for_target_namespaces() {
+    let (svc, store) = setup();
+    let owner = admin("agent-a");
+    store
+        .ensure_namespace(&scoped_ns("ns"), &"agent-a".to_string())
+        .await
+        .unwrap();
+    store
+        .grant(&NamespaceGrantRecord {
+            namespace: scoped_ns("ns"),
+            agent_id: "agent-a".to_string(),
+            can_read: true,
+            can_write: true,
+            granted_by: "agent-a".to_string(),
+            created_at: chrono::Utc::now(),
+        })
+        .await
+        .unwrap();
+    store.seed(&scoped_ns("ns"), "agent-a", "内容");
+    let backup = svc
+        .create(
+            &owner,
+            BackupCreateRequest {
+                namespace: "ns".to_string(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    // agent-b 有 admin scope 但没有该命名空间的写授权
+    let err = svc
+        .restore(
+            &admin("agent-b"),
+            RestoreRequest {
+                backup_id: backup.id,
+                mode: RestoreMode::DryRun,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, HubError::InsufficientScope), "实际: {err}");
+}
+
+/// 负载里的命名空间不得含账户作用域分隔符（防伪造内部键跨账户写入）。
+#[test]
+fn test_validate_target_namespaces_rejects_scope_keys() {
+    let bad = vec![format!("{}/evil", common::BOOTSTRAP_ACCOUNT_ID)];
+    let err = DefaultBackupService::validate_target_namespaces(&bad).unwrap_err();
+    assert!(matches!(err, HubError::InvalidArgument(_)), "实际: {err}");
+
+    let bad_wildcard = vec!["*".to_string()];
+    assert!(DefaultBackupService::validate_target_namespaces(&bad_wildcard).is_err());
+
+    let bad_empty = vec!["  ".to_string()];
+    assert!(DefaultBackupService::validate_target_namespaces(&bad_empty).is_err());
+
+    let ok = vec!["team-a".to_string(), "team-b".to_string()];
+    assert!(DefaultBackupService::validate_target_namespaces(&ok).is_ok());
 }
 
 // 编译期检查：Embedder trait 对象可用
