@@ -409,12 +409,16 @@ async fn pg_migration_018_dedupes_existing_open_duplicates() {
     }
 }
 
-/// 迁移 015 的部分索引必须能被真实查询命中。
+/// 迁移 015 的部分索引必须**可被规划器选用**，且谓词匹配是其中的关键条件。
 ///
-/// 静态测试只能证明"查询谓词与索引谓词逐字一致"，无法证明规划器真的选用它。
-/// 小表上 Seq Scan + Sort 成本更低，规划器不会走索引——这是正常的，不能据此
-/// 断言"索引失效"。因此这里批量写入足够多的行，再跑 EXPLAIN 断言计划里出现
-/// 索引名；若仍走 Seq Scan，输出完整计划供诊断。
+/// 这里要证明的是"索引对这条查询可用"，而不是"规划器一定会选它"——后者取决于
+/// 成本估算，在中小表上选 Seq Scan + Sort 是完全合理的，把它当成断言会得到
+/// 间歇性失败（实测两轮 CI 一次通过一次失败）。
+///
+/// 因此用两组对照：
+/// 1. 关闭 seqscan：若谓词不匹配部分索引，规划器无论如何也选不到它 → 必须出现索引名；
+/// 2. 反向验证：把状态谓词换成参数化 `status = any($1)`（修复前的写法），
+///    同一设置下索引**不应**被选用——这正是本任务修复的缺陷。
 #[tokio::test]
 #[ignore = "需要 DATABASE_URL"]
 async fn pg_ann_query_actually_uses_partial_index() {
@@ -426,8 +430,8 @@ async fn pg_ann_query_actually_uses_partial_index() {
         .unwrap();
     let pool = store.pool();
 
-    // 批量写入：逐条走 store.insert 会有 2 万次往返，直接一条 SQL 造数。
-    // 向量用确定性伪随机填充，避免全部同向导致 HNSW 图退化。
+    // 批量写入：一条 SQL 造数，避免 2 万次往返。
+    // 向量用随机填充，避免全部同向导致 HNSW 图退化。
     sqlx::query(
         r#"
         insert into memories
@@ -437,20 +441,29 @@ async fn pg_ann_query_actually_uses_partial_index() {
                '{}'::jsonb,
                (select array_agg((random())::real)::vector from generate_series(1, 1024)),
                'plan-probe', 'it-agent', 1.0, 'active', 1, now(), now(), 'ann sample ' || i
-        from generate_series(1, 20000) as i
+        from generate_series(1, 5000) as i
         "#,
     )
     .bind(ns)
     .execute(&pool)
     .await
     .unwrap();
-
     sqlx::query("analyze memories")
         .execute(&pool)
         .await
         .unwrap();
 
-    let plan: Vec<String> = sqlx::query_scalar(
+    // 在**同一会话**内设置参数并跑 EXPLAIN，保证设置生效
+    let mut conn = pool.acquire().await.unwrap();
+    sqlx::query("set local enable_seqscan = off")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+
+    let q = pgvector::HalfVector::from_f32_slice(&vec![0.1f32; 1024]);
+
+    // 1) 字面量谓词（修复后的写法）：索引必须被选用
+    let plan_literal: Vec<String> = sqlx::query_scalar(
         r#"
         explain (format text)
         select id from memories
@@ -459,16 +472,38 @@ async fn pg_ann_query_actually_uses_partial_index() {
         limit 20
         "#,
     )
-    .bind(pgvector::HalfVector::from_f32_slice(&vec![0.1f32; 1024]))
-    .fetch_all(&pool)
+    .bind(q.clone())
+    .fetch_all(&mut *conn)
     .await
     .unwrap();
-    let plan_text = plan.join("\n");
+    let literal_text = plan_literal.join("\n");
     assert!(
-        plan_text.contains("idx_memories_embedding_hf"),
-        "ANN 查询必须命中部分索引，实际计划：\n{plan_text}"
+        literal_text.contains("idx_memories_embedding_hf"),
+        "字面量状态谓词必须能选用部分索引，实际计划：\n{literal_text}"
     );
 
+    // 2) 参数化谓词（修复前的写法）：部分索引无法被证明蕴含 → 不应被选用
+    let plan_param: Vec<String> = sqlx::query_scalar(
+        r#"
+        explain (format text)
+        select id from memories
+        where embedding is not null and status = any($2)
+        order by embedding::halfvec(1024) <=> $1::halfvec(1024)
+        limit 20
+        "#,
+    )
+    .bind(q)
+    .bind(vec!["active".to_string()])
+    .fetch_all(&mut *conn)
+    .await
+    .unwrap();
+    let param_text = plan_param.join("\n");
+    assert!(
+        !param_text.contains("idx_memories_embedding_hf"),
+        "参数化状态谓词不应能选用部分索引（这正是不内联字面量时的失效表现），实际计划：\n{param_text}"
+    );
+
+    drop(conn);
     sqlx::query("delete from memories where namespace = $1")
         .bind(ns)
         .execute(&pool)
