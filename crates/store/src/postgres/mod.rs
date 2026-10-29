@@ -611,6 +611,44 @@ impl PostgresHubStore {
 
     /// 统一把 `MemoryFilter` 条件压入 SQL（list / count / similar 共用一份实现，
     /// 避免三处过滤语义漂移；带查询词时按词元 OR 部分匹配，交由相关性排序与打分区分）
+    /// ANN 查询的状态谓词（字面量内联）。
+    ///
+    /// 迁移 015 的向量索引是**部分索引**，谓词为 `status in ('active','archived')`。
+    /// 规划器只有在能证明查询谓词蕴含索引谓词时才会选用它；参数化
+    /// `status = any($1)` 无法被证明，会导致索引形同虚设。因此这里把状态
+    /// 直接内联为字面量列表——状态值来自固定的 `MemoryStatus` 枚举，不是用户输入。
+    fn ann_status_predicate(statuses: &[MemoryStatus]) -> Option<String> {
+        let mut indexable: Vec<&str> = Vec::new();
+        let mut has_unindexable = false;
+        for status in statuses {
+            match status {
+                MemoryStatus::Active | MemoryStatus::Archived => indexable.push(status.as_str()),
+                // merged 不进部分索引：出现即说明无法走索引路径
+                MemoryStatus::Merged => has_unindexable = true,
+            }
+        }
+        if has_unindexable || indexable.is_empty() {
+            return None;
+        }
+        indexable.sort_unstable();
+        Some(format!(
+            "status in ({})",
+            indexable
+                .iter()
+                .map(|s| format!("'{}'", s))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    }
+
+    /// 构造 ANN 查询的 WHERE 片段（供 `similar()` 与静态测试共用）。
+    fn ann_query_sql(statuses: &[MemoryStatus]) -> String {
+        match Self::ann_status_predicate(statuses) {
+            Some(predicate) => format!("where embedding is not null and {predicate}"),
+            None => "where embedding is not null".to_string(),
+        }
+    }
+
     fn push_memory_filters(qb: &mut sqlx::QueryBuilder<'_, sqlx::Postgres>, filter: &MemoryFilter) {
         if let Some(ns) = &filter.namespace {
             qb.push(" and namespace = ").push_bind(ns.clone());
@@ -635,6 +673,38 @@ impl PostgresHubStore {
                 )
                 .push(")");
         }
+        Self::push_memory_filters_rest(qb, filter);
+    }
+
+    /// 与 [`Self::push_memory_filters`] 相同，但**跳过状态谓词**。
+    ///
+    /// ANN 路径需要把状态内联为字面量以命中部分索引（见 `ann_status_predicate`），
+    /// 因此不能再追加参数化状态条件。
+    fn push_memory_filters_without_status(
+        qb: &mut sqlx::QueryBuilder<'_, sqlx::Postgres>,
+        filter: &MemoryFilter,
+    ) {
+        if let Some(ns) = &filter.namespace {
+            qb.push(" and namespace = ").push_bind(ns.clone());
+        }
+        if let Some(kinds) = &filter.kinds {
+            qb.push(" and kind = any(")
+                .push_bind(
+                    kinds
+                        .iter()
+                        .map(|k| k.as_str().to_string())
+                        .collect::<Vec<_>>(),
+                )
+                .push(")");
+        }
+        Self::push_memory_filters_rest(qb, filter);
+    }
+
+    /// 状态之外的全部过滤条件（两条路径共用，避免语义漂移）。
+    fn push_memory_filters_rest(
+        qb: &mut sqlx::QueryBuilder<'_, sqlx::Postgres>,
+        filter: &MemoryFilter,
+    ) {
         if let Some(tags) = &filter.tags {
             qb.push(" and tags @> ").push_bind(tags.clone());
         }
@@ -651,7 +721,6 @@ impl PostgresHubStore {
                         .push_bind(or_query)
                         .push(")");
                 }
-                // 查询词元全部是低信息量功能词：词法路不应命中任何文档
                 None => {
                     qb.push(" and false");
                 }
@@ -663,18 +732,12 @@ impl PostgresHubStore {
         if let Some(layer) = &filter.layer {
             qb.push(" and layer = ").push_bind(layer.as_str());
         }
-        if let Some(valid_at) = &filter.valid_at {
+        if let Some(from) = filter.valid_at {
             qb.push(" and (valid_from is null or valid_from <= ")
-                .push_bind(*valid_at)
-                .push(") and (valid_until is null or valid_until > ")
-                .push_bind(*valid_at)
+                .push_bind(from)
                 .push(")");
-        }
-        if let Some((ts, id)) = &filter.before {
-            qb.push(" and (updated_at, id) < (")
-                .push_bind(*ts)
-                .push(", ")
-                .push_bind(*id)
+            qb.push(" and (valid_until is null or valid_until > ")
+                .push_bind(from)
                 .push(")");
         }
     }

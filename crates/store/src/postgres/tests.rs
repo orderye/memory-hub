@@ -87,6 +87,61 @@ fn test_split_full_migration_keeps_do_block_intact() {
         && s.ends_with("$$;")));
 }
 
+/// 回归：ANN 查询的状态谓词必须能被部分索引谓词证明。
+///
+/// 索引谓词是 `status in ('active','archived')`。若查询发出参数化
+/// `status = any($1)`，规划器无法证明参数值蕴含索引谓词，partial index
+/// 不会被选用——索引存在却形同虚设，而 runbook 里用字面量写 EXPLAIN
+/// 示例会掩盖这个问题。查询侧必须用字面量状态集合。
+#[test]
+fn test_ann_query_status_predicate_is_index_provable() {
+    let sql = PostgresHubStore::ann_query_sql(&[MemoryStatus::Active]);
+    assert!(
+        !sql.contains("status = any("),
+        "参数化状态数组无法被部分索引谓词证明，会导致索引失效：{sql}"
+    );
+    assert!(
+        sql.contains("status in ('active')"),
+        "单状态查询必须内联为字面量 IN 列表：{sql}"
+    );
+
+    let two = PostgresHubStore::ann_query_sql(&[MemoryStatus::Active, MemoryStatus::Archived]);
+    assert!(
+        two.contains("status in ('active', 'archived')"),
+        "回溯查询必须内联为与索引谓词逐字一致的字面量：{two}"
+    );
+
+    // merged 不进索引：查询侧同样不得请求该状态走 ANN
+    let merged = PostgresHubStore::ann_query_sql(&[MemoryStatus::Merged]);
+    assert!(
+        !merged.contains("status in ("),
+        "merged 不在部分索引内，必须退化为非索引形态而不是伪装成可索引：{merged}"
+    );
+}
+
+/// ANN 查询片段必须始终以单个 `where` 开头，调用方只追加 `and` 条件；
+/// 否则拼接会产出非法 SQL 或多重 where。
+#[test]
+fn test_ann_query_fragment_is_single_where_clause() {
+    for statuses in [
+        vec![MemoryStatus::Active],
+        vec![MemoryStatus::Active, MemoryStatus::Archived],
+        vec![MemoryStatus::Merged],
+        vec![],
+    ] {
+        let sql = PostgresHubStore::ann_query_sql(&statuses);
+        assert!(
+            sql.starts_with("where "),
+            "ANN 片段必须以 where 开头：{sql}"
+        );
+        assert_eq!(
+            sql.matches("where ").count(),
+            1,
+            "ANN 片段只能含一个 where：{sql}"
+        );
+    }
+}
+
 #[test]
 fn test_vector_params_roundtrip() {
     let v = vec![0.5f32, -0.25, 1.0];

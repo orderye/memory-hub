@@ -198,9 +198,14 @@ impl mem_core::MemoryStore for PostgresHubStore {
             // idx_memories_embedding_hf（halfvec 半精度，索引体积减半）。
             .push(", (embedding::halfvec(1024) <=> ");
         qb.push_bind(mapping::halfvec_param(embedding))
-            .push(") as dist from memories where embedding is not null");
-        // 过滤条件下推到 SQL：否则其它场景/已失效条目会占满 top-k，导致目标候选缺失
-        Self::push_memory_filters(&mut qb, &effective);
+            .push(") as dist from memories ");
+        // 状态谓词内联为字面量：部分索引谓词是 `status in ('active','archived')`，
+        // 参数化 `status = any($1)` 无法被规划器证明蕴含，会导致索引不生效。
+        qb.push(Self::ann_query_sql(
+            &effective.statuses.clone().unwrap_or_default(),
+        ));
+        // 其余过滤条件下推到 SQL：否则其它场景/已失效条目会占满 top-k
+        Self::push_memory_filters_without_status(&mut qb, &effective);
         qb.push(" order by dist limit ").push_bind(k as i64);
 
         let rows = qb.build().fetch_all(&self.pool).await.pg()?;

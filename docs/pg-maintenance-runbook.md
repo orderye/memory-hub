@@ -60,9 +60,15 @@ from pg_stat_user_tables where relname = 'memories';
 
 -- ANN 查询是否命中表达式索引（应出现 idx_memories_embedding_hf 的 Index Scan；
 -- 表很小时 Seq Scan + Sort 反而正常，数据过万后必须走索引）
+--
+-- 注意：状态条件必须写成**字面量**。部分索引的谓词是
+-- `status in ('active','archived')`，若写成参数化数组（应用里的
+-- `status = any($1)`）规划器无法证明蕴含，索引不会被选用。
+-- 应用侧已在 store 层把状态内联为字面量（见 ann_status_predicate）；
+-- 手工 EXPLAIN 也必须用字面量，否则会误判"索引无效"。
 explain (analyze, buffers)
 select id from memories
-where namespace = 'ns' and status = 'active' and embedding is not null
+where namespace = 'ns' and status in ('active') and embedding is not null
 order by embedding::halfvec(1024) <=> '[0.1, ...]'::halfvec(1024)
 limit 20;
 ```
