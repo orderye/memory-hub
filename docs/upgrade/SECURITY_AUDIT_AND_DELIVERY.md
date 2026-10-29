@@ -75,7 +75,7 @@ CI `supply-chain` job 已通过：`cargo-deny check all --all-features` + `rusts
 | `fc3ce64` | feat | 恢复审计（此前 `audit_log` 从未被写入）+ 保留策略边界 |
 | `682b1f0` | fix | 跨进程 open 提案唯一性（迁移 018 部分唯一索引 + 原子入口） |
 | `a8d72bc` | docs | 认知作业调度核实（未启用 + Mock 抽取器契约测试） |
-| `154f57a` | fix | **索引失效缺陷**：ANN 状态谓词参数化导致部分索引不被选用 |
+| `154f57a` | refactor | ANN 状态谓词改为字面量内联，使「查询谓词 = 索引谓词」成为显式可校验契约（原「必然失效」判断已被 CI 证伪） |
 | `e4baa0b` | fix | 评测基线不可比时改为硬失败（此前静默跳过） |
 | `8ddd04c` | docs | 阻塞项整理 |
 | `7e1fbe5` / `b54a246` / `044eb73` | fix | PG 测试修正（时间戳精度、ACL 作用域、payload 可见名） |
@@ -93,7 +93,7 @@ CI `supply-chain` job 已通过：`cargo-deny check all --all-features` + `rusts
 | 本地 `cargo fmt --all -- --check` | 通过 |
 | 本地 `cargo clippy --workspace --all-targets --all-features -- -D warnings` | 通过 |
 | CI 质量门禁 | 通过 |
-| CI PostgreSQL 集成测试 | **12 passed / 0 failed**（pgvector:pg15） |
+| CI PostgreSQL 集成测试 | **12 passed / 0 failed**（pgvector:pg15，run 40831071128） |
 | CI 依赖准入与安全审计 | 通过 |
 | CI Release 构建 | 通过 |
 | ignored 项说明 | 19 项为需真实端点/校准/消融/微基准，已在报告中标注未验证 |
