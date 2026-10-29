@@ -584,8 +584,14 @@ HUB_EMBED_MODEL=bge-m3
 ### 备份与恢复
 
 - **只读快照**：单个命名空间或整个账户（`*`）都能打快照，带 SHA-256 校验和，建完就改不了；
-- **三种恢复姿势**：`dry_run` 先预演看看会变成什么样；`merge` 增量并入（推荐）；`replace` 整体替换——**替换前会强制先给当前数据打一份安全备份**，防止误操作把库清空；
-- **恢复前先验校验和**，对不上直接拒绝恢复。
+- **三种恢复姿势**：`dry_run` 先预演（同样校验目标范围与写权限，零写入）；`merge` 增量并入（推荐）；`replace` 整体替换；
+- **replace 是原子的**：写前会为每个受影响命名空间强制打安全备份（任一失败即中止，一行都不删），
+  清空与重建在**一次存储事务**内完成，中途失败整体回滚；
+- **merge 致命失败会自动回滚**：按补偿账本删除本轮新建的实体、把被修订的条目写回前像；
+  单条次要实体失败只计数继续，报告里 `partial=true`——要绝对一致请用 `replace`；
+- **恢复前先验校验和与版本**（支持 v1–v6），对不上直接拒绝恢复。
+
+细节（自动回滚的真实边界、仍未解决的风险）见 [`docs/backup-restore.md`](docs/backup-restore.md)。
 
 ---
 
@@ -783,9 +789,12 @@ docker compose -f docker-compose.lite.yml up -d --build    # Lite
    即使配了真实嵌入服务也不会自动启用向量整合；A 模式的语义增益需真实模型 +
    `cargo test --test consolidation_eval` 才能验收，详见
    [`docs/upgrade/CONSOLIDATION_AB.md`](docs/upgrade/CONSOLIDATION_AB.md)。
-7. **认知异步作业尚未装配**：`ChatCognitiveJob`（会话提炼重试）与 `ExperienceDistillJob`（经验提炼）
-   已实现并有测试，但**没有接进任何二进制的调度**——真实 LLM 抽取器尚未接入，
-   接进去只会用 Mock 抽取器产出占位数据。等真实抽取器落地后再装配。
+7. **认知异步作业尚未装配，认知抽取器默认关闭**：`ChatCognitiveJob`（会话提炼重试）与
+   `ExperienceDistillJob`（经验提炼）已实现并有测试，但**没有接进任何二进制的调度**——
+   真实 LLM 抽取器尚未接入。生产二进制默认 `HUB_COGNITIVE_EXTRACTOR=disabled`：
+   `cognitive_chat_propose` 明确返回 `E_METHOD_NOT_FOUND`，不写证据、不产出提案；
+   只有显式设 `mock`（仅限开发）才会装配占位抽取器。状态矩阵见
+   [`docs/upgrade/COGNITIVE_SCHEDULING_AUDIT.md`](docs/upgrade/COGNITIVE_SCHEDULING_AUDIT.md)。
 8. **定时快照与手工备份统一为 v6 载荷**：`backup-worker` 的周期快照与 `memory_backup_create` 使用同一格式
    （条目、**记忆版本历史**、证据、关系、任务、经验、经验版本历史、代码线程）；恢复路径支持 v1–v6，
    但**回滚后的旧二进制不能恢复 v6 备份**——降级前请保留新二进制或先完成恢复。
@@ -817,6 +826,7 @@ docker compose -f docker-compose.lite.yml up -d --build    # Lite
 | 检索评测、基线与消融 | [`docs/upgrade/EVALUATION.md`](docs/upgrade/EVALUATION.md) |
 | 记忆整合 A/B 双模式（候选发现、合并门槛、评测） | [`docs/upgrade/CONSOLIDATION_AB.md`](docs/upgrade/CONSOLIDATION_AB.md) |
 | PostgreSQL / pgvector 维护（halfvec 索引、ef_search、观测与重建） | [`docs/pg-maintenance-runbook.md`](docs/pg-maintenance-runbook.md) |
+| 备份与恢复（v6 载荷、三种模式、自动回滚边界） | [`docs/backup-restore.md`](docs/backup-restore.md) |
 | 双平台推送流程（GitHub + CNB 身份隔离与重放） | [`docs/upgrade/PUSH_PROCESS.md`](docs/upgrade/PUSH_PROCESS.md) |
 | 质量与安全基线 | [`docs/upgrade/BASELINE.md`](docs/upgrade/BASELINE.md) |
 | 仓库与构建环境审计 | [`docs/upgrade/REPOSITORY_AUDIT.md`](docs/upgrade/REPOSITORY_AUDIT.md) |

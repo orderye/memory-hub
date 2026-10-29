@@ -1,5 +1,17 @@
 # Memory Hub 轻量化升级 · 执行报告（LIGHTWEIGHT_EXECUTION_REPORT）
 
+> **历史快照（Historical）**
+>
+> - 适用基线：`3048efc` → 实施分支 `feat/lightweight-deployment`（本轮轻量化升级）
+> - 审阅日期：轻量化升级完成时（2026-10）
+> - 状态：**历史执行报告**。保留原文作为证据，不要据此判断当前能力。
+> - 已被取代的结论：
+>   - 「备份格式最高 v4，restore 兼容 v1–v4」→ 当前为 **v6**，恢复端兼容 **v1–v6**（v6 纳入记忆版本历史）。
+>   - 「restore 无事务/无自动回滚（G5），靠安全备份人工回滚」→ 当前 replace 走**单事务原子替换**，merge 致命失败有**补偿回滚**，并有失败注入测试。
+>   - 「28 个 MCP 工具」→ 当前 **38 个**。
+>   - 「本轮 0 迁移」→ 后续已新增 016/017/018 三个迁移。
+> - 当前有效文档：[`README.md`](../../README.md) · [`../backup-restore.md`](../backup-restore.md) · [`../pg-maintenance-runbook.md`](../pg-maintenance-runbook.md) · [`RELIABILITY_BASELINE_2026-10-29.md`](./RELIABILITY_BASELINE_2026-10-29.md)
+
 **任务书：** [`docs/ Memory Hub 轻量化升级完整执行任务书.md`](../../docs/%20Memory%20Hub%20轻量化升级完整执行任务书.md)
 **基线提交：** `3048efc`（`main`）→ 实施分支 `feat/lightweight-deployment`
 **实施方式：** 原地升级、分阶段提交、先审计后改码；**不推远端**（推 CNB 会触发生产部署，属发布决定）
