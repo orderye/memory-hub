@@ -197,10 +197,10 @@ mod tests {
         assert!(report.pruned.is_empty());
     }
 
-    /// 定时备份必须是 v4 全实体载荷：含证据/关系等实体，
-    /// 校验和能通过 restore 的完整性验证，且账户侧可按 v4 恢复。
+    /// 定时备份必须是 v6 全实体载荷：含证据/关系/记忆版本等实体，
+    /// 校验和能通过 restore 的完整性验证，且账户侧可按 v6 恢复。
     #[tokio::test]
-    async fn test_scheduled_backup_is_v4_payload_and_restorable() {
+    async fn test_scheduled_backup_is_v6_payload_and_restorable() {
         let account = BOOTSTRAP_ACCOUNT_ID;
         // 服务层视角的可见名；worker 落库用内部键
         let visible_ns = "ns";
@@ -249,7 +249,7 @@ mod tests {
             valid_until: None,
             occurred_at: None,
         };
-        store.insert(&entry).await.unwrap();
+        store.insert_initial(&entry).await.unwrap();
 
         // 第二条记忆：关系的合法目标（存储层拒绝自环关系）
         let entry_b = mem_core::MemoryEntry {
@@ -276,7 +276,7 @@ mod tests {
             valid_until: None,
             occurred_at: None,
         };
-        store.insert(&entry_b).await.unwrap();
+        store.insert_initial(&entry_b).await.unwrap();
 
         let evidence = store
             .append_evidence(&NewEvidence {
@@ -311,24 +311,30 @@ mod tests {
         assert_eq!(report.created.len(), 1);
         let (backup_id, _) = report.created[0];
 
-        // 1) 载荷版本必须为 v5（含经验版本历史）
+        // 1) 载荷版本必须为 v6（含记忆版本与经验版本历史）
         let record = mem_core::BackupStore::get_backup(store.as_ref(), backup_id)
             .await
             .unwrap();
         assert_eq!(
             record.payload["version"],
-            serde_json::json!(5),
-            "定时快照必须是 v5 载荷"
+            serde_json::json!(6),
+            "定时快照必须是 v6 载荷"
         );
 
         // 2) 全实体在载荷中
         let payload_entries: Vec<mem_core::MemoryEntry> =
             serde_json::from_value(record.payload["entries"].clone()).unwrap();
+        let payload_memory_versions: Vec<mem_core::MemoryVersion> =
+            serde_json::from_value(record.payload["memory_versions"].clone()).unwrap();
         let payload_evidences: Vec<mem_core::domain::MemoryEvidence> =
             serde_json::from_value(record.payload["evidences"].clone()).unwrap();
         let payload_relations: Vec<mem_core::domain::MemoryRelation> =
             serde_json::from_value(record.payload["relations"].clone()).unwrap();
         assert_eq!(payload_entries.len(), 2);
+        assert!(
+            !payload_memory_versions.is_empty(),
+            "定时快照必须包含记忆版本历史"
+        );
         assert_eq!(payload_evidences.len(), 1);
         assert_eq!(payload_relations.len(), 1);
 

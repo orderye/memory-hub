@@ -262,6 +262,15 @@ impl<S: MemoryStore + ?Sized> MemoryStore for AccountScopedStore<S> {
         self.inner.versions(id).await
     }
 
+    async fn all_versions_in_namespace(&self, namespace: &str) -> Result<Vec<MemoryVersion>> {
+        let entries = self.all_in_namespace(namespace, true).await?;
+        let mut versions = Vec::new();
+        for entry in entries {
+            versions.extend(self.inner.versions(entry.id).await?);
+        }
+        Ok(versions)
+    }
+
     async fn archive_expired(&self, now: DateTime<Utc>) -> Result<usize> {
         // 系统级批处理（worker 用原始存储调用）；经本包装器调用会作用于全库，
         // 服务层不得依赖此方法做账户内归档。
@@ -308,6 +317,90 @@ impl<S: BackupStore + ?Sized> BackupStore for AccountScopedStore<S> {
                 b
             })
             .collect())
+    }
+
+    async fn replace_namespaces_from_snapshots(
+        &self,
+        snapshots: &[(Namespace, crate::domain::RestoreSnapshot)],
+    ) -> Result<()> {
+        let mut scoped_snapshots = Vec::with_capacity(snapshots.len());
+        for (namespace, snapshot) in snapshots {
+            let scoped = self.scoped(namespace);
+            let mut snapshot = snapshot.clone();
+            let check_namespace = |actual: &str, entity: &str| -> Result<()> {
+                if actual != namespace {
+                    return Err(HubError::InvalidArgument(format!(
+                        "恢复快照包含不同命名空间的{entity}"
+                    )));
+                }
+                Ok(())
+            };
+            for entry in &mut snapshot.entries {
+                check_namespace(&entry.namespace, "记忆条目")?;
+                entry.namespace = scoped.clone();
+            }
+            for evidence in &mut snapshot.evidences {
+                check_namespace(&evidence.namespace, "证据")?;
+                evidence.namespace = scoped.clone();
+            }
+            for version in &mut snapshot.memory_versions {
+                let entry_ns = snapshot
+                    .entries
+                    .iter()
+                    .find(|entry| entry.id == version.memory_id)
+                    .map(|entry| entry.namespace.as_str())
+                    .unwrap_or(namespace.as_str());
+                check_namespace(entry_ns, "记忆版本")?;
+            }
+            for relation in &mut snapshot.relations {
+                if relation
+                    .namespace
+                    .as_deref()
+                    .is_some_and(|actual| actual != namespace)
+                {
+                    return Err(HubError::InvalidArgument(
+                        "恢复快照包含不同命名空间的关系".to_string(),
+                    ));
+                }
+                relation.namespace = Some(scoped.clone());
+            }
+            for task in &mut snapshot.tasks {
+                check_namespace(&task.namespace, "任务")?;
+                task.namespace = scoped.clone();
+            }
+            for experience in &mut snapshot.experiences {
+                check_namespace(&experience.namespace, "经验")?;
+                experience.namespace = scoped.clone();
+            }
+            for version in &mut snapshot.experience_versions {
+                check_namespace(&version.namespace, "经验版本")?;
+                version.namespace = scoped.clone();
+            }
+            for link in &mut snapshot.task_experiences {
+                if link
+                    .namespace
+                    .as_deref()
+                    .is_some_and(|actual| actual != namespace)
+                {
+                    return Err(HubError::InvalidArgument(
+                        "恢复快照包含不同命名空间的任务-经验关联".to_string(),
+                    ));
+                }
+                link.namespace = Some(scoped.clone());
+            }
+            for thread in &mut snapshot.coding_threads {
+                check_namespace(&thread.namespace, "代码线程")?;
+                thread.namespace = scoped.clone();
+            }
+            for revision in &mut snapshot.coding_revisions {
+                check_namespace(&revision.namespace, "代码修订")?;
+                revision.namespace = scoped.clone();
+            }
+            scoped_snapshots.push((scoped, snapshot));
+        }
+        self.inner
+            .replace_namespaces_from_snapshots(&scoped_snapshots)
+            .await
     }
 
     async fn delete_backup(&self, id: Uuid) -> Result<()> {

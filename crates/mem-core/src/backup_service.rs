@@ -10,9 +10,9 @@ use crate::access::GrantChecker;
 use crate::account_scope::AccountScopedStore;
 use crate::domain::{
     BackupRecord, BackupSummary, CodingRevision, CodingThread, MemoryEntry, MemoryEvidence,
-    MemoryExperience, MemoryRelation, MemoryTask, MemoryTaskExperience, NewCodingRevision,
-    NewCodingThread, NewEvidence, NewExperienceVersion, NewMemoryExperience, NewMemoryRelation,
-    NewMemoryTask, RestoreMode, RestoreReport, VersionChange,
+    MemoryExperience, MemoryRelation, MemoryTask, MemoryTaskExperience, MemoryVersion,
+    NewCodingRevision, NewCodingThread, NewEvidence, NewExperienceVersion, NewMemoryExperience,
+    NewMemoryRelation, NewMemoryTask, RestoreMode, RestoreReport, VersionChange,
 };
 use crate::infra::{
     AccessChecker, BackupStore, Clock, CodingStore, EvidenceStore, ExperienceStore, MemoryHubStore,
@@ -25,8 +25,8 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use uuid::Uuid;
 
-/// 备份负载格式版本（升级至 v4 支持代码演进线程与修订记录）
-pub const BACKUP_PAYLOAD_VERSION: u32 = 5;
+/// 备份负载格式版本（v6 纳入记忆版本历史）
+pub const BACKUP_PAYLOAD_VERSION: u32 = 6;
 
 /// 全量快照的保留命名空间标记（不对应任何真实命名空间，也不是授权对象）
 pub const ALL_NAMESPACES: &str = "*";
@@ -219,6 +219,16 @@ impl DefaultBackupService {
         }
     }
 
+    /// 从负载取出记忆版本历史列表（v6+；旧备份无此键时为空）
+    fn memory_versions_of(backup: &BackupRecord) -> Result<Vec<MemoryVersion>> {
+        match backup.payload.get("memory_versions") {
+            Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
+                HubError::Internal(anyhow::anyhow!("备份负载 memory_versions 解析失败: {}", e))
+            }),
+            None => Ok(Vec::new()),
+        }
+    }
+
     /// 计算 v1 负载的规范校验和（仅 entries）
     fn checksum_v1(entries: &[MemoryEntry]) -> String {
         let bytes = serde_json::to_vec(entries).unwrap_or_default();
@@ -307,11 +317,40 @@ impl DefaultBackupService {
         hex::encode(hasher.finalize())
     }
 
-    /// 构建备份负载（v5 格式）
+    /// 计算 v6 负载校验和（v5 + 记忆版本历史）。
+    #[allow(clippy::too_many_arguments)]
+    fn checksum_v6(
+        entries: &[MemoryEntry],
+        memory_versions: &[MemoryVersion],
+        evidences: &[MemoryEvidence],
+        relations: &[MemoryRelation],
+        tasks: &[MemoryTask],
+        experiences: &[MemoryExperience],
+        experience_versions: &[crate::domain::ExperienceVersion],
+        task_experiences: &[MemoryTaskExperience],
+        coding_threads: &[CodingThread],
+        coding_revisions: &[CodingRevision],
+    ) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(serde_json::to_vec(entries).unwrap_or_default());
+        hasher.update(serde_json::to_vec(memory_versions).unwrap_or_default());
+        hasher.update(serde_json::to_vec(evidences).unwrap_or_default());
+        hasher.update(serde_json::to_vec(relations).unwrap_or_default());
+        hasher.update(serde_json::to_vec(tasks).unwrap_or_default());
+        hasher.update(serde_json::to_vec(experiences).unwrap_or_default());
+        hasher.update(serde_json::to_vec(experience_versions).unwrap_or_default());
+        hasher.update(serde_json::to_vec(task_experiences).unwrap_or_default());
+        hasher.update(serde_json::to_vec(coding_threads).unwrap_or_default());
+        hasher.update(serde_json::to_vec(coding_revisions).unwrap_or_default());
+        hex::encode(hasher.finalize())
+    }
+
+    /// 构建备份负载（v6 格式）
     #[allow(clippy::too_many_arguments)]
     fn payload_of(
         namespace: &str,
         entries: &[MemoryEntry],
+        memory_versions: &[MemoryVersion],
         evidences: &[MemoryEvidence],
         relations: &[MemoryRelation],
         tasks: &[MemoryTask],
@@ -325,6 +364,7 @@ impl DefaultBackupService {
             "version": BACKUP_PAYLOAD_VERSION,
             "namespace": namespace,
             "entries": entries,
+            "memory_versions": memory_versions,
             "evidences": evidences,
             "relations": relations,
             "tasks": tasks,
@@ -349,6 +389,7 @@ impl DefaultBackupService {
         }
         let store = self.scoped(auth);
         let entries = store.all_in_namespace(namespace, true).await?;
+        let memory_versions = store.all_versions_in_namespace(namespace).await?;
         let evidences = store.all_evidence_in_namespace(namespace).await?;
         let relations = store.all_relations_in_namespace(namespace).await?;
         let tasks = store.all_tasks_in_namespace(namespace).await?;
@@ -376,8 +417,9 @@ impl DefaultBackupService {
             created_by: auth.agent_id.clone(),
             note: Some(format!("restore-safety:{}", namespace)),
             entry_count: entries.len(),
-            checksum: Self::checksum_v5(
+            checksum: Self::checksum_v6(
                 &entries,
+                &memory_versions,
                 &evidences,
                 &relations,
                 &tasks,
@@ -390,6 +432,7 @@ impl DefaultBackupService {
             payload: Self::payload_of(
                 namespace,
                 &entries,
+                &memory_versions,
                 &evidences,
                 &relations,
                 &tasks,
@@ -429,6 +472,7 @@ impl DefaultBackupService {
                 let visible_ns = crate::account_scope::unscope_name(&account, namespace);
                 let scoped = crate::account_scope::AccountScopedStore::new(store.clone(), account);
                 let entries = scoped.all_in_namespace(&visible_ns, true).await?;
+                let memory_versions = scoped.all_versions_in_namespace(&visible_ns).await?;
                 let evidences = scoped.all_evidence_in_namespace(&visible_ns).await?;
                 let relations = scoped.all_relations_in_namespace(&visible_ns).await?;
                 let tasks = scoped.all_tasks_in_namespace(&visible_ns).await?;
@@ -447,8 +491,9 @@ impl DefaultBackupService {
                     created_by: created_by.clone(),
                     note,
                     entry_count: entries.len(),
-                    checksum: Self::checksum_v5(
+                    checksum: Self::checksum_v6(
                         &entries,
+                        &memory_versions,
                         &evidences,
                         &relations,
                         &tasks,
@@ -461,6 +506,7 @@ impl DefaultBackupService {
                     payload: Self::payload_of(
                         &visible_ns,
                         &entries,
+                        &memory_versions,
                         &evidences,
                         &relations,
                         &tasks,
@@ -479,6 +525,7 @@ impl DefaultBackupService {
             }
             None => {
                 let entries = store.all_in_namespace(namespace, true).await?;
+                let memory_versions = store.all_versions_in_namespace(namespace).await?;
                 let evidences = store.all_evidence_in_namespace(namespace).await?;
                 let relations = store.all_relations_in_namespace(namespace).await?;
                 let tasks = store.all_tasks_in_namespace(namespace).await?;
@@ -495,8 +542,9 @@ impl DefaultBackupService {
                     created_by: created_by.clone(),
                     note,
                     entry_count: entries.len(),
-                    checksum: Self::checksum_v5(
+                    checksum: Self::checksum_v6(
                         &entries,
+                        &memory_versions,
                         &evidences,
                         &relations,
                         &tasks,
@@ -509,6 +557,7 @@ impl DefaultBackupService {
                     payload: Self::payload_of(
                         namespace,
                         &entries,
+                        &memory_versions,
                         &evidences,
                         &relations,
                         &tasks,
@@ -583,6 +632,16 @@ impl BackupService for DefaultBackupService {
             all
         } else {
             store.all_evidence_in_namespace(&req.namespace).await?
+        };
+
+        let memory_versions: Vec<MemoryVersion> = if req.namespace == "*" {
+            let mut all = Vec::new();
+            for ns in crate::infra::MemoryStore::list_namespaces(&store).await? {
+                all.extend(store.all_versions_in_namespace(&ns).await?);
+            }
+            all
+        } else {
+            store.all_versions_in_namespace(&req.namespace).await?
         };
 
         let relations: Vec<MemoryRelation> = if req.namespace == "*" {
@@ -666,8 +725,9 @@ impl BackupService for DefaultBackupService {
             created_by: auth.agent_id.clone(),
             note: req.note.clone(),
             entry_count: entries.len(),
-            checksum: Self::checksum_v5(
+            checksum: Self::checksum_v6(
                 &entries,
+                &memory_versions,
                 &evidences,
                 &relations,
                 &tasks,
@@ -680,6 +740,7 @@ impl BackupService for DefaultBackupService {
             payload: Self::payload_of(
                 &req.namespace,
                 &entries,
+                &memory_versions,
                 &evidences,
                 &relations,
                 &tasks,
@@ -716,9 +777,21 @@ impl BackupService for DefaultBackupService {
         self.require_admin(auth).await?;
         let store = self.scoped(auth);
         let backup = store.get_backup(req.backup_id).await?;
+        let payload_version = backup
+            .payload
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| HubError::Internal(anyhow::anyhow!("备份负载缺少有效版本号")))?;
+        if !(1..=u64::from(BACKUP_PAYLOAD_VERSION)).contains(&payload_version) {
+            return Err(HubError::Internal(anyhow::anyhow!(
+                "不支持的备份负载版本: {}",
+                payload_version
+            )));
+        }
 
-        // 完整性校验：重建校验和与写入时比对（兼容 v1–v5）
+        // 完整性校验：重建校验和与写入时比对（兼容 v1–v6）
         let entries = Self::entries_of(&backup)?;
+        let memory_versions = Self::memory_versions_of(&backup)?;
         let evidences = Self::evidences_of(&backup)?;
         let relations = Self::relations_of(&backup)?;
         let tasks = Self::tasks_of(&backup)?;
@@ -728,7 +801,19 @@ impl BackupService for DefaultBackupService {
         let coding_threads = Self::coding_threads_of(&backup)?;
         let coding_revisions = Self::coding_revisions_of(&backup)?;
 
-        // 先试 v5：旧备份的 checksum 不匹配 v5，会自然落到 v4–v1
+        let actual_v6 = Self::checksum_v6(
+            &entries,
+            &memory_versions,
+            &evidences,
+            &relations,
+            &tasks,
+            &experiences,
+            &experience_versions,
+            &task_experiences,
+            &coding_threads,
+            &coding_revisions,
+        );
+        // 旧备份的 checksum 不匹配 v6，会自然落到 v5–v1
         let actual_v5 = Self::checksum_v5(
             &entries,
             &evidences,
@@ -761,7 +846,8 @@ impl BackupService for DefaultBackupService {
         let actual_v2 = Self::checksum_v2(&entries, &evidences, &relations);
         let actual_v1 = Self::checksum_v1(&entries);
 
-        let valid = backup.checksum == actual_v5
+        let valid = backup.checksum == actual_v6
+            || backup.checksum == actual_v5
             || backup.checksum == actual_v4
             || backup.checksum == actual_v3
             || backup.checksum == actual_v2
@@ -834,58 +920,36 @@ impl BackupService for DefaultBackupService {
                     report.safety_backup_ids.push(safety.id);
                 }
             }
-            // 清空当前状态：按外键依赖逆序由子表到父表深度清空，保证无脏数据且无外键阻塞
+            // 清空当前状态：按外键依赖逆序由子表到父表深度清空，保证无脏数据且无外键阻塞。
+            // 任何查询或删除失败都必须中止；不能把未完成清理继续报告为成功恢复。
             for ns in &namespaces {
-                // 1. 删除代码修订
-                for cur in store
-                    .all_revisions_in_namespace(ns)
-                    .await
-                    .unwrap_or_default()
-                {
-                    let _ = store.delete_revision(ns, cur.id).await;
+                for cur in store.all_revisions_in_namespace(ns).await? {
+                    store.delete_revision(ns, cur.id).await?;
                 }
-                // 2. 删除代码线程
-                for cur in store.all_threads_in_namespace(ns).await.unwrap_or_default() {
-                    let _ = store.delete_thread(ns, cur.id).await;
+                for cur in store.all_threads_in_namespace(ns).await? {
+                    store.delete_thread(ns, cur.id).await?;
                 }
-                // 3. 删除经验（附带任务-经验关联清理）
-                for cur in store
-                    .all_experiences_in_namespace(ns)
-                    .await
-                    .unwrap_or_default()
-                {
-                    let _ = store.delete_experience(ns, cur.id).await;
+                for cur in store.all_experiences_in_namespace(ns).await? {
+                    store.delete_experience(ns, cur.id).await?;
                 }
-                // 4. 删除任务事实
-                for cur in store.all_tasks_in_namespace(ns).await.unwrap_or_default() {
-                    let _ = store.delete_task(ns, cur.id).await;
+                for cur in store.all_tasks_in_namespace(ns).await? {
+                    store.delete_task(ns, cur.id).await?;
                 }
-                // 5. 删除实体关联
-                for cur in store
-                    .all_relations_in_namespace(ns)
-                    .await
-                    .unwrap_or_default()
-                {
-                    let _ = store
+                for cur in store.all_relations_in_namespace(ns).await? {
+                    store
                         .delete_relation(
                             ns,
                             cur.from_memory_id,
                             cur.to_memory_id,
                             cur.relation_kind,
                         )
-                        .await;
+                        .await?;
                 }
-                // 6. 删除证据
-                for cur in store
-                    .all_evidence_in_namespace(ns)
-                    .await
-                    .unwrap_or_default()
-                {
-                    let _ = store.delete_evidence(&cur.namespace, cur.id).await;
+                for cur in store.all_evidence_in_namespace(ns).await? {
+                    store.delete_evidence(&cur.namespace, cur.id).await?;
                 }
-                // 7. 删除核心记忆条目（包括历史版本）
-                for cur in store.all_in_namespace(ns, true).await.unwrap_or_default() {
-                    let _ = store.delete(&cur.namespace, cur.id).await;
+                for cur in store.all_in_namespace(ns, true).await? {
+                    store.delete(&cur.namespace, cur.id).await?;
                 }
             }
         } else {
@@ -948,6 +1012,16 @@ impl BackupService for DefaultBackupService {
                     store.insert_initial(&e).await?;
                     report.created += 1;
                 }
+            }
+        }
+
+        // 恢复记忆版本历史（v6+；旧备份为空数组，不报错）
+        for version in &memory_versions {
+            if let Err(e) = store.record_version(version).await {
+                return Err(HubError::Internal(anyhow::anyhow!(
+                    "恢复记忆版本历史失败: {}",
+                    e
+                )));
             }
         }
 

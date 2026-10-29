@@ -179,6 +179,54 @@ fn core_agent_reg(id: &str, secret: Option<&str>) -> mem_core::AgentRegistration
 
 #[tokio::test]
 #[ignore = "需要 DATABASE_URL"]
+async fn pg_atomic_namespace_replace_rolls_back_on_failure() {
+    let store = store().await;
+    let namespace = "it-ns-atomic-replace";
+    store
+        .ensure_namespace(namespace, &AgentId::from("it-agent"))
+        .await
+        .unwrap();
+
+    let original = entry(namespace, "it-agent", "原有数据");
+    store.insert_initial(&original).await.unwrap();
+
+    let replacement = entry(namespace, "it-agent", "替换数据");
+    let snapshot = mem_core::RestoreSnapshot {
+        entries: vec![replacement.clone()],
+        memory_versions: vec![],
+        evidences: vec![],
+        relations: vec![],
+        experiences: vec![],
+        experience_versions: vec![],
+        task_experiences: vec![],
+        coding_threads: vec![],
+        coding_revisions: vec![],
+        tasks: vec![mem_core::MemoryTask {
+            id: Uuid::new_v4(),
+            namespace: namespace.to_string(),
+            scene: mem_core::MemoryScene::Working,
+            task: "invalid evidence foreign key".to_string(),
+            status: mem_core::TaskStatus::Completed,
+            started_at: Utc::now(),
+            finished_at: Some(Utc::now()),
+            result_summary: None,
+            failure_reason: None,
+            source_evidence_id: Some(Uuid::new_v4()),
+            metadata: serde_json::json!({}),
+        }],
+    };
+
+    assert!(store
+        .replace_namespaces_from_snapshots(&[(namespace.to_string(), snapshot)])
+        .await
+        .is_err());
+    assert_eq!(store.get(namespace, original.id).await.unwrap(), original);
+    assert!(store.get(namespace, replacement.id).await.is_err());
+    store.delete(namespace, original.id).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "需要 DATABASE_URL"]
 async fn pg_backup_and_restore_roundtrip() {
     let store = store().await;
     let ns = "it-ns-backup";

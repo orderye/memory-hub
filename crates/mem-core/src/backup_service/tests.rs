@@ -78,6 +78,12 @@ async fn test_backup_create_and_restore_dry_run() {
         .unwrap();
     assert_eq!(report.total, 2);
     assert_eq!(report.unchanged, 2);
+    assert_eq!(
+        backup.payload["version"],
+        serde_json::json!(6),
+        "complete backups must use v6 to cover memory version history"
+    );
+    assert!(backup.payload.get("memory_versions").is_some());
 
     // 修改一条后 merge：应识别 1 updated 1 unchanged
     let mut changed = store.get(&scoped_ns("ns"), e1.id).await.unwrap();
@@ -310,6 +316,59 @@ async fn test_restore_detects_corrupted_checksum() {
         .await
         .unwrap_err();
     assert!(matches!(err, HubError::Internal(_)));
+}
+
+#[tokio::test]
+async fn test_restore_rejects_unsupported_payload_version() {
+    let (svc, store) = setup();
+    let auth = admin("agent-a");
+    store
+        .ensure_namespace(&scoped_ns("future-version"), &"agent-a".to_string())
+        .await
+        .unwrap();
+    store
+        .grant(&NamespaceGrantRecord {
+            namespace: scoped_ns("future-version"),
+            agent_id: "agent-a".to_string(),
+            can_read: true,
+            can_write: true,
+            granted_by: "agent-a".to_string(),
+            created_at: chrono::Utc::now(),
+        })
+        .await
+        .unwrap();
+    let entry = store.seed(&scoped_ns("future-version"), "agent-a", "future format");
+    let backup = svc
+        .create(
+            &auth,
+            BackupCreateRequest {
+                namespace: "future-version".to_string(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+    let mut unsupported = backup.clone();
+    unsupported.namespace = scoped_ns("future-version");
+    unsupported.payload["version"] = serde_json::json!(99);
+    unsupported.checksum = DefaultBackupService::checksum_v1(&[{
+        let mut entry = entry;
+        entry.namespace = "future-version".to_string();
+        entry
+    }]);
+    store.save_backup(&unsupported).await.unwrap();
+
+    let error = svc
+        .restore(
+            &auth,
+            RestoreRequest {
+                backup_id: unsupported.id,
+                mode: RestoreMode::DryRun,
+            },
+        )
+        .await
+        .expect_err("unsupported payload version must fail closed");
+    assert!(matches!(error, HubError::Internal(_)));
 }
 
 #[tokio::test]
@@ -871,6 +930,7 @@ async fn test_restore_counts_partial_failures_and_continues() {
     struct FailingRelationStore {
         inner: crate::testing::TestHubStore,
         fail_relation_payloads: std::sync::Mutex<std::collections::HashSet<String>>,
+        fail_delete_ids: std::sync::Mutex<std::collections::HashSet<Uuid>>,
     }
 
     #[async_trait]
@@ -891,6 +951,9 @@ async fn test_restore_counts_partial_failures_and_continues() {
             self.inner.save(e).await
         }
         async fn delete(&self, ns: &str, id: Uuid) -> Result<()> {
+            if self.fail_delete_ids.lock().unwrap().contains(&id) {
+                return Err(HubError::Unavailable);
+            }
             self.inner.delete(ns, id).await
         }
         async fn list(&self, filter: &MemoryFilter) -> Result<Vec<MemoryEntry>> {
@@ -1416,6 +1479,7 @@ async fn test_restore_counts_partial_failures_and_continues() {
     let inner_store = Arc::new(FailingRelationStore {
         inner: crate::testing::TestHubStore::default(),
         fail_relation_payloads: std::sync::Mutex::new(std::collections::HashSet::new()),
+        fail_delete_ids: std::sync::Mutex::new(std::collections::HashSet::new()),
     });
     let svc = DefaultBackupService::new(
         inner_store.clone(),
@@ -1563,6 +1627,19 @@ async fn test_restore_counts_partial_failures_and_continues() {
         restored_task.is_some(),
         "关系失败后，排在后面的任务实体仍应恢复"
     );
+
+    inner_store.fail_delete_ids.lock().unwrap().insert(entry.id);
+    let replace_error = svc
+        .restore(
+            &a,
+            RestoreRequest {
+                backup_id: backup.id,
+                mode: RestoreMode::Replace,
+            },
+        )
+        .await
+        .expect_err("Replace 清理失败不得伪装成恢复成功");
+    assert!(matches!(replace_error, HubError::Unavailable));
 }
 
 fn make_record(ns: String) -> BackupRecord {

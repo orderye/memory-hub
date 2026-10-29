@@ -70,8 +70,8 @@ pub use domain::{
     MemoryTask, MemoryTaskExperience, MemoryVersion, Namespace, NamespaceGrantRecord,
     NamespaceInfo, NewCodingRevision, NewCodingThread, NewEvidence, NewExperienceVersion,
     NewMemory, NewMemoryExperience, NewMemoryRelation, NewMemoryTask, Page, ProposalStatus,
-    ResolvedCollection, RestoreMode, RestoreReport, Scored, TaskStatus, UpsertCollectionRequest,
-    VersionChange, MAX_COLLECTION_NAMESPACES,
+    ResolvedCollection, RestoreMode, RestoreReport, RestoreSnapshot, Scored, TaskStatus,
+    UpsertCollectionRequest, VersionChange, MAX_COLLECTION_NAMESPACES,
 };
 pub use fingerprint::{canonical_form, content_fingerprint, same_fingerprint};
 pub use infra::{

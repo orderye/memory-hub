@@ -644,6 +644,135 @@ impl BackupStore for TestHubStore {
         self.backups.write().unwrap().remove(&id);
         Ok(())
     }
+
+    async fn replace_namespaces_from_snapshots(
+        &self,
+        snapshots: &[(Namespace, crate::domain::RestoreSnapshot)],
+    ) -> Result<()> {
+        if snapshots.len() != 1 {
+            return Err(HubError::InvalidArgument(
+                "test store supports one namespace snapshot at a time".into(),
+            ));
+        }
+        let (namespace, snapshot) = &snapshots[0];
+        let items = self.items.read().unwrap().clone();
+        let versions = self.versions.read().unwrap().clone();
+        let evidences = self.evidences.read().unwrap().clone();
+        let relations = self.relations.read().unwrap().clone();
+        let tasks = self.tasks.read().unwrap().clone();
+        let experiences = self.experiences.read().unwrap().clone();
+        let experience_versions = self.experience_versions.read().unwrap().clone();
+        let task_experiences = self.task_experiences.read().unwrap().clone();
+        let coding_threads = self.coding_threads.read().unwrap().clone();
+        let coding_revisions = self.coding_revisions.read().unwrap().clone();
+
+        self.items
+            .write()
+            .unwrap()
+            .retain(|(ns, _), _| ns != namespace);
+        let namespace_entry_ids: std::collections::HashSet<Uuid> = items
+            .keys()
+            .filter(|(ns, _)| ns == namespace)
+            .map(|(_, id)| *id)
+            .collect();
+        self.versions
+            .write()
+            .unwrap()
+            .retain(|version| !namespace_entry_ids.contains(&version.memory_id));
+        self.evidences
+            .write()
+            .unwrap()
+            .retain(|evidence| evidence.namespace != *namespace);
+        self.relations
+            .write()
+            .unwrap()
+            .retain(|relation| relation.namespace.as_deref() != Some(namespace));
+        self.tasks
+            .write()
+            .unwrap()
+            .retain(|(ns, _), _| ns != namespace);
+        self.experiences
+            .write()
+            .unwrap()
+            .retain(|(ns, _), _| ns != namespace);
+        self.experience_versions
+            .write()
+            .unwrap()
+            .retain(|version| version.namespace != *namespace);
+        self.task_experiences
+            .write()
+            .unwrap()
+            .retain(|link| link.namespace.as_deref() != Some(namespace));
+        self.coding_threads
+            .write()
+            .unwrap()
+            .retain(|(ns, _), _| ns != namespace);
+        self.coding_revisions
+            .write()
+            .unwrap()
+            .retain(|(ns, _), _| ns != namespace);
+
+        let result = async {
+            for entry in &snapshot.entries {
+                if entry.namespace != *namespace {
+                    return Err(HubError::InvalidArgument(
+                        "snapshot namespace mismatch".into(),
+                    ));
+                }
+                self.insert_initial(entry).await?;
+            }
+            for evidence in &snapshot.evidences {
+                if evidence.namespace != *namespace {
+                    return Err(HubError::InvalidArgument(
+                        "snapshot namespace mismatch".into(),
+                    ));
+                }
+                self.append_evidence(&NewEvidence {
+                    id: Some(evidence.id),
+                    namespace: evidence.namespace.clone(),
+                    source_kind: evidence.source_kind,
+                    source_ref: evidence.source_ref.clone(),
+                    content_hash: evidence.content_hash.clone(),
+                    excerpt: evidence.excerpt.clone(),
+                    occurred_at: evidence.occurred_at,
+                    expires_at: evidence.expires_at,
+                })
+                .await?;
+            }
+            for task in &snapshot.tasks {
+                self.create_task(&NewMemoryTask {
+                    id: Some(task.id),
+                    namespace: task.namespace.clone(),
+                    scene: task.scene,
+                    task: task.task.clone(),
+                    status: task.status,
+                    started_at: task.started_at,
+                    finished_at: task.finished_at,
+                    result_summary: task.result_summary.clone(),
+                    failure_reason: task.failure_reason.clone(),
+                    source_evidence_id: task.source_evidence_id,
+                    metadata: task.metadata.clone(),
+                })
+                .await?;
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            *self.items.write().unwrap() = items;
+            *self.versions.write().unwrap() = versions;
+            *self.evidences.write().unwrap() = evidences;
+            *self.relations.write().unwrap() = relations;
+            *self.tasks.write().unwrap() = tasks;
+            *self.experiences.write().unwrap() = experiences;
+            *self.experience_versions.write().unwrap() = experience_versions;
+            *self.task_experiences.write().unwrap() = task_experiences;
+            *self.coding_threads.write().unwrap() = coding_threads;
+            *self.coding_revisions.write().unwrap() = coding_revisions;
+            return Err(error);
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]

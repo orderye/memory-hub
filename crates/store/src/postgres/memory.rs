@@ -354,6 +354,21 @@ impl mem_core::MemoryStore for PostgresHubStore {
         Ok(out)
     }
 
+    async fn all_versions_in_namespace(&self, namespace: &str) -> Result<Vec<MemoryVersion>> {
+        let ids: Vec<Uuid> = sqlx::query_scalar(
+            "select memory_id from memory_versions where memory_id in (select id from memories where namespace = $1) order by memory_id, version",
+        )
+        .bind(namespace)
+        .fetch_all(&self.pool)
+        .await
+        .pg()?;
+        let mut versions = Vec::new();
+        for id in ids {
+            versions.extend(self.versions(id).await?);
+        }
+        Ok(versions)
+    }
+
     async fn archive_expired(&self, now: DateTime<Utc>) -> Result<usize> {
         // 单条 CTE：归档 + 版本历史一次完成
         let res = sqlx::query(

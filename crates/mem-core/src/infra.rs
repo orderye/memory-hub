@@ -192,6 +192,16 @@ pub trait MemoryStore: Send + Sync {
     /// 查询版本历史（按版本号升序）
     async fn versions(&self, id: uuid::Uuid) -> Result<Vec<MemoryVersion>>;
 
+    /// 命名空间下所有记忆版本历史（完整备份用）。
+    async fn all_versions_in_namespace(&self, namespace: &str) -> Result<Vec<MemoryVersion>> {
+        let entries = self.all_in_namespace(namespace, true).await?;
+        let mut versions = Vec::new();
+        for entry in entries {
+            versions.extend(self.versions(entry.id).await?);
+        }
+        Ok(versions)
+    }
+
     /// 批量归档过期条目（worker 用），返回归档条数
     async fn archive_expired(&self, now: DateTime<Utc>) -> Result<usize>;
 
@@ -298,6 +308,17 @@ pub trait BackupStore: Send + Sync {
     async fn get_backup(&self, id: uuid::Uuid) -> Result<BackupRecord>;
     async fn list_backups(&self, namespace: Option<&str>) -> Result<Vec<BackupRecord>>;
     async fn delete_backup(&self, id: uuid::Uuid) -> Result<()>;
+
+    /// Replace a set of namespaces from complete snapshots in one atomic operation.
+    async fn replace_namespaces_from_snapshots(
+        &self,
+        snapshots: &[(Namespace, crate::domain::RestoreSnapshot)],
+    ) -> Result<()> {
+        let _ = snapshots;
+        Err(common::HubError::InvalidArgument(
+            "atomic namespace restore is not supported by this store".to_string(),
+        ))
+    }
 }
 
 /// 整合提案存储

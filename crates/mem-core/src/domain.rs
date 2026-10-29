@@ -1582,6 +1582,21 @@ pub struct ResolvedCollection {
 
 // ===== 备份 =====
 
+/// 单一命名空间的完整恢复快照。
+#[derive(Debug, Clone, Default)]
+pub struct RestoreSnapshot {
+    pub entries: Vec<MemoryEntry>,
+    pub memory_versions: Vec<MemoryVersion>,
+    pub evidences: Vec<MemoryEvidence>,
+    pub relations: Vec<MemoryRelation>,
+    pub tasks: Vec<MemoryTask>,
+    pub experiences: Vec<MemoryExperience>,
+    pub experience_versions: Vec<ExperienceVersion>,
+    pub task_experiences: Vec<MemoryTaskExperience>,
+    pub coding_threads: Vec<CodingThread>,
+    pub coding_revisions: Vec<CodingRevision>,
+}
+
 /// 备份快照记录
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupRecord {
