@@ -520,7 +520,7 @@ async fn pg_restore_matrix_v1_through_v6() {
         })
         .await
         .unwrap();
-    let e = entry(ns, "it-agent", "版本矩阵样本");
+    let e = entry(&ns, "it-agent", "版本矩阵样本");
     store.insert_initial(&e).await.unwrap();
     // 备份负载存的是**用户可见名**（服务层 create 经 AccountScopedStore 产出的形态），
     // 而不是内部作用域键。这里手工构造负载，必须同样换成可见名，否则 restore
@@ -717,7 +717,7 @@ async fn pg_restore_matrix_v1_through_v6() {
     );
     store.delete_backup(future.id).await.unwrap();
 
-    store.delete(ns, e.id).await.unwrap();
+    store.delete(&ns, e.id).await.unwrap();
 }
 
 #[tokio::test]
