@@ -1650,3 +1650,64 @@ fn test_in_memory_store_satisfies_contract() {
     fn assert_impl<T: mem_core::MemoryHubStore>() {}
     assert_impl::<InMemoryHubStore>();
 }
+
+/// 未装配认知抽取器（生产默认 `HUB_COGNITIVE_EXTRACTOR=disabled`）时：
+/// `cognitive_chat_propose` 必须明确返回不可用，且不产生任何正式记忆。
+///
+/// 这条断言保护的是"默认不把占位产物写进正式数据"：不是依赖 mock 恰好返回空列表，
+/// 而是服务根本没被构造，写路径不存在。
+#[tokio::test]
+async fn test_cognitive_chat_propose_is_disabled_without_extractor() {
+    let (d, auth) = harness();
+
+    // 先建命名空间（memory_put 会创建归属与授权），再对比调用前后的条目数
+    let seeded = d
+        .dispatch(
+            &auth,
+            "memory_put",
+            arg(json!({
+                "namespace": "cog-off-ns",
+                "kind": "fact",
+                "content": "先有的一条记忆"
+            })),
+        )
+        .await;
+    assert!(!seeded.is_error, "准备数据失败: {:?}", seeded);
+
+    let res = d
+        .dispatch(
+            &auth,
+            "cognitive_chat_propose",
+            arg(json!({
+                "namespace": "cog-off-ns",
+                "turns": [
+                    { "role": "user", "content": "我们以后统一用 Rust 2024" }
+                ]
+            })),
+        )
+        .await;
+    assert!(res.is_error, "未启用抽取器时必须返回错误: {:?}", res);
+    let detail = res.structured_content.unwrap();
+    assert_eq!(detail["code"], "E_METHOD_NOT_FOUND");
+    assert!(
+        detail["message_zh"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("未配置"),
+        "错误必须说明抽取器未配置: {detail}"
+    );
+
+    // 不产生正式记忆（服务未构造，连证据与提案的写路径都不存在）
+    let listed = d
+        .dispatch(
+            &auth,
+            "memory_list",
+            arg(json!({ "namespace": "cog-off-ns" })),
+        )
+        .await;
+    assert!(!listed.is_error, "列举应成功: {:?}", listed);
+    let items = listed.structured_content.unwrap();
+    let entries = items["items"].as_array().cloned().unwrap_or_default();
+    assert_eq!(entries.len(), 1, "未启用抽取器时不得新增记忆: {items}");
+    assert_eq!(entries[0]["content"], "先有的一条记忆");
+}

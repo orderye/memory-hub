@@ -188,6 +188,11 @@ pub struct AppConfig {
     /// 任务书 4.3：单次成功不代表已验证。该值只影响显式 `verify` 流转，
     /// 不影响提炼（提炼只会产出 candidate）。
     pub experience_verify_min_sources: usize,
+    /// 认知抽取器部署模式：`disabled`（默认，不装配抽取器）| `mock`（占位，仅限开发）
+    ///
+    /// 真实 LLM 抽取器尚未接入。默认关闭是结构性保证：未启用时
+    /// `cognitive_chat_propose` 明确返回不可用，而不是让占位实现悄悄写证据与提案。
+    pub cognitive_extractor: String,
 
     // ===== 时效与限流 =====
     pub idempotency_ttl_h: u32,
@@ -361,6 +366,7 @@ impl Default for AppConfig {
             job_lease_h: DEFAULT_JOB_LEASE_HOURS,
             consolidation_stats_ttl_s: DEFAULT_CONSOLIDATION_STATS_TTL_S,
             experience_verify_min_sources: 2,
+            cognitive_extractor: "disabled".to_string(),
             idempotency_ttl_h: 24,
             rate_limit_per_agent_rps: 50,
             max_request_bytes: 262_144,
@@ -464,6 +470,8 @@ impl AppConfig {
             var_or("HUB_CONSOLIDATION_MODE", &cfg.consolidation_mode).to_lowercase();
         cfg.consolidation_fallback =
             var_or("HUB_CONSOLIDATION_FALLBACK", &cfg.consolidation_fallback).to_lowercase();
+        cfg.cognitive_extractor =
+            var_or("HUB_COGNITIVE_EXTRACTOR", &cfg.cognitive_extractor).to_lowercase();
         cfg.consolidation_allow_mode_override = parse_bool(
             "HUB_CONSOLIDATION_ALLOW_MODE_OVERRIDE",
             cfg.consolidation_allow_mode_override,
@@ -655,6 +663,10 @@ impl AppConfig {
             .map_err(|e| anyhow::anyhow!("HUB_CONSOLIDATION_MODE 非法: {}", e))?;
         crate::consolidation::ConsolidationFallback::parse(&self.consolidation_fallback)
             .map_err(|e| anyhow::anyhow!("HUB_CONSOLIDATION_FALLBACK 非法: {}", e))?;
+        // 认知抽取器模式：未知值启动失败。默认 disabled——真实 LLM 抽取器未接入前，
+        // 装配占位抽取器会往证据与提案表写"看起来像认知记忆"的内容。
+        crate::cognitive::CognitiveExtractorMode::parse(&self.cognitive_extractor)
+            .map_err(|e| anyhow::anyhow!("HUB_COGNITIVE_EXTRACTOR 非法: {}", e))?;
         if self.consolidation_embed_top_k == 0 || self.consolidation_embed_top_k > 200 {
             anyhow::bail!("HUB_CONSOLIDATION_EMBED_TOP_K 必须落在 [1,200]");
         }
