@@ -354,6 +354,30 @@ mod tests {
         assert!(err.contains("PostgreSQL"), "{err}");
     }
 
+    /// 契约：认知作业不进入生产周期调度。
+    ///
+    /// `ChatCognitiveJob` 与 `ExperienceDistillJob` 是可直接调用的执行器，
+    /// 但它们没有任务领取、持久租约或状态记录；在生产环境被自动调度会让
+    /// 未验证的认知产物悄悄入库。本测试锁定"未被注册"这一事实，防止后续
+    /// 有人误以为它们已在跑，或在未补齐幂等/租约前贸然接上调度。
+    #[test]
+    fn embedded_jobs_do_not_schedule_cognitive_jobs() {
+        let source = include_str!("embedded.rs");
+        let production_part = source.split("#[cfg(test)]").next().unwrap_or_default();
+        for forbidden in [
+            "ChatCognitiveJob::new",
+            "ExperienceDistillJob::new",
+            "cognitive_job::",
+            "experience_job::",
+        ] {
+            assert!(
+                !production_part.contains(forbidden),
+                "周期作业装配不得注册认知作业（发现 {forbidden}）：\
+                 认知作业尚无任务领取/租约/状态记录，接入前必须先补齐"
+            );
+        }
+    }
+
     #[test]
     fn new_rejects_invalid_backup_cron() {
         let cfg = AppConfig {

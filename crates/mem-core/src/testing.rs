@@ -190,6 +190,14 @@ impl Embedder for CountingEmbedder {
     }
 }
 
+impl MockChatCognitiveExtractor {
+    /// 该抽取器是否提供真实语义提炼能力。Mock 恒为 false，
+    /// 供装配与健康检查区分"占位实现"与"真实 LLM"。
+    pub fn provides_semantic_extraction(&self) -> bool {
+        false
+    }
+}
+
 impl std::fmt::Debug for CountingEmbedder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CountingEmbedder")
@@ -201,6 +209,9 @@ impl std::fmt::Debug for CountingEmbedder {
 }
 
 /// 测试用可编程/确定性 Chat 认知抽取器
+///
+/// **它是占位实现，不是真实抽取器**：不会理解对话内容，候选完全由调用方注入。
+/// 生产装配使用它时，Chat 认知流的产出不得被当作"LLM 提炼结果"。
 #[derive(Default)]
 pub struct MockChatCognitiveExtractor {
     pub candidates: Mutex<Vec<CognitiveCandidate>>,
@@ -1807,6 +1818,17 @@ impl CollectionStore for TestHubStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Mock 抽取器必须自我声明为"非真实能力"，否则装配层可能把占位产出
+    /// 当成 LLM 提炼结果写进正式记忆。
+    #[test]
+    fn mock_chat_extractor_declares_no_semantic_extraction() {
+        let extractor = MockChatCognitiveExtractor::new();
+        assert!(
+            !extractor.provides_semantic_extraction(),
+            "MockChatCognitiveExtractor 不得声称提供真实语义提炼"
+        );
+    }
 
     #[tokio::test]
     async fn test_deterministic_and_normalized() {
