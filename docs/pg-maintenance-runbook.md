@@ -47,6 +47,71 @@ create index concurrently idx_memories_embedding_hf
 注意：`embedding` 列维度（1024）与 `HUB_EMBED_DIM` 绑定；换模型必须同步迁移、
 配置与 `similar()` 的 halfvec typmod。
 
+### 2.1 顺序与锁：先建后删
+
+上面的示例刻意写成 **先 `create index concurrently` 新索引，再 `drop index concurrently` 旧索引**。
+反过来（先删后建）会让线上查询在一段时间里完全没有向量索引。迁移 015 内部顺序是
+"先建新索引、再删旧索引"，但它用的是普通 `create index`（事务内、持 `ACCESS EXCLUSIVE` 锁），
+只适合空表/小表；大表必须走本节的 concurrent 路径。
+
+维护窗口建议操作序列：
+
+```sql
+-- 0) 观察有没有阻塞中的 DDL
+select pid, state, wait_event_type, left(query, 80)
+from pg_stat_activity where state <> 'idle' order by query_start;
+
+-- 1) 建新索引（不阻塞读写）
+create index concurrently idx_memories_embedding_hf_new
+  on memories using hnsw ((embedding::halfvec(1024)) halfvec_cosine_ops)
+  where status in ('active', 'archived');
+
+-- 2) 有效性检查（must be true / true）
+select c.relname, i.indisvalid, i.indisready
+from pg_index i join pg_class c on c.oid = i.indexrelid
+where c.relname = 'idx_memories_embedding_hf_new';
+
+-- 3) 换名 + 删旧（三步都在同一维护窗口内）
+alter index idx_memories_embedding_hf rename to idx_memories_embedding_hf_old;
+alter index idx_memories_embedding_hf_new rename to idx_memories_embedding_hf;
+drop index concurrently idx_memories_embedding_hf_old;
+
+-- 4) 计划验证（应出现 Index Scan using idx_memories_embedding_hf）
+explain (analyze, buffers)
+select id from memories
+where namespace = 'ns' and status = 'active' and embedding is not null
+order by embedding::halfvec(1024) <=> '[0.1, ...]'::halfvec(1024) limit 20;
+```
+
+### 2.2 失败与重试
+
+- 启动迁移执行器（`crates/store/src/postgres/mod.rs::run_migrations`）每个迁移一个事务：
+  `set local statement_timeout = 0` → `pg_advisory_xact_lock` → 账本检查 → 执行 → 记账 → commit。
+- 迁移 015 中途失败（锁等待被取消、磁盘满、语句被杀）时整条事务回滚：**索引不会留下半成品，
+  `_hub_migrations` 也不会记录该版本**，下次启动自动重试。
+- 手工执行 concurrent 建索引失败时，PostgreSQL 会留下一个 `indisvalid = false` 的索引对象；
+  必须先 `drop index concurrently <name>` 再重试，不能直接重跑 `create index`（会因同名已存在而跳过）。
+- CI 里另有一条"逐文件 `psql -f`"的路径（`.github/workflows/ci.yml`），它每个文件是隐式事务，
+  与运行时语义接近但不完全等同；两者都要能跑通。
+
+### 2.3 旧版本回滚后的性能影响（重要）
+
+迁移 015 只重建索引、不改表结构，回滚应用版本**能启动**，但旧二进制的查询是 fp32 形式
+`embedding <=> $1`，与 halfvec 表达式索引 `((embedding::halfvec(1024)) ...)` 不匹配，
+规划器不会用该索引，向量检索退化为 **Seq Scan + Sort**。
+
+- 数据量小时无感；数据上万后延迟会随表线性增长；
+- 需要回滚到 015 之前的二进制时，请在维护窗口**临时重建 fp32 索引**：
+
+```sql
+create index concurrently idx_memories_embedding
+  on memories using hnsw (embedding vector_cosine_ops);
+```
+
+- 回滚窗口结束后再 `drop index concurrently idx_memories_embedding`（新版本用不到它，留着是双份写放大）。
+
+> 结论：**"旧版能启动"不等于"性能兼容"**。生产回滚演练请同时验证查询计划，而不只看服务是否起来。
+
 ## 3. 观测
 
 ```sql
@@ -82,3 +147,6 @@ limit 20;
   或调小 `gin_pending_list_limit`。
 - HNSW / GIN 都随行更新累积膨胀：长期运行后用 `pg_repack` 或维护窗口
   `reindex concurrently` 回收，平时以第 3 节的索引大小曲线判断时机。
+
+<!-- kimi-badge -->
+[![powered by KimiCode](../.github/assets/kimi-badge.svg)](https://www.kimi.com/code)
