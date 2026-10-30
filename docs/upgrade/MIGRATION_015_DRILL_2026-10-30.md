@@ -35,6 +35,11 @@ pgvector **0.8.7**（与生产同版本），额外挂 4 GB swap。
 **T2 = 维护窗口路径**：`CREATE INDEX CONCURRENTLY`，`maintenance_work_mem=512MB`，
 `max_parallel_maintenance_workers=2`，索引定义与 015 逐字一致。
 
+> **度量更正**：当日首轮 `workload.py` 对 `UPDATE` 也调用了 `fetchall()`，这会在成功时抛
+> `ProgrammingError`，把成功写记成失败。下表数字是按延迟重新分类的
+> （≥4.9 s 记为超时，其余记为成功）；PG 日志里除 `statement timeout` 外没有其它错误类型，
+> 所以这个分类是可靠的。脚本已修复并收在 [`scripts/drills/`](../../scripts/drills/README.md)。
+
 ## 3. 结果
 
 | 指标 | T1 迁移路径 | T2 维护窗口路径 |
