@@ -798,8 +798,11 @@ This section exists so nobody steps on a landmine, not to brag:
    use the same format (entries, **memory version history**, evidence, relations, tasks, experiences, experience version history,
    coding threads, coding revisions). Restore accepts v1–v6, but **an older binary cannot restore a v6 backup** — keep the new
    binary around before downgrading, or finish the restore first.
-9. **Multiple replicas only get "no duplicate execution"** (via `HUB_JOB_LEASE_H`); resumable progress inside a single
-   replica is not provided — bound big namespaces with `HUB_INTEGRATION_SCAN_MAX_ENTRIES`.
+9. **Multiple replicas only get "no duplicate execution"** (via `HUB_JOB_LEASE_H`, 24 h window by default); resumable
+   progress inside a single replica is not provided — bound big namespaces with `HUB_INTEGRATION_SCAN_MAX_ENTRIES`.
+   ⚠️ **Restarting an instance inside the lease window skips the first scheduled backup** (the lease key is still held by
+   the previous incarnation; the log says "another replica"). For single-replica deployments that want every cron fire,
+   set `HUB_JOB_LEASE_H=0`. See [`docs/upgrade/RUNTIME_OBSERVATION_2026-10-30.md`](docs/upgrade/RUNTIME_OBSERVATION_2026-10-30.md).
 10. **Migration 015's index rebuild suits empty / small tables**: the `create index` (non-`CONCURRENTLY`) runs inside the
     startup migration transaction; for large tables, rebuild manually in a maintenance window per
     [`docs/pg-maintenance-runbook.md`](docs/pg-maintenance-runbook.md).

@@ -798,8 +798,11 @@ docker compose -f docker-compose.lite.yml up -d --build    # Lite
 8. **定时快照与手工备份统一为 v6 载荷**：`backup-worker` 的周期快照与 `memory_backup_create` 使用同一格式
    （条目、**记忆版本历史**、证据、关系、任务、经验、经验版本历史、代码线程）；恢复路径支持 v1–v6，
    但**回滚后的旧二进制不能恢复 v6 备份**——降级前请保留新二进制或先完成恢复。
-9. **多副本只保证\"不同副本重复执行\"被租约挡住**（`HUB_JOB_LEASE_H`），
+9. **多副本只保证"不同副本重复执行"被租约挡住**（`HUB_JOB_LEASE_H`，默认 24 小时窗口），
    不保证单副本内部的扫描进度可续传；大命名空间请用 `HUB_INTEGRATION_SCAN_MAX_ENTRIES` 分批。
+   ⚠️ **窗口内重启实例，第一次定时备份会被跳过**（租约键仍被上一次运行占用，日志会写"其它副本"）；
+   单副本部署若希望每次 cron 都执行，把 `HUB_JOB_LEASE_H` 设为 `0`。详见
+   [`docs/upgrade/RUNTIME_OBSERVATION_2026-10-30.md`](docs/upgrade/RUNTIME_OBSERVATION_2026-10-30.md)。
 10. **迁移 015 的向量索引重建适合空表 / 小表**：`create index`（非 `CONCURRENTLY`）在启动迁移事务内执行，
     大表升级请在维护窗口按 [`docs/pg-maintenance-runbook.md`](docs/pg-maintenance-runbook.md) 手动重建。
 11. **经验提炼与反馈的语义已变更**：`working_experience_distill` 只产出 `candidate`；`working_experience_feedback`
