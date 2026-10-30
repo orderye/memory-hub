@@ -1,6 +1,9 @@
 # PostgreSQL / pgvector 维护 runbook
 
-适用部署：2C/2GB 小内存 VPS（本仓生产形态），`pgvector/pgvector:pg15`（生产实测 pgvector 0.8.7）。
+适用部署：**2C/1GB** 小内存 VPS（本仓 2026-10-30 起的测试与部署基线；原 2C/2GB 实例已注销），
+`pgvector/pgvector:pg15`（生产实测 pgvector 0.8.7）。
+本文的耗时/锁数字来自 2026-10-30 的实测演练，见
+[`upgrade/MIGRATION_015_DRILL_2026-10-30.md`](upgrade/MIGRATION_015_DRILL_2026-10-30.md)。
 迁移 015（2026-10-27）起向量索引为 **halfvec 半精度 + 部分索引**：
 
 ```sql
@@ -26,7 +29,31 @@ idx_memories_embedding_hf
 ## 2. 索引重建（维护窗口）
 
 迁移执行器内的事务不能用 `CONCURRENTLY`，大表上重建索引必须手动做
-（应用侧不停写也可安全执行）：
+（应用侧不停写也可安全执行）。
+
+**前置检查：`/dev/shm` 必须不小于 `maintenance_work_mem`。**
+并行建索引通过共享内存传递状态，不够会直接失败。实测报错：
+
+```
+ERROR: could not resize shared memory segment … to 533761856 bytes: No space left on device
+```
+
+当时 `/dev/shm` 351 MB、需要 533 MB。Docker 默认 `/dev/shm` 常为 64 MB，容器部署尤其要检查：
+
+```bash
+df -h /dev/shm
+mount -o remount,size=1G /dev/shm      # 或给容器加 --shm-size=1g
+```
+
+**两条路径的实测对照**（50k 行 × 1024 维，2C/1G，PG 15.19 + pgvector 0.8.7，单次运行）：
+
+| 路径 | 耗时 | 写请求 |
+|---|---|---|
+| 迁移路径（事务内非 `CONCURRENTLY`，256 MB） | **432 s** | **构建期间写全部阻塞**（5 s 超时） |
+| 维护窗口路径（`CONCURRENTLY`，512 MB） | **3236 s（7.5×）** | p50 2.7 ms、p95 154 ms、超时 1.1% |
+
+所以：**大表不要指望"启动即迁移"**。`CONCURRENTLY` 慢一个量级，但写不中断。
+201k 行时非并发构建 60 分钟只到 52%，按 ~29 元组/秒外推 1M 约 9–10 小时写阻塞（外推，非实测）。
 
 ```sql
 -- 提升构建吞吐（会话级，一次性）
@@ -100,7 +127,10 @@ order by embedding::halfvec(1024) <=> '[0.1, ...]'::halfvec(1024) limit 20;
 `embedding <=> $1`，与 halfvec 表达式索引 `((embedding::halfvec(1024)) ...)` 不匹配，
 规划器不会用该索引，向量检索退化为 **Seq Scan + Sort**。
 
-- 数据量小时无感；数据上万后延迟会随表线性增长；
+- 数据量小时无感；数据上万后延迟会随表线性增长。**50k 行实测**：
+  旧形态 p50 **498 ms** / p95 509 ms（`Seq Scan on memories`），
+  新形态 p50 **21 ms** / p95 316 ms（`Index Scan using idx_memories_embedding_hf`）；
+  按线性外推 1M 行时旧形态约 **10 秒/查询**；
 - 需要回滚到 015 之前的二进制时，请在维护窗口**临时重建 fp32 索引**：
 
 ```sql

@@ -121,22 +121,32 @@
 
 ## 6. P1 migration 015
 
-**状态：行为已核实；中断/重试本轮补测试（PG 未在本地运行）。**
+**状态：中断/重试已由 CI 实测；大表耗时与锁、旧二进制延迟已于 2026-10-30 在 2C/1G 演练机上实测。**
 
 - 迁移 015 在启动迁移事务内执行非 `CONCURRENTLY` 的 `create index`：全程持锁，
   失败整条事务回滚且 `_hub_migrations` 不记账 → 下次启动自动重试。
 - 执行器不能容纳 `CREATE INDEX CONCURRENTLY`（事务块内禁止）。
 - 查询侧 `similar()` 已内联状态字面量，与索引表达式逐字一致（前序提交修正）。
-- 本轮新增 `pg_migration_015_interruption_leaves_no_partial_index_and_retries`：
-  用 `lock_timeout` 制造确定性中断，断言“失败后无半成品索引、解除阻塞后重试成功且索引有效”。
-- **CI 实测（2026-10-29，PR #2 的 PG job，PG15 + pgvector）**：
-  `pg_migration_015_interruption_leaves_no_partial_index_and_retries ... ok`，
-  该 job 13 passed / 0 failed。
+- 中断/重试：`pg_migration_015_interruption_leaves_no_partial_index_and_retries`
+  在 CI 的 PG15 上通过（`lock_timeout` 打断 → 无半成品 → 重试成功）。
 
-**未验证：**
-- 生产规模（百万行级）的建索引耗时、锁等待，以及 `CONCURRENTLY` 的维护窗口实测：**未演练**。
-  方案见 `docs/pg-maintenance-runbook.md` §2 / §2.1 / §2.3。
-- 旧二进制回滚后的性能：已给出机制说明与临时 fp32 索引方案，**未实测延迟**。
+**2026-10-30 演练（50k 行 × 1024 维，2C/1G，PG 15.19 + pgvector 0.8.7，详见
+[`MIGRATION_015_DRILL_2026-10-30.md`](./MIGRATION_015_DRILL_2026-10-30.md)）**：
+
+| 路径 | 耗时 | 写请求 |
+|---|---|---|
+| 非 `CONCURRENTLY`（迁移路径，256 MB） | **432 s** | 构建期间写全部阻塞（5 s 超时，79/79 采样有锁等待） |
+| `CONCURRENTLY`（维护窗口，512 MB） | **3236 s（7.5×）** | p50 2.7 ms、p95 154 ms、超时 1.1%（0 锁等待） |
+| 旧二进制 fp32 查询（回滚态） | p50 **498 ms** / Seq Scan | 新形态 p50 **21 ms** / Index Scan |
+
+顺带确认：并行建索引需要 `/dev/shm ≥ maintenance_work_mem`（本次 351 MB 不够 533 MB，
+扩容到 1G 后才成功）；201k 行时非并发构建 60 分钟只到 52%，按 ~29 元组/秒外推 1M
+约 9–10 小时写阻塞。
+
+**仍未验证：**
+- 百万行完整构建（本机只有 30 G 盘、1 GB 内存，装不下 1M 的向量 + 索引 + WAL）；
+- 构建期间 WAL 增量、`CONCURRENTLY` 失败后残留索引的处理；
+- 生产规格（若恢复为 2C/2GB 或更高）下的绝对值——**本机为 2C/1G，绝对值不可外推**。
 
 ---
 
@@ -179,9 +189,11 @@
 | 4 | `CARGO_TARGET_DIR=/tmp/mh-target cargo clippy --all-targets --all-features -- -D warnings` | 本机 | 见 §8.1 | 同上 |
 | 5 | `cargo test -p store --features pg-integration -- --ignored` | CI | **通过**（run `40853880906`，13 passed / 0 failed） | 含本轮新增的 015 中断用例 |
 | 6 | 迁移 015 中断/重试 | CI（PG15 + pgvector） | **通过** | `pg_migration_015_interruption_leaves_no_partial_index_and_retries ... ok` |
-| 7 | 大表 `CONCURRENTLY` 演练 | — | **未运行** | 需生产规模数据与维护窗口 |
-| 8 | Lite/Production 运行态观察 | — | **未运行** | 需起二进制 |
-| 9 | 真实 embedding 语义验收 | — | **不在本轮范围** | 任务书明确不做 |
+| 7 | 迁移 015 大表耗时与锁 | 演练机 2C/1G（2026-10-30） | **已完成（单次）** | 50k 行：非并发 **432 s**（写全阻塞）vs 并发 **3236 s**（写 p50 2.7 ms） |
+| 8 | 旧二进制回滚延迟 | 同上 | **已完成（单次）** | 50k 行：旧形态 p50 **498 ms**（Seq Scan）vs 新形态 **21 ms**（Index Scan） |
+| 9 | 百万行完整构建 | — | **未运行** | 本机 30 G 盘 / 1 GB 内存装不下 |
+| 10 | Lite/Production 运行态观察 | — | **未运行** | 需起二进制 |
+| 11 | 真实 embedding 语义验收 | — | **不在本轮范围** | 任务书明确不做 |
 
 ### 8.1 本次运行结果（2026-10-29，`CARGO_TARGET_DIR=/tmp/mh-target`）
 
@@ -237,7 +249,8 @@ ANN 部分索引命中都在真实 PG 上跑过。仍缺的只有生产规模数
 |---|---|---|---|
 | R1 | 真实 embedding / LLM 抽取器未接入，语义能力与认知提炼均未验收 | 高（能力缺口） | 否（本轮范围外，已在 README 与健康检查如实暴露） |
 | R2 | merge 补偿在 PostgreSQL 上没有注入测试，只有内存实现证据 | 中 | 否（replace 的原子路径有 PG 证据） |
-| R3 | 迁移 015 大表 `CONCURRENTLY` 未演练（耗时/锁）；中断/重试语义已由 CI 的 PG15 实测 | 中 | 否（单机小表可自动迁移；大表按 runbook 维护窗口） |
+| R3 | 迁移 015 已在 **50k / 2C1G** 实测（非并发 432 s 写全阻塞、并发 3236 s）；**百万行仍未验证** | 中 | 否（大表按 runbook 维护窗口；1M 规模需更大机器） |
+| R8 | 生产 `id` 为随机 UUID，慢盘上批量恢复写入仅 ~5 MB/分钟（顺序 UUID 为 ~18 MB/秒） | 中 | 否（恢复是运维操作，可安排在维护窗口并监控进度） |
 | R4 | 迁移 018 清理会删除历史重复提案（不可回溯） | 低 | 否（同逻辑候选的冗余副本） |
 | R5 | `partial=true` 的 merge 不保证原子；调用方必须检查报告 | 低 | 否（已在文档与报告字段显式暴露） |
 | R6 | 补偿回滚会让条目版本号 +2 | 低 | 否（内容与关联正确） |
