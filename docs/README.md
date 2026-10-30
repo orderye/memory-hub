@@ -9,7 +9,7 @@
 欢迎查阅 **记忆中枢 (Memory Hub)** 的技术文档库。本目录收录了系统的总体设计规范、认知记忆升级方案、各专业子系统技术协议、基线审计与评测报告。
 
 > **最近一次文档整理（2026-10，治理升级）**：新增经验资产生命周期与版本、Agent 记忆集合、认知服务命名空间 ACL；
-> MCP 工具从 28 个扩展到 38 个，迁移从 15 个增加到 17 个，备份负载升级到 v6。
+> MCP 工具从 28 个扩展到 38 个，迁移从 15 个增加到 18 个，备份负载升级到 v6。
 > 入口：[`ASSET_GOVERNANCE.md`](./upgrade/ASSET_GOVERNANCE.md) ·
 > [`DEPLOYMENT_MODES.md`](./upgrade/DEPLOYMENT_MODES.md) ·
 > [`GOVERNANCE_RELEASE.md`](./upgrade/GOVERNANCE_RELEASE.md) ·
@@ -58,7 +58,7 @@
 | Agent 记忆集合 | 仅有命名空间 grant | **`memory_collections` + 绑定**：只收窄候选范围、不授予权限；未绑定 fail closed；解绑即时生效；删除集合不删记忆 | 迁移 `20261028000017` + `docs/upgrade/ASSET_GOVERNANCE.md` |
 | 认知工具权限 | 只校验 token scope | **Working / Coding / Chat 全部校验命名空间 ACL**；显式单命名空间无权限返回错误（不静默为空） | `crates/mem-core/src/{working,coding,chat}_*.rs` |
 | 备份负载 | v4（无经验版本历史） | **v6**：含条目/**记忆版本历史**/证据/关系/任务/经验/经验版本/代码线程；恢复支持 v1–v6，但旧二进制不能恢复 v6 | `crates/mem-core/src/backup_service.rs` |
-| 迁移数量 | 15 个 | **17 个**（新增 016/017） | `crates/store/migrations/` |
+| 迁移数量 | 15 个 | **18 个**（新增 016/017/018） | `crates/store/migrations/` |
 | 评测指标 | MRR@5、6 大测试集（`upgrade/EVALUATION.md` 旧版） | **Recall@1/5/10、MRR@10、nDCG@10**、硬负例违规率、首位误取率、域外误召回率、p50/p95 延迟 | `crates/retrieval/tests/eval_bench.rs` |
 | 评测规模 | 6 大测试集 | **Bench v2：480 文档 / 600 查询**，指纹 `9f5b3b075a558371` | 同上 |
 | 检索最小分 | 无默认 `min_score` | **默认拒绝阈值 0.65**（`HUB_RETRIEVAL_MIN_SCORE`），无可靠匹配时返回 `no_reliable_match: true` | `crates/common/src/config.rs` |

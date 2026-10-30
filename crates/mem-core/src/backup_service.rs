@@ -68,6 +68,22 @@ pub trait BackupService: Send + Sync {
     async fn prune(&self, keep: usize, retention_days: u32) -> Result<PruneReport>;
 }
 
+/// Merge 恢复的补偿账本：记录本次动过的东西，供致命失败时回滚。
+///
+/// 只记录 id 与前像，不记录正文：错误日志与灾难恢复提示都不得泄露原始记忆内容。
+#[derive(Default)]
+struct MergeJournal {
+    /// 被本次恢复修订过的条目（修订前整行）；回滚时按原内容再修订一次
+    prior_entries: Vec<MemoryEntry>,
+    created_entries: Vec<(String, Uuid)>,
+    created_evidences: Vec<(String, Uuid)>,
+    created_relations: Vec<(String, Uuid, Uuid, crate::domain::MemoryRelationKind)>,
+    created_tasks: Vec<(String, Uuid)>,
+    created_experiences: Vec<(String, Uuid)>,
+    created_threads: Vec<(String, Uuid)>,
+    created_revisions: Vec<(String, Uuid)>,
+}
+
 /// 备份服务实现
 pub struct DefaultBackupService {
     store: Arc<dyn MemoryHubStore>,
@@ -674,6 +690,87 @@ impl DefaultBackupService {
         snapshots
     }
 
+    /// 按补偿账本回滚一次中途失败的 Merge。
+    ///
+    /// 顺序与外键依赖相反（子表先删，父表后删）；删除父行时依赖 `on delete cascade`
+    /// 连带清理经验版本与任务-经验关联（migration 007/009 已声明）。
+    /// 被修订的条目不能删了重建（会断掉引用它的关系与证据链），改为把前像再修订回去：
+    /// 版本号会继续递增并留下一条历史，这是可接受的代价——内容与关联都回到操作前。
+    async fn compensate_merge<S>(
+        store: &S,
+        journal: &MergeJournal,
+        agent: &common::AgentId,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()>
+    where
+        S: MemoryStore
+            + EvidenceStore
+            + RelationStore
+            + TaskStore
+            + ExperienceStore
+            + CodingStore
+            + ?Sized,
+    {
+        let mut failures: Vec<String> = Vec::new();
+
+        for (ns, id) in &journal.created_revisions {
+            if let Err(e) = store.delete_revision(ns, *id).await {
+                failures.push(format!("revision {id}: {e}"));
+            }
+        }
+        for (ns, id) in &journal.created_threads {
+            if let Err(e) = store.delete_thread(ns, *id).await {
+                failures.push(format!("thread {id}: {e}"));
+            }
+        }
+        for (ns, id) in &journal.created_experiences {
+            if let Err(e) = store.delete_experience(ns, *id).await {
+                failures.push(format!("experience {id}: {e}"));
+            }
+        }
+        for (ns, id) in &journal.created_tasks {
+            if let Err(e) = store.delete_task(ns, *id).await {
+                failures.push(format!("task {id}: {e}"));
+            }
+        }
+        for (ns, from, to, kind) in &journal.created_relations {
+            if let Err(e) = store.delete_relation(ns, *from, *to, *kind).await {
+                failures.push(format!("relation {from}->{to}: {e}"));
+            }
+        }
+        for (ns, id) in &journal.created_evidences {
+            if let Err(e) = store.delete_evidence(ns, *id).await {
+                failures.push(format!("evidence {id}: {e}"));
+            }
+        }
+        for (ns, id) in &journal.created_entries {
+            if let Err(e) = store.delete(ns, *id).await {
+                failures.push(format!("entry {id}: {e}"));
+            }
+        }
+        for prior in &journal.prior_entries {
+            let mut restored = prior.clone();
+            restored.version = prior.version + 2;
+            restored.updated_at = now;
+            restored.source_agent = agent.clone();
+            if let Err(e) = store
+                .revise(&restored, prior.version + 1, VersionChange::Updated)
+                .await
+            {
+                failures.push(format!("entry {} 前像回写: {e}", prior.id));
+            }
+        }
+
+        if failures.is_empty() {
+            return Ok(());
+        }
+        Err(HubError::Internal(anyhow::anyhow!(
+            "补偿回滚 {} 项失败（首项：{}）",
+            failures.len(),
+            failures.join("; ")
+        )))
+    }
+
     /// 记一次恢复失败：计数并保留首条错误（作汇总日志摘要）
     fn tally_failure(count: &mut usize, first_err: &mut Option<HubError>, e: HubError) {
         if first_err.is_none() {
@@ -699,6 +796,23 @@ impl DefaultBackupService {
             first_error = ?first_err.as_ref().map(|e| e.to_string()),
             "恢复部分实体失败（已跳过并继续，详见 RestoreReport 失败计数）"
         );
+    }
+
+    /// 备份负载里的命名空间必须是**用户可见名**：不得为空、不得是通配标记，
+    /// 也不得含账户作用域分隔符。后者是防止伪造 `{account}/{ns}` 内部键把数据
+    /// 写进别的账户；这是恢复路径上唯一的"跨账户"入口，必须 fail-closed。
+    fn validate_target_namespaces(namespaces: &[String]) -> Result<()> {
+        for ns in namespaces {
+            if ns.trim().is_empty()
+                || ns == ALL_NAMESPACES
+                || ns.contains(crate::account_scope::SCOPE_SEPARATOR)
+            {
+                return Err(HubError::InvalidArgument(format!(
+                    "备份负载包含非法命名空间: {ns}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// 记录恢复审计；审计写入失败只告警，不改变恢复结果。
@@ -841,7 +955,30 @@ impl DefaultBackupService {
             failed_task_links: 0,
             failed_threads: 0,
             failed_revisions: 0,
+            partial: false,
         };
+
+        // 目标命名空间集合（全量备份可能含多个命名空间，且涵盖认知各实体）。
+        // **dry_run 也要算**：预演必须验证"目标范围"与写权限，否则预演会给出
+        // 一个真正执行时必然失败的乐观结果。
+        let mut namespaces: Vec<String> = entries
+            .iter()
+            .map(|e| e.namespace.clone())
+            .chain(evidences.iter().map(|e| e.namespace.clone()))
+            .chain(tasks.iter().map(|t| t.namespace.clone()))
+            .chain(experiences.iter().map(|e| e.namespace.clone()))
+            .chain(coding_threads.iter().map(|t| t.namespace.clone()))
+            .chain(coding_revisions.iter().map(|r| r.namespace.clone()))
+            .collect();
+        if backup.namespace != ALL_NAMESPACES && !backup.namespace.trim().is_empty() {
+            namespaces.push(backup.namespace.clone());
+        }
+        namespaces.sort();
+        namespaces.dedup();
+        Self::validate_target_namespaces(&namespaces)?;
+        for ns in &namespaces {
+            self.require_write(auth, ns).await?;
+        }
 
         if req.mode == RestoreMode::DryRun {
             for e in &entries {
@@ -857,26 +994,9 @@ impl DefaultBackupService {
             return Ok(report);
         }
 
-        // 目标命名空间集合（全量备份可能含多个命名空间，且涵盖认知各实体）
-        let mut namespaces: Vec<String> = entries
-            .iter()
-            .map(|e| e.namespace.clone())
-            .chain(evidences.iter().map(|e| e.namespace.clone()))
-            .chain(tasks.iter().map(|t| t.namespace.clone()))
-            .chain(experiences.iter().map(|e| e.namespace.clone()))
-            .chain(coding_threads.iter().map(|t| t.namespace.clone()))
-            .chain(coding_revisions.iter().map(|r| r.namespace.clone()))
-            .collect();
-        if backup.namespace != ALL_NAMESPACES && !backup.namespace.trim().is_empty() {
-            namespaces.push(backup.namespace.clone());
-        }
-        namespaces.sort();
-        namespaces.dedup();
-
         if req.mode == RestoreMode::Replace {
             // 先为每个受影响的命名空间创建安全备份（逐个记录，多命名空间时不互相覆盖）
             for ns in &namespaces {
-                self.require_write(auth, ns).await?;
                 if let Some(safety) = self.create_safety_backup(auth, ns).await? {
                     if report.safety_backup_id.is_none() {
                         // 兼容旧消费方：单数形式保留第一个
@@ -905,291 +1025,376 @@ impl DefaultBackupService {
             store.replace_namespaces_from_snapshots(&snapshots).await?;
             report.created = entries.len();
             return Ok(report);
-        } else {
-            for ns in &namespaces {
-                self.require_write(auth, ns).await?;
-            }
         }
+        // merge：写权限已在上方统一校验，这里不再重复
 
         // 以下各实体的恢复遵循同一取舍：**单条失败不中止恢复**。
         // 部分恢复优于全不恢复——replace 模式在清空前已创建安全备份，
         // 即使恢复结果不完整，也能按安全备份重放找回现场；失败只计数、
         // 每类实体汇总一条告警（namespace + 失败数 + 首条错误摘要），避免逐条刷屏。
 
-        // 恢复证据存根
-        let mut first_err: Option<HubError> = None;
-        for ev in &evidences {
-            if let Err(e) = store
-                .append_evidence(&NewEvidence {
-                    id: Some(ev.id),
-                    namespace: ev.namespace.clone(),
-                    source_kind: ev.source_kind,
-                    source_ref: ev.source_ref.clone(),
-                    content_hash: ev.content_hash.clone(),
-                    excerpt: ev.excerpt.clone(),
-                    occurred_at: ev.occurred_at,
-                    expires_at: ev.expires_at,
-                })
+        // Merge 没有 replace 那样的单事务（写入分散在逐实体的存储调用里），
+        // 因此用补偿账本兜底：中途致命失败时按账本回滚，而不是留下半恢复状态。
+        // 单条实体失败的既有取舍（计数后继续）保留——只有条目主线与版本历史
+        // 这类会导致"数据分叉"的失败才升级为致命并触发回滚。
+        let mut journal = MergeJournal::default();
+        let outcome: Result<()> = async {
+            // 恢复证据存根
+            let mut first_err: Option<HubError> = None;
+            for ev in &evidences {
+                match store
+                    .append_evidence(&NewEvidence {
+                        id: Some(ev.id),
+                        namespace: ev.namespace.clone(),
+                        source_kind: ev.source_kind,
+                        source_ref: ev.source_ref.clone(),
+                        content_hash: ev.content_hash.clone(),
+                        excerpt: ev.excerpt.clone(),
+                        occurred_at: ev.occurred_at,
+                        expires_at: ev.expires_at,
+                    })
+                    .await
+                {
+                    Ok(_) => journal
+                        .created_evidences
+                        .push((ev.namespace.clone(), ev.id)),
+                    Err(e) => Self::tally_failure(&mut report.failed_evidences, &mut first_err, e),
+                }
+            }
+            Self::warn_restore_failures(
+                "evidences",
+                &backup.namespace,
+                report.failed_evidences,
+                &first_err,
+            );
+
+            for mut e in entries.clone() {
+                match store.get(&e.namespace, e.id).await {
+                    Ok(cur) => {
+                        if cur == e {
+                            report.unchanged += 1;
+                            continue;
+                        }
+                        // 合并：保留快照内容，推进版本与时间戳。
+                        // 前像**在修订成功之后**才登记：修订本身失败时库里的版本没动，
+                        // 把它记进账本会让补偿试图回写一个没发生的变更（版本不符 → 误报灾难状态）。
+                        let prior = cur.clone();
+                        e.version = cur.version + 1;
+                        e.updated_at = now;
+                        e.source_agent = auth.agent_id.clone();
+                        store
+                            .revise(&e, cur.version, VersionChange::Updated)
+                            .await?;
+                        journal.prior_entries.push(prior);
+                        report.updated += 1;
+                    }
+                    // 只有 NotFound 才是"库中不存在、应新建"；把其它错误（连接中断、
+                    // 权限、超时）也当成不存在去 insert，会把真实故障伪装成新建成功，
+                    // 并在主键冲突时留下一条语义不明的失败。
+                    Err(HubError::NotFound) => {
+                        // 新建：保留快照的 created_at，updated_at 置为恢复时刻
+                        e.updated_at = now;
+                        e.source_agent = auth.agent_id.clone();
+                        store.insert_initial(&e).await?;
+                        journal.created_entries.push((e.namespace.clone(), e.id));
+                        report.created += 1;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+
+            // 恢复记忆版本历史（v6+；旧备份为空数组，不报错）
+            for version in &memory_versions {
+                if let Err(e) = store.record_version(version).await {
+                    return Err(HubError::Internal(anyhow::anyhow!(
+                        "恢复记忆版本历史失败: {}",
+                        e
+                    )));
+                }
+            }
+
+            // 恢复实体关系网
+            let mut first_err: Option<HubError> = None;
+            for rel in &relations {
+                let rel_ns = if let Some(ref ns) = rel.namespace {
+                    ns.clone()
+                } else if backup.namespace != ALL_NAMESPACES {
+                    backup.namespace.clone()
+                } else {
+                    entries
+                        .iter()
+                        .find(|e| e.id == rel.from_memory_id)
+                        .map(|e| e.namespace.clone())
+                        .unwrap_or_else(|| backup.namespace.clone())
+                };
+                match store
+                    .add_relation(
+                        &rel_ns,
+                        &NewMemoryRelation {
+                            from_memory_id: rel.from_memory_id,
+                            to_memory_id: rel.to_memory_id,
+                            relation_kind: rel.relation_kind,
+                            confidence: rel.confidence,
+                            source_evidence_id: rel.source_evidence_id,
+                        },
+                    )
+                    .await
+                {
+                    Ok(_) => journal.created_relations.push((
+                        rel_ns,
+                        rel.from_memory_id,
+                        rel.to_memory_id,
+                        rel.relation_kind,
+                    )),
+                    Err(e) => Self::tally_failure(&mut report.failed_relations, &mut first_err, e),
+                }
+            }
+            Self::warn_restore_failures(
+                "relations",
+                &backup.namespace,
+                report.failed_relations,
+                &first_err,
+            );
+
+            // 恢复任务事实
+            let mut first_err: Option<HubError> = None;
+            for t in &tasks {
+                match store
+                    .create_task(&NewMemoryTask {
+                        id: Some(t.id),
+                        namespace: t.namespace.clone(),
+                        scene: t.scene,
+                        task: t.task.clone(),
+                        status: t.status,
+                        started_at: t.started_at,
+                        finished_at: t.finished_at,
+                        result_summary: t.result_summary.clone(),
+                        failure_reason: t.failure_reason.clone(),
+                        source_evidence_id: t.source_evidence_id,
+                        metadata: t.metadata.clone(),
+                    })
+                    .await
+                {
+                    Ok(_) => journal.created_tasks.push((t.namespace.clone(), t.id)),
+                    Err(e) => Self::tally_failure(&mut report.failed_tasks, &mut first_err, e),
+                }
+            }
+            Self::warn_restore_failures(
+                "tasks",
+                &backup.namespace,
+                report.failed_tasks,
+                &first_err,
+            );
+
+            // 恢复经验记忆
+            let mut first_err: Option<HubError> = None;
+            for exp in &experiences {
+                match store
+                    .save_experience(&NewMemoryExperience {
+                        id: Some(exp.id),
+                        namespace: exp.namespace.clone(),
+                        task: exp.task.clone(),
+                        search_keys: exp.search_keys.clone(),
+                        solution: exp.solution.clone(),
+                        preconditions: exp.preconditions.clone(),
+                        boundary_envs: exp.boundary_envs.clone(),
+                        failure_modes: exp.failure_modes.clone(),
+                        validation: exp.validation.clone(),
+                        confidence: exp.confidence,
+                        status: exp.status,
+                        feedback_score: exp.feedback_score,
+                    })
+                    .await
+                {
+                    Ok(_) => {
+                        journal
+                            .created_experiences
+                            .push((exp.namespace.clone(), exp.id));
+                        // save 只写内容与基础状态；版本号、验证元数据、来源计数与
+                        // 被替代指向由完整记录回写，避免恢复后版本历史与实体分叉
+                        if let Err(e) = store.update_experience(exp).await {
+                            Self::tally_failure(&mut report.failed_experiences, &mut first_err, e);
+                        }
+                    }
+                    Err(e) => {
+                        Self::tally_failure(&mut report.failed_experiences, &mut first_err, e)
+                    }
+                }
+            }
+            Self::warn_restore_failures(
+                "experiences",
+                &backup.namespace,
+                report.failed_experiences,
+                &first_err,
+            );
+
+            // 恢复经验版本历史（v5+；旧备份为空数组，不报错）
+            let mut first_err: Option<HubError> = None;
+            for v in &experience_versions {
+                if let Err(e) = store
+                    .append_experience_version(&NewExperienceVersion {
+                        id: Some(v.id),
+                        experience_id: v.experience_id,
+                        namespace: v.namespace.clone(),
+                        version: v.version,
+                        snapshot: v.snapshot.clone(),
+                        change_kind: v.change_kind,
+                        changed_by: v.changed_by.clone(),
+                        status: v.status,
+                        note: v.note.clone(),
+                        changed_at: v.changed_at,
+                    })
+                    .await
+                {
+                    Self::tally_failure(&mut report.failed_experience_versions, &mut first_err, e);
+                }
+            }
+            Self::warn_restore_failures(
+                "experience_versions",
+                &backup.namespace,
+                report.failed_experience_versions,
+                &first_err,
+            );
+
+            // 恢复任务-经验关联映射
+            let mut first_err: Option<HubError> = None;
+            for mut te in task_experiences {
+                if te.namespace.is_none() {
+                    let inferred = tasks
+                        .iter()
+                        .find(|t| t.id == te.task_id)
+                        .map(|t| t.namespace.clone())
+                        .or_else(|| {
+                            (backup.namespace != ALL_NAMESPACES).then(|| backup.namespace.clone())
+                        });
+                    te.namespace = inferred;
+                }
+                if let Err(e) = store.link_task_experience(&te).await {
+                    Self::tally_failure(&mut report.failed_task_links, &mut first_err, e);
+                }
+            }
+            Self::warn_restore_failures(
+                "task_experiences",
+                &backup.namespace,
+                report.failed_task_links,
+                &first_err,
+            );
+
+            // 恢复代码演进线程
+            let mut first_err: Option<HubError> = None;
+            for th in &coding_threads {
+                match store
+                    .create_thread(&NewCodingThread {
+                        id: Some(th.id),
+                        namespace: th.namespace.clone(),
+                        repository: th.repository.clone(),
+                        branch: th.branch.clone(),
+                        task_id: th.task_id,
+                        title: th.title.clone(),
+                        description: th.description.clone(),
+                    })
+                    .await
+                {
+                    Ok(_) => journal.created_threads.push((th.namespace.clone(), th.id)),
+                    Err(e) => Self::tally_failure(&mut report.failed_threads, &mut first_err, e),
+                }
+            }
+            Self::warn_restore_failures(
+                "coding_threads",
+                &backup.namespace,
+                report.failed_threads,
+                &first_err,
+            );
+
+            // 恢复代码修订记录
+            let mut first_err: Option<HubError> = None;
+            for rev in &coding_revisions {
+                match store
+                    .save_revision(
+                        &NewCodingRevision {
+                            id: Some(rev.id),
+                            thread_id: rev.thread_id,
+                            namespace: rev.namespace.clone(),
+                            repository: rev.repository.clone(),
+                            branch: rev.branch.clone(),
+                            commit_sha: rev.commit_sha.clone(),
+                            parent_sha: rev.parent_sha.clone(),
+                            file_path: rev.file_path.clone(),
+                            change_kind: rev.change_kind,
+                            diff_content: rev.diff_content.clone(),
+                            symbol_fingerprint: rev.symbol_fingerprint.clone(),
+                            is_committed: rev.is_committed,
+                            author: rev.author.clone(),
+                            occurred_at: Some(rev.occurred_at),
+                            source_evidence_id: rev.source_evidence_id,
+                            source_task_id: rev.source_task_id,
+                        },
+                        &rev.diff_hash,
+                    )
+                    .await
+                {
+                    Ok(_) => journal
+                        .created_revisions
+                        .push((rev.namespace.clone(), rev.id)),
+                    Err(e) => Self::tally_failure(&mut report.failed_revisions, &mut first_err, e),
+                }
+            }
+            Self::warn_restore_failures(
+                "coding_revisions",
+                &backup.namespace,
+                report.failed_revisions,
+                &first_err,
+            );
+
+            Ok(())
+        }
+        .await;
+
+        // 致命失败：按补偿账本回滚。单条实体失败只计数、不走到这里，
+        // 因此"部分恢复"的既有语义不变；只有会导致数据分叉的错误才整轮回滚。
+        if let Err(error) = outcome {
+            return match Self::compensate_merge(&store, &journal, &auth.agent_id, self.clock.now())
                 .await
             {
-                Self::tally_failure(&mut report.failed_evidences, &mut first_err, e);
-            }
-        }
-        Self::warn_restore_failures(
-            "evidences",
-            &backup.namespace,
-            report.failed_evidences,
-            &first_err,
-        );
-
-        for mut e in entries.clone() {
-            match store.get(&e.namespace, e.id).await {
-                Ok(cur) => {
-                    if cur == e {
-                        report.unchanged += 1;
-                        continue;
-                    }
-                    // 合并：保留快照内容，推进版本与时间戳
-                    e.version = cur.version + 1;
-                    e.updated_at = now;
-                    e.source_agent = auth.agent_id.clone();
-                    store
-                        .revise(&e, cur.version, VersionChange::Updated)
-                        .await?;
-                    report.updated += 1;
+                Ok(()) => {
+                    tracing::error!(
+                        error = %error,
+                        namespaces = ?namespaces,
+                        "恢复写入阶段失败，已按补偿账本回滚到操作前状态"
+                    );
+                    Err(HubError::Internal(anyhow::anyhow!(
+                        "恢复写入阶段失败，已按补偿账本回滚到操作前状态（受影响命名空间：{}）：{}",
+                        namespaces.join(", "),
+                        error
+                    )))
                 }
-                Err(_) => {
-                    // 新建：保留快照的 created_at，updated_at 置为恢复时刻
-                    e.updated_at = now;
-                    e.source_agent = auth.agent_id.clone();
-                    store.insert_initial(&e).await?;
-                    report.created += 1;
+                Err(rollback_error) => {
+                    tracing::error!(
+                        error = %error,
+                        rollback_error = %rollback_error,
+                        namespaces = ?namespaces,
+                        "恢复失败且补偿回滚失败（灾难恢复状态）"
+                    );
+                    Err(HubError::Internal(anyhow::anyhow!(
+                        "恢复失败且补偿回滚失败（灾难恢复状态）：请用本次操作前的安全备份手工恢复。\
+                         受影响命名空间：{}；原错误：{}；回滚错误：{}",
+                        namespaces.join(", "),
+                        error,
+                        rollback_error
+                    )))
                 }
-            }
-        }
-
-        // 恢复记忆版本历史（v6+；旧备份为空数组，不报错）
-        for version in &memory_versions {
-            if let Err(e) = store.record_version(version).await {
-                return Err(HubError::Internal(anyhow::anyhow!(
-                    "恢复记忆版本历史失败: {}",
-                    e
-                )));
-            }
-        }
-
-        // 恢复实体关系网
-        let mut first_err: Option<HubError> = None;
-        for rel in &relations {
-            let rel_ns = if let Some(ref ns) = rel.namespace {
-                ns.clone()
-            } else if backup.namespace != ALL_NAMESPACES {
-                backup.namespace.clone()
-            } else {
-                entries
-                    .iter()
-                    .find(|e| e.id == rel.from_memory_id)
-                    .map(|e| e.namespace.clone())
-                    .unwrap_or_else(|| backup.namespace.clone())
             };
-            if let Err(e) = store
-                .add_relation(
-                    &rel_ns,
-                    &NewMemoryRelation {
-                        from_memory_id: rel.from_memory_id,
-                        to_memory_id: rel.to_memory_id,
-                        relation_kind: rel.relation_kind,
-                        confidence: rel.confidence,
-                        source_evidence_id: rel.source_evidence_id,
-                    },
-                )
-                .await
-            {
-                Self::tally_failure(&mut report.failed_relations, &mut first_err, e);
-            }
         }
-        Self::warn_restore_failures(
-            "relations",
-            &backup.namespace,
-            report.failed_relations,
-            &first_err,
-        );
 
-        // 恢复任务事实
-        let mut first_err: Option<HubError> = None;
-        for t in &tasks {
-            if let Err(e) = store
-                .create_task(&NewMemoryTask {
-                    id: Some(t.id),
-                    namespace: t.namespace.clone(),
-                    scene: t.scene,
-                    task: t.task.clone(),
-                    status: t.status,
-                    started_at: t.started_at,
-                    finished_at: t.finished_at,
-                    result_summary: t.result_summary.clone(),
-                    failure_reason: t.failure_reason.clone(),
-                    source_evidence_id: t.source_evidence_id,
-                    metadata: t.metadata.clone(),
-                })
-                .await
-            {
-                Self::tally_failure(&mut report.failed_tasks, &mut first_err, e);
-            }
-        }
-        Self::warn_restore_failures("tasks", &backup.namespace, report.failed_tasks, &first_err);
-
-        // 恢复经验记忆
-        let mut first_err: Option<HubError> = None;
-        for exp in &experiences {
-            match store
-                .save_experience(&NewMemoryExperience {
-                    id: Some(exp.id),
-                    namespace: exp.namespace.clone(),
-                    task: exp.task.clone(),
-                    search_keys: exp.search_keys.clone(),
-                    solution: exp.solution.clone(),
-                    preconditions: exp.preconditions.clone(),
-                    boundary_envs: exp.boundary_envs.clone(),
-                    failure_modes: exp.failure_modes.clone(),
-                    validation: exp.validation.clone(),
-                    confidence: exp.confidence,
-                    status: exp.status,
-                    feedback_score: exp.feedback_score,
-                })
-                .await
-            {
-                Ok(_) => {
-                    // save 只写内容与基础状态；版本号、验证元数据、来源计数与
-                    // 被替代指向由完整记录回写，避免恢复后版本历史与实体分叉
-                    if let Err(e) = store.update_experience(exp).await {
-                        Self::tally_failure(&mut report.failed_experiences, &mut first_err, e);
-                    }
-                }
-                Err(e) => Self::tally_failure(&mut report.failed_experiences, &mut first_err, e),
-            }
-        }
-        Self::warn_restore_failures(
-            "experiences",
-            &backup.namespace,
-            report.failed_experiences,
-            &first_err,
-        );
-
-        // 恢复经验版本历史（v5+；旧备份为空数组，不报错）
-        let mut first_err: Option<HubError> = None;
-        for v in &experience_versions {
-            if let Err(e) = store
-                .append_experience_version(&NewExperienceVersion {
-                    id: Some(v.id),
-                    experience_id: v.experience_id,
-                    namespace: v.namespace.clone(),
-                    version: v.version,
-                    snapshot: v.snapshot.clone(),
-                    change_kind: v.change_kind,
-                    changed_by: v.changed_by.clone(),
-                    status: v.status,
-                    note: v.note.clone(),
-                    changed_at: v.changed_at,
-                })
-                .await
-            {
-                Self::tally_failure(&mut report.failed_experience_versions, &mut first_err, e);
-            }
-        }
-        Self::warn_restore_failures(
-            "experience_versions",
-            &backup.namespace,
-            report.failed_experience_versions,
-            &first_err,
-        );
-
-        // 恢复任务-经验关联映射
-        let mut first_err: Option<HubError> = None;
-        for mut te in task_experiences {
-            if te.namespace.is_none() {
-                let inferred = tasks
-                    .iter()
-                    .find(|t| t.id == te.task_id)
-                    .map(|t| t.namespace.clone())
-                    .or_else(|| {
-                        (backup.namespace != ALL_NAMESPACES).then(|| backup.namespace.clone())
-                    });
-                te.namespace = inferred;
-            }
-            if let Err(e) = store.link_task_experience(&te).await {
-                Self::tally_failure(&mut report.failed_task_links, &mut first_err, e);
-            }
-        }
-        Self::warn_restore_failures(
-            "task_experiences",
-            &backup.namespace,
-            report.failed_task_links,
-            &first_err,
-        );
-
-        // 恢复代码演进线程
-        let mut first_err: Option<HubError> = None;
-        for th in &coding_threads {
-            if let Err(e) = store
-                .create_thread(&NewCodingThread {
-                    id: Some(th.id),
-                    namespace: th.namespace.clone(),
-                    repository: th.repository.clone(),
-                    branch: th.branch.clone(),
-                    task_id: th.task_id,
-                    title: th.title.clone(),
-                    description: th.description.clone(),
-                })
-                .await
-            {
-                Self::tally_failure(&mut report.failed_threads, &mut first_err, e);
-            }
-        }
-        Self::warn_restore_failures(
-            "coding_threads",
-            &backup.namespace,
-            report.failed_threads,
-            &first_err,
-        );
-
-        // 恢复代码修订记录
-        let mut first_err: Option<HubError> = None;
-        for rev in &coding_revisions {
-            if let Err(e) = store
-                .save_revision(
-                    &NewCodingRevision {
-                        id: Some(rev.id),
-                        thread_id: rev.thread_id,
-                        namespace: rev.namespace.clone(),
-                        repository: rev.repository.clone(),
-                        branch: rev.branch.clone(),
-                        commit_sha: rev.commit_sha.clone(),
-                        parent_sha: rev.parent_sha.clone(),
-                        file_path: rev.file_path.clone(),
-                        change_kind: rev.change_kind,
-                        diff_content: rev.diff_content.clone(),
-                        symbol_fingerprint: rev.symbol_fingerprint.clone(),
-                        is_committed: rev.is_committed,
-                        author: rev.author.clone(),
-                        occurred_at: Some(rev.occurred_at),
-                        source_evidence_id: rev.source_evidence_id,
-                        source_task_id: rev.source_task_id,
-                    },
-                    &rev.diff_hash,
-                )
-                .await
-            {
-                Self::tally_failure(&mut report.failed_revisions, &mut first_err, e);
-            }
-        }
-        Self::warn_restore_failures(
-            "coding_revisions",
-            &backup.namespace,
-            report.failed_revisions,
-            &first_err,
-        );
-
+        report.partial = report.failed_evidences
+            + report.failed_relations
+            + report.failed_tasks
+            + report.failed_experiences
+            + report.failed_experience_versions
+            + report.failed_task_links
+            + report.failed_threads
+            + report.failed_revisions
+            > 0;
         Ok(report)
     }
 }

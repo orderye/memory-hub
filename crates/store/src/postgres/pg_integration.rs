@@ -950,3 +950,68 @@ async fn pg_vector_ann_halfvec_and_embeddings_by_ids() {
     }
     store.delete(other, cross.id).await.unwrap();
 }
+
+/// 迁移 015 的中断语义：建索引被锁等待打断时，事务整体回滚——
+/// 不留下半成品索引；解除阻塞后重试成功，且索引有效。
+///
+/// 用 `lock_timeout` 制造确定性中断（空表上 `statement_timeout` 可能根本来不及触发）。
+/// 运行时执行器的事务/账本语义（失败不记版本、下次启动重试）见
+/// `docs/pg-maintenance-runbook.md` §2.2。
+#[tokio::test]
+#[ignore = "需要 DATABASE_URL"]
+async fn pg_migration_015_interruption_leaves_no_partial_index_and_retries() {
+    let store = store().await;
+    let pool = store.pool();
+    const IDX: &str = "it_idx_015_retry";
+
+    let ddl = format!(
+        "create index {IDX} on memories \
+         using hnsw ((embedding::halfvec(1024)) halfvec_cosine_ops) \
+         where status in ('active', 'archived')"
+    );
+
+    sqlx::query(&format!("drop index if exists {IDX}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // 独立连接持有 ACCESS EXCLUSIVE 锁，让建索引必然等到 lock_timeout
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query("lock table memories in access exclusive mode")
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+
+    let mut attempt = pool.begin().await.unwrap();
+    sqlx::query("set local lock_timeout = '200ms'")
+        .execute(&mut *attempt)
+        .await
+        .unwrap();
+    let failed = sqlx::query(&ddl).execute(&mut *attempt).await;
+    assert!(failed.is_err(), "锁等待必须在 lock_timeout 后被取消");
+    assert!(attempt.rollback().await.is_ok());
+
+    blocker.rollback().await.unwrap();
+
+    let exists: Option<String> = sqlx::query_scalar("select to_regclass($1)::text")
+        .bind(IDX)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(exists.is_none(), "失败的事务不得留下半成品索引: {exists:?}");
+
+    // 解除阻塞后重试必须成功
+    sqlx::query(&ddl).execute(&pool).await.unwrap();
+    let valid: bool =
+        sqlx::query_scalar("select indisvalid from pg_index where indexrelid = $1::regclass")
+            .bind(IDX)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(valid, "重试建出的索引必须有效");
+
+    sqlx::query(&format!("drop index if exists {IDX}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+}

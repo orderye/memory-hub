@@ -3,7 +3,8 @@
 **阶段：** P1-A（Task 3）
 **核实时间：** 2026-10-29
 **基线 commit：** `d35f033`
-**结论：** 认知作业**未接入生产调度**；抽取器为 **Mock 占位实现**。二者均不得视为已启用能力。
+**结论：** 认知作业**未接入生产调度**；抽取器**生产默认不装配**（`HUB_COGNITIVE_EXTRACTOR=disabled`），
+仅开发时可用 Mock 占位实现。二者均不得视为已启用能力。
 
 ---
 
@@ -47,21 +48,32 @@
 | 幂等 | 服务层保证：同一会话重复输入不会重复入库（`test_duplicate_input_idempotency`）；经验提炼同一来源任务重复执行不产生重复经验 |
 | 事务边界 | 每次服务调用内部完成；无跨作业事务 |
 
-## 4. 抽取器真实性：**Mock**
+## 4. 抽取器真实性：**Mock，且生产默认不装配**
 
-`crates/bins/mcp-server/src/main.rs` 明确装配：
+原状：`crates/bins/mcp-server/src/main.rs` 无条件装配
 
 ```rust
 let chat_extractor = Arc::new(mem_core::testing::MockChatCognitiveExtractor::new());
 warn!("Chat 认知抽取器当前为 MockChatCognitiveExtractor（占位实现）...");
 ```
 
-- `MockChatCognitiveExtractor` **不会理解对话内容**，候选完全由调用方注入（`with_candidates`）。
-- 启动时已打印醒目告警，但告警不等于能力可用。
-- 已新增能力标记 `provides_semantic_extraction() -> false` 与契约测试
-  `mock_chat_extractor_declares_no_semantic_extraction`，供装配与健康检查区分占位与真实 LLM。
+**本轮修正（2026-10-29 后续）**：装配改为受 `HUB_COGNITIVE_EXTRACTOR` 控制，**默认 `disabled`**：
 
-**结论：Chat 认知流的产出不得被描述为"LLM 提炼结果"。**
+| 配置 | 行为 | 副作用 |
+|---|---|---|
+| `disabled`（默认） | 不构造 `ChatCognitiveService`；`cognitive_chat_propose` 返回 `E_METHOD_NOT_FOUND`（说明未配置抽取器）；`cognitive_intentions_list` 走只读存储分支 | **不写证据、不产出提案** |
+| `mock`（仅限开发） | 装配 `MockChatCognitiveExtractor` | 会写证据与认知提案（Manual 模式下只入待审队列） |
+
+- `MockChatCognitiveExtractor` **不会理解对话内容**，候选完全由调用方注入（`with_candidates`）。
+- 能力标记 `provides_semantic_extraction() -> false` 与契约测试
+  `mock_chat_extractor_declares_no_semantic_extraction` 继续保留，供装配与健康检查区分占位与真实 LLM。
+- 契约测试 `test_cognitive_chat_propose_is_disabled_without_extractor` 锁定默认行为：
+  工具返回 `E_METHOD_NOT_FOUND` 且不产生任何正式记忆。
+
+**结论：Chat 认知流的产出不得被描述为"LLM 提炼结果"；默认部署下该入口不可用。**
+
+> 为什么不是"只靠 mock 返回空列表"：那是实现细节，改一行 mock 就会让占位产物进入正式数据。
+> 关闭装配是部署契约层面的保证。
 
 ## 5. Lite / Production 差异
 
@@ -105,6 +117,10 @@ warn!("Chat 认知抽取器当前为 MockChatCognitiveExtractor（占位实现�
 |---|---|
 | `crates/worker/src/embedded.rs` | 新增契约测试 `embedded_jobs_do_not_schedule_cognitive_jobs` |
 | `crates/mem-core/src/testing.rs` | `MockChatCognitiveExtractor::provides_semantic_extraction() -> false`；新增契约测试；补充"占位实现"文档注释 |
+| `crates/common/src/cognitive.rs` | 新增 `CognitiveExtractorMode`（`disabled` 默认 / `mock`），未知值启动失败 |
+| `crates/common/src/config.rs` | 新增 `HUB_COGNITIVE_EXTRACTOR` 读取与校验 |
+| `crates/bins/mcp-server/src/main.rs` | 默认不构造 `ChatCognitiveService`；`mock` 时才装配并要求显式配置 |
+| `crates/mcp/src/tools/tests.rs` | `test_cognitive_chat_propose_is_disabled_without_extractor` |
 
 <!-- kimi-badge -->
 [![powered by KimiCode](../../.github/assets/kimi-badge.svg)](https://www.kimi.com/code)

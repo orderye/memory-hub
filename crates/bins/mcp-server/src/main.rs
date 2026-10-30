@@ -194,51 +194,65 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(WorkingMemoryService::new(store.clone()).with_access(access.clone()));
     let coding_memory =
         Arc::new(CodingMemoryService::new(store.clone()).with_access(access.clone()));
-    // 生产环境必须接入真实抽取器（LLM）；MockChatCognitiveExtractor 只是占位，
-    // 它不会理解对话内容，Chat 认知流的候选完全依赖调用方注入
-    let chat_extractor = Arc::new(mem_core::testing::MockChatCognitiveExtractor::new());
-    warn!(
-        "Chat 认知抽取器当前为 MockChatCognitiveExtractor（占位实现）：未接入真实 LLM 抽取器，\
-         自动入库候选完全依赖调用方注入；本轮不引入生成式 LLM 依赖"
-    );
-    let chat_cognitive = Arc::new(
-        ChatCognitiveService::new(
-            store.clone(),
-            chat_extractor,
-            CognitivePolicy {
-                mode: CognitiveGovernanceMode::Manual,
-                evidence_retention_days: cfg.evidence_retention_days,
-                ..Default::default()
-            },
-        )
-        .with_access(access.clone()),
-    );
+    // 认知抽取器默认**不装配**：真实 LLM 抽取器尚未接入，占位实现只会产出
+    // "看起来像认知记忆"的证据/提案。需要开发联调时显式设 HUB_COGNITIVE_EXTRACTOR=mock。
+    let cognitive_extractor_mode = common::CognitiveExtractorMode::parse(&cfg.cognitive_extractor)
+        .map_err(|e| anyhow::anyhow!("HUB_COGNITIVE_EXTRACTOR 非法: {}", e))?;
+    let chat_cognitive: Option<Arc<ChatCognitiveService>> = match cognitive_extractor_mode {
+        common::CognitiveExtractorMode::Disabled => {
+            info!(
+                mode = cognitive_extractor_mode.as_str(),
+                "认知抽取器未启用：cognitive_chat_propose 将返回 E_METHOD_NOT_FOUND，不写证据/提案"
+            );
+            None
+        }
+        common::CognitiveExtractorMode::Mock => {
+            warn!(
+                mode = cognitive_extractor_mode.as_str(),
+                "认知抽取器使用 MockChatCognitiveExtractor（占位实现，仅限开发）：\
+                 它会写入证据与认知提案，但不理解对话内容"
+            );
+            Some(Arc::new(
+                ChatCognitiveService::new(
+                    store.clone(),
+                    Arc::new(mem_core::testing::MockChatCognitiveExtractor::new()),
+                    CognitivePolicy {
+                        mode: CognitiveGovernanceMode::Manual,
+                        evidence_retention_days: cfg.evidence_retention_days,
+                        ..Default::default()
+                    },
+                )
+                .with_access(access.clone()),
+            ))
+        }
+    };
 
-    let dispatcher = Arc::new(
-        ToolDispatcher::new(
-            memory_service,
-            backup_service,
-            integration_service,
-            store.clone(),
-        )
-        .with_consolidation(mcp::ConsolidationParams {
-            sim_threshold: cfg.integrate_sim_threshold,
-            max_proposals: cfg.integrate_max_proposals,
-            mode: consolidation_mode,
-            fallback: consolidation_fallback,
-            allow_mode_override: cfg.consolidation_allow_mode_override,
-            embed_top_k: cfg.consolidation_embed_top_k,
-            embed_min_similarity: cfg.consolidation_embed_min_similarity,
-            lexical_min_similarity: cfg.consolidation_lexical_min_similarity,
-            scan_max_entries: cfg.integration_scan_max_entries,
-            stats_ttl_s: cfg.consolidation_stats_ttl_s,
-        })
-        .with_embedder(embedder.clone())
-        .with_working_memory(working_memory)
-        .with_coding_memory(coding_memory)
-        .with_chat_cognitive(chat_cognitive)
-        .with_experience_governance(cfg.experience_verify_min_sources),
-    );
+    let mut dispatcher = ToolDispatcher::new(
+        memory_service,
+        backup_service,
+        integration_service,
+        store.clone(),
+    )
+    .with_consolidation(mcp::ConsolidationParams {
+        sim_threshold: cfg.integrate_sim_threshold,
+        max_proposals: cfg.integrate_max_proposals,
+        mode: consolidation_mode,
+        fallback: consolidation_fallback,
+        allow_mode_override: cfg.consolidation_allow_mode_override,
+        embed_top_k: cfg.consolidation_embed_top_k,
+        embed_min_similarity: cfg.consolidation_embed_min_similarity,
+        lexical_min_similarity: cfg.consolidation_lexical_min_similarity,
+        scan_max_entries: cfg.integration_scan_max_entries,
+        stats_ttl_s: cfg.consolidation_stats_ttl_s,
+    })
+    .with_embedder(embedder.clone())
+    .with_working_memory(working_memory)
+    .with_coding_memory(coding_memory)
+    .with_experience_governance(cfg.experience_verify_min_sources);
+    if let Some(service) = chat_cognitive {
+        dispatcher = dispatcher.with_chat_cognitive(service);
+    }
+    let dispatcher = Arc::new(dispatcher);
 
     // ===== 鉴权 =====
     let introspector: Arc<dyn TokenIntrospector> = Arc::new(BearerIntrospector::new(

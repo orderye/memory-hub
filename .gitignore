@@ -1,10 +1,56 @@
+# ==============================================================================
+# 本地数据边界：仓库只收源码 / 文档 / 迁移 / 测试夹具；
+# 测试产物、运行数据、云服务与部署状态一律留在本机，不进入 GitHub / CNB。
+# ==============================================================================
+
+# ---------- Rust 构建产物 ----------
 /target
+# 本地 .cargo/config.toml 含本机绝对路径（target-dir 指向外置盘），不入库
+/.cargo/
 **/*.rs.bk
 Cargo.lock.bk
-*.onnx
+
+# ---------- 前端（landing page 整体留在本地，源码也不入库） ----------
+/web/
+node_modules/
+*.tsbuildinfo
+
+# ---------- 本地数据 / 测试产物 ----------
+/data/
+/local-data/
+/backups/
+/pgdata/
+coverage/
+*.dump
+*.sql.gz
+*.sqlite
+*.sqlite3
+*.db
+*.log
+*.profraw
+*.profdata
+
+# 注意：迁移 SQL 必须入库（crates/store/migrations），因此不忽略 *.sql
+
+# ---------- 云服务 / 部署状态 / 凭据 ----------
+.cloudbase/
+.cnb-worktree/
+*.env
+current_release.env
+previous_release.env
+*.pem
+*.key
+
+# ---------- 环境变量（示例文件除外） ----------
 .env
 .env.*
 !.env.example
+
+# ---------- 模型 / 大文件 ----------
+*.onnx
+*.gguf
+
+# ---------- 系统 / 编辑器 ----------
 .DS_Store
 **/.DS_Store
 Thumbs.db

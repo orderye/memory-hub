@@ -1,5 +1,16 @@
 # Memory Hub 仓库审计报告 (REPOSITORY_AUDIT)
 
+> **历史快照（Historical）**
+>
+> - 适用基线：`main` @ 2026-10-18（本文件写作时的仓库状态）
+> - 审阅日期：2026-10-18
+> - 状态：**只读审计快照，结论已被后续实现取代**。保留原文作为证据，不要据此修改代码。
+> - 已被取代的结论：
+>   - 「18 个 MCP 工具」→ 当前为 **38 个**（18 基础 + 15 认知 + 5 集合），见根目录 README「MCP 工具清单」与 `crates/mcp/src/schema.rs` 的工具数断言。
+>   - 「备份恢复靠 replace 前的安全备份人工回滚」→ 当前 replace 走**单事务原子替换**，merge 致命失败有**补偿回滚**，见 [`../backup-restore.md`](../backup-restore.md)。
+>   - 「备份负载最高 v5」→ 当前为 **v6**（纳入记忆版本历史），恢复端兼容 v1–v6。
+> - 当前有效文档：[`README.md`](../../README.md) · [`../backup-restore.md`](../backup-restore.md) · [`../pg-maintenance-runbook.md`](../pg-maintenance-runbook.md) · [`RELIABILITY_BASELINE_2026-10-29.md`](./RELIABILITY_BASELINE_2026-10-29.md)
+
 **审计日期：** 2026-10-18  
 **执行角色：** Antigravity Agent  
 **审计阶段：** Audit-only (第 1 阶段，严格只读与基线盘点，不修改任何业务代码)  

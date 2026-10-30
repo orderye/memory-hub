@@ -101,7 +101,7 @@ CREATE TABLE IF NOT EXISTS coding_revisions (
 
 ## 4. 备份与恢复 (v6 协议)
 
-- **备份负载版本升级**：`BACKUP_PAYLOAD_VERSION` 升级至 `4`；
+- **备份负载版本**：`BACKUP_PAYLOAD_VERSION = 6`（v5 → v6 新增 `memory_versions` 记忆版本历史）；
 - **全量快照包含内容**：
   - `entries`: 事实、规则与意图条目；
   - `evidences`: 证据存根；

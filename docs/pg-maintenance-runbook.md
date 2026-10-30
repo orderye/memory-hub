@@ -1,6 +1,9 @@
 # PostgreSQL / pgvector 维护 runbook
 
-适用部署：2C/2GB 小内存 VPS（本仓生产形态），`pgvector/pgvector:pg15`（生产实测 pgvector 0.8.7）。
+适用部署：**2C/1GB** 小内存 VPS（本仓 2026-10-30 起的测试与部署基线；原 2C/2GB 实例已注销），
+`pgvector/pgvector:pg15`（生产实测 pgvector 0.8.7）。
+本文的耗时/锁数字来自 2026-10-30 的实测演练，见
+[`upgrade/MIGRATION_015_DRILL_2026-10-30.md`](upgrade/MIGRATION_015_DRILL_2026-10-30.md)。
 迁移 015（2026-10-27）起向量索引为 **halfvec 半精度 + 部分索引**：
 
 ```sql
@@ -26,7 +29,31 @@ idx_memories_embedding_hf
 ## 2. 索引重建（维护窗口）
 
 迁移执行器内的事务不能用 `CONCURRENTLY`，大表上重建索引必须手动做
-（应用侧不停写也可安全执行）：
+（应用侧不停写也可安全执行）。
+
+**前置检查：`/dev/shm` 必须不小于 `maintenance_work_mem`。**
+并行建索引通过共享内存传递状态，不够会直接失败。实测报错：
+
+```
+ERROR: could not resize shared memory segment … to 533761856 bytes: No space left on device
+```
+
+当时 `/dev/shm` 351 MB、需要 533 MB。Docker 默认 `/dev/shm` 常为 64 MB，容器部署尤其要检查：
+
+```bash
+df -h /dev/shm
+mount -o remount,size=1G /dev/shm      # 或给容器加 --shm-size=1g
+```
+
+**两条路径的实测对照**（50k 行 × 1024 维，2C/1G，PG 15.19 + pgvector 0.8.7，单次运行）：
+
+| 路径 | 耗时 | 写请求 |
+|---|---|---|
+| 迁移路径（事务内非 `CONCURRENTLY`，256 MB） | **432 s** | **构建期间写全部阻塞**（5 s 超时） |
+| 维护窗口路径（`CONCURRENTLY`，512 MB） | **3236 s（7.5×）** | p50 2.7 ms、p95 154 ms、超时 1.1% |
+
+所以：**大表不要指望"启动即迁移"**。`CONCURRENTLY` 慢一个量级，但写不中断。
+201k 行时非并发构建 60 分钟只到 52%，按 ~29 元组/秒外推 1M 约 9–10 小时写阻塞（外推，非实测）。
 
 ```sql
 -- 提升构建吞吐（会话级，一次性）
@@ -46,6 +73,74 @@ create index concurrently idx_memories_embedding_hf
 
 注意：`embedding` 列维度（1024）与 `HUB_EMBED_DIM` 绑定；换模型必须同步迁移、
 配置与 `similar()` 的 halfvec typmod。
+
+### 2.1 顺序与锁：先建后删
+
+上面的示例刻意写成 **先 `create index concurrently` 新索引，再 `drop index concurrently` 旧索引**。
+反过来（先删后建）会让线上查询在一段时间里完全没有向量索引。迁移 015 内部顺序是
+"先建新索引、再删旧索引"，但它用的是普通 `create index`（事务内、持 `ACCESS EXCLUSIVE` 锁），
+只适合空表/小表；大表必须走本节的 concurrent 路径。
+
+维护窗口建议操作序列：
+
+```sql
+-- 0) 观察有没有阻塞中的 DDL
+select pid, state, wait_event_type, left(query, 80)
+from pg_stat_activity where state <> 'idle' order by query_start;
+
+-- 1) 建新索引（不阻塞读写）
+create index concurrently idx_memories_embedding_hf_new
+  on memories using hnsw ((embedding::halfvec(1024)) halfvec_cosine_ops)
+  where status in ('active', 'archived');
+
+-- 2) 有效性检查（must be true / true）
+select c.relname, i.indisvalid, i.indisready
+from pg_index i join pg_class c on c.oid = i.indexrelid
+where c.relname = 'idx_memories_embedding_hf_new';
+
+-- 3) 换名 + 删旧（三步都在同一维护窗口内）
+alter index idx_memories_embedding_hf rename to idx_memories_embedding_hf_old;
+alter index idx_memories_embedding_hf_new rename to idx_memories_embedding_hf;
+drop index concurrently idx_memories_embedding_hf_old;
+
+-- 4) 计划验证（应出现 Index Scan using idx_memories_embedding_hf）
+explain (analyze, buffers)
+select id from memories
+where namespace = 'ns' and status = 'active' and embedding is not null
+order by embedding::halfvec(1024) <=> '[0.1, ...]'::halfvec(1024) limit 20;
+```
+
+### 2.2 失败与重试
+
+- 启动迁移执行器（`crates/store/src/postgres/mod.rs::run_migrations`）每个迁移一个事务：
+  `set local statement_timeout = 0` → `pg_advisory_xact_lock` → 账本检查 → 执行 → 记账 → commit。
+- 迁移 015 中途失败（锁等待被取消、磁盘满、语句被杀）时整条事务回滚：**索引不会留下半成品，
+  `_hub_migrations` 也不会记录该版本**，下次启动自动重试。
+- 手工执行 concurrent 建索引失败时，PostgreSQL 会留下一个 `indisvalid = false` 的索引对象；
+  必须先 `drop index concurrently <name>` 再重试，不能直接重跑 `create index`（会因同名已存在而跳过）。
+- CI 里另有一条"逐文件 `psql -f`"的路径（`.github/workflows/ci.yml`），它每个文件是隐式事务，
+  与运行时语义接近但不完全等同；两者都要能跑通。
+
+### 2.3 旧版本回滚后的性能影响（重要）
+
+迁移 015 只重建索引、不改表结构，回滚应用版本**能启动**，但旧二进制的查询是 fp32 形式
+`embedding <=> $1`，与 halfvec 表达式索引 `((embedding::halfvec(1024)) ...)` 不匹配，
+规划器不会用该索引，向量检索退化为 **Seq Scan + Sort**。
+
+- 数据量小时无感；数据上万后延迟会随表线性增长。**50k 行实测**：
+  旧形态 p50 **498 ms** / p95 509 ms（`Seq Scan on memories`），
+  新形态 p50 **21 ms** / p95 316 ms（`Index Scan using idx_memories_embedding_hf`）；
+  按线性外推 1M 行时旧形态约 **10 秒/查询**；
+- 需要回滚到 015 之前的二进制时，请在维护窗口**临时重建 fp32 索引**：
+
+```sql
+create index concurrently idx_memories_embedding
+  on memories using hnsw (embedding vector_cosine_ops);
+```
+
+- 回滚窗口结束后再 `drop index concurrently idx_memories_embedding`（新版本用不到它，留着是双份写放大）。
+
+> 结论：**"旧版能启动"不等于"性能兼容"**。生产回滚演练请同时验证查询计划，而不只看服务是否起来。
 
 ## 3. 观测
 
@@ -82,3 +177,6 @@ limit 20;
   或调小 `gin_pending_list_limit`。
 - HNSW / GIN 都随行更新累积膨胀：长期运行后用 `pg_repack` 或维护窗口
   `reindex concurrently` 回收，平时以第 3 节的索引大小曲线判断时机。
+
+<!-- kimi-badge -->
+[![powered by KimiCode](../.github/assets/kimi-badge.svg)](https://www.kimi.com/code)

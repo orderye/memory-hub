@@ -163,7 +163,7 @@ cargo test --workspace
 1. **提炼状态**：`working_experience_distill` 返回 `candidate`，不再直接 `active`。需要“立即可用”的调用方应显式调用 `working_experience_transition(action="verify")`。
 2. **反馈工具**：`working_experience_feedback` 不再接受 `status`；传了会收到 `InvalidArgument`，提示改用 `transition`。
 3. **认知服务 ACL**：Working/Coding/Chat 的读写现在要求命名空间 grant，与 `memory_*` 工具口径一致。
-4. **备份格式**：新备份为 v5；新代码可恢复 v1–v5，**旧代码不能恢复 v5**（见 §6.2）。
+4. **备份格式**：新备份为 v6（v5 之后纳入记忆版本历史）；新代码可恢复 v1–v6，**旧代码不能恢复 v6**（见 §6.2）。
 5. **工具数量**：28 → 38，全部为新增；`memory_search` / `working_experience_search` 的 `namespace` 改为可选（与 `collection` 二选一），旧调用不受影响。
 
 ---

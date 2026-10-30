@@ -1,5 +1,16 @@
 # 治理升级源码审计（P0 基线）
 
+> **历史快照（Historical）**
+>
+> - 适用基线：`main` @ `92a809d`（本文件写作时的仓库状态）
+> - 审阅日期：2026-10 治理升级起始阶段
+> - 状态：**只读审计快照**。保留原文作为证据，不要据此修改代码。
+> - 已被取代的结论：
+>   - 「18 个基础工具」是**原始工具合同**的规模；当前工具总数为 **38 个**（18 基础 + 15 认知 + 5 集合）。
+>   - 「restore 无事务、靠人工回滚」→ 当前 replace 为单事务原子替换、merge 有补偿回滚。
+>   - 「备份负载 v5」→ 当前为 **v6**（纳入记忆版本历史）。
+> - 当前有效文档：[`README.md`](../../README.md) · [`../backup-restore.md`](../backup-restore.md) · [`../pg-maintenance-runbook.md`](../pg-maintenance-runbook.md) · [`RELIABILITY_BASELINE_2026-10-29.md`](./RELIABILITY_BASELINE_2026-10-29.md)
+
 [![powered by KimiCode](../../.github/assets/kimi-badge.svg)](https://www.kimi.com/code)
 
 > 审计对象：`toroyxxx/memory-hub`，`main` @ `92a809d`（工作区干净）。

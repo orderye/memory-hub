@@ -318,6 +318,14 @@ pub struct TestHubStore {
     pub fail_add_relation: std::sync::atomic::AtomicBool,
     /// 错误注入：置位后 revise 一律失败（测试 supersedes 封堵失败不拖垮主流程）
     pub fail_revise: std::sync::atomic::AtomicBool,
+    /// 错误注入：置位后 `get` 返回内部错误（不是 NotFound）。
+    /// 用来证明恢复流程不会把"读失败"误判成"库里没有、应当新建"。
+    pub fail_get: std::sync::atomic::AtomicBool,
+    /// 错误注入：置位后 `record_version` 失败（恢复中途致命失败的注入点）
+    pub fail_record_version: std::sync::atomic::AtomicBool,
+    /// 错误注入：`insert_initial` 成功 N 次后失败（`None` = 不注入）。
+    /// 用来证明"已经写进去的条目会被补偿删除"，而不是只验证第一次就失败的路径。
+    pub fail_insert_initial_after: std::sync::Mutex<Option<usize>>,
     /// 原子替换接口被调用的次数（验证 Replace 走批量事务而非逐步提交）
     pub replace_calls: std::sync::atomic::AtomicUsize,
     /// 审计记录：(actor, action, target, detail)
@@ -373,6 +381,18 @@ impl MemoryStore for TestHubStore {
     }
 
     async fn insert_initial(&self, entry: &MemoryEntry) -> Result<MemoryEntry> {
+        {
+            let mut budget = self.fail_insert_initial_after.lock().unwrap();
+            match *budget {
+                None => {}
+                Some(0) => {
+                    return Err(HubError::Internal(anyhow::anyhow!(
+                        "injected insert_initial failure"
+                    )))
+                }
+                Some(n) => *budget = Some(n - 1),
+            }
+        }
         self.items
             .write()
             .unwrap()
@@ -397,6 +417,9 @@ impl MemoryStore for TestHubStore {
     }
 
     async fn get(&self, ns: &str, id: Uuid) -> Result<MemoryEntry> {
+        if self.fail_get.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(HubError::Internal(anyhow::anyhow!("injected get failure")));
+        }
         self.items
             .read()
             .unwrap()
@@ -614,6 +637,14 @@ impl MemoryStore for TestHubStore {
     }
 
     async fn record_version(&self, v: &MemoryVersion) -> Result<()> {
+        if self
+            .fail_record_version
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(HubError::Internal(anyhow::anyhow!(
+                "injected record_version failure"
+            )));
+        }
         self.versions.write().unwrap().push(v.clone());
         Ok(())
     }

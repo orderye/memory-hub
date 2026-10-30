@@ -150,3 +150,16 @@ jobs:
           for b in mcp-server auth-server backup-worker; do
             test -x "target/release/$b" && echo "OK: $b"
           done
+
+      # 运行态观察/演练机（2C/1G）没有 docker 也没有足够内存编译 release，
+      # 直接取这里产出的二进制，避免在小机器上硬编。
+      - name: 上传二进制产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: memory-hub-binaries-${{ github.sha }}
+          path: |
+            target/release/mcp-server
+            target/release/auth-server
+            target/release/backup-worker
+          retention-days: 7
+          if-no-files-found: error

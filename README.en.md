@@ -583,8 +583,12 @@ Details in [`docs/upgrade/CONSOLIDATION_AB.md`](docs/upgrade/CONSOLIDATION_AB.md
 ### Backup and restore
 
 - **Read-only snapshots**: a single namespace or an entire account (`*`) can be snapshotted, with a SHA-256 checksum; once written, a snapshot is immutable;
-- **Three restore postures**: `dry_run` previews the result; `merge` merges incrementally (recommended); `replace` replaces wholesale — and **a safety backup of the current data is forced before replacing**, so a mistaken command cannot empty the database;
-- **The checksum is verified before restoring**; a mismatch refuses the restore outright.
+- **Three restore postures**: `dry_run` previews the result (it also validates the target scope and write permissions, with zero writes); `merge` merges incrementally (recommended); `replace` replaces wholesale;
+- **`replace` is atomic**: a safety backup is forced for every affected namespace first (any failure aborts before a single row is deleted), and clearing plus rebuilding happens inside **one store transaction** — a mid-way failure rolls back;
+- **A fatal `merge` failure rolls back automatically**: the compensation ledger deletes what this run created and revises updated entries back to their pre-image; individual secondary-entity failures are only counted (`partial=true`) — use `replace` when you need strict consistency;
+- **Checksum and payload version are verified before restoring** (v1–v6 supported); a mismatch refuses the restore outright.
+
+See [`docs/backup-restore.md`](docs/backup-restore.md) for the real boundaries of automatic rollback and the remaining risks.
 
 ---
 
@@ -785,15 +789,20 @@ This section exists so nobody steps on a landmine, not to brag:
    so configuring a real embedding service does not automatically turn on vector consolidation; the semantic gain of mode A has to be
    validated with a real model and `cargo test --test consolidation_eval`, see
    [`docs/upgrade/CONSOLIDATION_AB.md`](docs/upgrade/CONSOLIDATION_AB.md).
-7. **Cognitive async jobs are not wired yet**: `ChatCognitiveJob` (session distillation retries) and `ExperienceDistillJob` (experience distillation)
-   exist and are tested, but **no binary schedules them** — a real LLM extractor is not integrated yet, and wiring them now
-   would only produce placeholder data from the mock extractor.
-8. **Scheduled and manual backups share the v5 payload**: the periodic `backup-worker` snapshot and `memory_backup_create`
-   use the same format (entries, evidence, relations, tasks, experiences, **experience version history**, coding threads).
-   Restore accepts v1–v5, but **an older binary cannot restore a v5 backup** — keep the new binary around before downgrading,
-   or finish the restore first.
-9. **Multiple replicas only get "no duplicate execution"** (via `HUB_JOB_LEASE_H`); resumable progress inside a single
-   replica is not provided — bound big namespaces with `HUB_INTEGRATION_SCAN_MAX_ENTRIES`.
+7. **Cognitive async jobs are not wired yet, and the extractor is off by default**: `ChatCognitiveJob` (session distillation retries) and `ExperienceDistillJob` (experience distillation)
+   exist and are tested, but **no binary schedules them** — a real LLM extractor is not integrated yet. Production defaults to
+   `HUB_COGNITIVE_EXTRACTOR=disabled`: `cognitive_chat_propose` returns `E_METHOD_NOT_FOUND` and writes no evidence or proposals.
+   Setting `mock` (development only) is the sole way to mount the placeholder extractor.
+   See [`docs/upgrade/COGNITIVE_SCHEDULING_AUDIT.md`](docs/upgrade/COGNITIVE_SCHEDULING_AUDIT.md).
+8. **Scheduled and manual backups share the v6 payload**: the periodic `backup-worker` snapshot and `memory_backup_create`
+   use the same format (entries, **memory version history**, evidence, relations, tasks, experiences, experience version history,
+   coding threads, coding revisions). Restore accepts v1–v6, but **an older binary cannot restore a v6 backup** — keep the new
+   binary around before downgrading, or finish the restore first.
+9. **Multiple replicas only get "no duplicate execution"** (via `HUB_JOB_LEASE_H`, 24 h window by default); resumable
+   progress inside a single replica is not provided — bound big namespaces with `HUB_INTEGRATION_SCAN_MAX_ENTRIES`.
+   ⚠️ **Restarting an instance inside the lease window skips the first scheduled backup** (the lease key is still held by
+   the previous incarnation; the log says "another replica"). For single-replica deployments that want every cron fire,
+   set `HUB_JOB_LEASE_H=0`. See [`docs/upgrade/RUNTIME_OBSERVATION_2026-10-30.md`](docs/upgrade/RUNTIME_OBSERVATION_2026-10-30.md).
 10. **Migration 015's index rebuild suits empty / small tables**: the `create index` (non-`CONCURRENTLY`) runs inside the
     startup migration transaction; for large tables, rebuild manually in a maintenance window per
     [`docs/pg-maintenance-runbook.md`](docs/pg-maintenance-runbook.md).

@@ -1702,6 +1702,12 @@ pub struct RestoreReport {
     pub failed_threads: usize,
     #[serde(default)]
     pub failed_revisions: usize,
+    /// 本次恢复是否留下了被跳过的次要实体失败（`failed_*` 任一非零）。
+    ///
+    /// 只描述"写入了但不完整"。整轮被回滚的情况不会返回报告，而是返回错误：
+    /// 错误信息里明确写"已按补偿账本回滚到操作前状态"，审计记录同样落这条结论。
+    #[serde(default)]
+    pub partial: bool,
 }
 
 // ===== 整合 =====
