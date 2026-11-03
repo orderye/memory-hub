@@ -11,6 +11,7 @@
 [![MCP](https://img.shields.io/badge/MCP-38%20tools-purple.svg)](https://modelcontextprotocol.io/)
 [![Storage](https://img.shields.io/badge/storage-PostgreSQL%2015%20%2B%20pgvector%20%7C%20in--memory-blue.svg)](https://www.postgresql.org/)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
+[![M8ven Score](https://m8ven.ai/badge/mcp/orderye/memory-hub)](https://m8ven.ai/mcp/orderye/memory-hub?s=readme)
 
 [![powered by KimiCode](.github/assets/kimi-badge.svg)](https://www.kimi.com/code) [![powered by dsh](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)
 
