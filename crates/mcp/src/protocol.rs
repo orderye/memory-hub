@@ -79,9 +79,10 @@ pub fn handle_tools_list() -> Value {
                 "description": d.description,
                 "inputSchema": d.input_schema,
                 "annotations": {
-                    "readOnly": d.read_only,
-                    "destructive": d.destructive,
-                    "idempotent": d.idempotent,
+                    "readOnlyHint": d.read_only,
+                    "destructiveHint": d.destructive,
+                    "idempotentHint": d.idempotent,
+                    "openWorldHint": d.open_world,
                 }
             })
         })
@@ -126,13 +127,20 @@ mod tests {
     fn test_all_tools_carry_annotations() {
         let tools = handle_tools_list();
         for t in tools["tools"].as_array().unwrap() {
-            assert!(
-                t["annotations"]["readOnly"].is_boolean(),
-                "工具 {} 缺少 readOnly 标注",
-                t["name"]
-            );
-            assert!(t["annotations"]["destructive"].is_boolean());
-            assert!(t["annotations"]["idempotent"].is_boolean());
+            // 四个 hint 必须齐备且为布尔：严格校验的目录（如 OpenAI）
+            // 会拒掉任何一个缺失或非布尔值的工具。
+            for key in [
+                "readOnlyHint",
+                "destructiveHint",
+                "idempotentHint",
+                "openWorldHint",
+            ] {
+                assert!(
+                    t["annotations"][key].is_boolean(),
+                    "工具 {} 缺少 {key} 标注",
+                    t["name"]
+                );
+            }
             assert!(t["description"].as_str().is_some_and(|d| !d.is_empty()));
         }
     }

@@ -24,6 +24,9 @@ pub struct ToolDefinition {
     pub read_only: bool,
     pub destructive: bool,
     pub idempotent: bool,
+    /// 工具是否会与外部世界交互（网络调用、第三方系统等）。
+    /// 本服务所有工具均只操作内部存储，因此一律为 false。
+    pub open_world: bool,
     /// 声明的作用域：memory:read | memory:write | memory:admin
     pub required_scope: &'static str,
     pub input_schema: Value,
@@ -115,6 +118,7 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
             read_only: false,
             destructive: false,
             idempotent: true,
+            open_world: false,
             required_scope: "memory:write",
             input_schema: json!({
                 "type": "object",
@@ -165,6 +169,7 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
             read_only: true,
             destructive: false,
             idempotent: true,
+            open_world: false,
             required_scope: "memory:read",
             input_schema: json!({
                 "type": "object",
@@ -191,6 +196,7 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
             read_only: false,
             destructive: false,
             idempotent: true,
+            open_world: false,
             required_scope: "memory:write",
             input_schema: json!({
                 "type": "object",
@@ -222,6 +228,7 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
             read_only: false,
             destructive: true,
             idempotent: true,
+            open_world: false,
             required_scope: "memory:write",
             input_schema: json!({
                 "type": "object",
@@ -239,6 +246,7 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
             read_only: true,
             destructive: false,
             idempotent: true,
+            open_world: false,
             required_scope: "memory:read",
             input_schema: json!({
                 "type": "object",
@@ -313,6 +321,7 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
             read_only: true,
             destructive: false,
             idempotent: true,
+            open_world: false,
             required_scope: "memory:read",
             input_schema: json!({
                 "type": "object",
@@ -365,6 +374,7 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
             read_only: true,
             destructive: false,
             idempotent: true,
+            open_world: false,
             required_scope: "memory:read",
             input_schema: json!({
                 "type": "object",
@@ -381,6 +391,7 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
             read_only: true,
             destructive: false,
             idempotent: true,
+            open_world: false,
             required_scope: "memory:read",
             input_schema: json!({
                 "type": "object",
@@ -399,6 +410,7 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
             read_only: false,
             destructive: false,
             idempotent: true,
+            open_world: false,
             required_scope: "memory:admin",
             input_schema: json!({
                 "type": "object",
@@ -426,6 +438,7 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
             read_only: true,
             destructive: false,
             idempotent: true,
+            open_world: false,
             required_scope: "memory:admin",
             input_schema: json!({
                 "type": "object",
@@ -445,6 +458,7 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
             read_only: false,
             destructive: true,
             idempotent: false,
+            open_world: false,
             required_scope: "memory:admin",
             input_schema: json!({
                 "type": "object",
@@ -466,6 +480,7 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
             read_only: false,
             destructive: false,
             idempotent: true,
+            open_world: false,
             required_scope: "memory:write",
             input_schema: json!({
                 "type": "object",
@@ -497,6 +512,7 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
             read_only: true,
             destructive: false,
             idempotent: true,
+            open_world: false,
             required_scope: "memory:read",
             input_schema: json!({
                 "type": "object",
@@ -513,6 +529,7 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
             read_only: false,
             destructive: false,
             idempotent: true,
+            open_world: false,
             required_scope: "memory:write",
             input_schema: json!({
                 "type": "object",
@@ -540,6 +557,7 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
             read_only: false,
             destructive: false,
             idempotent: true,
+            open_world: false,
             required_scope: "memory:write",
             input_schema: json!({
                 "type": "object",
@@ -576,6 +594,7 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
             read_only: true,
             destructive: false,
             idempotent: true,
+            open_world: false,
             required_scope: "memory:read",
             input_schema: json!({
                 "type": "object",
@@ -593,6 +612,7 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
             read_only: false,
             destructive: false,
             idempotent: true,
+            open_world: false,
             required_scope: "memory:admin",
             input_schema: json!({
                 "type": "object",
@@ -617,6 +637,7 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
             read_only: false,
             destructive: true,
             idempotent: true,
+            open_world: false,
             required_scope: "memory:admin",
             input_schema: json!({
                 "type": "object",
@@ -635,6 +656,7 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
             read_only: false,
             destructive: false,
             idempotent: true,
+            open_world: false,
             required_scope: "memory:admin",
             input_schema: json!({
                 "type": "object",
@@ -660,6 +682,7 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
             read_only: true,
             destructive: false,
             idempotent: true,
+            open_world: false,
             required_scope: "memory:admin",
             input_schema: json!({
                 "type": "object",
@@ -673,6 +696,7 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
             read_only: false,
             destructive: true,
             idempotent: true,
+            open_world: false,
             required_scope: "memory:admin",
             input_schema: json!({
                 "type": "object",
@@ -689,6 +713,7 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
             read_only: false,
             destructive: false,
             idempotent: true,
+            open_world: false,
             required_scope: "memory:admin",
             input_schema: json!({
                 "type": "object",
@@ -706,6 +731,7 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
             read_only: false,
             destructive: false,
             idempotent: true,
+            open_world: false,
             required_scope: "memory:admin",
             input_schema: json!({
                 "type": "object",
@@ -724,6 +750,7 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
             read_only: false,
             destructive: false,
             idempotent: false,
+            open_world: false,
             required_scope: "memory:write",
             input_schema: json!({
                 "type": "object",
@@ -767,6 +794,7 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
             read_only: false,
             destructive: false,
             idempotent: true,
+            open_world: false,
             required_scope: "memory:write",
             input_schema: json!({
                 "type": "object",
@@ -801,6 +829,7 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
             read_only: true,
             destructive: false,
             idempotent: true,
+            open_world: false,
             required_scope: "memory:read",
             input_schema: json!({
                 "type": "object",
@@ -829,6 +858,7 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
             read_only: false,
             destructive: false,
             idempotent: false,
+            open_world: false,
             required_scope: "memory:write",
             input_schema: json!({
                 "type": "object",
@@ -864,6 +894,7 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
             read_only: false,
             destructive: false,
             idempotent: true,
+            open_world: false,
             required_scope: "memory:write",
             input_schema: json!({
                 "type": "object",
@@ -899,6 +930,7 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
             read_only: false,
             destructive: false,
             idempotent: false,
+            open_world: false,
             required_scope: "memory:write",
             input_schema: json!({
                 "type": "object",
@@ -964,6 +996,7 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
             read_only: false,
             destructive: false,
             idempotent: true,
+            open_world: false,
             required_scope: "memory:write",
             input_schema: json!({
                 "type": "object",
@@ -991,6 +1024,7 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
             read_only: false,
             destructive: false,
             idempotent: false,
+            open_world: false,
             required_scope: "memory:write",
             input_schema: json!({
                 "type": "object",
@@ -1021,6 +1055,7 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
             read_only: true,
             destructive: false,
             idempotent: true,
+            open_world: false,
             required_scope: "memory:read",
             input_schema: json!({
                 "type": "object",
@@ -1048,6 +1083,7 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
             read_only: true,
             destructive: false,
             idempotent: true,
+            open_world: false,
             required_scope: "memory:read",
             input_schema: json!({
                 "type": "object",
@@ -1100,6 +1136,7 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
             read_only: false,
             destructive: false,
             idempotent: false,
+            open_world: false,
             required_scope: "memory:write",
             input_schema: json!({
                 "type": "object",
@@ -1143,6 +1180,7 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
             read_only: false,
             destructive: false,
             idempotent: true,
+            open_world: false,
             required_scope: "memory:write",
             input_schema: json!({
                 "type": "object",
@@ -1227,6 +1265,7 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
             read_only: true,
             destructive: false,
             idempotent: true,
+            open_world: false,
             required_scope: "memory:read",
             input_schema: json!({
                 "type": "object",
@@ -1245,6 +1284,7 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
             read_only: true,
             destructive: false,
             idempotent: true,
+            open_world: false,
             required_scope: "memory:read",
             input_schema: json!({
                 "type": "object",
@@ -1265,6 +1305,7 @@ pub fn get_tool_definitions() -> &'static Vec<ToolDefinition> {
             read_only: true,
             destructive: false,
             idempotent: true,
+            open_world: false,
             required_scope: "memory:read",
             input_schema: json!({
                 "type": "object",

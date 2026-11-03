@@ -27,6 +27,7 @@
         "type": "object"
       },
       "name": "coding_revision_get",
+      "open_world": false,
       "read_only": true,
       "required": [
         "namespace",
@@ -72,6 +73,7 @@
         "type": "object"
       },
       "name": "coding_revision_list",
+      "open_world": false,
       "read_only": true,
       "required": [
         "namespace"
@@ -174,6 +176,7 @@
         "type": "object"
       },
       "name": "coding_revision_record",
+      "open_world": false,
       "read_only": false,
       "required": [
         "namespace",
@@ -233,6 +236,7 @@
         "type": "object"
       },
       "name": "coding_thread_create",
+      "open_world": false,
       "read_only": false,
       "required": [
         "namespace",
@@ -271,6 +275,7 @@
         "type": "object"
       },
       "name": "coding_thread_list",
+      "open_world": false,
       "read_only": true,
       "required": [
         "namespace"
@@ -340,6 +345,7 @@
         "type": "object"
       },
       "name": "cognitive_chat_propose",
+      "open_world": false,
       "read_only": false,
       "required": [
         "namespace",
@@ -384,6 +390,7 @@
         "type": "object"
       },
       "name": "cognitive_intentions_list",
+      "open_world": false,
       "read_only": true,
       "required": [
         "namespace"
@@ -427,6 +434,7 @@
         "type": "object"
       },
       "name": "cognitive_proposal_resolve",
+      "open_world": false,
       "read_only": false,
       "required": [
         "proposal_id",
@@ -459,6 +467,7 @@
         "type": "object"
       },
       "name": "memory_backup_create",
+      "open_world": false,
       "read_only": false,
       "required": [
         "namespace"
@@ -480,6 +489,7 @@
         "type": "object"
       },
       "name": "memory_backup_list",
+      "open_world": false,
       "read_only": true,
       "required": [],
       "required_scope": "memory:admin"
@@ -507,6 +517,7 @@
         "type": "object"
       },
       "name": "memory_collection_bind",
+      "open_world": false,
       "read_only": false,
       "required": [
         "collection_id",
@@ -531,6 +542,7 @@
         "type": "object"
       },
       "name": "memory_collection_delete",
+      "open_world": false,
       "read_only": false,
       "required": [
         "collection_id"
@@ -546,6 +558,7 @@
         "type": "object"
       },
       "name": "memory_collection_list",
+      "open_world": false,
       "read_only": true,
       "required": [],
       "required_scope": "memory:admin"
@@ -573,6 +586,7 @@
         "type": "object"
       },
       "name": "memory_collection_unbind",
+      "open_world": false,
       "read_only": false,
       "required": [
         "collection_id",
@@ -703,6 +717,7 @@
         "type": "object"
       },
       "name": "memory_collection_upsert",
+      "open_world": false,
       "read_only": false,
       "required": [
         "name",
@@ -753,6 +768,7 @@
         "type": "object"
       },
       "name": "memory_consolidate",
+      "open_world": false,
       "read_only": false,
       "required": [
         "namespace"
@@ -779,6 +795,7 @@
         "type": "object"
       },
       "name": "memory_consolidation_stats",
+      "open_world": false,
       "read_only": true,
       "required": [
         "namespace"
@@ -810,6 +827,7 @@
         "type": "object"
       },
       "name": "memory_delete",
+      "open_world": false,
       "read_only": false,
       "required": [
         "namespace",
@@ -847,6 +865,7 @@
         "type": "object"
       },
       "name": "memory_get",
+      "open_world": false,
       "read_only": true,
       "required": [
         "namespace"
@@ -888,6 +907,7 @@
         "type": "object"
       },
       "name": "memory_grant",
+      "open_world": false,
       "read_only": false,
       "required": [
         "namespace",
@@ -920,6 +940,7 @@
         "type": "object"
       },
       "name": "memory_history",
+      "open_world": false,
       "read_only": true,
       "required": [
         "namespace",
@@ -965,6 +986,7 @@
         "type": "object"
       },
       "name": "memory_integrate_scan",
+      "open_world": false,
       "read_only": false,
       "required": [
         "namespace"
@@ -991,6 +1013,7 @@
         "type": "object"
       },
       "name": "memory_integration_list",
+      "open_world": false,
       "read_only": true,
       "required": [
         "namespace"
@@ -1031,6 +1054,7 @@
         "type": "object"
       },
       "name": "memory_integration_resolve",
+      "open_world": false,
       "read_only": false,
       "required": [
         "proposal_id",
@@ -1115,6 +1139,7 @@
         "type": "object"
       },
       "name": "memory_list",
+      "open_world": false,
       "read_only": true,
       "required": [
         "namespace"
@@ -1190,6 +1215,7 @@
         "type": "object"
       },
       "name": "memory_put",
+      "open_world": false,
       "read_only": false,
       "required": [
         "namespace",
@@ -1223,6 +1249,7 @@
         "type": "object"
       },
       "name": "memory_restore",
+      "open_world": false,
       "read_only": false,
       "required": [
         "backup_id"
@@ -1255,6 +1282,7 @@
         "type": "object"
       },
       "name": "memory_revoke",
+      "open_world": false,
       "read_only": false,
       "required": [
         "namespace",
@@ -1354,6 +1382,7 @@
         "type": "object"
       },
       "name": "memory_search",
+      "open_world": false,
       "read_only": true,
       "required": [],
       "required_scope": "memory:read"
@@ -1378,6 +1407,7 @@
         "type": "object"
       },
       "name": "memory_stats",
+      "open_world": false,
       "read_only": true,
       "required": [
         "namespace"
@@ -1445,6 +1475,7 @@
         "type": "object"
       },
       "name": "memory_update",
+      "open_world": false,
       "read_only": false,
       "required": [
         "namespace",
@@ -1535,6 +1566,7 @@
         "type": "object"
       },
       "name": "working_experience_distill",
+      "open_world": false,
       "read_only": false,
       "required": [
         "namespace",
@@ -1576,6 +1608,7 @@
         "type": "object"
       },
       "name": "working_experience_feedback",
+      "open_world": false,
       "read_only": false,
       "required": [
         "namespace",
@@ -1616,6 +1649,7 @@
         "type": "object"
       },
       "name": "working_experience_history",
+      "open_world": false,
       "read_only": true,
       "required": [
         "namespace",
@@ -1684,6 +1718,7 @@
         "type": "object"
       },
       "name": "working_experience_search",
+      "open_world": false,
       "read_only": true,
       "required": [
         "query"
@@ -1731,6 +1766,7 @@
         "type": "object"
       },
       "name": "working_experience_transition",
+      "open_world": false,
       "read_only": false,
       "required": [
         "namespace",
@@ -1784,6 +1820,7 @@
         "type": "object"
       },
       "name": "working_task_finish",
+      "open_world": false,
       "read_only": false,
       "required": [
         "namespace",
@@ -1836,6 +1873,7 @@
         "type": "object"
       },
       "name": "working_task_start",
+      "open_world": false,
       "read_only": false,
       "required": [
         "namespace",

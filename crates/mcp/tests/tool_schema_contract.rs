@@ -43,6 +43,7 @@ fn snapshot() -> Value {
                 "read_only": d.read_only,
                 "destructive": d.destructive,
                 "idempotent": d.idempotent,
+                "open_world": d.open_world,
                 "required": required,
                 "input_schema": d.input_schema,
             })
